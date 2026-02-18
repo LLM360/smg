@@ -464,6 +464,11 @@ struct Router {
     mesh_advertise_host: Option<String>,
     mesh_port: u16,
     mesh_peer_urls: Vec<String>,
+    pre_prefill_url: Option<String>,
+    pre_prefill_decode_url: Option<String>,
+    pre_prefill_match_threshold: f32,
+    pre_prefill_unmatched_chars_threshold: usize,
+    pre_prefill_min_tokens: usize,
 }
 
 impl Router {
@@ -564,6 +569,11 @@ impl Router {
                     .as_ref()
                     .map(convert_policy)
                     .transpose()?,
+                pre_prefill_url: self.pre_prefill_url.clone(),
+                pre_prefill_decode_url: self.pre_prefill_decode_url.clone(),
+                pre_prefill_match_threshold: self.pre_prefill_match_threshold,
+                pre_prefill_unmatched_chars_threshold: self.pre_prefill_unmatched_chars_threshold,
+                pre_prefill_min_tokens: self.pre_prefill_min_tokens,
             }
         } else {
             RoutingMode::Regular {
@@ -846,6 +856,11 @@ impl Router {
         mesh_port = 39527u16,
         mesh_peer_urls = vec![],
         mesh_advertise_host = None,
+        pre_prefill_url = None,
+        pre_prefill_decode_url = None,
+        pre_prefill_match_threshold = 0.1,
+        pre_prefill_unmatched_chars_threshold = 10000,
+        pre_prefill_min_tokens = 10000,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -952,6 +967,11 @@ impl Router {
         mesh_port: u16,
         mesh_peer_urls: Vec<String>,
         mesh_advertise_host: Option<String>,
+        pre_prefill_url: Option<String>,
+        pre_prefill_decode_url: Option<String>,
+        pre_prefill_match_threshold: f32,
+        pre_prefill_unmatched_chars_threshold: usize,
+        pre_prefill_min_tokens: usize,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1068,6 +1088,11 @@ impl Router {
             mesh_advertise_host,
             mesh_port,
             mesh_peer_urls,
+            pre_prefill_url,
+            pre_prefill_decode_url,
+            pre_prefill_match_threshold,
+            pre_prefill_unmatched_chars_threshold,
+            pre_prefill_min_tokens,
         })
     }
 
