@@ -1261,6 +1261,7 @@ fn get_counters() -> &'static Mutex<HashMap<u16, Arc<AtomicU64>>> {
     REQUEST_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(clippy::unwrap_used)]
 fn increment_request_count(port: u16) {
     let mut map = get_counters().lock().unwrap();
     map.entry(port)
@@ -1270,6 +1271,7 @@ fn increment_request_count(port: u16) {
 
 /// Get the total number of chat/generate requests received by a worker on this port.
 /// Call this from tests to verify which worker handled a request.
+#[allow(clippy::unwrap_used)]
 pub fn get_request_count(port: u16) -> u64 {
     let map = get_counters().lock().unwrap();
     map.get(&port)
@@ -1278,6 +1280,7 @@ pub fn get_request_count(port: u16) -> u64 {
 }
 
 /// Reset request counters for all ports. Call at the start of a test.
+#[allow(clippy::unwrap_used)]
 pub fn reset_request_counters() {
     let map = get_counters().lock().unwrap();
     for counter in map.values() {

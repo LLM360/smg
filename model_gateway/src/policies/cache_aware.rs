@@ -768,12 +768,7 @@ impl CacheAwarePolicy {
     ///
     /// This updates the string tree so future requests with overlapping prefixes
     /// will be routed to the same worker (cache hit).
-    pub fn record_assignment(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        text: &str,
-        worker_url: &str,
-    ) {
+    pub fn record_assignment(&self, workers: &[Arc<dyn Worker>], text: &str, worker_url: &str) {
         if workers.is_empty() || text.is_empty() {
             return;
         }
@@ -787,16 +782,7 @@ impl CacheAwarePolicy {
         tree.insert_text(text, worker_url);
 
         // Sync insert operation to mesh if enabled
-        if let Some(ref mesh_sync) = self.mesh_sync {
-            let op = TreeOperation::Insert(TreeInsertOp {
-                text: text.to_string(),
-                tenant: worker_url.to_string(),
-            });
-            let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-            if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
-                warn!("Failed to sync pre-prefill tree insert to mesh: {}", e);
-            }
-        }
+        self.sync_insert_operation(model_id, TreeKey::Text(text.to_string()), worker_url);
     }
 }
 

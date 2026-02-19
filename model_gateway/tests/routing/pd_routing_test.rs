@@ -8,19 +8,19 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use serde_json::json;
-use smg::config::RouterConfig;
+use smg::config::{PrePrefillConfig, RouterConfig, RoutingMode};
 use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{self, HealthStatus, MockWorkerConfig, WorkerType},
     AppTestContext, TestWorkerConfig,
 };
-use smg::config::RoutingMode;
 
 #[cfg(test)]
 mod pd_routing_tests {
-    use super::*;
     use serial_test::serial;
+
+    use super::*;
 
     /// Test basic PD mode routing with prefill and decode workers
     #[tokio::test]
@@ -244,21 +244,19 @@ mod pd_routing_tests {
         let config = RouterConfig::builder()
             .mode(RoutingMode::PrefillDecode {
                 prefill_urls: vec![
-                    (format!("http://127.0.0.1:{}", prefill_port_1), None),
-                    (format!("http://127.0.0.1:{}", prefill_port_2), None),
-                    (format!("http://127.0.0.1:{}", pp_prefill_port), None),
+                    (format!("http://127.0.0.1:{prefill_port_1}"), None),
+                    (format!("http://127.0.0.1:{prefill_port_2}"), None),
                 ],
-                decode_urls: vec![
-                    format!("http://127.0.0.1:{}", decode_port),
-                    format!("http://127.0.0.1:{}", pp_decode_port),
-                ],
+                decode_urls: vec![format!("http://127.0.0.1:{decode_port}")],
                 prefill_policy: None,
                 decode_policy: None,
-                pre_prefill_url: Some(format!("http://127.0.0.1:{}", pp_prefill_port)),
-                pre_prefill_decode_url: Some(format!("http://127.0.0.1:{}", pp_decode_port)),
-                pre_prefill_match_threshold: 0.1,
-                pre_prefill_unmatched_chars_threshold: 50,
-                pre_prefill_min_tokens: 50,
+                pre_prefill_urls: vec![(format!("http://127.0.0.1:{pp_prefill_port}"), None)],
+                pre_prefill_decode_urls: vec![format!("http://127.0.0.1:{pp_decode_port}")],
+                pre_prefill_config: PrePrefillConfig {
+                    match_threshold: 0.1,
+                    unmatched_chars_threshold: 50,
+                    min_chars: 50,
+                },
             })
             .cache_aware_policy(0.3, 64, 1.5, 0, 100_000)
             .host("127.0.0.1")
@@ -283,7 +281,7 @@ mod pd_routing_tests {
         )
         .await;
 
-        let app = ctx.create_app().await;
+        let app = ctx.create_app();
         mock_worker::reset_request_counters();
 
         // ---- Warmup: seed the cache-aware tree so it exists for subsequent requests ----
@@ -300,7 +298,11 @@ mod pd_routing_tests {
             .body(Body::from(serde_json::to_string(&warmup_payload).unwrap()))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "Warmup request should succeed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Warmup request should succeed"
+        );
 
         // ---- Test 1: Cold request (different text, never seen) → pre-prefill worker ----
         mock_worker::reset_request_counters();
@@ -324,21 +326,19 @@ mod pd_routing_tests {
         let pp_count = mock_worker::get_request_count(pp_prefill_port);
         assert_eq!(
             pp_count, 1,
-            "Cold request should route to pre-prefill worker (port {}), got {} requests",
-            pp_prefill_port, pp_count
+            "Cold request should route to pre-prefill worker (port {pp_prefill_port}), got {pp_count} requests",
         );
         let ppd_count = mock_worker::get_request_count(pp_decode_port);
         assert_eq!(
             ppd_count, 1,
-            "Cold request decode should route to pre-prefill decode worker (port {}), got {}",
-            pp_decode_port, ppd_count
+            "Cold request decode should route to pre-prefill decode worker (port {pp_decode_port}), got {ppd_count}",
         );
         let normal_p1 = mock_worker::get_request_count(prefill_port_1);
         let normal_p2 = mock_worker::get_request_count(prefill_port_2);
         assert_eq!(
-            normal_p1 + normal_p2, 0,
-            "Normal prefill workers should NOT receive cold request, got {} + {}",
-            normal_p1, normal_p2
+            normal_p1 + normal_p2,
+            0,
+            "Normal prefill workers should NOT receive cold request, got {normal_p1} + {normal_p2}",
         );
 
         // ---- Test 2: Same text again (warm) → normal routing (cache hit, not pre-prefill) ----
@@ -357,7 +357,10 @@ mod pd_routing_tests {
         let total_prefill = mock_worker::get_request_count(prefill_port_1)
             + mock_worker::get_request_count(prefill_port_2)
             + mock_worker::get_request_count(pp_prefill_port);
-        assert_eq!(total_prefill, 1, "Warm request should route to exactly one prefill worker");
+        assert_eq!(
+            total_prefill, 1,
+            "Warm request should route to exactly one prefill worker"
+        );
 
         // ---- Test 3: Short text → bypasses pre-prefill ----
         mock_worker::reset_request_counters();
@@ -379,7 +382,10 @@ mod pd_routing_tests {
         let total_prefill = mock_worker::get_request_count(prefill_port_1)
             + mock_worker::get_request_count(prefill_port_2)
             + mock_worker::get_request_count(pp_prefill_port);
-        assert_eq!(total_prefill, 1, "Short request should route to exactly one prefill worker");
+        assert_eq!(
+            total_prefill, 1,
+            "Short request should route to exactly one prefill worker"
+        );
 
         ctx.shutdown().await;
     }
@@ -410,21 +416,19 @@ mod pd_routing_tests {
         let config = RouterConfig::builder()
             .mode(RoutingMode::PrefillDecode {
                 prefill_urls: vec![
-                    (format!("http://127.0.0.1:{}", p1_port), None),
-                    (format!("http://127.0.0.1:{}", p2_port), None),
-                    (format!("http://127.0.0.1:{}", pp_port), None),
+                    (format!("http://127.0.0.1:{p1_port}"), None),
+                    (format!("http://127.0.0.1:{p2_port}"), None),
                 ],
-                decode_urls: vec![
-                    format!("http://127.0.0.1:{}", d_port),
-                    format!("http://127.0.0.1:{}", ppd_port),
-                ],
+                decode_urls: vec![format!("http://127.0.0.1:{d_port}")],
                 prefill_policy: None,
                 decode_policy: None,
-                pre_prefill_url: Some(format!("http://127.0.0.1:{}", pp_port)),
-                pre_prefill_decode_url: Some(format!("http://127.0.0.1:{}", ppd_port)),
-                pre_prefill_match_threshold: 0.1,
-                pre_prefill_unmatched_chars_threshold: 50,
-                pre_prefill_min_tokens: 50,
+                pre_prefill_urls: vec![(format!("http://127.0.0.1:{pp_port}"), None)],
+                pre_prefill_decode_urls: vec![format!("http://127.0.0.1:{ppd_port}")],
+                pre_prefill_config: PrePrefillConfig {
+                    match_threshold: 0.1,
+                    unmatched_chars_threshold: 50,
+                    min_chars: 50,
+                },
             })
             .cache_aware_policy(0.3, 64, 1.5, 0, 100_000)
             .host("127.0.0.1")
@@ -449,7 +453,7 @@ mod pd_routing_tests {
         )
         .await;
 
-        let app = ctx.create_app().await;
+        let app = ctx.create_app();
         mock_worker::reset_request_counters();
 
         // ---- Build multi-turn conversations ----
@@ -470,7 +474,8 @@ mod pd_routing_tests {
 
         let user_b1 = "How do I make fresh pasta from scratch? I want to learn the traditional Italian method with eggs and flour.";
         let asst_b1 = "Start with 100g flour per egg on a clean surface. Make a well, crack eggs in center, and slowly incorporate...";
-        let user_b2 = "What is the best flour type for fresh pasta? Should I use 00 flour or semolina?";
+        let user_b2 =
+            "What is the best flour type for fresh pasta? Should I use 00 flour or semolina?";
 
         let user_c1 = "Explain the fundamental theorem of calculus and how it connects differentiation and integration together.";
 
@@ -506,7 +511,10 @@ mod pd_routing_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let pp_hits = mock_worker::get_request_count(pp_port);
-        assert_eq!(pp_hits, 1, "Conv A turn 1 should be COLD → PP worker (got {} PP hits)", pp_hits);
+        assert_eq!(
+            pp_hits, 1,
+            "Conv A turn 1 should be COLD → PP worker (got {pp_hits} PP hits)"
+        );
 
         // ---- Conv A, Turn 2: follow-up (WARM — shares sys_a + user_a1 prefix) ----
         mock_worker::reset_request_counters();
@@ -522,13 +530,16 @@ mod pd_routing_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let pp_hits = mock_worker::get_request_count(pp_port);
-        let normal_hits = mock_worker::get_request_count(p1_port)
-            + mock_worker::get_request_count(p2_port);
+        let normal_hits =
+            mock_worker::get_request_count(p1_port) + mock_worker::get_request_count(p2_port);
         // Warm: high prefix overlap with turn 1 → should NOT go to PP
         // Note: it may still land on PP via normal cache-aware routing (PP "owns" this prefix).
         // What matters is total_prefill == 1 (one worker handles it)
         let total = pp_hits + normal_hits;
-        assert_eq!(total, 1, "Conv A turn 2: exactly one prefill worker should handle it");
+        assert_eq!(
+            total, 1,
+            "Conv A turn 2: exactly one prefill worker should handle it"
+        );
 
         // ---- Conv B, Turn 1: NEW conversation (COLD) ----
         mock_worker::reset_request_counters();
@@ -542,7 +553,10 @@ mod pd_routing_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let pp_hits = mock_worker::get_request_count(pp_port);
-        assert_eq!(pp_hits, 1, "Conv B turn 1 should be COLD → PP worker (got {} PP hits)", pp_hits);
+        assert_eq!(
+            pp_hits, 1,
+            "Conv B turn 1 should be COLD → PP worker (got {pp_hits} PP hits)"
+        );
 
         // ---- Conv A, Turn 3: continuing conv A (WARM) ----
         mock_worker::reset_request_counters();
@@ -562,7 +576,10 @@ mod pd_routing_tests {
         let total = mock_worker::get_request_count(pp_port)
             + mock_worker::get_request_count(p1_port)
             + mock_worker::get_request_count(p2_port);
-        assert_eq!(total, 1, "Conv A turn 3: exactly one prefill worker should handle it");
+        assert_eq!(
+            total, 1,
+            "Conv A turn 3: exactly one prefill worker should handle it"
+        );
 
         // ---- Conv C, Turn 1: NEW conversation (COLD) ----
         mock_worker::reset_request_counters();
@@ -576,7 +593,10 @@ mod pd_routing_tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let pp_hits = mock_worker::get_request_count(pp_port);
-        assert_eq!(pp_hits, 1, "Conv C turn 1 should be COLD → PP worker (got {} PP hits)", pp_hits);
+        assert_eq!(
+            pp_hits, 1,
+            "Conv C turn 1 should be COLD → PP worker (got {pp_hits} PP hits)"
+        );
 
         // ---- Conv B, Turn 2: continuing conv B (WARM) ----
         mock_worker::reset_request_counters();
@@ -594,7 +614,10 @@ mod pd_routing_tests {
         let total = mock_worker::get_request_count(pp_port)
             + mock_worker::get_request_count(p1_port)
             + mock_worker::get_request_count(p2_port);
-        assert_eq!(total, 1, "Conv B turn 2: exactly one prefill worker should handle it");
+        assert_eq!(
+            total, 1,
+            "Conv B turn 2: exactly one prefill worker should handle it"
+        );
 
         // ---- Conv A, Turn 4: deep continuation (WARM) ----
         mock_worker::reset_request_counters();
@@ -616,7 +639,10 @@ mod pd_routing_tests {
         let total = mock_worker::get_request_count(pp_port)
             + mock_worker::get_request_count(p1_port)
             + mock_worker::get_request_count(p2_port);
-        assert_eq!(total, 1, "Conv A turn 4: exactly one prefill worker should handle it");
+        assert_eq!(
+            total, 1,
+            "Conv A turn 4: exactly one prefill worker should handle it"
+        );
 
         // ---- Summary: count total PP vs normal across ALL requests ----
         // We can't aggregate across resets, but the per-step assertions above prove:
