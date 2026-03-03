@@ -83,7 +83,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let chat_response = ctx
         .pipeline
         .execute_chat(
-            chat_request.clone(),
+            chat_request,
             params.headers,
             params.model_id,
             ctx.components.clone(),
@@ -864,7 +864,7 @@ async fn execute_tool_loop_streaming_internal(
             }
 
             // Build next request with conversation history
-            current_request = build_next_request(&state, &current_request);
+            current_request = build_next_request(&state, current_request);
 
             continue;
         }
