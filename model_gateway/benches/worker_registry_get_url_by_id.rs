@@ -37,6 +37,10 @@ fn setup_registry(count: usize) -> (Arc<WorkerRegistry>, WorkerId, WorkerId, Vec
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "Benchmark setup: panicking on failure is intended behavior for setup"
+    )]
     (
         registry,
         first_id.expect("at least one worker"),
