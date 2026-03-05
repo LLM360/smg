@@ -29,7 +29,10 @@ use super::{
     types::HarmonyChannelDelta, HarmonyParserAdapter,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::{
+        events::{request_timestamps_from_local_timing, Event, RequestStatsEvent},
+        metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    },
     routers::grpc::{
         common::{
             response_formatting::CompletionTokenTracker,
@@ -39,7 +42,9 @@ use crate::{
             },
         },
         context,
-        proto_wrapper::{ProtoResponseVariant, ProtoStream},
+        proto_wrapper::{
+            collect_unified_request_stats, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
+        },
         utils,
     },
 };
@@ -142,6 +147,7 @@ impl HarmonyStreamingProcessor {
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -206,6 +212,7 @@ impl HarmonyStreamingProcessor {
                     }
                 }
                 ProtoResponseVariant::Complete(complete_wrapper) => {
+                    completed_responses.push(complete_wrapper.clone());
                     let index = complete_wrapper.index();
 
                     // Store final metadata
@@ -273,6 +280,22 @@ impl HarmonyStreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
+        if let Some(mut request_stats) = collect_unified_request_stats(&completed_responses) {
+            request_stats.prompt_tokens = total_prompt as u64;
+            request_stats.completion_tokens = total_completion as u64;
+            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
+                start_time,
+                first_token_time,
+            ));
+            RequestStatsEvent {
+                request_id: &dispatch.request_id,
+                model: &original_request.model,
+                router_backend: metrics_labels::BACKEND_HARMONY,
+                stats: &request_stats,
+            }
+            .emit();
+        }
+
         Ok(())
     }
 
@@ -307,6 +330,7 @@ impl HarmonyStreamingProcessor {
         let mut finish_reasons: HashMap<u32, Option<String>> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
+        let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -368,6 +392,7 @@ impl HarmonyStreamingProcessor {
                     }
                 }
                 ProtoResponseVariant::Complete(complete_wrapper) => {
+                    completed_responses.push(complete_wrapper.clone());
                     let index = complete_wrapper.index();
 
                     finish_reasons
@@ -433,6 +458,22 @@ impl HarmonyStreamingProcessor {
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
         });
+
+        if let Some(mut request_stats) = collect_unified_request_stats(&completed_responses) {
+            request_stats.prompt_tokens = total_prompt as u64;
+            request_stats.completion_tokens = total_completion as u64;
+            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
+                start_time,
+                first_token_time,
+            ));
+            RequestStatsEvent {
+                request_id: &dispatch.request_id,
+                model: &original_request.model,
+                router_backend: metrics_labels::BACKEND_HARMONY,
+                stats: &request_stats,
+            }
+            .emit();
+        }
 
         Ok(())
     }
@@ -606,7 +647,7 @@ impl HarmonyStreamingProcessor {
             if let ProtoResponseVariant::Complete(complete_wrapper) = response.into_response() {
                 prefill_cached_tokens_by_index
                     .insert(complete_wrapper.index(), complete_wrapper.cached_tokens());
-            }
+        }
         }
         let prefill_cached_tokens: u32 = prefill_cached_tokens_by_index.values().sum();
 

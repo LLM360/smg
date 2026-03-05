@@ -18,13 +18,19 @@ use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
-        proto_wrapper::ProtoGenerateComplete,
-        utils,
+use crate::{
+    observability::{
+        events::{request_timestamps_from_local_timing, Event, RequestStatsEvent},
+        metrics::metrics_labels,
+    },
+    routers::{
+        error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::{collect_unified_request_stats, ProtoGenerateComplete},
+            utils,
+        },
     },
 };
 
@@ -199,6 +205,8 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
+        let start_time = Instant::now();
+
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -269,6 +277,18 @@ impl ResponseProcessor {
 
         // Build usage
         let usage = response_formatting::build_usage(&all_responses);
+
+        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
+            request_stats
+                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+            RequestStatsEvent {
+                request_id: &dispatch.request_id,
+                model: &dispatch.model,
+                router_backend: metrics_labels::BACKEND_REGULAR,
+                stats: &request_stats,
+            }
+            .emit();
+        }
 
         // Build final ChatCompletionResponse
         Ok(
@@ -351,6 +371,18 @@ impl ResponseProcessor {
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
+
+        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
+            request_stats
+                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+            RequestStatsEvent {
+                request_id: &dispatch.request_id,
+                model: &dispatch.model,
+                router_backend: metrics_labels::BACKEND_REGULAR,
+                stats: &request_stats,
+            }
+            .emit();
+        }
 
         // Process each completion
         let mut result_array = Vec::new();

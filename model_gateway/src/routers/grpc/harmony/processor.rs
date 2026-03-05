@@ -7,19 +7,27 @@ use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
     common::{ChatLogProbs, ToolCall, Usage},
     responses::{
-        InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponseUsage, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage,
+        InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem, ResponseReasoningContent,
+        ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use tracing::error;
 
+use std::time::Instant;
+
 use super::{builder::convert_harmony_logprobs, HarmonyParserAdapter};
-use crate::routers::{
-    error,
-    grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+use crate::{
+    observability::{
+        events::{request_timestamps_from_local_timing, Event, RequestStatsEvent},
+        metrics::metrics_labels,
+    },
+    routers::{
+        error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::collect_unified_request_stats,
+        },
     },
 };
 
@@ -42,6 +50,7 @@ impl HarmonyResponseProcessor {
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
     ) -> Result<ChatCompletionResponse, Response> {
+        let start_time = Instant::now();
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
@@ -129,6 +138,18 @@ impl HarmonyResponseProcessor {
         let usage = response_formatting::build_usage(&all_responses)
             .with_reasoning_tokens(total_reasoning_tokens);
 
+        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
+            request_stats
+                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+            RequestStatsEvent {
+                request_id: &dispatch.request_id,
+                model: &chat_request.model,
+                router_backend: metrics_labels::BACKEND_HARMONY,
+                stats: &request_stats,
+            }
+            .emit();
+        }
+
         // Final ChatCompletionResponse
         Ok(
             ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
@@ -189,6 +210,7 @@ impl HarmonyResponseProcessor {
         responses_request: Arc<ResponsesRequest>,
         dispatch: DispatchMetadata,
     ) -> Result<ResponsesIterationResult, Response> {
+        let start_time = Instant::now();
         let request_logprobs = responses_request.top_logprobs.is_some();
 
         // Collect all completed responses
@@ -258,6 +280,18 @@ impl HarmonyResponseProcessor {
         // Build usage (needed for both ToolCallsFound and Completed)
         let usage = response_formatting::build_usage(std::slice::from_ref(complete))
             .with_reasoning_tokens(parsed.reasoning_token_count);
+
+        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
+            request_stats
+                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+            RequestStatsEvent {
+                request_id: &dispatch.request_id,
+                model: &responses_request.model,
+                router_backend: metrics_labels::BACKEND_HARMONY,
+                stats: &request_stats,
+            }
+            .emit();
+        }
 
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {

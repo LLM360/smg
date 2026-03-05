@@ -24,11 +24,18 @@ use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, Tool
 use tracing::{debug, error, warn};
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::{
+        events::{
+            request_timestamps_from_local_timing, Event, RequestStatsEvent, UnifiedRequestStats,
+        },
+        metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    },
     routers::grpc::{
         common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
         context,
-        proto_wrapper::{ProtoResponseVariant, ProtoStream},
+        proto_wrapper::{
+            collect_unified_request_stats, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
+        },
         utils,
     },
 };
@@ -197,6 +204,7 @@ impl StreamingProcessor {
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -414,6 +422,7 @@ impl StreamingProcessor {
                     }
                 }
                 ProtoResponseVariant::Complete(complete) => {
+                    completed_responses.push(complete.clone());
                     let index = complete.index();
 
                     // Flush any remaining text for this index's stop_decoder
@@ -554,6 +563,22 @@ impl StreamingProcessor {
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
         });
+
+        if let Some(mut request_stats) = collect_unified_request_stats(&completed_responses) {
+            request_stats.prompt_tokens = total_prompt as u64;
+            request_stats.completion_tokens = total_completion as u64;
+            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
+                start_time,
+                first_token_time,
+            ));
+            RequestStatsEvent {
+                request_id,
+                model,
+                router_backend: self.backend_type,
+                stats: &request_stats,
+            }
+            .emit();
+        }
 
         Ok(())
     }
@@ -705,6 +730,7 @@ impl StreamingProcessor {
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {e}"))?;
@@ -756,6 +782,7 @@ impl StreamingProcessor {
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
+                    completed_responses.push(complete.clone());
                     let index = complete.index();
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
@@ -799,6 +826,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::emit_generate_request_stats(start_time, first_token_time, &ctx, &completed_responses);
 
         Ok(())
     }
@@ -872,6 +900,7 @@ impl StreamingProcessor {
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {e}"))?;
@@ -949,6 +978,7 @@ impl StreamingProcessor {
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
+                    completed_responses.push(complete.clone());
                     let index = complete.index();
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
@@ -1006,6 +1036,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::emit_generate_request_stats(start_time, first_token_time, &ctx, &completed_responses);
 
         Ok(())
     }
@@ -1031,6 +1062,36 @@ impl StreamingProcessor {
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
             output_tokens: total_completion as u64,
         });
+    }
+
+    fn emit_generate_request_stats(
+        start_time: Instant,
+        first_token_time: Option<Instant>,
+        ctx: &GenerateStreamContext,
+        completed_responses: &[ProtoGenerateComplete],
+    ) {
+        if let Some(mut request_stats) = collect_unified_request_stats(completed_responses) {
+            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
+                start_time,
+                first_token_time,
+            ));
+            Self::emit_request_stats_event(&ctx.request_id, &ctx.model, ctx.backend_type, &request_stats);
+        }
+    }
+
+    fn emit_request_stats_event(
+        request_id: &str,
+        model: &str,
+        router_backend: &'static str,
+        request_stats: &UnifiedRequestStats,
+    ) {
+        RequestStatsEvent {
+            request_id,
+            model,
+            router_backend,
+            stats: request_stats,
+        }
+        .emit();
     }
 
     /// Process a chunk of tokens through the stop decoder
