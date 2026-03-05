@@ -199,8 +199,13 @@ pub struct WorkerRegistry {
     /// Workers indexed by connection mode
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
 
-    /// URL to worker ID mapping
+    /// URL to worker ID mapping (forward: url → id)
     url_to_id: Arc<DashMap<String, WorkerId>>,
+
+    /// Reverse mapping: WorkerId → URL for O(1) `get_url_by_id` lookups.
+    /// Maintained symmetrically with `url_to_id` in `register` and `remove`.
+    id_to_url: Arc<DashMap<WorkerId, String>>,
+
     /// Optional mesh sync manager for state synchronization
     /// When None, the registry works independently without mesh synchronization
     /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
@@ -217,6 +222,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            id_to_url: Arc::new(DashMap::new()),
             mesh_sync: Arc::new(RwLock::new(None)),
         }
     }
@@ -255,9 +261,11 @@ impl WorkerRegistry {
         // Store worker
         self.workers.insert(worker_id.clone(), worker.clone());
 
-        // Update URL mapping
+        // Update URL ↔ ID mappings (both directions)
         self.url_to_id
             .insert(worker.url().to_string(), worker_id.clone());
+        self.id_to_url
+            .insert(worker_id.clone(), worker.url().to_string());
 
         // Update model index for O(1) lookups using copy-on-write
         // This creates a new immutable snapshot with the added worker
@@ -310,21 +318,26 @@ impl WorkerRegistry {
         self.url_to_id.entry(url.to_string()).or_default().clone()
     }
 
-    /// Best-effort lookup of the URL for a given worker ID.
+    /// O(1) lookup of the URL for a given worker ID.
+    ///
+    /// Uses the `id_to_url` reverse index, so cost is a single DashMap
+    /// hash lookup regardless of fleet size. This replaces the previous
+    /// O(N) full scan of `url_to_id` for IDs not present in `workers`.
     pub fn get_url_by_id(&self, worker_id: &WorkerId) -> Option<String> {
+        // Fast path: worker is live get URL directly from the worker object.
         if let Some(worker) = self.get(worker_id) {
             return Some(worker.url().to_string());
         }
-        self.url_to_id
-            .iter()
-            .find_map(|entry| (entry.value() == worker_id).then(|| entry.key().clone()))
+        // Reverse index lookup  O(1) for removed/stale IDs.
+        self.id_to_url.get(worker_id).map(|url| url.clone())
     }
 
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         if let Some((_, worker)) = self.workers.remove(worker_id) {
-            // Remove from URL mapping
+            // Remove from URL ↔ ID mappings (both directions)
             self.url_to_id.remove(worker.url());
+            self.id_to_url.remove(worker_id);
 
             // Remove from model index using copy-on-write
             // Create new snapshot without the removed worker
