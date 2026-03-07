@@ -34,12 +34,15 @@ use uuid::Uuid;
 use super::{
     client::GrpcClient,
     context::RequestContext,
-    proto_wrapper::{ProtoGenerateComplete, ProtoInputLogProbs, ProtoOutputLogProbs, ProtoStream},
+    proto_wrapper::{
+        collect_request_stats, ProtoGenerateComplete, ProtoInputLogProbs, ProtoOutputLogProbs,
+        ProtoStream,
+    },
     ProcessedMessages,
 };
 use crate::{
     core::Worker,
-    observability::metrics::metrics_labels,
+    observability::{events::UnifiedRequestStats, metrics::metrics_labels},
     routers::{error, grpc::proto_wrapper::ProtoResponseVariant},
 };
 
@@ -647,13 +650,19 @@ pub(crate) fn parse_json_schema_response(
 /// * `worker_name` - Name for logging (e.g., "Prefill", "Decode", "Worker")
 ///
 /// # Returns
-/// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
+/// * `Ok(CollectedStreamResponses)` - Collected complete responses and unified request stats
 /// * `Err(Response)` - Error response if the stream fails or returns an error
+pub(crate) struct CollectedStreamResponses {
+    pub completes: Vec<ProtoGenerateComplete>,
+    pub request_stats: Option<UnifiedRequestStats>,
+}
+
 pub(crate) async fn collect_stream_responses(
     stream: &mut ProtoStream,
     worker_name: &str,
-) -> Result<Vec<ProtoGenerateComplete>, Response> {
+) -> Result<CollectedStreamResponses, Response> {
     let mut all_responses = Vec::new();
+    let mut stream_request_stats = Vec::new();
 
     while let Some(response) = stream.next().await {
         match response {
@@ -673,6 +682,9 @@ pub(crate) async fn collect_stream_responses(
                     ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
                     }
+                    ProtoResponseVariant::RequestStats(request_stats) => {
+                        stream_request_stats.push(request_stats);
+                    }
                     ProtoResponseVariant::None => {
                         // Empty response - no action needed
                     }
@@ -689,7 +701,12 @@ pub(crate) async fn collect_stream_responses(
         }
     }
 
-    Ok(all_responses)
+    let request_stats = collect_request_stats(&all_responses, &stream_request_stats);
+
+    Ok(CollectedStreamResponses {
+        completes: all_responses,
+        request_stats,
+    })
 }
 
 /// Count the number of tool calls in the request message history

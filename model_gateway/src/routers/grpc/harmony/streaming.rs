@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     observability::{
-        events::{request_timestamps_from_local_timing, Event, RequestStatsEvent},
+        events::{Event, RequestStatsEvent},
         metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     },
     routers::grpc::{
@@ -43,7 +43,8 @@ use crate::{
         },
         context,
         proto_wrapper::{
-            collect_unified_request_stats, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
+            collect_request_stats, ProtoGenerateComplete, ProtoRequestStats, ProtoResponseVariant,
+            ProtoStream,
         },
         utils,
     },
@@ -103,7 +104,7 @@ impl HarmonyStreamingProcessor {
                 tokio::spawn(async move {
                     let result =
                         Self::process_dual_stream(prefill, *decode, dispatch, chat_request, &tx)
-                            .await;
+                        .await;
 
                     if let Err(e) = result {
                         error!("Harmony dual streaming error: {}", e);
@@ -148,6 +149,7 @@ impl HarmonyStreamingProcessor {
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
+        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -244,6 +246,9 @@ impl HarmonyStreamingProcessor {
                 ProtoResponseVariant::Error(error_wrapper) => {
                     return Err(format!("Server error: {}", error_wrapper.message()));
                 }
+                ProtoResponseVariant::RequestStats(request_stats) => {
+                    stream_request_stats.push(request_stats);
+                }
                 ProtoResponseVariant::None => {}
             }
         }
@@ -280,13 +285,11 @@ impl HarmonyStreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        if let Some(mut request_stats) = collect_unified_request_stats(&completed_responses) {
+        let request_stats = collect_request_stats(&completed_responses, &stream_request_stats);
+
+        if let Some(mut request_stats) = request_stats {
             request_stats.prompt_tokens = total_prompt as u64;
             request_stats.completion_tokens = total_completion as u64;
-            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
-                start_time,
-                first_token_time,
-            ));
             RequestStatsEvent {
                 request_id: &dispatch.request_id,
                 model: &original_request.model,
@@ -331,6 +334,7 @@ impl HarmonyStreamingProcessor {
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
+        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -420,6 +424,9 @@ impl HarmonyStreamingProcessor {
                 ProtoResponseVariant::Error(error_wrapper) => {
                     return Err(format!("Server error: {}", error_wrapper.message()));
                 }
+                ProtoResponseVariant::RequestStats(request_stats) => {
+                    stream_request_stats.push(request_stats);
+                }
                 ProtoResponseVariant::None => {}
             }
         }
@@ -459,13 +466,11 @@ impl HarmonyStreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        if let Some(mut request_stats) = collect_unified_request_stats(&completed_responses) {
+        let request_stats = collect_request_stats(&completed_responses, &stream_request_stats);
+
+        if let Some(mut request_stats) = request_stats {
             request_stats.prompt_tokens = total_prompt as u64;
             request_stats.completion_tokens = total_completion as u64;
-            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
-                start_time,
-                first_token_time,
-            ));
             RequestStatsEvent {
                 request_id: &dispatch.request_id,
                 model: &original_request.model,
@@ -1045,6 +1050,7 @@ impl HarmonyStreamingProcessor {
                 ProtoResponseVariant::Error(error_wrapper) => {
                     return Err(format!("Server error: {}", error_wrapper.message()));
                 }
+                ProtoResponseVariant::RequestStats(_) => {}
                 ProtoResponseVariant::None => {}
             }
         }

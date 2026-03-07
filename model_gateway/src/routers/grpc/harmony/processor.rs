@@ -13,12 +13,10 @@ use openai_protocol::{
 };
 use tracing::error;
 
-use std::time::Instant;
-
 use super::{builder::convert_harmony_logprobs, HarmonyParserAdapter};
 use crate::{
     observability::{
-        events::{request_timestamps_from_local_timing, Event, RequestStatsEvent},
+        events::{Event, RequestStatsEvent},
         metrics::metrics_labels,
     },
     routers::{
@@ -26,7 +24,6 @@ use crate::{
         grpc::{
             common::{response_collection, response_formatting},
             context::{DispatchMetadata, ExecutionResult},
-            proto_wrapper::collect_unified_request_stats,
         },
     },
 };
@@ -50,12 +47,13 @@ impl HarmonyResponseProcessor {
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
     ) -> Result<ChatCompletionResponse, Response> {
-        let start_time = Instant::now();
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let response_collection::CollectedResponses {
+            completes: all_responses,
+            request_stats,
+        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
         if all_responses.is_empty() {
             return Err(error::internal_error(
                 "no_responses_from_server",
@@ -138,9 +136,7 @@ impl HarmonyResponseProcessor {
         let usage = response_formatting::build_usage(&all_responses)
             .with_reasoning_tokens(total_reasoning_tokens);
 
-        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
-            request_stats
-                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+        if let Some(request_stats) = request_stats {
             RequestStatsEvent {
                 request_id: &dispatch.request_id,
                 model: &chat_request.model,
@@ -210,12 +206,13 @@ impl HarmonyResponseProcessor {
         responses_request: Arc<ResponsesRequest>,
         dispatch: DispatchMetadata,
     ) -> Result<ResponsesIterationResult, Response> {
-        let start_time = Instant::now();
         let request_logprobs = responses_request.top_logprobs.is_some();
 
         // Collect all completed responses
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let response_collection::CollectedResponses {
+            completes: all_responses,
+            request_stats,
+        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
         if all_responses.is_empty() {
             return Err(error::internal_error(
                 "no_responses_from_server",
@@ -281,9 +278,7 @@ impl HarmonyResponseProcessor {
         let usage = response_formatting::build_usage(std::slice::from_ref(complete))
             .with_reasoning_tokens(parsed.reasoning_token_count);
 
-        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
-            request_stats
-                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+        if let Some(request_stats) = request_stats {
             RequestStatsEvent {
                 request_id: &dispatch.request_id,
                 model: &responses_request.model,

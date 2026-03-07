@@ -9,6 +9,12 @@ use crate::routers::{
     error,
     grpc::{context::ExecutionResult, proto_wrapper::ProtoGenerateComplete, utils},
 };
+use crate::observability::events::UnifiedRequestStats;
+
+pub(crate) struct CollectedResponses {
+    pub completes: Vec<ProtoGenerateComplete>,
+    pub request_stats: Option<UnifiedRequestStats>,
+}
 
 /// Collect and merge responses from execution result
 ///
@@ -24,24 +30,27 @@ use crate::routers::{
 pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
-) -> Result<Vec<ProtoGenerateComplete>, Response> {
-    let all_responses = match execution_result {
+) -> Result<CollectedResponses, Response> {
+    let collected = match execution_result {
         ExecutionResult::Single { mut stream } => {
             let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
             stream.mark_completed();
-            responses
+            CollectedResponses {
+                completes: responses.completes,
+                request_stats: responses.request_stats,
+            }
         }
         ExecutionResult::Dual {
             mut prefill,
             decode,
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_responses =
+            let prefill_collected =
                 utils::collect_stream_responses(&mut prefill, "Prefill").await?;
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
-            let mut decode_responses =
+            let mut decode_collected =
                 utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
 
             // Mark both streams as completed now that both succeeded
@@ -50,10 +59,16 @@ pub(crate) async fn collect_responses(
 
             // Merge prefill input_logprobs if requested
             if merge_logprobs {
-                merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
+                merge_prefill_logprobs(
+                    &prefill_collected.completes,
+                    &mut decode_collected.completes,
+                );
             }
 
-            decode_responses
+            CollectedResponses {
+                completes: decode_collected.completes,
+                request_stats: decode_collected.request_stats,
+            }
         }
         ExecutionResult::Embedding { .. } => {
             // Embeddings do not support this path (no generate complete response)
@@ -64,14 +79,14 @@ pub(crate) async fn collect_responses(
         }
     };
 
-    if all_responses.is_empty() {
+    if collected.completes.is_empty() {
         return Err(error::internal_error(
             "no_responses_from_server",
             "No responses from server",
         ));
     }
 
-    Ok(all_responses)
+    Ok(collected)
 }
 
 /// Merge prefill input_logprobs into decode responses

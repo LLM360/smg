@@ -20,7 +20,7 @@ use tracing::error;
 
 use crate::{
     observability::{
-        events::{request_timestamps_from_local_timing, Event, RequestStatsEvent},
+        events::{Event, RequestStatsEvent},
         metrics::metrics_labels,
     },
     routers::{
@@ -28,7 +28,7 @@ use crate::{
         grpc::{
             common::{response_collection, response_formatting},
             context::{DispatchMetadata, ExecutionResult},
-            proto_wrapper::{collect_unified_request_stats, ProtoGenerateComplete},
+            proto_wrapper::ProtoGenerateComplete,
             utils,
         },
     },
@@ -205,11 +205,11 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
-        let start_time = Instant::now();
-
         // Collect all responses from the execution result
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let response_collection::CollectedResponses {
+            completes: all_responses,
+            request_stats,
+        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
@@ -278,9 +278,7 @@ impl ResponseProcessor {
         // Build usage
         let usage = response_formatting::build_usage(&all_responses);
 
-        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
-            request_stats
-                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+        if let Some(request_stats) = request_stats {
             RequestStatsEvent {
                 request_id: &dispatch.request_id,
                 model: &dispatch.model,
@@ -369,12 +367,12 @@ impl ResponseProcessor {
         start_time: Instant,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         // Collect all responses from the execution result
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let response_collection::CollectedResponses {
+            completes: all_responses,
+            request_stats,
+        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
 
-        if let Some(mut request_stats) = collect_unified_request_stats(&all_responses) {
-            request_stats
-                .apply_timestamp_fallbacks(request_timestamps_from_local_timing(start_time, None));
+        if let Some(request_stats) = request_stats {
             RequestStatsEvent {
                 request_id: &dispatch.request_id,
                 model: &dispatch.model,

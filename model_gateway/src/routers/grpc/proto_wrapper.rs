@@ -444,6 +444,9 @@ impl ProtoGenerateResponse {
                 Some(sglang::generate_response::Response::Error(error)) => {
                     ProtoResponseVariant::Error(ProtoGenerateError::Sglang(error))
                 }
+                Some(sglang::generate_response::Response::RequestStats(request_stats)) => {
+                    ProtoResponseVariant::RequestStats(ProtoRequestStats::Sglang(request_stats))
+                }
                 None => ProtoResponseVariant::None,
             },
             Self::Vllm(resp) => match resp.response {
@@ -477,7 +480,14 @@ pub enum ProtoResponseVariant {
     Chunk(ProtoGenerateStreamChunk),
     Complete(ProtoGenerateComplete),
     Error(ProtoGenerateError),
+    RequestStats(ProtoRequestStats),
     None,
+}
+
+/// Unified request-stats payload from stream responses.
+#[derive(Clone)]
+pub enum ProtoRequestStats {
+    Sglang(sglang::RequestStats),
 }
 
 /// Unified GenerateStreamChunk
@@ -873,13 +883,14 @@ impl EngineRequestStatsMapper for SglangRequestStatsMapper {
 
     fn field_mapping() -> RequestStatsFieldMapping {
         RequestStatsFieldMapping {
-            request_received_timestamp: Some("request_received_timestamp_s"),
-            first_token_generated_timestamp: Some("first_token_generated_timestamp_s"),
-            request_finished_timestamp: Some("request_finished_timestamp_s"),
-            cache_hit_rate: Some("cache_hit_rate"),
-            spec_decoding_acceptance_rate: Some("spec_decoding_acceptance_rate"),
+            request_received_timestamp: None,
+            first_token_generated_timestamp: None,
+            request_finished_timestamp: None,
+            cache_hit_rate: Some("cached_tokens/prompt_tokens"),
+            spec_decoding_acceptance_rate: None,
             prompt_tokens: Some("prompt_tokens"),
             completion_tokens: Some("completion_tokens"),
+            cached_tokens: Some("cached_tokens"),
         }
     }
 
@@ -889,14 +900,11 @@ impl EngineRequestStatsMapper for SglangRequestStatsMapper {
             let completion_tokens = u64::from(c.completion_tokens);
             let cached_tokens = u64::from(c.cached_tokens);
             Some(EngineRequestStatsSample {
-                request_received_timestamp_s: c.request_received_timestamp_s,
-                first_token_generated_timestamp_s: c.first_token_generated_timestamp_s,
-                request_finished_timestamp_s: c.request_finished_timestamp_s,
-                // Fall back for older producers that don't emit direct per-request rate.
-                cache_hit_rate: c
-                    .cache_hit_rate
-                    .or_else(|| derive_cache_hit_rate(cached_tokens, prompt_tokens)),
-                spec_decoding_acceptance_rate: c.spec_decoding_acceptance_rate,
+                request_received_timestamp_s: None,
+                first_token_generated_timestamp_s: None,
+                request_finished_timestamp_s: None,
+                cache_hit_rate: derive_cache_hit_rate(cached_tokens, prompt_tokens),
+                spec_decoding_acceptance_rate: None,
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
@@ -919,6 +927,7 @@ impl EngineRequestStatsMapper for VllmRequestStatsMapper {
             spec_decoding_acceptance_rate: None,
             prompt_tokens: Some("prompt_tokens"),
             completion_tokens: Some("completion_tokens"),
+            cached_tokens: Some("cached_tokens"),
         }
     }
 
@@ -955,6 +964,7 @@ impl EngineRequestStatsMapper for TrtllmRequestStatsMapper {
             spec_decoding_acceptance_rate: None,
             prompt_tokens: Some("prompt_tokens"),
             completion_tokens: Some("completion_tokens"),
+            cached_tokens: Some("cached_tokens"),
         }
     }
 
@@ -1011,6 +1021,118 @@ pub fn collect_unified_request_stats(
             aggregate_request_stats::<TrtllmRequestStatsMapper>(completes)
         }
     }
+}
+
+/// Build unified request-level stats from engine-specific stream stats protos.
+pub fn collect_stream_request_stats(
+    stream_stats: &[ProtoRequestStats],
+) -> Option<UnifiedRequestStats> {
+    let first = stream_stats.first()?;
+    match first {
+        ProtoRequestStats::Sglang(_) => {
+            let mut stats = Vec::with_capacity(stream_stats.len());
+            for sample in stream_stats {
+                match sample {
+                    ProtoRequestStats::Sglang(s) => stats.push(s.clone()),
+                }
+            }
+            collect_sglang_request_stats(&stats)
+        }
+    }
+}
+
+/// Build unified request-level stats from either stream stats or complete responses.
+///
+/// Stream stats are preferred when available because they may contain engine-native
+/// timestamps and metrics not present in complete responses.
+pub fn collect_request_stats(
+    completes: &[ProtoGenerateComplete],
+    stream_stats: &[ProtoRequestStats],
+) -> Option<UnifiedRequestStats> {
+    collect_stream_request_stats(stream_stats).or_else(|| collect_unified_request_stats(completes))
+}
+
+/// Build unified request-level stats from the dedicated SGLang request-stats API.
+pub fn collect_sglang_request_stats(
+    stats: &[sglang::RequestStats],
+) -> Option<UnifiedRequestStats> {
+    let mut seen = 0u64;
+    let mut request_received_timestamp_s: Option<f64> = None;
+    let mut first_token_generated_timestamp_s: Option<f64> = None;
+    let mut request_finished_timestamp_s: Option<f64> = None;
+    let mut cache_hit_rate_sum = 0.0f64;
+    let mut cache_hit_rate_count = 0u64;
+    let mut spec_acceptance_rate_sum = 0.0f64;
+    let mut spec_acceptance_rate_count = 0u64;
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
+    let mut cached_tokens = 0u64;
+
+    for sample in stats {
+        seen += 1;
+        let sample_prompt = u64::from(sample.prompt_tokens);
+        let sample_completion = u64::from(sample.completion_tokens);
+        let sample_cached = u64::from(sample.cached_tokens);
+
+        prompt_tokens = prompt_tokens.saturating_add(sample_prompt);
+        completion_tokens = completion_tokens.saturating_add(sample_completion);
+        cached_tokens = cached_tokens.saturating_add(sample_cached);
+
+        request_received_timestamp_s =
+            min_timestamp(request_received_timestamp_s, sample.request_received_timestamp_s);
+        first_token_generated_timestamp_s = min_timestamp(
+            first_token_generated_timestamp_s,
+            sample.first_token_generated_timestamp_s,
+        );
+        request_finished_timestamp_s =
+            max_timestamp(request_finished_timestamp_s, sample.request_finished_timestamp_s);
+
+        if let Some(rate) = sample.cache_hit_rate {
+            cache_hit_rate_sum += rate;
+            cache_hit_rate_count += 1;
+        }
+        if let Some(rate) = sample.spec_decoding_acceptance_rate {
+            spec_acceptance_rate_sum += rate;
+            spec_acceptance_rate_count += 1;
+        }
+    }
+
+    if seen == 0 {
+        return None;
+    }
+
+    let cache_hit_rate = if cache_hit_rate_count > 0 {
+        Some(cache_hit_rate_sum / cache_hit_rate_count as f64)
+    } else {
+        derive_cache_hit_rate(cached_tokens, prompt_tokens)
+    };
+    let spec_decoding_acceptance_rate = if spec_acceptance_rate_count > 0 {
+        Some(spec_acceptance_rate_sum / spec_acceptance_rate_count as f64)
+    } else {
+        None
+    };
+
+    Some(UnifiedRequestStats {
+        engine: "sglang",
+        field_mapping: RequestStatsFieldMapping {
+            request_received_timestamp: Some("request_received_timestamp_s"),
+            first_token_generated_timestamp: Some("first_token_generated_timestamp_s"),
+            request_finished_timestamp: Some("request_finished_timestamp_s"),
+            cache_hit_rate: Some("cache_hit_rate"),
+            spec_decoding_acceptance_rate: Some("spec_decoding_acceptance_rate"),
+            prompt_tokens: Some("prompt_tokens"),
+            completion_tokens: Some("completion_tokens"),
+            cached_tokens: Some("cached_tokens"),
+        },
+        request_received_timestamp_s,
+        first_token_generated_timestamp_s,
+        request_finished_timestamp_s,
+        cache_hit_rate,
+        spec_decoding_acceptance_rate,
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+    })
 }
 
 fn aggregate_request_stats<M: EngineRequestStatsMapper>(
@@ -1085,6 +1207,7 @@ fn aggregate_request_stats<M: EngineRequestStatsMapper>(
         spec_decoding_acceptance_rate,
         prompt_tokens,
         completion_tokens,
+        cached_tokens,
     })
 }
 

@@ -30,6 +30,9 @@ service SglangScheduler {
   // Get comprehensive load metrics
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
+  // Get request-level statistics for a completed request
+  rpc GetRequestStats(GetRequestStatsRequest) returns (GetRequestStatsResponse);
+
   // Get tokenizer artifacts for remote construction
   rpc GetTokenizer(smg.grpc.common.GetTokenizerRequest) returns (stream smg.grpc.common.GetTokenizerChunk);
 
@@ -195,6 +198,7 @@ message GenerateResponse {
     GenerateStreamChunk chunk = 2;
     GenerateComplete complete = 3;
     GenerateError error = 4;
+    RequestStats request_stats = 5;
   }
 }
 
@@ -218,16 +222,6 @@ message GenerateStreamChunk {
 
   // Index for ordering when n>1 (for parallel request multiplexing)
   uint32 index = 8;
-
-  // Request-level timing metrics (unix epoch seconds)
-  optional double request_received_timestamp_s = 9;
-  optional double first_token_generated_timestamp_s = 10;
-  optional double request_finished_timestamp_s = 11;
-  optional double response_sent_timestamp_s = 12;
-
-  // Request-level efficiency metrics
-  optional double cache_hit_rate = 13;
-  optional double spec_decoding_acceptance_rate = 14;
 }
 
 message GenerateComplete {
@@ -259,22 +253,33 @@ message GenerateComplete {
 
   // Index for ordering when n>1 (for parallel request multiplexing)
   uint32 index = 11;
-
-  // Request-level timing metrics (unix epoch seconds)
-  optional double request_received_timestamp_s = 12;
-  optional double first_token_generated_timestamp_s = 13;
-  optional double request_finished_timestamp_s = 14;
-  optional double response_sent_timestamp_s = 15;
-
-  // Request-level efficiency metrics
-  optional double cache_hit_rate = 16;
-  optional double spec_decoding_acceptance_rate = 17;
 }
 
 message GenerateError {
   string message = 1;
   string http_status_code = 2;
   string details = 3;
+}
+
+message GetRequestStatsRequest {
+  string request_id = 1;
+}
+
+message RequestStats {
+  uint32 index = 1;
+  optional double request_received_timestamp_s = 2;
+  optional double first_token_generated_timestamp_s = 3;
+  optional double request_finished_timestamp_s = 4;
+  optional double response_sent_timestamp_s = 5;
+  optional double cache_hit_rate = 6;
+  optional double spec_decoding_acceptance_rate = 7;
+  uint32 prompt_tokens = 8;
+  uint32 completion_tokens = 9;
+  uint32 cached_tokens = 10;
+}
+
+message GetRequestStatsResponse {
+  repeated RequestStats stats = 1;
 }
 
 // Output logprobs - all values are present (no None)

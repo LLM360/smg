@@ -25,16 +25,15 @@ use tracing::{debug, error, warn};
 
 use crate::{
     observability::{
-        events::{
-            request_timestamps_from_local_timing, Event, RequestStatsEvent, UnifiedRequestStats,
-        },
+        events::{Event, RequestStatsEvent, UnifiedRequestStats},
         metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     },
     routers::grpc::{
         common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
         context,
         proto_wrapper::{
-            collect_unified_request_stats, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
+            collect_request_stats, ProtoGenerateComplete, ProtoRequestStats, ProtoResponseVariant,
+            ProtoStream,
         },
         utils,
     },
@@ -205,6 +204,7 @@ impl StreamingProcessor {
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
+        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -464,6 +464,9 @@ impl StreamingProcessor {
                 ProtoResponseVariant::Error(error) => {
                     return Err(error.message().to_string());
                 }
+                ProtoResponseVariant::RequestStats(request_stats) => {
+                    stream_request_stats.push(request_stats);
+                }
                 ProtoResponseVariant::None => continue,
             }
         }
@@ -564,13 +567,11 @@ impl StreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        if let Some(mut request_stats) = collect_unified_request_stats(&completed_responses) {
+        let request_stats = collect_request_stats(&completed_responses, &stream_request_stats);
+
+        if let Some(mut request_stats) = request_stats {
             request_stats.prompt_tokens = total_prompt as u64;
             request_stats.completion_tokens = total_completion as u64;
-            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
-                start_time,
-                first_token_time,
-            ));
             RequestStatsEvent {
                 request_id,
                 model,
@@ -673,7 +674,7 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result =
-                        Self::process_generate_streaming(tokenizer, stream, ctx, &tx).await;
+                    Self::process_generate_streaming(tokenizer, stream, ctx, &tx).await;
 
                     if let Err(e) = result {
                         utils::send_error_sse(&tx, &e, "internal_error");
@@ -731,6 +732,7 @@ impl StreamingProcessor {
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
+        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {e}"))?;
@@ -816,6 +818,9 @@ impl StreamingProcessor {
                 ProtoResponseVariant::Error(error) => {
                     return Err(error.message().to_string());
                 }
+                ProtoResponseVariant::RequestStats(request_stats) => {
+                    stream_request_stats.push(request_stats);
+                }
                 ProtoResponseVariant::None => continue,
             }
         }
@@ -826,7 +831,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
-        Self::emit_generate_request_stats(start_time, first_token_time, &ctx, &completed_responses);
+        Self::emit_generate_request_stats(&ctx, &completed_responses, &stream_request_stats).await;
 
         Ok(())
     }
@@ -901,6 +906,7 @@ impl StreamingProcessor {
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
+        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {e}"))?;
@@ -1026,6 +1032,9 @@ impl StreamingProcessor {
                 ProtoResponseVariant::Error(error) => {
                     return Err(error.message().to_string());
                 }
+                ProtoResponseVariant::RequestStats(request_stats) => {
+                    stream_request_stats.push(request_stats);
+                }
                 ProtoResponseVariant::None => continue,
             }
         }
@@ -1036,7 +1045,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
-        Self::emit_generate_request_stats(start_time, first_token_time, &ctx, &completed_responses);
+        Self::emit_generate_request_stats(&ctx, &completed_responses, &stream_request_stats).await;
 
         Ok(())
     }
@@ -1064,17 +1073,14 @@ impl StreamingProcessor {
         });
     }
 
-    fn emit_generate_request_stats(
-        start_time: Instant,
-        first_token_time: Option<Instant>,
+    async fn emit_generate_request_stats(
         ctx: &GenerateStreamContext,
         completed_responses: &[ProtoGenerateComplete],
+        stream_request_stats: &[ProtoRequestStats],
     ) {
-        if let Some(mut request_stats) = collect_unified_request_stats(completed_responses) {
-            request_stats.apply_timestamp_fallbacks(request_timestamps_from_local_timing(
-                start_time,
-                first_token_time,
-            ));
+        let request_stats = collect_request_stats(completed_responses, stream_request_stats);
+
+        if let Some(request_stats) = request_stats {
             Self::emit_request_stats_event(&ctx.request_id, &ctx.model, ctx.backend_type, &request_stats);
         }
     }

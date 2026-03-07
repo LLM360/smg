@@ -2,8 +2,6 @@
 //!
 //! Events use DEBUG level when OTEL is disabled, INFO when enabled.
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
 use tracing::{debug, event, Level};
 
 use super::otel_trace::is_otel_enabled;
@@ -87,6 +85,7 @@ pub struct RequestStatsFieldMapping {
     pub spec_decoding_acceptance_rate: Option<&'static str>,
     pub prompt_tokens: Option<&'static str>,
     pub completion_tokens: Option<&'static str>,
+    pub cached_tokens: Option<&'static str>,
 }
 
 /// Normalized request-level stats collected from engine-specific responses.
@@ -101,58 +100,7 @@ pub struct UnifiedRequestStats {
     pub spec_decoding_acceptance_rate: Option<f64>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-}
-
-impl UnifiedRequestStats {
-    /// Fill in missing timestamps with SMG-derived wall-clock values.
-    pub fn apply_timestamp_fallbacks(&mut self, fallbacks: RequestTimestampFallbacks) {
-        if self.request_received_timestamp_s.is_none() {
-            self.request_received_timestamp_s = fallbacks.request_received_timestamp_s;
-        }
-        if self.first_token_generated_timestamp_s.is_none() {
-            self.first_token_generated_timestamp_s = fallbacks.first_token_generated_timestamp_s;
-        }
-        if self.request_finished_timestamp_s.is_none() {
-            self.request_finished_timestamp_s = fallbacks.request_finished_timestamp_s;
-        }
-    }
-}
-
-/// Optional wall-clock timestamp fallbacks in Unix seconds.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RequestTimestampFallbacks {
-    pub request_received_timestamp_s: Option<f64>,
-    pub first_token_generated_timestamp_s: Option<f64>,
-    pub request_finished_timestamp_s: Option<f64>,
-}
-
-/// Current wall-clock timestamp as Unix epoch seconds.
-#[inline]
-pub fn now_unix_timestamp_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-/// Build fallback timestamps from streaming/non-streaming local timing.
-#[inline]
-pub fn request_timestamps_from_local_timing(
-    start_time: Instant,
-    first_token_time: Option<Instant>,
-) -> RequestTimestampFallbacks {
-    let finished_at = now_unix_timestamp_seconds();
-    let elapsed = start_time.elapsed().as_secs_f64();
-    let received_at = (finished_at - elapsed).max(0.0);
-    let first_token_at = first_token_time
-        .map(|t| t.duration_since(start_time).as_secs_f64())
-        .map(|ttft| received_at + ttft);
-
-    RequestTimestampFallbacks {
-        request_received_timestamp_s: Some(received_at),
-        first_token_generated_timestamp_s: first_token_at,
-        request_finished_timestamp_s: Some(finished_at),
-    }
+    pub cached_tokens: u64,
 }
 
 /// Unified request-stats event emitted once per backend request.
@@ -167,6 +115,16 @@ pub struct RequestStatsEvent<'a> {
 impl Event for RequestStatsEvent<'_> {
     #[inline]
     fn emit(&self) {
+        let request_received_timestamp_s =
+            format_optional_f64(self.stats.request_received_timestamp_s);
+        let first_token_generated_timestamp_s =
+            format_optional_f64(self.stats.first_token_generated_timestamp_s);
+        let request_finished_timestamp_s =
+            format_optional_f64(self.stats.request_finished_timestamp_s);
+        let cache_hit_rate = format_optional_f64(self.stats.cache_hit_rate);
+        let spec_decoding_acceptance_rate =
+            format_optional_f64(self.stats.spec_decoding_acceptance_rate);
+
         if is_otel_enabled() {
             event!(
                 Level::INFO,
@@ -174,13 +132,14 @@ impl Event for RequestStatsEvent<'_> {
                 model = %self.model,
                 router_backend = %self.router_backend,
                 engine = %self.stats.engine,
-                request_received_timestamp_s = ?self.stats.request_received_timestamp_s,
-                first_token_generated_timestamp_s = ?self.stats.first_token_generated_timestamp_s,
-                request_finished_timestamp_s = ?self.stats.request_finished_timestamp_s,
-                cache_hit_rate = ?self.stats.cache_hit_rate,
-                spec_decoding_acceptance_rate = ?self.stats.spec_decoding_acceptance_rate,
+                request_received_timestamp_s = %request_received_timestamp_s,
+                first_token_generated_timestamp_s = %first_token_generated_timestamp_s,
+                request_finished_timestamp_s = %request_finished_timestamp_s,
+                cache_hit_rate = %cache_hit_rate,
+                spec_decoding_acceptance_rate = %spec_decoding_acceptance_rate,
                 prompt_tokens = self.stats.prompt_tokens,
                 completion_tokens = self.stats.completion_tokens,
+                cached_tokens = self.stats.cached_tokens,
                 "request_stats"
             );
         } else {
@@ -189,17 +148,25 @@ impl Event for RequestStatsEvent<'_> {
                 model = %self.model,
                 router_backend = %self.router_backend,
                 engine = %self.stats.engine,
-                request_received_timestamp_s = ?self.stats.request_received_timestamp_s,
-                first_token_generated_timestamp_s = ?self.stats.first_token_generated_timestamp_s,
-                request_finished_timestamp_s = ?self.stats.request_finished_timestamp_s,
-                cache_hit_rate = ?self.stats.cache_hit_rate,
-                spec_decoding_acceptance_rate = ?self.stats.spec_decoding_acceptance_rate,
+                request_received_timestamp_s = %request_received_timestamp_s,
+                first_token_generated_timestamp_s = %first_token_generated_timestamp_s,
+                request_finished_timestamp_s = %request_finished_timestamp_s,
+                cache_hit_rate = %cache_hit_rate,
+                spec_decoding_acceptance_rate = %spec_decoding_acceptance_rate,
                 prompt_tokens = self.stats.prompt_tokens,
                 completion_tokens = self.stats.completion_tokens,
+                cached_tokens = self.stats.cached_tokens,
                 "request_stats"
             );
         }
     }
+}
+
+#[inline]
+fn format_optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "None".to_string())
 }
 
 #[cfg(test)]
