@@ -67,6 +67,7 @@ impl GrpcRouter {
 
         let worker_registry = ctx.worker_registry.clone();
         let _policy_registry = ctx.policy_registry.clone();
+        let enable_request_statistics = ctx.router_config.enable_request_statistics;
 
         // Create multimodal components (best-effort; non-fatal if initialization fails)
         let multimodal = match MultimodalComponents::new() {
@@ -93,6 +94,7 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            enable_request_statistics,
         );
 
         // Create Harmony pipelines
@@ -103,6 +105,7 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            enable_request_statistics,
         );
 
         // Create Embedding pipeline

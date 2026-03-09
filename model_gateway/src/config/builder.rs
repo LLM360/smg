@@ -339,6 +339,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn enable_request_statistics(mut self, enable: bool) -> Self {
+        self.config.enable_request_statistics = enable;
+        self
+    }
+
     // ==================== IGW Mode ====================
 
     pub fn enable_igw(mut self) -> Self {

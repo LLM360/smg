@@ -299,6 +299,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
 
+    /// Enable request-level statistics collection and logging
+    #[arg(long, default_value_t = false, help_heading = "Request Handling")]
+    enable_request_statistics: bool,
+
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
@@ -1080,6 +1084,7 @@ impl CliArgs {
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
+            .enable_request_statistics(self.enable_request_statistics)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())

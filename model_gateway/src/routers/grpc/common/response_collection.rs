@@ -30,10 +30,13 @@ pub(crate) struct CollectedResponses {
 pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
+    enable_request_statistics: bool,
 ) -> Result<CollectedResponses, Response> {
     let collected = match execution_result {
         ExecutionResult::Single { mut stream } => {
-            let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
+            let responses =
+                utils::collect_stream_responses(&mut stream, "Single", enable_request_statistics)
+                    .await?;
             stream.mark_completed();
             CollectedResponses {
                 completes: responses.completes,
@@ -45,13 +48,21 @@ pub(crate) async fn collect_responses(
             decode,
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_collected =
-                utils::collect_stream_responses(&mut prefill, "Prefill").await?;
+            let prefill_collected = utils::collect_stream_responses(
+                &mut prefill,
+                "Prefill",
+                enable_request_statistics,
+            )
+            .await?;
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
-            let mut decode_collected =
-                utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+            let mut decode_collected = utils::collect_stream_responses(
+                &mut decode_stream,
+                "Decode",
+                enable_request_statistics,
+            )
+            .await?;
 
             // Mark both streams as completed now that both succeeded
             prefill.mark_completed();

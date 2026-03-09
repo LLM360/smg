@@ -47,6 +47,7 @@ pub(crate) struct StreamingProcessor {
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
     backend_type: &'static str,
+    enable_request_statistics: bool,
 }
 
 /// Context for generate endpoint streaming - groups config params to reduce function arguments
@@ -56,6 +57,7 @@ struct GenerateStreamContext {
     return_logprob: bool,
     backend_type: &'static str,
     model: String,
+    enable_request_statistics: bool,
 }
 
 impl StreamingProcessor {
@@ -65,6 +67,7 @@ impl StreamingProcessor {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         backend_type: &'static str,
+        enable_request_statistics: bool,
     ) -> Self {
         Self {
             tool_parser_factory,
@@ -72,6 +75,7 @@ impl StreamingProcessor {
             configured_tool_parser,
             configured_reasoning_parser,
             backend_type,
+            enable_request_statistics,
         }
     }
 
@@ -465,7 +469,9 @@ impl StreamingProcessor {
                     return Err(error.message().to_string());
                 }
                 ProtoResponseVariant::RequestStats(request_stats) => {
-                    stream_request_stats.push(request_stats);
+                    if self.enable_request_statistics {
+                        stream_request_stats.push(request_stats);
+                    }
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -567,18 +573,20 @@ impl StreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        let request_stats = collect_request_stats(&completed_responses, &stream_request_stats);
+        if self.enable_request_statistics {
+            let request_stats = collect_request_stats(&completed_responses, &stream_request_stats);
 
-        if let Some(mut request_stats) = request_stats {
-            request_stats.prompt_tokens = total_prompt as u64;
-            request_stats.completion_tokens = total_completion as u64;
-            RequestStatsEvent {
-                request_id,
-                model,
-                router_backend: self.backend_type,
-                stats: &request_stats,
+            if let Some(mut request_stats) = request_stats {
+                request_stats.prompt_tokens = total_prompt as u64;
+                request_stats.completion_tokens = total_completion as u64;
+                RequestStatsEvent {
+                    request_id,
+                    model,
+                    router_backend: self.backend_type,
+                    stats: &request_stats,
+                }
+                .emit();
             }
-            .emit();
         }
 
         Ok(())
@@ -662,6 +670,7 @@ impl StreamingProcessor {
             return_logprob: generate_request.return_logprob.unwrap_or(false),
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
+            enable_request_statistics: self.enable_request_statistics,
         };
 
         // Spawn background task based on execution mode
@@ -674,7 +683,13 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result =
-                    Self::process_generate_streaming(tokenizer, stream, ctx, &tx).await;
+                        Self::process_generate_streaming(
+                            tokenizer,
+                            stream,
+                            ctx,
+                            &tx,
+                        )
+                        .await;
 
                     if let Err(e) = result {
                         utils::send_error_sse(&tx, &e, "internal_error");
@@ -819,7 +834,9 @@ impl StreamingProcessor {
                     return Err(error.message().to_string());
                 }
                 ProtoResponseVariant::RequestStats(request_stats) => {
-                    stream_request_stats.push(request_stats);
+                    if ctx.enable_request_statistics {
+                        stream_request_stats.push(request_stats);
+                    }
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -1033,7 +1050,9 @@ impl StreamingProcessor {
                     return Err(error.message().to_string());
                 }
                 ProtoResponseVariant::RequestStats(request_stats) => {
-                    stream_request_stats.push(request_stats);
+                    if ctx.enable_request_statistics {
+                        stream_request_stats.push(request_stats);
+                    }
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -1078,6 +1097,9 @@ impl StreamingProcessor {
         completed_responses: &[ProtoGenerateComplete],
         stream_request_stats: &[ProtoRequestStats],
     ) {
+        if !ctx.enable_request_statistics {
+            return;
+        }
         let request_stats = collect_request_stats(completed_responses, stream_request_stats);
 
         if let Some(request_stats) = request_stats {

@@ -31,6 +31,8 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
+    #[serde(default)]
+    pub enable_request_statistics: bool,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
@@ -530,6 +532,7 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            enable_request_statistics: false,
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,

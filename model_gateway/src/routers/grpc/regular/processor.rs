@@ -41,6 +41,7 @@ pub(crate) struct ResponseProcessor {
     pub reasoning_parser_factory: ReasoningParserFactory,
     pub configured_tool_parser: Option<String>,
     pub configured_reasoning_parser: Option<String>,
+    pub enable_request_statistics: bool,
 }
 
 impl ResponseProcessor {
@@ -49,12 +50,14 @@ impl ResponseProcessor {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        enable_request_statistics: bool,
     ) -> Self {
         Self {
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            enable_request_statistics,
         }
     }
 
@@ -209,7 +212,12 @@ impl ResponseProcessor {
         let response_collection::CollectedResponses {
             completes: all_responses,
             request_stats,
-        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
+        } = response_collection::collect_responses(
+            execution_result,
+            request_logprobs,
+            self.enable_request_statistics,
+        )
+        .await?;
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
@@ -370,7 +378,12 @@ impl ResponseProcessor {
         let response_collection::CollectedResponses {
             completes: all_responses,
             request_stats,
-        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
+        } = response_collection::collect_responses(
+            execution_result,
+            request_logprobs,
+            self.enable_request_statistics,
+        )
+        .await?;
 
         if let Some(request_stats) = request_stats {
             RequestStatsEvent {

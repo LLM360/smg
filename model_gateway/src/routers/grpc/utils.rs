@@ -660,6 +660,7 @@ pub(crate) struct CollectedStreamResponses {
 pub(crate) async fn collect_stream_responses(
     stream: &mut ProtoStream,
     worker_name: &str,
+    enable_request_statistics: bool,
 ) -> Result<CollectedStreamResponses, Response> {
     let mut all_responses = Vec::new();
     let mut stream_request_stats = Vec::new();
@@ -683,7 +684,9 @@ pub(crate) async fn collect_stream_responses(
                         // Streaming chunk - no action needed
                     }
                     ProtoResponseVariant::RequestStats(request_stats) => {
-                        stream_request_stats.push(request_stats);
+                        if enable_request_statistics {
+                            stream_request_stats.push(request_stats);
+                        }
                     }
                     ProtoResponseVariant::None => {
                         // Empty response - no action needed
@@ -701,7 +704,11 @@ pub(crate) async fn collect_stream_responses(
         }
     }
 
-    let request_stats = collect_request_stats(&all_responses, &stream_request_stats);
+    let request_stats = if enable_request_statistics {
+        collect_request_stats(&all_responses, &stream_request_stats)
+    } else {
+        None
+    };
 
     Ok(CollectedStreamResponses {
         completes: all_responses,

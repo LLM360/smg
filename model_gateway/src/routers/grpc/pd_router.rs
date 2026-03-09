@@ -34,6 +34,7 @@ impl GrpcPDRouter {
         // Get registries from context
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
+        let enable_request_statistics = ctx.router_config.enable_request_statistics;
 
         // Get tokenizer registry (no longer requires pre-loaded tokenizer)
         let tokenizer_registry = ctx.tokenizer_registry.clone();
@@ -74,6 +75,7 @@ impl GrpcPDRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            enable_request_statistics,
         );
 
         Ok(GrpcPDRouter {

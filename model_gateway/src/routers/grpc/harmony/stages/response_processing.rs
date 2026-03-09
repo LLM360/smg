@@ -29,17 +29,17 @@ pub(crate) struct HarmonyResponseProcessingStage {
 
 impl HarmonyResponseProcessingStage {
     /// Create a new Harmony response processing stage
-    pub fn new() -> Self {
+    pub fn new(enable_request_statistics: bool) -> Self {
         Self {
-            processor: HarmonyResponseProcessor::new(),
-            streaming_processor: Arc::new(HarmonyStreamingProcessor::new()),
+            processor: HarmonyResponseProcessor::new(enable_request_statistics),
+            streaming_processor: Arc::new(HarmonyStreamingProcessor::new(enable_request_statistics)),
         }
     }
 }
 
 impl Default for HarmonyResponseProcessingStage {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -162,7 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_response_processing_stage_creation() {
-        let stage = HarmonyResponseProcessingStage::new();
+        let stage = HarmonyResponseProcessingStage::new(false);
         assert_eq!(stage.name(), "HarmonyResponseProcessing");
     }
 }
