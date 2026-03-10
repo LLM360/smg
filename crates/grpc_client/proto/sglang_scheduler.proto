@@ -198,7 +198,6 @@ message GenerateResponse {
     GenerateStreamChunk chunk = 2;
     GenerateComplete complete = 3;
     GenerateError error = 4;
-    RequestStats request_stats = 5;
   }
 }
 
@@ -273,9 +272,9 @@ message RequestStats {
   optional double response_sent_timestamp_s = 5;
   optional double cache_hit_rate = 6;
   optional double spec_decoding_acceptance_rate = 7;
-  uint32 prompt_tokens = 8;
-  uint32 completion_tokens = 9;
-  uint32 cached_tokens = 10;
+  optional uint32 prompt_tokens = 8;
+  optional uint32 completion_tokens = 9;
+  optional uint32 cached_tokens = 10;
   optional string error_message = 11;
 }
 
@@ -398,7 +397,6 @@ message AbortRequest {
 message AbortResponse {
   bool success = 1;
   string message = 2;
-  RequestStats request_stats = 3;
 }
 
 

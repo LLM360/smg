@@ -280,6 +280,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Logging")]
     log_json: bool,
 
+    /// Enable request-level statistics collection and logging
+    #[arg(long, default_value_t = false, help_heading = "Logging")]
+    enable_request_statistics: bool,
+
     // ==================== Prometheus Metrics ====================
     /// Port to expose Prometheus metrics
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
@@ -301,10 +305,6 @@ struct CliArgs {
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
-
-    /// Enable request-level statistics collection and logging
-    #[arg(long, default_value_t = false, help_heading = "Request Handling")]
-    enable_request_statistics: bool,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
@@ -1102,10 +1102,10 @@ impl CliArgs {
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .enable_request_statistics(self.enable_request_statistics)
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
-            .enable_request_statistics(self.enable_request_statistics)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())

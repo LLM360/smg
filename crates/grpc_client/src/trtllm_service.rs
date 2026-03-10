@@ -69,17 +69,6 @@ impl AbortOnDropStream {
         debug!("Request {} marked as completed", self.request_id);
     }
 
-    /// Manually abort the request and return the backend abort response.
-    pub async fn abort(
-        &mut self,
-        _reason: String,
-    ) -> Result<proto::AbortResponse, Box<dyn std::error::Error + Send + Sync>> {
-        self.aborted.store(true, Ordering::Release);
-        self.client
-            .abort_request(self.request_id.clone())
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-    }
 }
 
 impl Drop for AbortOnDropStream {
@@ -228,7 +217,7 @@ impl TrtllmServiceClient {
     pub async fn abort_request(
         &self,
         request_id: String,
-    ) -> Result<proto::AbortResponse, tonic::Status> {
+    ) -> Result<(), tonic::Status> {
         debug!("Sending abort request for {}", request_id);
         let request = Request::new(proto::AbortRequest {
             request_id: request_id.clone(),
@@ -242,7 +231,7 @@ impl TrtllmServiceClient {
             response.get_ref().success,
             response.get_ref().message
         );
-        Ok(response.into_inner())
+        Ok(())
     }
 
     /// Get model information

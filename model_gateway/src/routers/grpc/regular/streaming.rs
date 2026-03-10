@@ -32,8 +32,7 @@ use crate::{
         common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
         context,
         proto_wrapper::{
-            collect_request_stats, ProtoGenerateComplete, ProtoRequestStats, ProtoResponseVariant,
-            ProtoStream,
+            collect_request_stats, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
         },
         utils,
     },
@@ -208,7 +207,6 @@ impl StreamingProcessor {
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
-        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -224,7 +222,6 @@ impl StreamingProcessor {
         // Reusable SSE formatting buffer to avoid allocations per chunk
         let mut sse_buffer = Vec::with_capacity(512);
         let mut client_disconnected = false;
-        let mut abort_sent = false;
         let mut client_disconnect_error_message: Option<&'static str> = None;
 
         // Use dispatch metadata for consistent response fields
@@ -285,8 +282,7 @@ impl StreamingProcessor {
                         let total_prompt: u64 =
                             prompt_tokens.values().map(|v| u64::from(*v)).sum();
                         let total_completion = u64::from(completion_tokens.total());
-                        if let Some(mut request_stats) =
-                            collect_request_stats(&completed_responses, &stream_request_stats)
+                        if let Some(mut request_stats) = collect_request_stats(&completed_responses)
                         {
                             if total_prompt > 0 {
                                 request_stats.prompt_tokens = total_prompt;
@@ -362,11 +358,8 @@ impl StreamingProcessor {
                             tx,
                             Bytes::from(sse_buffer.clone()),
                             &mut client_disconnected,
-                            &mut abort_sent,
-                            &mut grpc_stream,
                             "Failed to send first chunk",
                             &mut client_disconnect_error_message,
-                            Some(&mut stream_request_stats),
                         )
                         .await?;
                         is_firsts.insert(index, false);
@@ -395,11 +388,8 @@ impl StreamingProcessor {
                                 tx,
                                 Bytes::from(sse_buffer.clone()),
                                 &mut client_disconnected,
-                                &mut abort_sent,
-                                &mut grpc_stream,
                                 "Failed to send reasoning chunk",
                                 &mut client_disconnect_error_message,
-                                Some(&mut stream_request_stats),
                             )
                             .await?;
                         }
@@ -455,11 +445,8 @@ impl StreamingProcessor {
                                     tx,
                                     Bytes::from(sse_buffer.clone()),
                                     &mut client_disconnected,
-                                    &mut abort_sent,
-                                    &mut grpc_stream,
                                     "Failed to send tool call chunk",
                                     &mut client_disconnect_error_message,
-                                    Some(&mut stream_request_stats),
                                 )
                                 .await?;
                             }
@@ -488,11 +475,8 @@ impl StreamingProcessor {
                             tx,
                             Bytes::from(sse_buffer.clone()),
                             &mut client_disconnected,
-                            &mut abort_sent,
-                            &mut grpc_stream,
                             "Failed to send content chunk",
                             &mut client_disconnect_error_message,
-                            Some(&mut stream_request_stats),
                         )
                         .await?;
                     }
@@ -523,11 +507,8 @@ impl StreamingProcessor {
                                     tx,
                                     Bytes::from(format!("data: {sse_chunk}\n\n")),
                                     &mut client_disconnected,
-                                    &mut abort_sent,
-                                    &mut grpc_stream,
                                     "Failed to send flushed content",
                                     &mut client_disconnect_error_message,
-                                    Some(&mut stream_request_stats),
                                 )
                                 .await?;
                             }
@@ -551,8 +532,7 @@ impl StreamingProcessor {
                         let total_prompt: u64 =
                             prompt_tokens.values().map(|v| u64::from(*v)).sum();
                         let total_completion = u64::from(completion_tokens.total());
-                        if let Some(mut request_stats) =
-                            collect_request_stats(&completed_responses, &stream_request_stats)
+                        if let Some(mut request_stats) = collect_request_stats(&completed_responses)
                         {
                             if total_prompt > 0 {
                                 request_stats.prompt_tokens = total_prompt;
@@ -572,11 +552,6 @@ impl StreamingProcessor {
                         }
                     }
                     return Err(error.message().to_string());
-                }
-                ProtoResponseVariant::RequestStats(request_stats) => {
-                    if self.enable_request_statistics {
-                        stream_request_stats.push(request_stats);
-                    }
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -613,11 +588,8 @@ impl StreamingProcessor {
                         tx,
                         Bytes::from(format!("data: {sse_chunk}\n\n")),
                         &mut client_disconnected,
-                        &mut abort_sent,
-                        &mut grpc_stream,
                         "Failed to send unstreamed tool args",
                         &mut client_disconnect_error_message,
-                        Some(&mut stream_request_stats),
                     )
                     .await?;
                 }
@@ -647,11 +619,8 @@ impl StreamingProcessor {
                 tx,
                 Bytes::from(format!("data: {sse_chunk}\n\n")),
                 &mut client_disconnected,
-                &mut abort_sent,
-                &mut grpc_stream,
                 "Failed to send finish chunk",
                 &mut client_disconnect_error_message,
-                Some(&mut stream_request_stats),
             )
             .await?;
         }
@@ -678,11 +647,8 @@ impl StreamingProcessor {
                     tx,
                     Bytes::from(format!("data: {sse_chunk}\n\n")),
                     &mut client_disconnected,
-                    &mut abort_sent,
-                    &mut grpc_stream,
                     "Failed to send usage chunk",
                     &mut client_disconnect_error_message,
-                    Some(&mut stream_request_stats),
                 )
                 .await?;
             }
@@ -706,7 +672,7 @@ impl StreamingProcessor {
         });
 
         if self.enable_request_statistics {
-            let request_stats = collect_request_stats(&completed_responses, &stream_request_stats);
+            let request_stats = collect_request_stats(&completed_responses);
 
             if let Some(mut request_stats) = request_stats {
                 if total_prompt > 0 {
@@ -886,14 +852,12 @@ impl StreamingProcessor {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
         let mut client_disconnected = false;
-        let mut abort_sent = false;
         let mut client_disconnect_error_message: Option<&'static str> = None;
 
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
-        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = match response {
@@ -907,7 +871,6 @@ impl StreamingProcessor {
                         Self::emit_generate_request_stats(
                             &ctx,
                             &completed_responses,
-                            &stream_request_stats,
                             None,
                             Some(&stream_error),
                         )
@@ -964,11 +927,8 @@ impl StreamingProcessor {
                         tx,
                         Bytes::from(format!("data: {sse_data}\n\n")),
                         &mut client_disconnected,
-                        &mut abort_sent,
-                        &mut stream,
                         "Failed to send chunk",
                         &mut client_disconnect_error_message,
-                        Some(&mut stream_request_stats),
                     )
                     .await?;
                 }
@@ -1003,11 +963,8 @@ impl StreamingProcessor {
                         tx,
                         Bytes::from(format!("data: {sse_data}\n\n")),
                         &mut client_disconnected,
-                        &mut abort_sent,
-                        &mut stream,
                         "Failed to send finish chunk",
                         &mut client_disconnect_error_message,
-                        Some(&mut stream_request_stats),
                     )
                     .await?;
 
@@ -1018,18 +975,12 @@ impl StreamingProcessor {
                         Self::emit_generate_request_stats(
                             &ctx,
                             &completed_responses,
-                            &stream_request_stats,
                             error.http_status_code(),
                             Some(error.message()),
                         )
                         .await;
                     }
                     return Err(error.message().to_string());
-                }
-                ProtoResponseVariant::RequestStats(request_stats) => {
-                    if ctx.enable_request_statistics {
-                        stream_request_stats.push(request_stats);
-                    }
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -1044,7 +995,6 @@ impl StreamingProcessor {
         Self::emit_generate_request_stats(
             &ctx,
             &completed_responses,
-            &stream_request_stats,
             if client_disconnected { Some(499) } else { Some(200) },
             if client_disconnected {
                 client_disconnect_error_message.or(Some("Client disconnected"))
@@ -1122,7 +1072,6 @@ impl StreamingProcessor {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
         let mut client_disconnected = false;
-        let mut abort_sent = false;
         let mut client_disconnect_error_message: Option<&'static str> = None;
 
         // Track state per index for n>1 case
@@ -1131,7 +1080,6 @@ impl StreamingProcessor {
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
-        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = match response {
@@ -1145,7 +1093,6 @@ impl StreamingProcessor {
                         Self::emit_generate_request_stats(
                             &ctx,
                             &completed_responses,
-                            &stream_request_stats,
                             None,
                             Some(&stream_error),
                         )
@@ -1228,11 +1175,8 @@ impl StreamingProcessor {
                         tx,
                         Bytes::from(format!("data: {sse_data}\n\n")),
                         &mut client_disconnected,
-                        &mut abort_sent,
-                        &mut stream,
                         "Failed to send chunk",
                         &mut client_disconnect_error_message,
-                        Some(&mut stream_request_stats),
                     )
                     .await?;
                 }
@@ -1281,11 +1225,8 @@ impl StreamingProcessor {
                         tx,
                         Bytes::from(format!("data: {sse_data}\n\n")),
                         &mut client_disconnected,
-                        &mut abort_sent,
-                        &mut stream,
                         "Failed to send finish chunk",
                         &mut client_disconnect_error_message,
-                        Some(&mut stream_request_stats),
                     )
                     .await?;
 
@@ -1296,18 +1237,12 @@ impl StreamingProcessor {
                         Self::emit_generate_request_stats(
                             &ctx,
                             &completed_responses,
-                            &stream_request_stats,
                             error.http_status_code(),
                             Some(error.message()),
                         )
                         .await;
                     }
                     return Err(error.message().to_string());
-                }
-                ProtoResponseVariant::RequestStats(request_stats) => {
-                    if ctx.enable_request_statistics {
-                        stream_request_stats.push(request_stats);
-                    }
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -1322,7 +1257,6 @@ impl StreamingProcessor {
         Self::emit_generate_request_stats(
             &ctx,
             &completed_responses,
-            &stream_request_stats,
             if client_disconnected { Some(499) } else { Some(200) },
             if client_disconnected {
                 client_disconnect_error_message.or(Some("Client disconnected"))
@@ -1361,14 +1295,13 @@ impl StreamingProcessor {
     async fn emit_generate_request_stats(
         ctx: &GenerateStreamContext,
         completed_responses: &[ProtoGenerateComplete],
-        stream_request_stats: &[ProtoRequestStats],
         http_status_code: Option<u16>,
         error_message: Option<&str>,
     ) {
         if !ctx.enable_request_statistics {
             return;
         }
-        let request_stats = collect_request_stats(completed_responses, stream_request_stats);
+        let request_stats = collect_request_stats(completed_responses);
 
         if let Some(request_stats) = request_stats {
             Self::emit_request_stats_event(
@@ -1674,11 +1607,8 @@ impl StreamingProcessor {
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         payload: Bytes,
         client_disconnected: &mut bool,
-        abort_sent: &mut bool,
-        stream: &mut ProtoStream,
         send_error_message: &'static str,
         client_disconnect_error_message: &mut Option<&'static str>,
-        stream_request_stats: Option<&mut Vec<ProtoRequestStats>>,
     ) -> Result<(), String> {
         if *client_disconnected {
             return Ok(());
@@ -1688,20 +1618,6 @@ impl StreamingProcessor {
             *client_disconnected = true;
             if client_disconnect_error_message.is_none() {
                 *client_disconnect_error_message = Some(send_error_message);
-            }
-            if !*abort_sent {
-                match stream.abort_with_request_stats("Client disconnected").await {
-                    Ok(Some(request_stats)) => {
-                        if let Some(stream_stats) = stream_request_stats {
-                            stream_stats.push(request_stats);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!("Failed to abort backend stream after disconnect: {}", e);
-                    }
-                }
-                *abort_sent = true;
             }
             return Ok(());
         }

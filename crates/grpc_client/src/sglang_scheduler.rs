@@ -67,16 +67,6 @@ impl AbortOnDropStream {
         debug!("Request {} marked as completed", self.request_id);
     }
 
-    /// Manually abort the request and return the backend abort response.
-    pub async fn abort(
-        &mut self,
-        reason: String,
-    ) -> Result<proto::AbortResponse, Box<dyn std::error::Error + Send + Sync>> {
-        self.aborted.store(true, Ordering::Release);
-        self.client
-            .abort_request(self.request_id.clone(), reason)
-            .await
-    }
 }
 
 impl Drop for AbortOnDropStream {
@@ -247,7 +237,7 @@ impl SglangSchedulerClient {
         &self,
         request_id: String,
         reason: String,
-    ) -> Result<proto::AbortResponse, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), tonic::Status> {
         debug!(
             "Sending abort request for {} (reason: {})",
             request_id, reason
@@ -265,7 +255,7 @@ impl SglangSchedulerClient {
             response.get_ref().success,
             response.get_ref().message
         );
-        Ok(response.into_inner())
+        Ok(())
     }
 
     /// Get model information

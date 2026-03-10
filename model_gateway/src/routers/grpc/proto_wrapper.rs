@@ -15,7 +15,7 @@ use smg_grpc_client::{
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
 };
 
-use crate::observability::events::{RequestStatsFieldMapping, UnifiedRequestStats};
+use crate::observability::events::UnifiedRequestStats;
 
 // =====================
 // Multimodal Data
@@ -453,9 +453,6 @@ impl ProtoGenerateResponse {
                 Some(sglang::generate_response::Response::Error(error)) => {
                     ProtoResponseVariant::Error(ProtoGenerateError::Sglang(error))
                 }
-                Some(sglang::generate_response::Response::RequestStats(request_stats)) => {
-                    ProtoResponseVariant::RequestStats(ProtoRequestStats::Sglang(request_stats))
-                }
                 None => ProtoResponseVariant::None,
             },
             Self::Vllm(resp) => match resp.response {
@@ -489,14 +486,7 @@ pub enum ProtoResponseVariant {
     Chunk(ProtoGenerateStreamChunk),
     Complete(ProtoGenerateComplete),
     Error(ProtoGenerateError),
-    RequestStats(ProtoRequestStats),
     None,
-}
-
-/// Unified request-stats payload from stream responses.
-#[derive(Clone)]
-pub enum ProtoRequestStats {
-    Sglang(sglang::RequestStats),
 }
 
 /// Unified GenerateStreamChunk
@@ -888,8 +878,6 @@ struct EngineRequestStatsSample {
 trait EngineRequestStatsMapper {
     const ENGINE: &'static str;
 
-    fn field_mapping() -> RequestStatsFieldMapping;
-
     fn map_complete(complete: &ProtoGenerateComplete) -> Option<EngineRequestStatsSample>;
 }
 
@@ -899,19 +887,6 @@ struct TrtllmRequestStatsMapper;
 
 impl EngineRequestStatsMapper for SglangRequestStatsMapper {
     const ENGINE: &'static str = "sglang";
-
-    fn field_mapping() -> RequestStatsFieldMapping {
-        RequestStatsFieldMapping {
-            request_received_timestamp: None,
-            first_token_generated_timestamp: None,
-            request_finished_timestamp: None,
-            cache_hit_rate: Some("cached_tokens/prompt_tokens"),
-            spec_decoding_acceptance_rate: None,
-            prompt_tokens: Some("prompt_tokens"),
-            completion_tokens: Some("completion_tokens"),
-            cached_tokens: Some("cached_tokens"),
-        }
-    }
 
     fn map_complete(complete: &ProtoGenerateComplete) -> Option<EngineRequestStatsSample> {
         if let ProtoGenerateComplete::Sglang(c) = complete {
@@ -937,19 +912,6 @@ impl EngineRequestStatsMapper for SglangRequestStatsMapper {
 impl EngineRequestStatsMapper for VllmRequestStatsMapper {
     const ENGINE: &'static str = "vllm";
 
-    fn field_mapping() -> RequestStatsFieldMapping {
-        RequestStatsFieldMapping {
-            request_received_timestamp: None,
-            first_token_generated_timestamp: None,
-            request_finished_timestamp: None,
-            cache_hit_rate: Some("cached_tokens/prompt_tokens"),
-            spec_decoding_acceptance_rate: None,
-            prompt_tokens: Some("prompt_tokens"),
-            completion_tokens: Some("completion_tokens"),
-            cached_tokens: Some("cached_tokens"),
-        }
-    }
-
     fn map_complete(complete: &ProtoGenerateComplete) -> Option<EngineRequestStatsSample> {
         if let ProtoGenerateComplete::Vllm(c) = complete {
             let prompt_tokens = u64::from(c.prompt_tokens);
@@ -973,19 +935,6 @@ impl EngineRequestStatsMapper for VllmRequestStatsMapper {
 
 impl EngineRequestStatsMapper for TrtllmRequestStatsMapper {
     const ENGINE: &'static str = "trtllm";
-
-    fn field_mapping() -> RequestStatsFieldMapping {
-        RequestStatsFieldMapping {
-            request_received_timestamp: Some("perf_metrics.arrival_time"),
-            first_token_generated_timestamp: Some("perf_metrics.first_token_time"),
-            request_finished_timestamp: Some("perf_metrics.last_token_time"),
-            cache_hit_rate: Some("cached_tokens/prompt_tokens"),
-            spec_decoding_acceptance_rate: None,
-            prompt_tokens: Some("prompt_tokens"),
-            completion_tokens: Some("completion_tokens"),
-            cached_tokens: Some("cached_tokens"),
-        }
-    }
 
     fn map_complete(complete: &ProtoGenerateComplete) -> Option<EngineRequestStatsSample> {
         if let ProtoGenerateComplete::Trtllm(c) = complete {
@@ -1042,123 +991,9 @@ pub fn collect_unified_request_stats(
     }
 }
 
-/// Build unified request-level stats from engine-specific stream stats protos.
-pub fn collect_stream_request_stats(
-    stream_stats: &[ProtoRequestStats],
-) -> Option<UnifiedRequestStats> {
-    let first = stream_stats.first()?;
-    match first {
-        ProtoRequestStats::Sglang(_) => {
-            let mut stats = Vec::with_capacity(stream_stats.len());
-            for sample in stream_stats {
-                match sample {
-                    ProtoRequestStats::Sglang(s) => stats.push(s.clone()),
-                }
-            }
-            collect_sglang_request_stats(&stats)
-        }
-    }
-}
-
-/// Build unified request-level stats from either stream stats or complete responses.
-///
-/// Stream stats are preferred when available because they may contain engine-native
-/// timestamps and metrics not present in complete responses.
-pub fn collect_request_stats(
-    completes: &[ProtoGenerateComplete],
-    stream_stats: &[ProtoRequestStats],
-) -> Option<UnifiedRequestStats> {
-    collect_stream_request_stats(stream_stats).or_else(|| collect_unified_request_stats(completes))
-}
-
-/// Build unified request-level stats from the dedicated SGLang request-stats API.
-pub fn collect_sglang_request_stats(
-    stats: &[sglang::RequestStats],
-) -> Option<UnifiedRequestStats> {
-    let mut seen = 0u64;
-    let mut request_received_timestamp_s: Option<f64> = None;
-    let mut first_token_generated_timestamp_s: Option<f64> = None;
-    let mut request_finished_timestamp_s: Option<f64> = None;
-    let mut cache_hit_rate_sum = 0.0f64;
-    let mut cache_hit_rate_count = 0u64;
-    let mut spec_acceptance_rate_sum = 0.0f64;
-    let mut spec_acceptance_rate_count = 0u64;
-    let mut prompt_tokens = 0u64;
-    let mut completion_tokens = 0u64;
-    let mut cached_tokens = 0u64;
-    let mut error_message: Option<String> = None;
-
-    for sample in stats {
-        seen += 1;
-        let sample_prompt = u64::from(sample.prompt_tokens);
-        let sample_completion = u64::from(sample.completion_tokens);
-        let sample_cached = u64::from(sample.cached_tokens);
-
-        prompt_tokens = prompt_tokens.saturating_add(sample_prompt);
-        completion_tokens = completion_tokens.saturating_add(sample_completion);
-        cached_tokens = cached_tokens.saturating_add(sample_cached);
-
-        request_received_timestamp_s =
-            min_timestamp(request_received_timestamp_s, sample.request_received_timestamp_s);
-        first_token_generated_timestamp_s = min_timestamp(
-            first_token_generated_timestamp_s,
-            sample.first_token_generated_timestamp_s,
-        );
-        request_finished_timestamp_s =
-            max_timestamp(request_finished_timestamp_s, sample.request_finished_timestamp_s);
-
-        if let Some(rate) = sample.cache_hit_rate {
-            cache_hit_rate_sum += rate;
-            cache_hit_rate_count += 1;
-        }
-        if let Some(rate) = sample.spec_decoding_acceptance_rate {
-            spec_acceptance_rate_sum += rate;
-            spec_acceptance_rate_count += 1;
-        }
-        if error_message.is_none() {
-            if let Some(msg) = sample.error_message.as_ref().filter(|m| !m.is_empty()) {
-                error_message = Some(msg.clone());
-            }
-        }
-    }
-
-    if seen == 0 {
-        return None;
-    }
-
-    let cache_hit_rate = if cache_hit_rate_count > 0 {
-        Some(cache_hit_rate_sum / cache_hit_rate_count as f64)
-    } else {
-        derive_cache_hit_rate(cached_tokens, prompt_tokens)
-    };
-    let spec_decoding_acceptance_rate = if spec_acceptance_rate_count > 0 {
-        Some(spec_acceptance_rate_sum / spec_acceptance_rate_count as f64)
-    } else {
-        None
-    };
-
-    Some(UnifiedRequestStats {
-        engine: "sglang",
-        field_mapping: RequestStatsFieldMapping {
-            request_received_timestamp: Some("request_received_timestamp_s"),
-            first_token_generated_timestamp: Some("first_token_generated_timestamp_s"),
-            request_finished_timestamp: Some("request_finished_timestamp_s"),
-            cache_hit_rate: Some("cache_hit_rate"),
-            spec_decoding_acceptance_rate: Some("spec_decoding_acceptance_rate"),
-            prompt_tokens: Some("prompt_tokens"),
-            completion_tokens: Some("completion_tokens"),
-            cached_tokens: Some("cached_tokens"),
-        },
-        error_message,
-        request_received_timestamp_s,
-        first_token_generated_timestamp_s,
-        request_finished_timestamp_s,
-        cache_hit_rate,
-        spec_decoding_acceptance_rate,
-        prompt_tokens,
-        completion_tokens,
-        cached_tokens,
-    })
+/// Build unified request-level stats from complete responses.
+pub fn collect_request_stats(completes: &[ProtoGenerateComplete]) -> Option<UnifiedRequestStats> {
+    collect_unified_request_stats(completes)
 }
 
 fn aggregate_request_stats<M: EngineRequestStatsMapper>(
@@ -1225,7 +1060,6 @@ fn aggregate_request_stats<M: EngineRequestStatsMapper>(
 
     Some(UnifiedRequestStats {
         engine: M::ENGINE,
-        field_mapping: M::field_mapping(),
         error_message: None,
         request_received_timestamp_s,
         first_token_generated_timestamp_s,
@@ -1363,34 +1197,6 @@ impl ProtoStream {
         }
     }
 
-    /// Abort the underlying request stream.
-    pub async fn abort(&mut self, reason: &str) -> Result<(), String> {
-        self.abort_with_request_stats(reason).await.map(|_| ())
-    }
-
-    /// Abort the underlying request stream and return request stats if the backend provides them.
-    pub async fn abort_with_request_stats(
-        &mut self,
-        reason: &str,
-    ) -> Result<Option<ProtoRequestStats>, String> {
-        match self {
-            Self::Sglang(stream) => stream
-                .abort(reason.to_string())
-                .await
-                .map(|resp| resp.request_stats.map(ProtoRequestStats::Sglang))
-                .map_err(|e| e.to_string()),
-            Self::Vllm(stream) => stream
-                .abort(reason.to_string())
-                .await
-                .map(|_| None)
-                .map_err(|e| e.to_string()),
-            Self::Trtllm(stream) => stream
-                .abort(reason.to_string())
-                .await
-                .map(|_| None)
-                .map_err(|e| e.to_string()),
-        }
-    }
 }
 
 /// Unified EmbedRequest that works with both backends

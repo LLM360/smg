@@ -27,8 +27,7 @@ use crate::{
         grpc::{
             context::RequestContext,
             proto_wrapper::{
-                collect_request_stats, ProtoGenerateComplete, ProtoInputLogProbs,
-                ProtoOutputLogProbs, ProtoResponseVariant, ProtoStream,
+                collect_request_stats, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
             },
             ProcessedMessages,
         },
@@ -619,7 +618,6 @@ pub(crate) async fn collect_stream_responses(
     enable_request_statistics: bool,
 ) -> Result<CollectedStreamResponses, Response> {
     let mut all_responses = Vec::new();
-    let mut stream_request_stats = Vec::new();
 
     while let Some(response) = stream.next().await {
         match response {
@@ -639,11 +637,6 @@ pub(crate) async fn collect_stream_responses(
                     ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
                     }
-                    ProtoResponseVariant::RequestStats(request_stats) => {
-                        if enable_request_statistics {
-                            stream_request_stats.push(request_stats);
-                        }
-                    }
                     ProtoResponseVariant::None => {
                         // Empty response - no action needed
                     }
@@ -661,7 +654,7 @@ pub(crate) async fn collect_stream_responses(
     }
 
     let request_stats = if enable_request_statistics {
-        collect_request_stats(&all_responses, &stream_request_stats)
+        collect_request_stats(&all_responses)
     } else {
         None
     };

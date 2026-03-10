@@ -75,24 +75,10 @@ impl Event for RequestReceivedEvent {
     }
 }
 
-/// Backend-specific field names mapped into the unified request stats schema.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RequestStatsFieldMapping {
-    pub request_received_timestamp: Option<&'static str>,
-    pub first_token_generated_timestamp: Option<&'static str>,
-    pub request_finished_timestamp: Option<&'static str>,
-    pub cache_hit_rate: Option<&'static str>,
-    pub spec_decoding_acceptance_rate: Option<&'static str>,
-    pub prompt_tokens: Option<&'static str>,
-    pub completion_tokens: Option<&'static str>,
-    pub cached_tokens: Option<&'static str>,
-}
-
 /// Normalized request-level stats collected from engine-specific responses.
 #[derive(Debug, Clone)]
 pub struct UnifiedRequestStats {
     pub engine: &'static str,
-    pub field_mapping: RequestStatsFieldMapping,
     pub error_message: Option<String>,
     pub request_received_timestamp_s: Option<f64>,
     pub first_token_generated_timestamp_s: Option<f64>,

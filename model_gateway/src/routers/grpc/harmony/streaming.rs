@@ -43,8 +43,7 @@ use crate::{
         },
         context,
         proto_wrapper::{
-            collect_request_stats, ProtoGenerateComplete, ProtoRequestStats, ProtoResponseVariant,
-            ProtoStream,
+            collect_request_stats, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
         },
         utils,
     },
@@ -235,7 +234,6 @@ impl HarmonyStreamingProcessor {
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut completed_responses: Vec<ProtoGenerateComplete> = Vec::new();
-        let mut stream_request_stats: Vec<ProtoRequestStats> = Vec::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -335,8 +333,7 @@ impl HarmonyStreamingProcessor {
                         let total_prompt: u64 =
                             prompt_tokens.values().map(|v| u64::from(*v)).sum();
                         let total_completion = u64::from(completion_tokens.total());
-                        if let Some(mut request_stats) =
-                            collect_request_stats(&completed_responses, &stream_request_stats)
+                        if let Some(mut request_stats) = collect_request_stats(&completed_responses)
                         {
                             if total_prompt > 0 {
                                 request_stats.prompt_tokens = total_prompt;
@@ -356,11 +353,6 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                     return Err(format!("Server error: {}", error_wrapper.message()));
-                }
-                ProtoResponseVariant::RequestStats(request_stats) => {
-                    if enable_request_statistics {
-                        stream_request_stats.push(request_stats);
-                    }
                 }
                 ProtoResponseVariant::None => {}
             }
@@ -399,7 +391,7 @@ impl HarmonyStreamingProcessor {
         });
 
         if enable_request_statistics {
-            let request_stats = collect_request_stats(&completed_responses, &stream_request_stats);
+            let request_stats = collect_request_stats(&completed_responses);
 
             if let Some(mut request_stats) = request_stats {
                 request_stats.prompt_tokens = total_prompt as u64;
@@ -986,7 +978,6 @@ impl HarmonyStreamingProcessor {
                 ProtoResponseVariant::Error(error_wrapper) => {
                     return Err(format!("Server error: {}", error_wrapper.message()));
                 }
-                ProtoResponseVariant::RequestStats(_) => {}
                 ProtoResponseVariant::None => {}
             }
         }

@@ -339,13 +339,13 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn request_id_headers(mut self, headers: Vec<String>) -> Self {
-        self.config.request_id_headers = Some(headers);
+    pub fn enable_request_statistics(mut self, enable: bool) -> Self {
+        self.config.enable_request_statistics = enable;
         self
     }
 
-    pub fn enable_request_statistics(mut self, enable: bool) -> Self {
-        self.config.enable_request_statistics = enable;
+    pub fn request_id_headers(mut self, headers: Vec<String>) -> Self {
+        self.config.request_id_headers = Some(headers);
         self
     }
 
