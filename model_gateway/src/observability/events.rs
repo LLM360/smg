@@ -93,6 +93,7 @@ pub struct RequestStatsFieldMapping {
 pub struct UnifiedRequestStats {
     pub engine: &'static str,
     pub field_mapping: RequestStatsFieldMapping,
+    pub error_message: Option<String>,
     pub request_received_timestamp_s: Option<f64>,
     pub first_token_generated_timestamp_s: Option<f64>,
     pub request_finished_timestamp_s: Option<f64>,
@@ -109,6 +110,8 @@ pub struct RequestStatsEvent<'a> {
     pub request_id: &'a str,
     pub model: &'a str,
     pub router_backend: &'a str,
+    pub http_status_code: Option<u16>,
+    pub error_message: Option<&'a str>,
     pub stats: &'a UnifiedRequestStats,
 }
 
@@ -124,6 +127,11 @@ impl Event for RequestStatsEvent<'_> {
         let cache_hit_rate = format_optional_f64(self.stats.cache_hit_rate);
         let spec_decoding_acceptance_rate =
             format_optional_f64(self.stats.spec_decoding_acceptance_rate);
+        let http_status_code = format_optional_u16(self.http_status_code);
+        let error_message = self
+            .error_message
+            .or(self.stats.error_message.as_deref())
+            .unwrap_or("None");
 
         if is_otel_enabled() {
             event!(
@@ -131,6 +139,8 @@ impl Event for RequestStatsEvent<'_> {
                 request_id = %self.request_id,
                 model = %self.model,
                 router_backend = %self.router_backend,
+                http_status_code = %http_status_code,
+                error_message = %error_message,
                 engine = %self.stats.engine,
                 request_received_timestamp_s = %request_received_timestamp_s,
                 first_token_generated_timestamp_s = %first_token_generated_timestamp_s,
@@ -147,6 +157,8 @@ impl Event for RequestStatsEvent<'_> {
                 request_id = %self.request_id,
                 model = %self.model,
                 router_backend = %self.router_backend,
+                http_status_code = %http_status_code,
+                error_message = %error_message,
                 engine = %self.stats.engine,
                 request_received_timestamp_s = %request_received_timestamp_s,
                 first_token_generated_timestamp_s = %first_token_generated_timestamp_s,
@@ -164,6 +176,13 @@ impl Event for RequestStatsEvent<'_> {
 
 #[inline]
 fn format_optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "None".to_string())
+}
+
+#[inline]
+fn format_optional_u16(value: Option<u16>) -> String {
     value
         .map(|v| v.to_string())
         .unwrap_or_else(|| "None".to_string())

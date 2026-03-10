@@ -1067,6 +1067,7 @@ pub fn collect_sglang_request_stats(
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
     let mut cached_tokens = 0u64;
+    let mut error_message: Option<String> = None;
 
     for sample in stats {
         seen += 1;
@@ -1094,6 +1095,11 @@ pub fn collect_sglang_request_stats(
         if let Some(rate) = sample.spec_decoding_acceptance_rate {
             spec_acceptance_rate_sum += rate;
             spec_acceptance_rate_count += 1;
+        }
+        if error_message.is_none() {
+            if let Some(msg) = sample.error_message.as_ref().filter(|m| !m.is_empty()) {
+                error_message = Some(msg.clone());
+            }
         }
     }
 
@@ -1124,6 +1130,7 @@ pub fn collect_sglang_request_stats(
             completion_tokens: Some("completion_tokens"),
             cached_tokens: Some("cached_tokens"),
         },
+        error_message,
         request_received_timestamp_s,
         first_token_generated_timestamp_s,
         request_finished_timestamp_s,
@@ -1200,6 +1207,7 @@ fn aggregate_request_stats<M: EngineRequestStatsMapper>(
     Some(UnifiedRequestStats {
         engine: M::ENGINE,
         field_mapping: M::field_mapping(),
+        error_message: None,
         request_received_timestamp_s,
         first_token_generated_timestamp_s,
         request_finished_timestamp_s,
@@ -1291,6 +1299,14 @@ impl ProtoGenerateError {
             Self::Trtllm(e) => &e.message,
         }
     }
+
+    /// Get HTTP status code when provided by backend.
+    pub fn http_status_code(&self) -> Option<u16> {
+        match self {
+            Self::Sglang(e) => e.http_status_code.parse::<u16>().ok(),
+            Self::Trtllm(_) => None,
+        }
+    }
 }
 
 /// Unified stream wrapper
@@ -1325,6 +1341,35 @@ impl ProtoStream {
             Self::Sglang(stream) => stream.mark_completed(),
             Self::Vllm(stream) => stream.mark_completed(),
             Self::Trtllm(stream) => stream.mark_completed(),
+        }
+    }
+
+    /// Abort the underlying request stream.
+    pub async fn abort(&mut self, reason: &str) -> Result<(), String> {
+        self.abort_with_request_stats(reason).await.map(|_| ())
+    }
+
+    /// Abort the underlying request stream and return request stats if the backend provides them.
+    pub async fn abort_with_request_stats(
+        &mut self,
+        reason: &str,
+    ) -> Result<Option<ProtoRequestStats>, String> {
+        match self {
+            Self::Sglang(stream) => stream
+                .abort(reason.to_string())
+                .await
+                .map(|resp| resp.request_stats.map(ProtoRequestStats::Sglang))
+                .map_err(|e| e.to_string()),
+            Self::Vllm(stream) => stream
+                .abort(reason.to_string())
+                .await
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            Self::Trtllm(stream) => stream
+                .abort(reason.to_string())
+                .await
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
         }
     }
 }

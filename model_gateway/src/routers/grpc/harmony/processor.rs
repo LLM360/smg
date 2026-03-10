@@ -57,12 +57,16 @@ impl HarmonyResponseProcessor {
         let response_collection::CollectedResponses {
             completes: all_responses,
             request_stats,
-        } = response_collection::collect_responses(
+        } = match response_collection::collect_responses(
             execution_result,
             request_logprobs,
             self.enable_request_statistics,
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) => return Err(err),
+        };
         if all_responses.is_empty() {
             return Err(error::internal_error(
                 "no_responses_from_server",
@@ -150,6 +154,8 @@ impl HarmonyResponseProcessor {
                 request_id: &dispatch.request_id,
                 model: &chat_request.model,
                 router_backend: metrics_labels::BACKEND_HARMONY,
+                http_status_code: Some(200),
+                error_message: None,
                 stats: &request_stats,
             }
             .emit();
@@ -221,12 +227,16 @@ impl HarmonyResponseProcessor {
         let response_collection::CollectedResponses {
             completes: all_responses,
             request_stats,
-        } = response_collection::collect_responses(
+        } = match response_collection::collect_responses(
             execution_result,
             request_logprobs,
             self.enable_request_statistics,
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) => return Err(err),
+        };
         if all_responses.is_empty() {
             return Err(error::internal_error(
                 "no_responses_from_server",
@@ -297,6 +307,8 @@ impl HarmonyResponseProcessor {
                 request_id: &dispatch.request_id,
                 model: &responses_request.model,
                 router_backend: metrics_labels::BACKEND_HARMONY,
+                http_status_code: Some(200),
+                error_message: None,
                 stats: &request_stats,
             }
             .emit();

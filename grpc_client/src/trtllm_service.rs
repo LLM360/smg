@@ -65,6 +65,15 @@ impl AbortOnDropStream {
         self.aborted.store(true, Ordering::Release);
         debug!("Request {} marked as completed", self.request_id);
     }
+
+    /// Manually abort the request and return the backend abort response.
+    pub async fn abort(
+        &mut self,
+        _reason: String,
+    ) -> Result<proto::AbortResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.aborted.store(true, Ordering::Release);
+        self.client.abort_request(self.request_id.clone()).await
+    }
 }
 
 impl Drop for AbortOnDropStream {

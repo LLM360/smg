@@ -66,6 +66,17 @@ impl AbortOnDropStream {
         self.aborted.store(true, Ordering::Release);
         debug!("Request {} marked as completed", self.request_id);
     }
+
+    /// Manually abort the request and return the backend abort response.
+    pub async fn abort(
+        &mut self,
+        reason: String,
+    ) -> Result<proto::AbortResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.aborted.store(true, Ordering::Release);
+        self.client
+            .abort_request(self.request_id.clone(), reason)
+            .await
+    }
 }
 
 impl Drop for AbortOnDropStream {
@@ -221,16 +232,16 @@ impl VllmEngineClient {
         &self,
         request_id: String,
         _reason: String,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<proto::AbortResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending abort request for {}", request_id);
         let request = Request::new(proto::AbortRequest {
             request_ids: vec![request_id.clone()],
         });
 
         let mut client = self.client.clone();
-        let _response = client.abort(request).await?;
+        let response = client.abort(request).await?;
         debug!("Abort response received for {}", request_id);
-        Ok(())
+        Ok(response.into_inner())
     }
 
     /// Get model information

@@ -212,12 +212,16 @@ impl ResponseProcessor {
         let response_collection::CollectedResponses {
             completes: all_responses,
             request_stats,
-        } = response_collection::collect_responses(
+        } = match response_collection::collect_responses(
             execution_result,
             request_logprobs,
             self.enable_request_statistics,
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) => return Err(err),
+        };
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
@@ -291,6 +295,8 @@ impl ResponseProcessor {
                 request_id: &dispatch.request_id,
                 model: &dispatch.model,
                 router_backend: metrics_labels::BACKEND_REGULAR,
+                http_status_code: Some(200),
+                error_message: None,
                 stats: &request_stats,
             }
             .emit();
@@ -378,18 +384,24 @@ impl ResponseProcessor {
         let response_collection::CollectedResponses {
             completes: all_responses,
             request_stats,
-        } = response_collection::collect_responses(
+        } = match response_collection::collect_responses(
             execution_result,
             request_logprobs,
             self.enable_request_statistics,
         )
-        .await?;
+        .await
+        {
+            Ok(collected) => collected,
+            Err(err) => return Err(err),
+        };
 
         if let Some(request_stats) = request_stats {
             RequestStatsEvent {
                 request_id: &dispatch.request_id,
                 model: &dispatch.model,
                 router_backend: metrics_labels::BACKEND_REGULAR,
+                http_status_code: Some(200),
+                error_message: None,
                 stats: &request_stats,
             }
             .emit();

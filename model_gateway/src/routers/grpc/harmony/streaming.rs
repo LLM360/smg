@@ -264,6 +264,30 @@ impl HarmonyStreamingProcessor {
                     }
                 }
                 ProtoResponseVariant::Error(error_wrapper) => {
+                    if enable_request_statistics {
+                        let total_prompt: u64 =
+                            prompt_tokens.values().map(|v| u64::from(*v)).sum();
+                        let total_completion = u64::from(completion_tokens.total());
+                        if let Some(mut request_stats) =
+                            collect_request_stats(&completed_responses, &stream_request_stats)
+                        {
+                            if total_prompt > 0 {
+                                request_stats.prompt_tokens = total_prompt;
+                            }
+                            if total_completion > 0 {
+                                request_stats.completion_tokens = total_completion;
+                            }
+                            RequestStatsEvent {
+                                request_id: &dispatch.request_id,
+                                model: &original_request.model,
+                                router_backend: metrics_labels::BACKEND_HARMONY,
+                                http_status_code: error_wrapper.http_status_code(),
+                                error_message: Some(error_wrapper.message()),
+                                stats: &request_stats,
+                            }
+                            .emit();
+                        }
+                    }
                     return Err(format!("Server error: {}", error_wrapper.message()));
                 }
                 ProtoResponseVariant::RequestStats(request_stats) => {
@@ -317,6 +341,8 @@ impl HarmonyStreamingProcessor {
                     request_id: &dispatch.request_id,
                     model: &original_request.model,
                     router_backend: metrics_labels::BACKEND_HARMONY,
+                    http_status_code: Some(200),
+                    error_message: None,
                     stats: &request_stats,
                 }
                 .emit();
@@ -447,6 +473,30 @@ impl HarmonyStreamingProcessor {
                     }
                 }
                 ProtoResponseVariant::Error(error_wrapper) => {
+                    if enable_request_statistics {
+                        let total_prompt: u64 =
+                            prompt_tokens.values().map(|v| u64::from(*v)).sum();
+                        let total_completion = u64::from(completion_tokens.total());
+                        if let Some(mut request_stats) =
+                            collect_request_stats(&completed_responses, &stream_request_stats)
+                        {
+                            if total_prompt > 0 {
+                                request_stats.prompt_tokens = total_prompt;
+                            }
+                            if total_completion > 0 {
+                                request_stats.completion_tokens = total_completion;
+                            }
+                            RequestStatsEvent {
+                                request_id: &dispatch.request_id,
+                                model: &original_request.model,
+                                router_backend: metrics_labels::BACKEND_HARMONY,
+                                http_status_code: error_wrapper.http_status_code(),
+                                error_message: Some(error_wrapper.message()),
+                                stats: &request_stats,
+                            }
+                            .emit();
+                        }
+                    }
                     return Err(format!("Server error: {}", error_wrapper.message()));
                 }
                 ProtoResponseVariant::RequestStats(request_stats) => {
@@ -503,6 +553,8 @@ impl HarmonyStreamingProcessor {
                     request_id: &dispatch.request_id,
                     model: &original_request.model,
                     router_backend: metrics_labels::BACKEND_HARMONY,
+                    http_status_code: Some(200),
+                    error_message: None,
                     stats: &request_stats,
                 }
                 .emit();
