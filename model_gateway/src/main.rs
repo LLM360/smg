@@ -280,8 +280,9 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Logging")]
     log_json: bool,
 
+    // ==================== Observability ====================
     /// Enable request-level statistics collection and logging
-    #[arg(long, default_value_t = false, help_heading = "Logging")]
+    #[arg(long, help_heading = "Observability")]
     enable_request_statistics: bool,
 
     // ==================== Prometheus Metrics ====================

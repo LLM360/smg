@@ -1272,34 +1272,16 @@ impl StreamingProcessor {
         error_message: Option<&str>,
     ) {
         if let Some(request_stats) = request_stats {
-            Self::emit_request_stats_event(
-                &ctx.request_id,
-                &ctx.model,
-                ctx.backend_type,
+            RequestStatsEvent {
+                request_id: &ctx.request_id,
+                model: &ctx.model,
+                router_backend: ctx.backend_type,
                 http_status_code,
                 error_message,
-                &request_stats,
-            );
+                stats: &request_stats,
+            }
+            .emit();
         }
-    }
-
-    fn emit_request_stats_event(
-        request_id: &str,
-        model: &str,
-        router_backend: &'static str,
-        http_status_code: Option<u16>,
-        error_message: Option<&str>,
-        request_stats: &UnifiedRequestStats,
-    ) {
-        RequestStatsEvent {
-            request_id,
-            model,
-            router_backend,
-            http_status_code,
-            error_message,
-            stats: request_stats,
-        }
-        .emit();
     }
 
     /// Process a chunk of tokens through the stop decoder

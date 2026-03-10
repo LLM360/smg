@@ -512,24 +512,11 @@ impl ProtoGenerateResponse {
                         complete.completion_tokens,
                         complete.cached_tokens,
                     );
-                    let (
-                        request_received_timestamp_s,
-                        first_token_generated_timestamp_s,
-                        request_finished_timestamp_s,
-                    ) = complete
-                        .perf_metrics
-                        .as_ref()
-                        .map(|m| {
-                            normalize_trtllm_timestamps(
-                                Some(m.arrival_time),
-                                Some(m.first_token_time),
-                                Some(m.last_token_time),
-                            )
-                        })
-                        .unwrap_or((None, None, None));
-                    sample.request_received_timestamp_s = request_received_timestamp_s;
-                    sample.first_token_generated_timestamp_s = first_token_generated_timestamp_s;
-                    sample.request_finished_timestamp_s = request_finished_timestamp_s;
+                    if let Some(m) = complete.perf_metrics.as_ref() {
+                        sample.request_received_timestamp_s = Some(m.arrival_time);
+                        sample.first_token_generated_timestamp_s = Some(m.first_token_time);
+                        sample.request_finished_timestamp_s = Some(m.last_token_time);
+                    }
                     Some(("trtllm", sample))
                 }
                 _ => None,
@@ -980,43 +967,6 @@ fn max_timestamp(current: Option<f64>, candidate: Option<f64>) -> Option<f64> {
     }
 }
 
-#[inline]
-fn normalize_trtllm_timestamps(
-    arrival: Option<f64>,
-    first_token: Option<f64>,
-    last_token: Option<f64>,
-) -> (Option<f64>, Option<f64>, Option<f64>) {
-    let first_token_generated_timestamp_s = match (arrival, first_token) {
-        (Some(arrival_ts), Some(first_val)) => {
-            if first_val >= arrival_ts {
-                Some(first_val)
-            } else {
-                Some(arrival_ts + first_val)
-            }
-        }
-        (None, Some(first_val)) => Some(first_val),
-        _ => None,
-    };
-
-    let request_finished_timestamp_s = match (arrival, last_token) {
-        (Some(arrival_ts), Some(last_val)) => {
-            if last_val >= arrival_ts {
-                Some(last_val)
-            } else {
-                Some(arrival_ts + last_val)
-            }
-        }
-        (None, Some(last_val)) => Some(last_val),
-        _ => None,
-    };
-
-    (
-        arrival,
-        first_token_generated_timestamp_s,
-        request_finished_timestamp_s,
-    )
-}
-
 /// Unified GenerateError
 /// Note: vLLM proto no longer has GenerateError - errors are returned via gRPC status
 #[derive(Clone)]
@@ -1047,7 +997,6 @@ impl ProtoGenerateError {
 struct RequestStatsCollector {
     enabled: bool,
     engine: Option<&'static str>,
-    seen: u64,
     request_received_timestamp_s: Option<f64>,
     first_token_generated_timestamp_s: Option<f64>,
     request_finished_timestamp_s: Option<f64>,
@@ -1064,7 +1013,6 @@ impl RequestStatsCollector {
     #[inline]
     fn reset(&mut self) {
         self.engine = None;
-        self.seen = 0;
         self.request_received_timestamp_s = None;
         self.first_token_generated_timestamp_s = None;
         self.request_finished_timestamp_s = None;
@@ -1095,7 +1043,6 @@ impl RequestStatsCollector {
             self.engine = Some(engine);
         }
 
-        self.seen += 1;
         self.prompt_tokens = self.prompt_tokens.saturating_add(sample.prompt_tokens);
         self.completion_tokens = self
             .completion_tokens
@@ -1130,9 +1077,7 @@ impl RequestStatsCollector {
         if !self.enabled {
             return None;
         }
-        if self.seen == 0 {
-            return None;
-        }
+        let engine = self.engine?;
 
         let cache_hit_rate = if self.cache_hit_rate_count > 0 {
             Some(self.cache_hit_rate_sum / self.cache_hit_rate_count as f64)
@@ -1146,9 +1091,7 @@ impl RequestStatsCollector {
         };
 
         let stats = Some(UnifiedRequestStats {
-            engine: self
-                .engine
-                .expect("collector invariant violated: seen>0 requires engine"),
+            engine,
             error_message: None,
             request_received_timestamp_s: self.request_received_timestamp_s,
             first_token_generated_timestamp_s: self.first_token_generated_timestamp_s,
