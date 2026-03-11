@@ -40,6 +40,7 @@ pub mod parse;
 pub mod persistence_utils;
 pub mod router_manager;
 pub mod tokenize;
+pub mod worker_selection;
 
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
@@ -281,6 +282,15 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Realtime WebSocket not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route a realtime WebRTC upgrade request
+    async fn route_realtime_webrtc(&self, _req: Request<Body>, _model_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Realtime WebRTC not implemented",
         )
             .into_response()
     }
