@@ -481,6 +481,7 @@ impl ProtoGenerateResponse {
     }
 
     #[inline]
+    /// Returns true if this response should trigger backend request level stats lookup.
     fn should_fetch_backend_request_stats(&self) -> bool {
         match self {
             Self::Sglang(resp) => matches!(
@@ -493,6 +494,7 @@ impl ProtoGenerateResponse {
     }
 
     #[inline]
+    /// Returns the index of the engine response used for backend request level stats lookup.
     fn backend_request_stats_index(&self) -> Option<u32> {
         match self {
             Self::Sglang(resp) => match resp.response.as_ref() {
@@ -888,6 +890,7 @@ impl ProtoGenerateComplete {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Backend-agnostic request stats for a single request sample.
 struct RequestStatsSample {
     request_received_timestamp_s: Option<f64>,
     first_token_generated_timestamp_s: Option<f64>,
@@ -900,6 +903,7 @@ struct RequestStatsSample {
     cached_tokens: Option<u64>,
 }
 
+/// `RequestStatsSample` with its corresponding backend name and response index.
 struct IndexedRequestStatsSample {
     engine: &'static str,
     index: u32,
@@ -907,7 +911,8 @@ struct IndexedRequestStatsSample {
 }
 
 #[inline]
-fn request_stats_sample_from_proto(stats: sglang::RequestStats) -> RequestStatsSample {
+/// Converts SGLang engine request stats into the shared stats sample format.
+fn request_stats_sample_from_proto_sglang(stats: sglang::RequestStats) -> RequestStatsSample {
     RequestStatsSample {
         request_received_timestamp_s: stats.request_received_timestamp_s,
         first_token_generated_timestamp_s: stats.first_token_generated_timestamp_s,
@@ -1013,7 +1018,7 @@ impl RequestStatsCollector {
             self.prompt_tokens.get_or_insert(pt);
         }
         if let Some(ct) = sample.completion_tokens {
-            self.completion_tokens = Some(self.completion_tokens.unwrap_or(0).saturating_add(ct));
+            self.completion_tokens = Some(self.completion_tokens.unwrap_or(0) + ct);
         }
         if let Some(ct) = sample.cached_tokens {
             self.cached_tokens.get_or_insert(ct);
@@ -1039,6 +1044,7 @@ impl RequestStatsCollector {
         if let Some(rate) = sample.cache_hit_rate {
             self.cache_hit_rate.get_or_insert(rate);
         }
+        // Take the first reported spec decoding acceptance rate.
         if let Some(rate) = sample.spec_decoding_acceptance_rate {
             self.spec_decoding_acceptance_rate.get_or_insert(rate);
         }
@@ -1104,6 +1110,7 @@ impl ProtoStream {
         }
     }
 
+    /// Fetches engine request stats for the current request.
     async fn fetch_backend_request_stats(&self) -> Option<Vec<IndexedRequestStatsSample>> {
         match self {
             Self::Sglang(stream) => match stream
@@ -1118,7 +1125,7 @@ impl ProtoStream {
                         .map(|s| IndexedRequestStatsSample {
                             engine: "sglang",
                             index: s.index,
-                            sample: request_stats_sample_from_proto(s),
+                            sample: request_stats_sample_from_proto_sglang(s),
                         })
                         .collect(),
                 ),
@@ -1149,6 +1156,7 @@ impl StatsProtoStream {
         }
     }
 
+    /// Build an index of (backend, RequestStatsSample) pairs keyed by backend request index.
     fn build_backend_request_stats_index(
         samples: Vec<IndexedRequestStatsSample>,
     ) -> HashMap<u32, (&'static str, RequestStatsSample)> {
@@ -1159,6 +1167,7 @@ impl StatsProtoStream {
         by_index
     }
 
+    /// For this response, fetch the corresponding backend request stats and return the matching sample, if any.
     async fn take_backend_request_stats_sample(
         &mut self,
         gen_response: &ProtoGenerateResponse,
@@ -1174,6 +1183,7 @@ impl StatsProtoStream {
         if let Some(idx) = index {
             return by_index.remove(&idx);
         }
+        // If no explicit index was provided, take the only available sample.
         if by_index.len() == 1 {
             let only_index = *by_index.keys().next()?;
             return by_index.remove(&only_index);
@@ -1181,6 +1191,7 @@ impl StatsProtoStream {
         None
     }
 
+    /// Advance the stream and record request stats.
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let response = self.stream.next().await;
         let gen_response = response.as_ref().and_then(|r| r.as_ref().ok());
