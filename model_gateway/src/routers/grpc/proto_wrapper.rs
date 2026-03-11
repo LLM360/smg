@@ -892,6 +892,7 @@ struct RequestStatsSample {
     request_received_timestamp_s: Option<f64>,
     first_token_generated_timestamp_s: Option<f64>,
     request_finished_timestamp_s: Option<f64>,
+    response_sent_timestamp_s: Option<f64>,
     cache_hit_rate: Option<f64>,
     spec_decoding_acceptance_rate: Option<f64>,
     prompt_tokens: Option<u64>,
@@ -911,6 +912,7 @@ fn request_stats_sample_from_proto(stats: sglang::RequestStats) -> RequestStatsS
         request_received_timestamp_s: stats.request_received_timestamp_s,
         first_token_generated_timestamp_s: stats.first_token_generated_timestamp_s,
         request_finished_timestamp_s: stats.request_finished_timestamp_s,
+        response_sent_timestamp_s: stats.response_sent_timestamp_s,
         cache_hit_rate: stats.cache_hit_rate,
         spec_decoding_acceptance_rate: stats.spec_decoding_acceptance_rate,
         prompt_tokens: stats.prompt_tokens.map(Into::into),
@@ -970,6 +972,7 @@ struct RequestStatsCollector {
     request_received_timestamp_s: Option<f64>,
     first_token_generated_timestamp_s: Option<f64>,
     request_finished_timestamp_s: Option<f64>,
+    response_sent_timestamp_s: Option<f64>,
     cache_hit_rate: Option<f64>,
     spec_decoding_acceptance_rate: Option<f64>,
     prompt_tokens: Option<u64>,
@@ -984,6 +987,7 @@ impl RequestStatsCollector {
         self.request_received_timestamp_s = None;
         self.first_token_generated_timestamp_s = None;
         self.request_finished_timestamp_s = None;
+        self.response_sent_timestamp_s = None;
         self.cache_hit_rate = None;
         self.spec_decoding_acceptance_rate = None;
         self.prompt_tokens = None;
@@ -1027,6 +1031,10 @@ impl RequestStatsCollector {
             self.request_finished_timestamp_s,
             sample.request_finished_timestamp_s,
         );
+        self.response_sent_timestamp_s = max_timestamp(
+            self.response_sent_timestamp_s,
+            sample.response_sent_timestamp_s,
+        );
 
         if let Some(rate) = sample.cache_hit_rate {
             self.cache_hit_rate.get_or_insert(rate);
@@ -1049,6 +1057,7 @@ impl RequestStatsCollector {
             request_received_timestamp_s: self.request_received_timestamp_s,
             first_token_generated_timestamp_s: self.first_token_generated_timestamp_s,
             request_finished_timestamp_s: self.request_finished_timestamp_s,
+            response_sent_timestamp_s: self.response_sent_timestamp_s,
             cache_hit_rate: self.cache_hit_rate,
             spec_decoding_acceptance_rate: self.spec_decoding_acceptance_rate,
             prompt_tokens: self.prompt_tokens,
