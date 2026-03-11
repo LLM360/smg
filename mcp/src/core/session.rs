@@ -34,6 +34,10 @@ pub struct McpServerBinding {
     pub label: String,
     /// Internal key used to look up the server in the orchestrator.
     pub server_key: String,
+    /// Whether tools on this server require interactive approval before execution.
+    ///
+    /// This is a per-binding (per-server) configuration, not per-tool.
+    pub require_approval: bool,
     /// Optional per-server tool allowlist.
     ///
     /// When `Some`, only the listed tool names are exposed for this server.
@@ -265,6 +269,19 @@ impl<'a> McpToolSession<'a> {
             .unwrap_or(ResponseFormat::Passthrough)
     }
 
+    /// Returns true if the invoked (exposed) tool name maps to an MCP server
+    /// binding configured with `require_approval=true`.
+    pub fn tool_requires_approval(&self, invoked_tool_name: &str) -> bool {
+        let Some(binding) = self.exposed_name_map.get(invoked_tool_name) else {
+            return false;
+        };
+
+        self.all_mcp_servers
+            .iter()
+            .find(|b| b.server_key == binding.server_key)
+            .is_some_and(|b| b.require_approval)
+    }
+
     /// Build function-tool JSON payloads for upstream model calls.
     pub fn build_function_tools_json(&self) -> Vec<serde_json::Value> {
         build_function_tools_json_with_names(&self.mcp_tools, Some(&self.exposed_name_by_qualified))
@@ -433,11 +450,13 @@ mod tests {
             McpServerBinding {
                 label: "label1".to_string(),
                 server_key: "key1".to_string(),
+                require_approval: false,
                 allowed_tools: None,
             },
             McpServerBinding {
                 label: "label2".to_string(),
                 server_key: "key2".to_string(),
+                require_approval: false,
                 allowed_tools: None,
             },
         ];
@@ -464,6 +483,7 @@ mod tests {
         let mcp_servers = vec![McpServerBinding {
             label: "my_label".to_string(),
             server_key: "my_key".to_string(),
+            require_approval: false,
             allowed_tools: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
@@ -518,6 +538,7 @@ mod tests {
         let mcp_servers = vec![McpServerBinding {
             label: "label1".to_string(),
             server_key: "server1".to_string(),
+            require_approval: false,
             allowed_tools: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
@@ -537,6 +558,7 @@ mod tests {
         let mcp_servers = vec![McpServerBinding {
             label: "my_server".to_string(),
             server_key: "server1".to_string(),
+            require_approval: false,
             allowed_tools: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
@@ -564,11 +586,13 @@ mod tests {
                 McpServerBinding {
                     label: "alpha".to_string(),
                     server_key: "server1".to_string(),
+                    require_approval: false,
                     allowed_tools: None,
                 },
                 McpServerBinding {
                     label: "beta".to_string(),
                     server_key: "server2".to_string(),
+                    require_approval: false,
                     allowed_tools: None,
                 },
             ],
@@ -617,16 +641,19 @@ mod tests {
                 McpServerBinding {
                     label: "a".to_string(),
                     server_key: "s1".to_string(),
+                    require_approval: false,
                     allowed_tools: None,
                 },
                 McpServerBinding {
                     label: "b".to_string(),
                     server_key: "s2".to_string(),
+                    require_approval: false,
                     allowed_tools: None,
                 },
                 McpServerBinding {
                     label: "c".to_string(),
                     server_key: "s3".to_string(),
+                    require_approval: false,
                     allowed_tools: None,
                 },
             ],
@@ -688,11 +715,13 @@ mod tests {
             McpServerBinding {
                 label: "brave".to_string(),
                 server_key: "brave-builtin".to_string(),
+                require_approval: false,
                 allowed_tools: None,
             },
             McpServerBinding {
                 label: "regular".to_string(),
                 server_key: "regular-server".to_string(),
+                require_approval: false,
                 allowed_tools: None,
             },
         ];
@@ -731,6 +760,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "mock".to_string(),
                 server_key: "server1".to_string(),
+                require_approval: false,
                 allowed_tools: Some(vec!["brave_web_search".to_string()]),
             }],
             "test-request",
@@ -783,11 +813,13 @@ mod tests {
                 McpServerBinding {
                     label: "brave".to_string(),
                     server_key: "server1".to_string(),
+                    require_approval: false,
                     allowed_tools: Some(vec!["brave_web_search".to_string()]),
                 },
                 McpServerBinding {
                     label: "deepwiki".to_string(),
                     server_key: "server2".to_string(),
+                    require_approval: false,
                     allowed_tools: None,
                 },
             ],

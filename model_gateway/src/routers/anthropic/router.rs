@@ -103,6 +103,7 @@ impl RouterTrait for AnthropicRouter {
                     authorization: server.authorization_token.clone(),
                     headers: HashMap::new(),
                     allowed_tools: toolset_allowed.get(&server.name).and_then(|v| v.clone()),
+                    require_approval: false,
                 })
                 .collect();
 

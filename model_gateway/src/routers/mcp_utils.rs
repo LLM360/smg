@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use openai_protocol::responses::ResponseTool;
+use openai_protocol::responses::{RequireApproval, ResponseTool};
 use smg_mcp::{
     BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport,
     ResponseFormat,
@@ -23,6 +23,8 @@ pub struct McpServerInput {
     pub headers: HashMap<String, String>,
     /// Optional per-server tool allowlist.
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether tools on this server require interactive approval.
+    pub require_approval: bool,
 }
 
 /// Connect to MCP servers described by protocol-agnostic inputs.
@@ -90,6 +92,7 @@ pub async fn connect_mcp_servers(
                         mcp_servers.push(McpServerBinding {
                             label: input.label.clone(),
                             server_key,
+                            require_approval: input.require_approval,
                             allowed_tools: input.allowed_tools.clone(),
                         });
                     }
@@ -104,6 +107,7 @@ pub async fn connect_mcp_servers(
             mcp_servers.push(McpServerBinding {
                 label: input.label.clone(),
                 server_key: input.label.clone(),
+                require_approval: input.require_approval,
                 allowed_tools: input.allowed_tools.clone(),
             });
         }
@@ -225,6 +229,7 @@ pub async fn ensure_mcp_servers(
                 mcp_servers.push(McpServerBinding {
                     label: server_name.clone(),
                     server_key: server_name,
+                    require_approval: false,
                     allowed_tools: None,
                 });
             }
@@ -260,6 +265,7 @@ pub async fn ensure_request_mcp_client(
                 authorization: mcp.authorization.clone(),
                 headers: mcp.headers.clone().unwrap_or_default(),
                 allowed_tools: mcp.allowed_tools.clone(),
+                require_approval: matches!(mcp.require_approval, Some(RequireApproval::Always)),
             }),
             _ => None,
         })

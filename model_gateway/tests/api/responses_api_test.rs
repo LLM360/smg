@@ -691,6 +691,141 @@ async fn test_multi_turn_loop_with_mcp() {
 
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 #[tokio::test]
+async fn test_mcp_require_approval_pauses_non_streaming() {
+    // This test verifies PR1 MCP approval behavior for non-streaming responses:
+    // - status is completed
+    // - output ends with mcp_approval_request
+    // - output contains no function_call/function_tool_call/function_call_output
+    // - no MCP tool is executed (no mcp_call)
+
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+    std::env::set_var("SGLANG_MCP_CONFIG", cfg_path.to_str().unwrap());
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("info")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx = crate::common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        background: Some(false),
+        include: None,
+        input: ResponseInput::Text("search for SGLang".to_string()),
+        instructions: Some("Be helpful".to_string()),
+        max_output_tokens: Some(128),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.7),
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: Some("Mock MCP server for testing".to_string()),
+            require_approval: Some(RequireApproval::Always),
+            allowed_tools: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: Some(1.0),
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_mcp_approval_non_streaming_test".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let response = router.route_responses(None, &req, None).await;
+    assert_eq!(response.status(), StatusCode::OK, "Request should succeed");
+
+    use axum::body::to_bytes;
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    println!(
+        "Non-streaming approval response: {}",
+        serde_json::to_string_pretty(&response_json).unwrap()
+    );
+
+    assert_eq!(response_json["object"], "response");
+    assert_eq!(response_json["status"], "completed");
+
+    let output = response_json["output"]
+        .as_array()
+        .expect("output should be array");
+    assert!(!output.is_empty(), "output should not be empty");
+
+    let last = output.last().expect("output should have last item");
+    assert_eq!(
+        last.get("type").and_then(|v| v.as_str()),
+        Some("mcp_approval_request"),
+        "Last output item should be mcp_approval_request"
+    );
+
+    assert!(
+        output.iter().all(|item| {
+            let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            t != "function_call"
+                && t != "function_tool_call"
+                && t != "function_call_output"
+        }),
+        "output must not contain any function call items"
+    );
+
+    assert!(
+        output.iter().all(|item| item.get("type").and_then(|v| v.as_str()) != Some("mcp_call")),
+        "output must not contain mcp_call (tool should not execute)"
+    );
+
+    // Clean up
+    std::env::remove_var("SGLANG_MCP_CONFIG");
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
 async fn test_max_tool_calls_limit() {
     // This test verifies that max_tool_calls is respected
     // Note: The mock worker returns a final answer after one tool call,
@@ -1179,6 +1314,133 @@ async fn test_streaming_with_mcp_tool_calls() {
     // Verify no error events
     let has_error = body_text.contains("event: error");
     assert!(!has_error, "Should not have error events");
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+async fn test_streaming_mcp_require_approval_pauses() {
+    // This test verifies PR1 MCP approval behavior for streaming responses:
+    // - response.completed contains output ending with mcp_approval_request
+    // - no function_call/function_tool_call/function_call_output items
+    // - no mcp_call items (tool not executed)
+
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+
+    let req = ResponsesRequest {
+        background: Some(false),
+        include: None,
+        input: ResponseInput::Text("search for something interesting".to_string()),
+        instructions: Some("Use tools when needed".to_string()),
+        max_output_tokens: Some(256),
+        max_tool_calls: Some(3),
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true),
+        temperature: Some(0.7),
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: Some("Mock MCP for streaming approval test".to_string()),
+            require_approval: Some(RequireApproval::Always),
+            allowed_tools: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: Some(1.0),
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_streaming_mcp_approval_test".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let response = router.route_responses(None, &req, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Streaming request should succeed"
+    );
+
+    // Read the streaming body
+    use axum::body::to_bytes;
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_text = String::from_utf8_lossy(&body_bytes);
+
+    println!("Streaming approval SSE response:\n{body_text}");
+
+    assert!(body_text.contains("data: [DONE]"), "Stream should end with [DONE]");
+    assert!(!body_text.contains("event: error"), "Should not have error events");
+
+    let events = parse_sse_events(&body_text);
+    assert!(!events.is_empty(), "Should have SSE events");
+
+    let completed = events.iter().find_map(|(_, data)| {
+        (data.get("type").and_then(|v| v.as_str()) == Some("response.completed"))
+            .then(|| data.clone())
+    });
+    let completed = completed.expect("missing response.completed event");
+
+    let response_obj = completed
+        .get("response")
+        .expect("response.completed should have response object");
+    assert_eq!(
+        response_obj.get("status").and_then(|v| v.as_str()),
+        Some("completed")
+    );
+
+    let output = response_obj
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("response.output should be array");
+    assert!(!output.is_empty(), "response.output should not be empty");
+
+    let last = output.last().expect("output should have last item");
+    assert_eq!(
+        last.get("type").and_then(|v| v.as_str()),
+        Some("mcp_approval_request"),
+        "Last output item should be mcp_approval_request"
+    );
+
+    assert!(
+        output.iter().all(|item| {
+            let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            t != "function_call"
+                && t != "function_tool_call"
+                && t != "function_call_output"
+                && t != "mcp_call"
+        }),
+        "output must not contain function call items or mcp_call"
+    );
+
+    let found_approval_item_event = events.iter().any(|(_, data)| {
+        data.get("type").and_then(|v| v.as_str()) == Some("response.output_item.added")
+            && data
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("mcp_approval_request")
+    });
+    assert!(
+        found_approval_item_event,
+        "Should emit output_item.added for mcp_approval_request"
+    );
 
     worker.stop().await;
     mcp.stop().await;

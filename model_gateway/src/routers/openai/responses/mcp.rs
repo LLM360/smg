@@ -561,6 +561,16 @@ pub(super) async fn execute_tool_loop(
             return Ok(response_json);
         }
 
+        // PR1: Pause execution and return approval request(s) without executing any tools.
+        let approval_calls: Vec<(String, String)> = function_calls
+            .iter()
+            .filter(|call| session.tool_requires_approval(&call.name))
+            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .collect();
+        if !approval_calls.is_empty() {
+            return build_mcp_approval_pause_response(response_json, &state, session, &approval_calls);
+        }
+
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&original_body.model);
 
@@ -675,6 +685,60 @@ pub(super) async fn execute_tool_loop(
             false,
         )?;
     }
+}
+
+fn build_mcp_approval_pause_response(
+    mut response: Value,
+    state: &ToolLoopState,
+    session: &McpToolSession<'_>,
+    approval_calls: &[(String, String)],
+) -> Result<Value, String> {
+    let obj = response
+        .as_object_mut()
+        .ok_or_else(|| "response not an object".to_string())?;
+
+    obj.insert("status".to_string(), Value::String("completed".to_string()));
+    obj.remove("incomplete_details");
+
+    let mut output_items: Vec<Value> = Vec::new();
+
+    // 1) Prepend mcp_list_tools for each non-builtin server
+    for binding in session.mcp_servers() {
+        output_items.push(session.build_mcp_list_tools_json(&binding.label, &binding.server_key));
+    }
+
+    // 2) Include any prior executed tool call items (if this pause happens after earlier iterations)
+    output_items.extend(state.mcp_call_items.iter().cloned());
+
+    // 3) Retain non-function items from upstream output
+    if let Some(existing) = obj.get("output").and_then(|v| v.as_array()) {
+        output_items.extend(existing.iter().filter_map(|item| {
+            let item_type = item.get("type").and_then(|t| t.as_str());
+            if item_type.is_some_and(is_function_call_type)
+                || item_type == Some("function_call_output")
+            {
+                None
+            } else {
+                Some(item.clone())
+            }
+        }));
+    }
+
+    // 4) Append approval request item(s) at the end
+    for (name, args) in approval_calls {
+        let arguments = if args.trim().is_empty() { "{}" } else { args.as_str() };
+        let server_label = session.resolve_tool_server_label(name);
+        output_items.push(json!({
+            "id": generate_id("mcpr"),
+            "type": "mcp_approval_request",
+            "server_label": server_label,
+            "name": name,
+            "arguments": arguments
+        }));
+    }
+
+    obj.insert("output".to_string(), Value::Array(output_items));
+    Ok(response)
 }
 
 /// Build an incomplete response when limits are exceeded

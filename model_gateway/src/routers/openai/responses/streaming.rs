@@ -21,7 +21,7 @@ use openai_protocol::{
         is_function_call_type, is_response_event, CodeInterpreterCallEvent, FileSearchCallEvent,
         FunctionCallEvent, ItemType, McpEvent, OutputItemEvent, ResponseEvent, WebSearchCallEvent,
     },
-    responses::{ResponseTool, ResponsesRequest},
+    responses::{generate_id, ResponseTool, ResponsesRequest},
 };
 use serde_json::{json, Value};
 use smg_mcp::{McpOrchestrator, McpServerBinding, McpToolSession, ResponseFormat};
@@ -36,7 +36,7 @@ use super::{
         build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
         prepare_mcp_tools_as_functions, send_mcp_list_tools_events, ToolLoopState,
     },
-    tool_handler::{StreamAction, StreamingToolHandler},
+    tool_handler::{FunctionCallInProgress, StreamAction, StreamingToolHandler},
     utils::{
         patch_response_with_request_metadata, response_tool_to_value, restore_original_tools,
         rewrite_streaming_block,
@@ -790,7 +790,32 @@ pub(super) fn handle_streaming_with_tool_interception(
                                         })
                                     };
 
-                                    if !should_skip {
+                                    let should_skip_for_approval = parsed.as_ref().is_some_and(|v| {
+                                        let event_type = v.get("type").and_then(|t| t.as_str());
+                                        if !matches!(
+                                            event_type,
+                                            Some(OutputItemEvent::ADDED) | Some(OutputItemEvent::DONE)
+                                        ) {
+                                            return false;
+                                        }
+
+                                        let Some(item) = v.get("item") else {
+                                            return false;
+                                        };
+                                        let item_type = item.get("type").and_then(|t| t.as_str());
+                                        if !item_type.is_some_and(is_function_call_type) {
+                                            return false;
+                                        }
+
+                                        let tool_name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                        if tool_name.is_empty() {
+                                            return false;
+                                        }
+
+                                        session.tool_requires_approval(tool_name)
+                                    });
+
+                                    if !should_skip && !should_skip_for_approval {
                                         // Forward the event with pre-parsed value
                                         if !forward_streaming_event(
                                             SseEventData {
@@ -840,18 +865,25 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     // Don't forward, just buffer
                                 }
                                 StreamAction::ExecuteTools => {
-                                    if !forward_streaming_event(
-                                        SseEventData {
-                                            raw_block: &raw_block,
-                                            event_name,
-                                            data: data.as_ref(),
-                                            pre_parsed: None,
-                                        },
-                                        &mut handler,
-                                        &tx,
-                                        &streaming_ctx,
-                                        &mut sequence_number,
-                                    ) {
+                                    let requires_approval = handler
+                                        .pending_calls
+                                        .iter()
+                                        .any(|call| session.tool_requires_approval(&call.name));
+
+                                    if !requires_approval
+                                        && !forward_streaming_event(
+                                            SseEventData {
+                                                raw_block: &raw_block,
+                                                event_name,
+                                                data: data.as_ref(),
+                                                pre_parsed: None,
+                                            },
+                                            &mut handler,
+                                            &tx,
+                                            &streaming_ctx,
+                                            &mut sequence_number,
+                                        )
+                                    {
                                         return;
                                     }
                                     tool_calls_detected = true;
@@ -936,6 +968,153 @@ pub(super) fn handle_streaming_with_tool_interception(
 
             // Execute tools
             let pending_calls = handler.take_pending_calls();
+
+            // PR1: Pause execution and return approval request(s) without executing any tools.
+            let approval_calls: Vec<&FunctionCallInProgress> = pending_calls
+                .iter()
+                .filter(|call| session.tool_requires_approval(&call.name))
+                .collect();
+            if !approval_calls.is_empty() {
+                let mut approval_items: Vec<Value> = Vec::with_capacity(approval_calls.len());
+                for call in &approval_calls {
+                    let arguments = if call.arguments_buffer.trim().is_empty() {
+                        "{}"
+                    } else {
+                        call.arguments_buffer.as_str()
+                    };
+                    approval_items.push(json!({
+                        "id": generate_id("mcpr"),
+                        "type": "mcp_approval_request",
+                        "server_label": session.resolve_tool_server_label(&call.name),
+                        "name": &call.name,
+                        "arguments": arguments
+                    }));
+                }
+
+                // Emit output_item.added + output_item.done for approval request item(s)
+                for item in &approval_items {
+                    let output_index = handler.allocate_synthetic_output_index();
+                    let added_payload = json!({
+                        "type": OutputItemEvent::ADDED,
+                        "sequence_number": sequence_number,
+                        "output_index": output_index,
+                        "item": item
+                    });
+                    sequence_number += 1;
+                    if !send_sse_event(&tx, OutputItemEvent::ADDED, &added_payload) {
+                        return;
+                    }
+
+                    let done_payload = json!({
+                        "type": OutputItemEvent::DONE,
+                        "sequence_number": sequence_number,
+                        "output_index": output_index,
+                        "item": item
+                    });
+                    sequence_number += 1;
+                    if !send_sse_event(&tx, OutputItemEvent::DONE, &done_payload) {
+                        return;
+                    }
+                }
+
+                let mut response_json = handler.snapshot_final_response().unwrap_or_else(|| {
+                    let id = preserved_response_id.clone().unwrap_or_else(|| {
+                        format!("resp_{}", uuid::Uuid::now_v7())
+                    });
+                    json!({
+                        "id": id,
+                        "object": "response",
+                        "created_at": 0,
+                        "model": original_request.model,
+                        "status": "completed",
+                        "output": []
+                    })
+                });
+
+                if let Some(original_id) = handler.original_response_id() {
+                    if let Some(obj) = response_json.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(original_id.to_string()));
+                    }
+                }
+
+                // Rewrite output: list_tools + prior mcp_call items + retained items + approval requests (at end)
+                if let Some(obj) = response_json.as_object_mut() {
+                    obj.insert("status".to_string(), Value::String("completed".to_string()));
+                    obj.remove("incomplete_details");
+
+                    let mut output_items: Vec<Value> = Vec::new();
+                    for binding in session.mcp_servers() {
+                        output_items.push(
+                            session.build_mcp_list_tools_json(&binding.label, &binding.server_key),
+                        );
+                    }
+                    output_items.extend(state.mcp_call_items.iter().cloned());
+
+                    if let Some(existing) = obj.get("output").and_then(|v| v.as_array()) {
+                        output_items.extend(existing.iter().filter_map(|item| {
+                            let item_type = item.get("type").and_then(|t| t.as_str());
+                            if item_type.is_some_and(is_function_call_type)
+                                || item_type == Some("function_call_output")
+                            {
+                                None
+                            } else {
+                                Some(item.clone())
+                            }
+                        }));
+                    }
+
+                    output_items.extend(approval_items.into_iter());
+                    obj.insert("output".to_string(), Value::Array(output_items));
+                }
+
+                restore_original_tools(&mut response_json, &original_request);
+                patch_response_with_request_metadata(
+                    &mut response_json,
+                    &original_request,
+                    previous_response_id.as_deref(),
+                );
+
+                let response_for_persist = if should_store || persist_needed {
+                    Some(response_json.clone())
+                } else {
+                    None
+                };
+
+                // Send final response.completed
+                let completed_payload = json!({
+                    "type": ResponseEvent::COMPLETED,
+                    "sequence_number": sequence_number,
+                    "response": response_json
+                });
+                let completed_event = format!(
+                    "event: {}\ndata: {}\n\n",
+                    ResponseEvent::COMPLETED,
+                    completed_payload
+                );
+                if tx.send(Ok(Bytes::from(completed_event))).is_err() {
+                    return;
+                }
+
+                if let Some(response_json) = response_for_persist {
+                    if let Err(err) = persist_conversation_items(
+                        storage.conversation.clone(),
+                        storage.conversation_item.clone(),
+                        storage.response.clone(),
+                        &response_json,
+                        &original_request,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to persist conversation items (stream + MCP approval): {}",
+                            err
+                        );
+                    }
+                }
+
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                return;
+            }
 
             // Check iteration limit
             state.iteration += 1;
