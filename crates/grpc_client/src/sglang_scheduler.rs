@@ -66,6 +66,16 @@ impl AbortOnDropStream {
         self.aborted.store(true, Ordering::Release);
         debug!("Request {} marked as completed", self.request_id);
     }
+
+    /// Get this stream's request id.
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Get the scheduler client used by this stream.
+    pub fn scheduler_client(&self) -> &SglangSchedulerClient {
+        &self.client
+    }
 }
 
 impl Drop for AbortOnDropStream {
@@ -293,6 +303,19 @@ impl SglangSchedulerClient {
         let mut client = self.client.clone();
         let response = client.get_loads(request).await?;
         debug!("Load metrics response received");
+        Ok(response.into_inner())
+    }
+
+    /// Get request-level statistics for a completed request.
+    pub async fn get_request_stats(
+        &self,
+        request_id: String,
+    ) -> Result<proto::GetRequestStatsResponse, tonic::Status> {
+        debug!("Requesting request stats for {}", request_id);
+        let request = Request::new(proto::GetRequestStatsRequest { request_id });
+
+        let mut client = self.client.clone();
+        let response = client.get_request_stats(request).await?;
         Ok(response.into_inner())
     }
 

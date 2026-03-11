@@ -481,7 +481,30 @@ impl ProtoGenerateResponse {
     }
 
     #[inline]
-    fn to_stats_sample(&self) -> Option<(&'static str, EngineRequestStatsSample)> {
+    fn should_fetch_backend_request_stats(&self) -> bool {
+        match self {
+            Self::Sglang(resp) => matches!(
+                resp.response.as_ref(),
+                Some(sglang::generate_response::Response::Complete(_))
+                    | Some(sglang::generate_response::Response::Error(_))
+            ),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn backend_request_stats_index(&self) -> Option<u32> {
+        match self {
+            Self::Sglang(resp) => match resp.response.as_ref() {
+                Some(sglang::generate_response::Response::Complete(complete)) => Some(complete.index),
+                _ => None,
+            },
+            Self::Vllm(_) | Self::Trtllm(_) => None,
+        }
+    }
+
+    #[inline]
+    fn to_stats_sample(&self) -> Option<(&'static str, RequestStatsSample)> {
         match self {
             Self::Sglang(resp) => match resp.response.as_ref() {
                 Some(sglang::generate_response::Response::Complete(complete)) => Some((
@@ -908,7 +931,7 @@ impl ProtoGenerateComplete {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct EngineRequestStatsSample {
+struct RequestStatsSample {
     request_received_timestamp_s: Option<f64>,
     first_token_generated_timestamp_s: Option<f64>,
     request_finished_timestamp_s: Option<f64>,
@@ -917,6 +940,12 @@ struct EngineRequestStatsSample {
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: u64,
+}
+
+struct IndexedRequestStatsSample {
+    engine: &'static str,
+    index: u32,
+    sample: RequestStatsSample,
 }
 
 #[inline]
@@ -933,11 +962,11 @@ fn basic_stats_sample(
     prompt_tokens: u32,
     completion_tokens: u32,
     cached_tokens: u32,
-) -> EngineRequestStatsSample {
+) -> RequestStatsSample {
     let prompt_tokens = u64::from(prompt_tokens);
     let completion_tokens = u64::from(completion_tokens);
     let cached_tokens = u64::from(cached_tokens);
-    EngineRequestStatsSample {
+    RequestStatsSample {
         request_received_timestamp_s: None,
         first_token_generated_timestamp_s: None,
         request_finished_timestamp_s: None,
@@ -946,6 +975,20 @@ fn basic_stats_sample(
         prompt_tokens,
         completion_tokens,
         cached_tokens,
+    }
+}
+
+#[inline]
+fn request_stats_sample_from_proto(stats: sglang::RequestStats) -> RequestStatsSample {
+    RequestStatsSample {
+        request_received_timestamp_s: stats.request_received_timestamp_s,
+        first_token_generated_timestamp_s: stats.first_token_generated_timestamp_s,
+        request_finished_timestamp_s: stats.request_finished_timestamp_s,
+        cache_hit_rate: stats.cache_hit_rate,
+        spec_decoding_acceptance_rate: stats.spec_decoding_acceptance_rate,
+        prompt_tokens: u64::from(stats.prompt_tokens.unwrap_or_default()),
+        completion_tokens: u64::from(stats.completion_tokens.unwrap_or_default()),
+        cached_tokens: u64::from(stats.cached_tokens.unwrap_or_default()),
     }
 }
 
@@ -1026,14 +1069,10 @@ impl RequestStatsCollector {
     }
 
     #[inline]
-    fn record(&mut self, response: &ProtoGenerateResponse) {
+    fn record(&mut self, engine: &'static str, sample: RequestStatsSample) {
         if !self.enabled {
             return;
         }
-
-        let Some((engine, sample)) = response.to_stats_sample() else {
-            return;
-        };
 
         if let Some(current_engine) = self.engine {
             if current_engine != engine {
@@ -1141,12 +1180,40 @@ impl ProtoStream {
             Self::Trtllm(stream) => stream.mark_completed(),
         }
     }
+
+    async fn fetch_backend_request_stats(&self) -> Option<Vec<IndexedRequestStatsSample>> {
+        match self {
+            Self::Sglang(stream) => match stream
+                .scheduler_client()
+                .get_request_stats(stream.request_id().to_string())
+                .await
+            {
+                Ok(response) => Some(
+                    response
+                        .stats
+                        .into_iter()
+                        .map(|s| IndexedRequestStatsSample {
+                            engine: "sglang",
+                            index: s.index,
+                            sample: request_stats_sample_from_proto(s),
+                        })
+                        .collect(),
+                ),
+                Err(status) => {
+                    tracing::debug!("GetRequestStats failed: {}", status.message());
+                    None
+                }
+            },
+            Self::Vllm(_) | Self::Trtllm(_) => None,
+        }
+    }
 }
 
 /// Optional stats-collecting wrapper around `ProtoStream`.
 pub struct StatsProtoStream {
     stream: ProtoStream,
     request_stats: RequestStatsCollector,
+    backend_request_stats: Option<HashMap<u32, (&'static str, RequestStatsSample)>>,
 }
 
 impl StatsProtoStream {
@@ -1157,13 +1224,59 @@ impl StatsProtoStream {
                 enabled: enable_request_statistics,
                 ..RequestStatsCollector::default()
             },
+            backend_request_stats: None,
         }
+    }
+
+    fn build_backend_request_stats_index(
+        samples: Vec<IndexedRequestStatsSample>,
+    ) -> HashMap<u32, (&'static str, RequestStatsSample)> {
+        let mut by_index = HashMap::with_capacity(samples.len());
+        for sample in samples {
+            by_index.insert(sample.index, (sample.engine, sample.sample));
+        }
+        by_index
+    }
+
+    async fn take_backend_request_stats_sample(
+        &mut self,
+        gen_response: &ProtoGenerateResponse,
+    ) -> Option<(&'static str, RequestStatsSample)> {
+        if !gen_response.should_fetch_backend_request_stats() {
+            return None;
+        }
+
+        if self.backend_request_stats.is_none() {
+            let fetched = self.stream.fetch_backend_request_stats().await;
+            self.backend_request_stats = Some(Self::build_backend_request_stats_index(
+                fetched.unwrap_or_default(),
+            ));
+        }
+
+        let stats_by_index = self.backend_request_stats.as_mut()?;
+        if let Some(index) = gen_response.backend_request_stats_index() {
+            return stats_by_index.remove(&index);
+        }
+        if stats_by_index.len() == 1 {
+            let only_index = *stats_by_index.keys().next()?;
+            return stats_by_index.remove(&only_index);
+        }
+        None
     }
 
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let response = self.stream.next().await;
-        if let Some(Ok(gen_response)) = response.as_ref() {
-            self.request_stats.record(gen_response);
+        let gen_response = response.as_ref().and_then(|r| r.as_ref().ok());
+
+        let rpc_sample = match (self.request_stats.enabled, gen_response) {
+            (true, Some(gr)) => self.take_backend_request_stats_sample(gr).await,
+            _ => None,
+        };
+
+        if let Some((engine, sample)) =
+            rpc_sample.or_else(|| gen_response.and_then(ProtoGenerateResponse::to_stats_sample))
+        {
+            self.request_stats.record(engine, sample);
         }
         response
     }
