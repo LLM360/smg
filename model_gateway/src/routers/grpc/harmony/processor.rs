@@ -33,12 +33,12 @@ use crate::{
 ///
 /// Collects all output tokens from execution and parses them using
 /// HarmonyParserAdapter to extract the complete response.
-pub(crate) struct HarmonyResponseProcessor {}
+pub(crate) struct HarmonyResponseProcessor;
 
 impl HarmonyResponseProcessor {
     /// Create a new Harmony response processor
     pub fn new() -> Self {
-        Self {}
+        Self
     }
 
     /// Process a non-streaming Harmony chat response
@@ -51,7 +51,7 @@ impl HarmonyResponseProcessor {
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
-        let response_collection::CollectedResponses {
+        let response_collection::CollectedGenerateBatchWithStats {
             completes: all_responses,
             request_stats,
         } = response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -208,7 +208,7 @@ impl HarmonyResponseProcessor {
         let request_logprobs = responses_request.top_logprobs.is_some();
 
         // Collect all completed responses
-        let response_collection::CollectedResponses {
+        let response_collection::CollectedGenerateBatchWithStats {
             completes: all_responses,
             request_stats,
         } = response_collection::collect_responses(execution_result, request_logprobs).await?;

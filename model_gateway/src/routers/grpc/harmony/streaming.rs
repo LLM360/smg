@@ -51,12 +51,12 @@ use crate::{
 ///
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
-pub(crate) struct HarmonyStreamingProcessor {}
+pub(crate) struct HarmonyStreamingProcessor;
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor
     pub fn new() -> Self {
-        Self {}
+        Self
     }
 
     /// Process a streaming Harmony Chat Completion response

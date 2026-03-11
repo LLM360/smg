@@ -213,7 +213,10 @@ impl TrtllmServiceClient {
     }
 
     /// Abort a request
-    pub async fn abort_request(&self, request_id: String) -> Result<(), tonic::Status> {
+    pub async fn abort_request(
+        &self,
+        request_id: String,
+    ) -> Result<proto::AbortResponse, tonic::Status> {
         debug!("Sending abort request for {}", request_id);
         let request = Request::new(proto::AbortRequest {
             request_id: request_id.clone(),
@@ -227,7 +230,7 @@ impl TrtllmServiceClient {
             response.get_ref().success,
             response.get_ref().message
         );
-        Ok(())
+        Ok(response.into_inner())
     }
 
     /// Get model information

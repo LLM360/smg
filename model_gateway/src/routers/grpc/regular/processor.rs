@@ -206,7 +206,7 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
         // Collect all responses from the execution result
-        let response_collection::CollectedResponses {
+        let response_collection::CollectedGenerateBatchWithStats {
             completes: all_responses,
             request_stats,
         } = response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -369,7 +369,7 @@ impl ResponseProcessor {
         start_time: Instant,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         // Collect all responses from the execution result
-        let response_collection::CollectedResponses {
+        let response_collection::CollectedGenerateBatchWithStats {
             completes: all_responses,
             request_stats,
         } = response_collection::collect_responses(execution_result, request_logprobs).await?;

@@ -16,7 +16,7 @@ use crate::routers::{
     },
 };
 
-pub(crate) struct CollectedResponses {
+pub(crate) struct CollectedGenerateBatchWithStats {
     pub completes: Vec<ProtoGenerateComplete>,
     pub request_stats: Option<UnifiedRequestStats>,
 }
@@ -35,8 +35,8 @@ pub(crate) struct CollectedResponses {
 pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
-) -> Result<CollectedResponses, Response> {
-    let collected = match execution_result {
+) -> Result<CollectedGenerateBatchWithStats, Response> {
+    let collected_batch = match execution_result {
         ExecutionResult::Single { mut stream } => {
             let responses = collect_stream_responses(&mut stream, "Single").await?;
             stream.mark_completed();
@@ -47,11 +47,11 @@ pub(crate) async fn collect_responses(
             decode,
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_collected = collect_stream_responses(&mut prefill, "Prefill").await?;
+            let prefill_batch = collect_stream_responses(&mut prefill, "Prefill").await?;
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
-            let mut decode_collected =
+            let mut decode_batch =
                 collect_stream_responses(&mut decode_stream, "Decode").await?;
 
             // Mark both streams as completed now that both succeeded
@@ -61,17 +61,17 @@ pub(crate) async fn collect_responses(
             // Merge prefill input_logprobs if requested
             if merge_logprobs {
                 merge_prefill_logprobs(
-                    &prefill_collected.completes,
-                    &mut decode_collected.completes,
+                    &prefill_batch.completes,
+                    &mut decode_batch.completes,
                 );
             }
 
-            let request_stats = decode_collected
+            let request_stats = decode_batch
                 .request_stats
-                .or(prefill_collected.request_stats);
+                .or(prefill_batch.request_stats);
 
-            CollectedResponses {
-                completes: decode_collected.completes,
+            CollectedGenerateBatchWithStats {
+                completes: decode_batch.completes,
                 request_stats,
             }
         }
@@ -84,14 +84,14 @@ pub(crate) async fn collect_responses(
         }
     };
 
-    if collected.completes.is_empty() {
+    if collected_batch.completes.is_empty() {
         return Err(error::internal_error(
             "no_responses_from_server",
             "No responses from server",
         ));
     }
 
-    Ok(collected)
+    Ok(collected_batch)
 }
 
 /// Merge prefill input_logprobs into decode responses
@@ -121,7 +121,7 @@ fn merge_prefill_logprobs(
 async fn collect_stream_responses(
     stream: &mut StatsProtoStream,
     worker_name: &str,
-) -> Result<CollectedResponses, Response> {
+) -> Result<CollectedGenerateBatchWithStats, Response> {
     let mut all_responses = Vec::new();
 
     while let Some(response) = stream.next().await {
@@ -160,7 +160,7 @@ async fn collect_stream_responses(
         }
     }
 
-    Ok(CollectedResponses {
+    Ok(CollectedGenerateBatchWithStats {
         completes: all_responses,
         request_stats: stream.take_request_stats(),
     })

@@ -311,7 +311,6 @@ impl SglangSchedulerClient {
         &self,
         request_id: String,
     ) -> Result<proto::GetRequestStatsResponse, tonic::Status> {
-        debug!("Requesting request stats for {}", request_id);
         let request = Request::new(proto::GetRequestStatsRequest { request_id });
 
         let mut client = self.client.clone();
