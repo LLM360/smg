@@ -863,7 +863,6 @@ impl ProtoGenerateComplete {
     }
 }
 
-#[inline]
 fn unified_stats_from_sglang(stats: sglang::RequestStats) -> UnifiedRequestStats {
     UnifiedRequestStats {
         engine: "sglang",
