@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
+use super::{
+    chat::ChatPreparationStage, completion::CompletionPreparationStage,
+    embedding::preparation::EmbeddingPreparationStage, generate::GeneratePreparationStage,
+};
 use crate::routers::{
     error as grpc_error,
     grpc::{
@@ -20,6 +23,8 @@ use crate::routers::{
 pub(crate) struct PreparationStage {
     chat_stage: ChatPreparationStage,
     generate_stage: GeneratePreparationStage,
+    completion_stage: CompletionPreparationStage,
+    embedding_stage: EmbeddingPreparationStage,
 }
 
 impl PreparationStage {
@@ -27,6 +32,8 @@ impl PreparationStage {
         Self {
             chat_stage: ChatPreparationStage,
             generate_stage: GeneratePreparationStage,
+            completion_stage: CompletionPreparationStage::new(),
+            embedding_stage: EmbeddingPreparationStage::new(),
         }
     }
 }
@@ -43,20 +50,18 @@ impl PipelineStage for PreparationStage {
         match &ctx.input.request_type {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
-            other => {
-                let type_name = match other {
-                    RequestType::Embedding(_) => "Embedding",
-                    RequestType::Classify(_) => "Classify",
-                    RequestType::Responses(_) => "Responses",
-                    _ => "Unknown",
-                };
+            RequestType::Completion(_) => self.completion_stage.execute(ctx).await,
+            RequestType::Embedding(_) => self.embedding_stage.execute(ctx).await,
+            // Classify reuses the embedding preparation (tokenization)
+            RequestType::Classify(_) => self.embedding_stage.execute(ctx).await,
+            RequestType::Responses(_) => {
                 error!(
                     function = "PreparationStage::execute",
-                    "RequestType::{type_name} reached regular preparation stage"
+                    "RequestType::Responses reached regular preparation stage"
                 );
                 Err(grpc_error::internal_error(
-                    "wrong_pipeline",
-                    format!("RequestType::{type_name} should use its dedicated pipeline"),
+                    "responses_in_wrong_pipeline",
+                    "RequestType::Responses reached regular preparation stage",
                 ))
             }
         }
