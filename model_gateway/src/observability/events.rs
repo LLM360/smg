@@ -114,37 +114,6 @@ impl UnifiedRequestStats {
         }
     }
 
-    /// Emit a success [`RequestStatsEvent`] if stats are present.
-    pub fn emit_for_success(
-        stats: Option<Self>,
-        request_id: &str,
-        model: &str,
-        router_backend: &str,
-    ) {
-        Self::maybe_emit_event(stats, request_id, model, router_backend, Some(200), None);
-    }
-
-    /// Emit an error [`RequestStatsEvent`] if stats are present, and return the
-    /// error message as a `String`. Designed for use in `map_err` closures.
-    pub fn emit_for_error(
-        stats: Option<Self>,
-        request_id: &str,
-        model: &str,
-        router_backend: &str,
-        http_status_code: Option<u16>,
-        error_message: &str,
-    ) -> String {
-        Self::maybe_emit_event(
-            stats,
-            request_id,
-            model,
-            router_backend,
-            http_status_code,
-            Some(error_message),
-        );
-        error_message.to_string()
-    }
-
     /// Merge another stats sample into this one (for multi-sample aggregation).
     /// Uses min for start timestamps, max for end timestamps, sum for
     /// completion_tokens, and first seen value for the remaining fields.

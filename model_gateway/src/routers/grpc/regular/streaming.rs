@@ -24,10 +24,7 @@ use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, Tool
 use tracing::{debug, error, warn};
 
 use crate::{
-    observability::{
-        events::UnifiedRequestStats,
-        metrics::{metrics_labels, Metrics, StreamingMetricsParams},
-    },
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     routers::grpc::{
         common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
         context,
@@ -263,16 +260,7 @@ impl StreamingProcessor {
 
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
-            let gen_response = response.map_err(|e| {
-                UnifiedRequestStats::emit_for_error(
-                    grpc_stream.take_request_stats(),
-                    request_id,
-                    model,
-                    self.backend_type,
-                    None,
-                    &format!("Stream error: {}", e.message()),
-                )
-            })?;
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -465,14 +453,7 @@ impl StreamingProcessor {
                     // Don't break - continue reading all Complete messages for n>1
                 }
                 ProtoResponseVariant::Error(error) => {
-                    return Err(UnifiedRequestStats::emit_for_error(
-                        grpc_stream.take_request_stats(),
-                        request_id,
-                        model,
-                        self.backend_type,
-                        error.http_status_code(),
-                        error.message(),
-                    ));
+                    return Err(error.message().to_string());
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -574,12 +555,7 @@ impl StreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        UnifiedRequestStats::emit_for_success(
-            grpc_stream.take_request_stats(),
-            request_id,
-            model,
-            self.backend_type,
-        );
+        grpc_stream.spawn_stats_emission();
 
         Ok(())
     }
@@ -734,16 +710,7 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| {
-                UnifiedRequestStats::emit_for_error(
-                    stream.take_request_stats(),
-                    &ctx.request_id,
-                    &ctx.model,
-                    ctx.backend_type,
-                    None,
-                    &format!("Stream error: {}", e.message()),
-                )
-            })?;
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -819,17 +786,11 @@ impl StreamingProcessor {
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
                     tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
+
                     // Continue to process all completions if n>1
                 }
                 ProtoResponseVariant::Error(error) => {
-                    return Err(UnifiedRequestStats::emit_for_error(
-                        stream.take_request_stats(),
-                        &ctx.request_id,
-                        &ctx.model,
-                        ctx.backend_type,
-                        error.http_status_code(),
-                        error.message(),
-                    ));
+                    return Err(error.message().to_string());
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -841,12 +802,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
-        UnifiedRequestStats::emit_for_success(
-            stream.take_request_stats(),
-            &ctx.request_id,
-            &ctx.model,
-            ctx.backend_type,
-        );
+        stream.spawn_stats_emission();
 
         Ok(())
     }
@@ -923,16 +879,7 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| {
-                UnifiedRequestStats::emit_for_error(
-                    stream.take_request_stats(),
-                    &ctx.request_id,
-                    &ctx.model,
-                    ctx.backend_type,
-                    None,
-                    &format!("Stream error: {}", e.message()),
-                )
-            })?;
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -1048,17 +995,11 @@ impl StreamingProcessor {
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
                     tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
+
                     // Continue to process all completions if n>1
                 }
                 ProtoResponseVariant::Error(error) => {
-                    return Err(UnifiedRequestStats::emit_for_error(
-                        stream.take_request_stats(),
-                        &ctx.request_id,
-                        &ctx.model,
-                        ctx.backend_type,
-                        error.http_status_code(),
-                        error.message(),
-                    ));
+                    return Err(error.message().to_string());
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -1070,12 +1011,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
-        UnifiedRequestStats::emit_for_success(
-            stream.take_request_stats(),
-            &ctx.request_id,
-            &ctx.model,
-            ctx.backend_type,
-        );
+        stream.spawn_stats_emission();
 
         Ok(())
     }

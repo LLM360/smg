@@ -940,76 +940,100 @@ impl ProtoStream {
         }
     }
 
-    /// Fetches backend request stats for the current request.
-    async fn fetch_backend_request_stats(&self) -> Option<Vec<UnifiedRequestStats>> {
+    /// Spawn a fire-and-forget task to fetch per-request stats from the engine
+    /// and emit a tracing event. Each engine arm implements its own RPC; arms
+    /// that do not yet support stats retrieval are no-ops.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "stats fetch+emit is best-effort observability; safe to drop on shutdown"
+    )]
+    fn spawn_stats_emission(
+        &self,
+        request_id: String,
+        model: String,
+        router_backend: &'static str,
+    ) {
         match self {
             Self::Sglang(stream) => {
-                let response = stream
-                    .scheduler_client()
-                    .get_request_stats(stream.request_id().to_string())
-                    .await
-                    .map_err(|status| {
-                        tracing::debug!("GetRequestStats failed: {}", status.message());
-                    })
-                    .ok()?;
-
-                Some(
-                    response
-                        .stats
-                        .into_iter()
-                        .map(unified_stats_from_sglang)
-                        .collect(),
-                )
+                let client = stream.scheduler_client().clone();
+                let engine_request_id = stream.request_id().to_string();
+                tokio::spawn(async move {
+                    let response = match client.get_request_stats(engine_request_id).await {
+                        Ok(r) => r,
+                        Err(status) => {
+                            tracing::debug!("GetRequestStats failed: {}", status.message());
+                            return;
+                        }
+                    };
+                    let mut merged: Option<UnifiedRequestStats> = None;
+                    for sample in response.stats.into_iter().map(unified_stats_from_sglang) {
+                        match &mut merged {
+                            Some(existing) => existing.merge(&sample),
+                            None => merged = Some(sample),
+                        }
+                    }
+                    UnifiedRequestStats::maybe_emit_event(
+                        merged,
+                        &request_id,
+                        &model,
+                        router_backend,
+                        Some(200),
+                        None,
+                    );
+                });
             }
-            Self::Vllm(_) | Self::Trtllm(_) => None,
+            Self::Vllm(_) | Self::Trtllm(_) => {}
         }
     }
 }
 
-/// Optional stats-collecting wrapper around `ProtoStream`.
+/// Thin wrapper around [`ProtoStream`] that can fire-and-forget a stats fetch
+/// after the stream is consumed.
 pub struct StatsProtoStream {
     stream: ProtoStream,
     enable_request_statistics: bool,
-    stats: Option<UnifiedRequestStats>,
+    request_id: String,
+    model: String,
+    router_backend: &'static str,
 }
 
 impl StatsProtoStream {
-    pub fn new(stream: ProtoStream, enable_request_statistics: bool) -> Self {
+    pub fn new(
+        stream: ProtoStream,
+        enable_request_statistics: bool,
+        request_id: &str,
+        model: &str,
+        router_backend: &'static str,
+    ) -> Self {
         Self {
             stream,
             enable_request_statistics,
-            stats: None,
+            request_id: request_id.to_owned(),
+            model: model.to_owned(),
+            router_backend,
         }
     }
 
-    /// Advance the stream and, when exhausted, fetch request stats from engine.
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        let response = self.stream.next().await;
-
-        if response.is_none() && self.enable_request_statistics {
-            if let Some(samples) = self.stream.fetch_backend_request_stats().await {
-                for sample in &samples {
-                    match &mut self.stats {
-                        Some(existing) => existing.merge(sample),
-                        None => self.stats = Some(sample.clone()),
-                    }
-                }
-            }
-        }
-
-        response
+        self.stream.next().await
     }
 
     pub fn mark_completed(&mut self) {
         self.stream.mark_completed();
     }
 
-    pub fn take_request_stats(&mut self) -> Option<UnifiedRequestStats> {
-        if self.enable_request_statistics {
-            self.stats.take()
-        } else {
-            None
+    /// Spawn a fire-and-forget stats fetch+emit for the current request.
+    /// No-op when stats collection is disabled. Moves the stored request
+    /// metadata into the spawned task, so this should only be called once.
+    pub fn spawn_stats_emission(&mut self) {
+        if !self.enable_request_statistics {
+            return;
         }
+        self.stream.spawn_stats_emission(
+            std::mem::take(&mut self.request_id),
+            std::mem::take(&mut self.model),
+            self.router_backend,
+        );
     }
 }
 

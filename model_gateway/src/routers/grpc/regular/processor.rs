@@ -18,16 +18,13 @@ use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
-use crate::{
-    observability::{events::UnifiedRequestStats, metrics::metrics_labels},
-    routers::{
-        error,
-        grpc::{
-            common::{response_collection, response_formatting},
-            context::{DispatchMetadata, ExecutionResult},
-            proto_wrapper::ProtoGenerateComplete,
-            utils,
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        common::{response_collection, response_formatting},
+        context::{DispatchMetadata, ExecutionResult},
+        proto_wrapper::ProtoGenerateComplete,
+        utils,
     },
 };
 
@@ -203,10 +200,8 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
         // Collect all responses from the execution result
-        let response_collection::CollectedResponsesWithStats {
-            completes: all_responses,
-            request_stats,
-        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let all_responses =
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
@@ -274,13 +269,6 @@ impl ResponseProcessor {
 
         // Build usage
         let usage = response_formatting::build_usage(&all_responses);
-
-        UnifiedRequestStats::emit_for_success(
-            request_stats,
-            &dispatch.request_id,
-            &dispatch.model,
-            metrics_labels::BACKEND_REGULAR,
-        );
 
         // Build final ChatCompletionResponse
         Ok(
@@ -361,17 +349,8 @@ impl ResponseProcessor {
         start_time: Instant,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         // Collect all responses from the execution result
-        let response_collection::CollectedResponsesWithStats {
-            completes: all_responses,
-            request_stats,
-        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
-
-        UnifiedRequestStats::emit_for_success(
-            request_stats,
-            &dispatch.request_id,
-            &dispatch.model,
-            metrics_labels::BACKEND_REGULAR,
-        );
+        let all_responses =
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         // Process each completion
         let mut result_array = Vec::new();

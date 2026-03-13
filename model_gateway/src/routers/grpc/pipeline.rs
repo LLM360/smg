@@ -89,7 +89,10 @@ impl RequestPipeline {
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(RequestExecutionStage::new(
+                ExecutionMode::Single,
+                metrics_labels::BACKEND_REGULAR,
+            )),
             Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
@@ -118,7 +121,10 @@ impl RequestPipeline {
             Box::new(ClientAcquisitionStage),
             Box::new(harmony::stages::HarmonyRequestBuildingStage::new(false)),
             Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(RequestExecutionStage::new(
+                ExecutionMode::Single,
+                metrics_labels::BACKEND_HARMONY,
+            )),
             Box::new(harmony::stages::HarmonyResponseProcessingStage::new()),
         ];
 
@@ -148,7 +154,10 @@ impl RequestPipeline {
             Box::new(ClientAcquisitionStage),
             Box::new(harmony::stages::HarmonyRequestBuildingStage::new(true)),
             Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
+            Box::new(RequestExecutionStage::new(
+                ExecutionMode::DualDispatch,
+                metrics_labels::BACKEND_PD,
+            )),
             Box::new(harmony::stages::HarmonyResponseProcessingStage::new()),
         ];
 
@@ -192,7 +201,10 @@ impl RequestPipeline {
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
             Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
+            Box::new(RequestExecutionStage::new(
+                ExecutionMode::DualDispatch,
+                metrics_labels::BACKEND_PD,
+            )),
             Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
@@ -217,7 +229,10 @@ impl RequestPipeline {
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),
             Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(RequestExecutionStage::new(
+                ExecutionMode::Single,
+                metrics_labels::BACKEND_REGULAR,
+            )),
             Box::new(EmbeddingResponseProcessingStage::new()),
         ];
 
@@ -245,7 +260,10 @@ impl RequestPipeline {
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),
             Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(RequestExecutionStage::new(
+                ExecutionMode::Single,
+                metrics_labels::BACKEND_REGULAR,
+            )),
             Box::new(ClassifyResponseProcessingStage::new()),
         ];
 

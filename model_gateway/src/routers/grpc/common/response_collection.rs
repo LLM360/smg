@@ -6,27 +6,22 @@
 use axum::response::Response;
 use tracing::{error as trace_error, warn};
 
-use crate::{
-    observability::events::UnifiedRequestStats,
-    routers::{
-        error,
-        grpc::{
-            context::ExecutionResult,
-            proto_wrapper::{ProtoGenerateComplete, ProtoResponseVariant, StatsProtoStream},
-            utils::tonic_ext::TonicStatusExt,
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        context::ExecutionResult,
+        proto_wrapper::{ProtoGenerateComplete, ProtoResponseVariant, StatsProtoStream},
+        utils::tonic_ext::TonicStatusExt,
     },
 };
-
-pub(crate) struct CollectedResponsesWithStats {
-    pub completes: Vec<ProtoGenerateComplete>,
-    pub request_stats: Option<UnifiedRequestStats>,
-}
 
 /// Collect and merge responses from execution result
 ///
 /// Handles both Single and Dual (prefill-decode) execution modes.
 /// For Dual mode, merges prefill input_logprobs into decode responses if requested.
+///
+/// When `enable_request_statistics` is active on the streams, a fire-and-forget
+/// task is spawned to fetch and emit per-request stats from the engine.
 ///
 /// # Arguments
 /// * `execution_result` - The execution result containing stream(s)
@@ -37,11 +32,12 @@ pub(crate) struct CollectedResponsesWithStats {
 pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
-) -> Result<CollectedResponsesWithStats, Response> {
+) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let all_responses = match execution_result {
         ExecutionResult::Single { mut stream } => {
             let responses = collect_stream_responses(&mut stream, "Single").await?;
             stream.mark_completed();
+            stream.spawn_stats_emission();
             responses
         }
         ExecutionResult::Dual {
@@ -49,27 +45,26 @@ pub(crate) async fn collect_responses(
             decode,
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_batch = collect_stream_responses(&mut prefill, "Prefill").await?;
+            let prefill_responses = collect_stream_responses(&mut prefill, "Prefill").await?;
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
-            let mut decode_batch = collect_stream_responses(&mut decode_stream, "Decode").await?;
+            let mut decode_responses =
+                collect_stream_responses(&mut decode_stream, "Decode").await?;
 
             // Mark both streams as completed now that both succeeded
             prefill.mark_completed();
             decode_stream.mark_completed();
 
+            // Emit stats from the decode stream (preferred over prefill)
+            decode_stream.spawn_stats_emission();
+
             // Merge prefill input_logprobs if requested
             if merge_logprobs {
-                merge_prefill_logprobs(&prefill_batch.completes, &mut decode_batch.completes);
+                merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
             }
 
-            let request_stats = decode_batch.request_stats.or(prefill_batch.request_stats);
-
-            CollectedResponsesWithStats {
-                completes: decode_batch.completes,
-                request_stats,
-            }
+            decode_responses
         }
         ExecutionResult::Embedding { .. } => {
             // Embeddings do not support this path (no generate complete response)
@@ -80,7 +75,7 @@ pub(crate) async fn collect_responses(
         }
     };
 
-    if all_responses.completes.is_empty() {
+    if all_responses.is_empty() {
         return Err(error::internal_error(
             "no_responses_from_server",
             "No responses from server",
@@ -117,7 +112,7 @@ fn merge_prefill_logprobs(
 async fn collect_stream_responses(
     stream: &mut StatsProtoStream,
     worker_name: &str,
-) -> Result<CollectedResponsesWithStats, Response> {
+) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
 
     while let Some(response) = stream.next().await {
@@ -156,8 +151,5 @@ async fn collect_stream_responses(
         }
     }
 
-    Ok(CollectedResponsesWithStats {
-        completes: all_responses,
-        request_stats: stream.take_request_stats(),
-    })
+    Ok(all_responses)
 }

@@ -15,14 +15,11 @@ use openai_protocol::{
 use tracing::error;
 
 use super::{builder::convert_harmony_logprobs, HarmonyParserAdapter};
-use crate::{
-    observability::{events::UnifiedRequestStats, metrics::metrics_labels},
-    routers::{
-        error,
-        grpc::{
-            common::{response_collection, response_formatting},
-            context::{DispatchMetadata, ExecutionResult},
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        common::{response_collection, response_formatting},
+        context::{DispatchMetadata, ExecutionResult},
     },
 };
 
@@ -48,10 +45,8 @@ impl HarmonyResponseProcessor {
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
-        let response_collection::CollectedResponsesWithStats {
-            completes: all_responses,
-            request_stats,
-        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let all_responses =
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
         if all_responses.is_empty() {
             return Err(error::internal_error(
                 "no_responses_from_server",
@@ -130,13 +125,6 @@ impl HarmonyResponseProcessor {
         let usage = response_formatting::build_usage(&all_responses)
             .with_reasoning_tokens(total_reasoning_tokens);
 
-        UnifiedRequestStats::emit_for_success(
-            request_stats,
-            &dispatch.request_id,
-            &chat_request.model,
-            metrics_labels::BACKEND_HARMONY,
-        );
-
         // Final ChatCompletionResponse
         Ok(
             ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
@@ -200,10 +188,8 @@ impl HarmonyResponseProcessor {
         let request_logprobs = responses_request.top_logprobs.is_some();
 
         // Collect all completed responses
-        let response_collection::CollectedResponsesWithStats {
-            completes: all_responses,
-            request_stats,
-        } = response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let all_responses =
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
         if all_responses.is_empty() {
             return Err(error::internal_error(
                 "no_responses_from_server",
@@ -262,13 +248,6 @@ impl HarmonyResponseProcessor {
         // Build usage (needed for both ToolCallsFound and Completed)
         let usage = response_formatting::build_usage(std::slice::from_ref(complete))
             .with_reasoning_tokens(parsed.reasoning_token_count);
-
-        UnifiedRequestStats::emit_for_success(
-            request_stats,
-            &dispatch.request_id,
-            &responses_request.model,
-            metrics_labels::BACKEND_HARMONY,
-        );
 
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {

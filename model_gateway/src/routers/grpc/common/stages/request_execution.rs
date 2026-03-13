@@ -27,6 +27,7 @@ type StreamResult = Result<ProtoStream, tonic::Status>;
 /// Request execution stage: Execute gRPC requests (single or dual dispatch)
 pub(crate) struct RequestExecutionStage {
     mode: ExecutionMode,
+    router_backend: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,8 +39,11 @@ pub(crate) enum ExecutionMode {
 }
 
 impl RequestExecutionStage {
-    pub fn new(mode: ExecutionMode) -> Self {
-        Self { mode }
+    pub fn new(mode: ExecutionMode, router_backend: &'static str) -> Self {
+        Self {
+            mode,
+            router_backend,
+        }
     }
 }
 
@@ -96,12 +100,23 @@ impl PipelineStage for RequestExecutionStage {
 
         let result = async {
             let enable_request_statistics = ctx.components.enable_request_statistics;
+            let router_backend = self.router_backend;
+            let wrap = |stream| {
+                StatsProtoStream::new(
+                    stream,
+                    enable_request_statistics,
+                    request_id,
+                    model,
+                    router_backend,
+                )
+            };
+
             match proto_request {
                 ProtoRequest::Generate(req) => match self.mode {
                     ExecutionMode::Single => {
                         let stream = self.execute_single(req, clients, workers).await?;
                         Ok(ExecutionResult::Single {
-                            stream: StatsProtoStream::new(stream, enable_request_statistics),
+                            stream: wrap(stream),
                         })
                     }
                     ExecutionMode::DualDispatch => {
@@ -114,24 +129,15 @@ impl PipelineStage for RequestExecutionStage {
                                 let stream =
                                     self.execute_sequential_pd(req, clients, workers).await?;
                                 Ok(ExecutionResult::Single {
-                                    stream: StatsProtoStream::new(
-                                        stream,
-                                        enable_request_statistics,
-                                    ),
+                                    stream: wrap(stream),
                                 })
                             }
                             Some(RuntimeType::Sglang) => {
                                 let (prefill, decode) =
                                     self.execute_dual_dispatch(req, clients, workers).await?;
                                 Ok(ExecutionResult::Dual {
-                                    prefill: StatsProtoStream::new(
-                                        prefill,
-                                        enable_request_statistics,
-                                    ),
-                                    decode: Box::new(StatsProtoStream::new(
-                                        decode,
-                                        enable_request_statistics,
-                                    )),
+                                    prefill: wrap(prefill),
+                                    decode: Box::new(wrap(decode)),
                                 })
                             }
                             Some(RuntimeType::Trtllm) | Some(RuntimeType::External) => {
