@@ -311,10 +311,6 @@ impl RequestContext {
     }
 
     /// Create context for messages request
-    #[expect(
-        dead_code,
-        reason = "scaffolding for Messages API pipeline, wired in follow-up PR"
-    )]
     pub fn for_messages(
         request: Arc<CreateMessageRequest>,
         headers: Option<HeaderMap>,
@@ -612,9 +608,5 @@ pub(crate) enum FinalResponse {
     /// Classification response
     Classify(ClassifyResponse),
     /// Messages API response
-    #[expect(
-        dead_code,
-        reason = "scaffolding for Messages API pipeline, wired in follow-up PR"
-    )]
     Messages(Message),
 }
