@@ -37,7 +37,7 @@ def collect_sse_events(response: httpx.Response) -> list[dict]:
     events = []
     for line in response.text.split("\n"):
         if line.startswith("data: "):
-            data = line[len("data: "):]
+            data = line[len("data: ") :]
             try:
                 events.append(json.loads(data))
             except json.JSONDecodeError:
@@ -82,8 +82,14 @@ class TestGrpcMessagesBasic:
         """Basic non-streaming message returns valid Anthropic response."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {"model": model, "max_tokens": 64,
-            "messages": [{"role": "user", "content": "Say hello in one word."}]})
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Say hello in one word."}],
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -101,9 +107,15 @@ class TestGrpcMessagesBasic:
         """System prompt is accepted and doesn't error."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {"model": model, "max_tokens": 32,
-            "system": "You always reply with exactly one word.",
-            "messages": [{"role": "user", "content": "What color is the sky?"}]})
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 32,
+                "system": "You always reply with exactly one word.",
+                "messages": [{"role": "user", "content": "What color is the sky?"}],
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -114,12 +126,18 @@ class TestGrpcMessagesBasic:
         """Multi-turn messages are accepted."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {"model": model, "max_tokens": 64,
-            "messages": [
-                {"role": "user", "content": "My name is Alice."},
-                {"role": "assistant", "content": "Nice to meet you, Alice!"},
-                {"role": "user", "content": "What is my name?"},
-            ]})
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "user", "content": "My name is Alice."},
+                    {"role": "assistant", "content": "Nice to meet you, Alice!"},
+                    {"role": "user", "content": "What is my name?"},
+                ],
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -130,8 +148,11 @@ class TestGrpcMessagesBasic:
         """stream=false must return a single JSON object, NOT SSE."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {"model": model, "max_tokens": 16,
-            "messages": [{"role": "user", "content": "Hi"}]}, stream=False)
+        resp = messages_post(
+            gateway,
+            {"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "Hi"}]},
+            stream=False,
+        )
 
         assert resp.status_code == 200
         assert "text/event-stream" not in resp.headers.get("content-type", "")
@@ -156,9 +177,15 @@ class TestGrpcMessagesStreaming:
         """Streaming returns the required Anthropic SSE event types."""
         _, model, _, gateway = setup_backend
 
-        with httpx.stream("POST", f"{gateway.base_url}/v1/messages",
-            json={"model": model, "max_tokens": 32, "stream": True,
-                  "messages": [{"role": "user", "content": "Count to 3."}]},
+        with httpx.stream(
+            "POST",
+            f"{gateway.base_url}/v1/messages",
+            json={
+                "model": model,
+                "max_tokens": 32,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Count to 3."}],
+            },
             headers={"content-type": "application/json", "x-api-key": "test"},
             timeout=60.0,
         ) as resp:
@@ -174,8 +201,14 @@ class TestGrpcMessagesStreaming:
                     pass
 
         event_types = {e["type"] for e in events}
-        required = {"message_start", "content_block_start", "content_block_delta",
-                     "content_block_stop", "message_delta", "message_stop"}
+        required = {
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        }
         missing = required - event_types
         assert not missing, f"Missing SSE event types: {missing}"
 
@@ -183,8 +216,15 @@ class TestGrpcMessagesStreaming:
         """Text deltas concatenate to a non-empty string."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {"model": model, "max_tokens": 32,
-            "messages": [{"role": "user", "content": "Say hello."}]}, stream=True)
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+            stream=True,
+        )
 
         events = collect_sse_events(resp)
         text = "".join(
@@ -204,9 +244,7 @@ class TestGrpcMessagesStreaming:
 @pytest.mark.engine("sglang")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
-@pytest.mark.gateway(
-    extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
-)
+@pytest.mark.gateway(extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestGrpcMessagesToolUse:
     """Tool use tests for Messages API through the gRPC router."""
@@ -215,13 +253,16 @@ class TestGrpcMessagesToolUse:
         """Non-streaming request with tools can return tool_use content block."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {
-            "model": model, "max_tokens": 256,
-            "tools": [GET_WEATHER_TOOL],
-            "tool_choice": {"type": "tool", "name": "get_weather"},
-            "messages": [{"role": "user",
-                          "content": "What is the weather in San Francisco?"}],
-        })
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 256,
+                "tools": [GET_WEATHER_TOOL],
+                "tool_choice": {"type": "tool", "name": "get_weather"},
+                "messages": [{"role": "user", "content": "What is the weather in San Francisco?"}],
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -235,13 +276,17 @@ class TestGrpcMessagesToolUse:
         """Streaming with tools emits input_json_delta events."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {
-            "model": model, "max_tokens": 256, "stream": True,
-            "tools": [GET_WEATHER_TOOL],
-            "tool_choice": {"type": "tool", "name": "get_weather"},
-            "messages": [{"role": "user",
-                          "content": "What is the weather in London?"}],
-        })
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 256,
+                "tools": [GET_WEATHER_TOOL],
+                "tool_choice": {"type": "tool", "name": "get_weather"},
+                "messages": [{"role": "user", "content": "What is the weather in London?"}],
+            },
+            stream=True,
+        )
 
         events = collect_sse_events(resp)
         event_types = {e["type"] for e in events}
@@ -284,11 +329,15 @@ class TestGrpcMessagesReasoning:
         """Non-streaming with thinking enabled produces thinking + text blocks."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {
-            "model": model, "max_tokens": 256,
-            "thinking": {"type": "enabled", "budget_tokens": 1024},
-            "messages": [{"role": "user", "content": "What is 2+3?"}],
-        })
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 256,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [{"role": "user", "content": "What is 2+3?"}],
+            },
+        )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -305,11 +354,16 @@ class TestGrpcMessagesReasoning:
         """Streaming with thinking enabled emits thinking_delta events."""
         _, model, _, gateway = setup_backend
 
-        resp = messages_post(gateway, {
-            "model": model, "max_tokens": 256, "stream": True,
-            "thinking": {"type": "enabled", "budget_tokens": 1024},
-            "messages": [{"role": "user", "content": "What is 7*8?"}],
-        })
+        resp = messages_post(
+            gateway,
+            {
+                "model": model,
+                "max_tokens": 256,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [{"role": "user", "content": "What is 7*8?"}],
+            },
+            stream=True,
+        )
 
         events = collect_sse_events(resp)
         event_types = {e["type"] for e in events}
