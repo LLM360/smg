@@ -292,11 +292,19 @@ impl RequestPipeline {
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
-        );
+            metrics_labels::BACKEND_REGULAR,
+        ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(MessagePreparationStage),
@@ -312,7 +320,10 @@ impl RequestPipeline {
                 ExecutionMode::Single,
                 metrics_labels::BACKEND_REGULAR,
             )),
-            Box::new(MessageResponseProcessingStage::new(processor)),
+            Box::new(MessageResponseProcessingStage::new(
+                processor,
+                streaming_processor,
+            )),
         ];
 
         Self {
@@ -331,11 +342,19 @@ impl RequestPipeline {
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
-        );
+            metrics_labels::BACKEND_PD,
+        ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(MessagePreparationStage),
@@ -351,7 +370,10 @@ impl RequestPipeline {
                 ExecutionMode::DualDispatch,
                 metrics_labels::BACKEND_PD,
             )),
-            Box::new(MessageResponseProcessingStage::new(processor)),
+            Box::new(MessageResponseProcessingStage::new(
+                processor,
+                streaming_processor,
+            )),
         ];
 
         Self {
