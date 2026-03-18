@@ -403,7 +403,7 @@ class GrpcRequestManager:
                             yield final_response
                         self._store_request_stats(
                             request_id,
-                            final_response,
+                            response,
                             parent_request_id,
                             parent_index,
                         )
