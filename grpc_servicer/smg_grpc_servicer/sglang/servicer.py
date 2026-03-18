@@ -12,6 +12,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 
 import grpc
 import msgspec
@@ -542,6 +543,47 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             loads=loads,
             aggregate=_compute_aggregate_protobuf(loads),
         )
+
+    async def GetRequestStats(
+        self,
+        request: sglang_scheduler_pb2.GetRequestStatsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetRequestStatsResponse:
+        """Get request-level statistics for a completed request."""
+        logger.debug(f"Receive get request stats request: {request.request_id}")
+        try:
+            stored = self.request_manager.get_request_stats(request.request_id)
+            stats = [self._build_request_stats(entry) for entry in stored]
+            return sglang_scheduler_pb2.GetRequestStatsResponse(stats=stats)
+        except Exception as e:
+            logger.error(f"GetRequestStats failed: {e}\n{get_exception_traceback()}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"Failed to get request stats: {e}")
+            return sglang_scheduler_pb2.GetRequestStatsResponse()
+
+    @staticmethod
+    def _build_request_stats(entry: dict[str, Any]) -> sglang_scheduler_pb2.RequestStats:
+        """Convert a stored stats entry to a protobuf RequestStats message."""
+        meta = entry.get("meta_info", {})
+        kwargs: dict[str, Any] = {
+            "index": int(entry.get("index", 0)),
+        }
+        _optional_fields = {
+            "request_received_timestamp_s": float,
+            "first_token_generated_timestamp_s": float,
+            "request_finished_timestamp_s": float,
+            "response_sent_timestamp_s": float,
+            "cache_hit_rate": float,
+            "spec_decoding_acceptance_rate": float,
+            "prompt_tokens": int,
+            "completion_tokens": int,
+            "cached_tokens": int,
+        }
+        for field, cast in _optional_fields.items():
+            value = meta.get(field)
+            if value is not None:
+                kwargs[field] = cast(value)
+        return sglang_scheduler_pb2.RequestStats(**kwargs)
 
     async def SubscribeKvEvents(
         self,
