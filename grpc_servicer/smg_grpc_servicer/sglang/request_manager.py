@@ -852,7 +852,6 @@ class GrpcRequestManager:
         (timestamps, cache hit rate, spec decoding metrics, etc).
         Only called once when a request completes.
         """
-        state.time_stats.set_finished_time()
 
         meta: dict[str, Any] = state.time_stats.convert_to_output_meta_info(
             completion_tokens=state.last_completion_tokens,
