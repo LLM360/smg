@@ -147,6 +147,21 @@ def _compute_aggregate_protobuf(
     )
 
 
+# Proto field name -> Python cast for each `optional` field in RequestStats.
+# Only populated fields (not None) from meta_info are set
+_REQUEST_STATS_OPTIONAL_FIELDS: dict[str, type] = {
+    "request_received_timestamp_s": float,
+    "first_token_generated_timestamp_s": float,
+    "request_finished_timestamp_s": float,
+    "response_sent_timestamp_s": float,
+    "cache_hit_rate": float,
+    "spec_decoding_acceptance_rate": float,
+    "prompt_tokens": int,
+    "completion_tokens": int,
+    "cached_tokens": int,
+}
+
+
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
     """
     Standalone gRPC service implementation using GrpcRequestManager.
@@ -550,7 +565,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.GetRequestStatsResponse:
         """Get request-level statistics for a completed request."""
-        logger.debug(f"Receive get request stats request: {request.request_id}")
         try:
             stored = self.request_manager.get_request_stats(request.request_id)
             stats = [self._build_request_stats(entry) for entry in stored]
@@ -568,18 +582,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         kwargs: dict[str, Any] = {
             "index": int(entry.get("index", 0)),
         }
-        _optional_fields = {
-            "request_received_timestamp_s": float,
-            "first_token_generated_timestamp_s": float,
-            "request_finished_timestamp_s": float,
-            "response_sent_timestamp_s": float,
-            "cache_hit_rate": float,
-            "spec_decoding_acceptance_rate": float,
-            "prompt_tokens": int,
-            "completion_tokens": int,
-            "cached_tokens": int,
-        }
-        for field, cast in _optional_fields.items():
+        for field, cast in _REQUEST_STATS_OPTIONAL_FIELDS.items():
             value = meta.get(field)
             if value is not None:
                 kwargs[field] = cast(value)

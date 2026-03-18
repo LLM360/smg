@@ -850,19 +850,14 @@ class GrpcRequestManager:
     ) -> dict[str, Any]:
         """Build additional meta_info fields for a finished request
         (timestamps, cache hit rate, spec decoding metrics, etc).
-
-        Only called once when a request completes, matching the HTTP path's
-        pattern of computing time stats and spec-decoding metrics on finish.
+        Only called once when a request completes.
         """
         state.time_stats.set_finished_time()
 
-        meta: dict[str, Any] = {}
-        meta.update(
-            state.time_stats.convert_to_output_meta_info(
-                completion_tokens=state.last_completion_tokens,
-            )
+        meta: dict[str, Any] = state.time_stats.convert_to_output_meta_info(
+            completion_tokens=state.last_completion_tokens,
         )
-        self._inject_timestamps(meta, state.time_stats)
+        self._populate_timestamps(meta, state.time_stats)
 
         if state.last_prompt_tokens > 0:
             meta["cache_hit_rate"] = state.last_cached_tokens / state.last_prompt_tokens
@@ -880,12 +875,8 @@ class GrpcRequestManager:
     ) -> None:
         """Populate speculative decoding stats when available."""
         if not (
-            hasattr(batch_out, "spec_verify_ct")
-            and hasattr(batch_out, "spec_accepted_tokens")
-            and batch_out.spec_verify_ct
-            and len(batch_out.spec_verify_ct) > index
+            len(batch_out.spec_verify_ct) > index
             and batch_out.spec_verify_ct[index] > 0
-            and batch_out.spec_accepted_tokens
             and len(batch_out.spec_accepted_tokens) > index
         ):
             return
@@ -901,7 +892,7 @@ class GrpcRequestManager:
             meta_info["spec_decoding_acceptance_rate"] = accept_rate
 
     @staticmethod
-    def _inject_timestamps(
+    def _populate_timestamps(
         meta_info: dict[str, Any],
         time_stats: APIServerReqTimeStats,
     ) -> None:
