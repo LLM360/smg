@@ -300,7 +300,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
 
 pub fn extract_piggyback_metrics(headers: &HeaderMap, worker_url: &str) -> Option<WorkerSnapshot> {
     let mut snapshot = WorkerSnapshot::new(worker_url.to_string(), MetricSource::Piggyback);
-    let mut found = false;
+    let mut core_found = false;
 
     for (name, value) in headers {
         let key_str = name.as_str();
@@ -308,21 +308,21 @@ pub fn extract_piggyback_metrics(headers: &HeaderMap, worker_url: &str) -> Optio
             if let Ok(v_str) = value.to_str() {
                 if let Ok(val) = v_str.parse::<isize>() {
                     snapshot.kv_cache_tokens = Some(val);
-                    found = true;
+                    core_found = true;
                 }
             }
         } else if key_str.eq_ignore_ascii_case("x-sglang-in-flight-requests") {
             if let Ok(v_str) = value.to_str() {
                 if let Ok(val) = v_str.parse::<isize>() {
                     snapshot.in_flight_requests = val;
-                    found = true;
+                    core_found = true;
                 }
             }
         } else if key_str.eq_ignore_ascii_case("x-sglang-avg-tokens-per-req") {
             if let Ok(v_str) = value.to_str() {
                 if let Ok(val) = v_str.parse::<isize>() {
                     snapshot.avg_tokens_per_req = val;
-                    found = true;
+                    core_found = true;
                 }
             }
         } else if key_str.to_lowercase().starts_with("x-sglang-") {
@@ -331,13 +331,12 @@ pub fn extract_piggyback_metrics(headers: &HeaderMap, worker_url: &str) -> Optio
                     let metric_name = key_str[9..].to_string(); // strip "x-sglang-"
                     let safe_name = metric_name.replace("-", "_");
                     snapshot.custom_metrics.insert(safe_name, val);
-                    found = true;
                 }
             }
         }
     }
 
-    if found {
+    if core_found {
         Some(snapshot)
     } else {
         None

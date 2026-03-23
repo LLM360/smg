@@ -174,19 +174,9 @@ impl CelPolicyEngine {
             };
         }
 
-        // Build a map of snapshot data keyed by worker URL
-        let all_snapshots = self.metrics_store.get_all();
-        let snapshot_map: HashMap<&str, &WorkerSnapshot> = all_snapshots
-            .iter()
-            .map(|s| (s.url.as_str(), s.as_ref()))
-            .collect();
-
         let now = SystemTime::now();
-
         // Tier 1: Try fresh snapshots
-        if let Some(idx) =
-            Self::select_by_tier(workers, &snapshot_map, now, self.fresh_threshold, strategy)
-        {
+        if let Some(idx) = self.select_by_tier(workers, now, self.fresh_threshold, strategy) {
             return PolicyResult {
                 decision: PolicyDecision::SelectWorker(idx),
                 tier: SelectionTier::Fresh,
@@ -194,9 +184,7 @@ impl CelPolicyEngine {
         }
 
         // Tier 2: Try stale snapshots (larger window)
-        if let Some(idx) =
-            Self::select_by_tier(workers, &snapshot_map, now, self.stale_threshold, strategy)
-        {
+        if let Some(idx) = self.select_by_tier(workers, now, self.stale_threshold, strategy) {
             warn!("CelPolicyEngine: no fresh snapshots, using stale data for worker selection");
             return PolicyResult {
                 decision: PolicyDecision::SelectWorker(idx),
@@ -223,8 +211,8 @@ impl CelPolicyEngine {
 
     /// Select the best worker whose snapshot age is within `max_age`, scoring by strategy.
     fn select_by_tier(
+        &self,
         workers: &[Arc<dyn Worker>],
-        snapshot_map: &HashMap<&str, &WorkerSnapshot>,
         now: SystemTime,
         max_age: Duration,
         strategy: &RoutingStrategy,
@@ -237,7 +225,7 @@ impl CelPolicyEngine {
                 continue;
             }
 
-            let Some(snapshot) = snapshot_map.get(worker.url()) else {
+            let Some(snapshot) = self.metrics_store.get(worker.url()) else {
                 continue;
             };
 

@@ -19,13 +19,10 @@ pub struct DirectScraper {
 }
 
 impl DirectScraper {
-    pub fn new(store: Arc<MetricsStore>, interval: Duration) -> Self {
+    pub fn new(store: Arc<MetricsStore>, client: Client, interval: Duration) -> Self {
         Self {
             store,
-            client: Client::builder()
-                .timeout(Duration::from_secs(3))
-                .build()
-                .unwrap_or_default(),
+            client,
             interval,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SCRAPES)),
         }

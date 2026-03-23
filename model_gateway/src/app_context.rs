@@ -345,6 +345,12 @@ impl AppContextBuilder {
     ) -> Result<Self, String> {
         let scraper_cfg = &router_config.metrics_scraper;
 
+        let mut builder = Self::new().with_client(&router_config, request_timeout_secs)?;
+        let gateway_client = builder
+            .client
+            .clone()
+            .ok_or("Failed to create HTTP client")?;
+
         // Create the WorkerRegistry early so the DirectScraper closure can hold
         // a Weak reference to the same registry that the application uses.
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -360,6 +366,7 @@ impl AppContextBuilder {
         {
             let direct_scraper = DirectScraper::new(
                 Arc::clone(&metrics_store),
+                gateway_client,
                 Duration::from_secs(scraper_cfg.scrape_interval_secs),
             );
             let weak_wr = Arc::downgrade(&worker_registry);
@@ -386,7 +393,11 @@ impl AppContextBuilder {
         }
 
         // Optionally spawn PrometheusScraper when prometheus_url is configured
-        if let Some(prom_url) = &scraper_cfg.prometheus_url {
+        if let Some(prom_url) = scraper_cfg
+            .prometheus_url
+            .as_ref()
+            .filter(|u| !u.is_empty())
+        {
             let prom_url = prom_url.clone();
             let prom_interval = Duration::from_secs(scraper_cfg.prometheus_scrape_interval_secs);
             let prom_store = Arc::clone(&metrics_store);
@@ -403,8 +414,7 @@ impl AppContextBuilder {
         // Start EventBus observability exporter (exports smg_worker_* Prometheus gauges)
         start_metrics_observability_exporter(Arc::clone(&metrics_store));
 
-        Ok(Self::new()
-            .with_client(&router_config, request_timeout_secs)?
+        Ok(builder
             .maybe_rate_limiter(&router_config)
             .with_tokenizer_registry()
             .with_reasoning_parser_factory()
