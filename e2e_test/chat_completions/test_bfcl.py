@@ -40,11 +40,9 @@ import pytest
 from bfcl import (
     MissingBFCLAnswerFileError,
     bfcl_to_openai_tools,
-    evaluate_tool_calls,
     load_bfcl_category,
-    save_test_log,
 )
-from bfcl.session_state import append_result, get_or_create_run_dir
+from bfcl.session_state import append_result, get_evaluator, get_or_create_run_dir
 
 logger = logging.getLogger(__name__)
 
@@ -68,17 +66,21 @@ def _extract_tool_calls(response: Any) -> list[dict[str, Any]]:
     tool_calls = getattr(message, "tool_calls", None) or []
     result = []
     for tc in tool_calls:
+        function = getattr(tc, "function", None)
+        if function is None:
+            logger.warning("Skipping malformed tool call with no function payload: %r", tc)
+            continue
         try:
-            args = json.loads(tc.function.arguments)
+            args = json.loads(function.arguments)
         except (json.JSONDecodeError, TypeError) as exc:
             logger.warning(
                 "Malformed tool call arguments for %r — %s | raw: %r",
-                tc.function.name,
+                function.name,
                 exc,
-                tc.function.arguments,
+                function.arguments,
             )
             args = {"_parse_error": str(exc)}
-        result.append({"name": tc.function.name, "arguments": args})
+        result.append({"name": function.name, "arguments": args})
     return result
 
 
@@ -123,6 +125,11 @@ def _get_cases_for_category(category: str) -> list[dict]:
     return _cases_cache[category]
 
 
+def _log_file_for_summary(run_dir: Path, log_path: Path) -> str:
+    """Persist log paths relative to the BFCL run directory."""
+    return str(log_path.relative_to(run_dir))
+
+
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     """Parametrize 'case' lazily — data is loaded only when BFCL tests are collected."""
     if "case" not in metafunc.fixturenames:
@@ -165,6 +172,7 @@ def _run_bfcl_case(
     run_dir: Path,
 ) -> None:
     """Execute a single BFCL test case, log the result, assert on failure."""
+    evaluator = get_evaluator()
     category = case["category"]
     test_id = case["id"]
     messages = case["question"]
@@ -189,7 +197,7 @@ def _run_bfcl_case(
         actual = _extract_tool_calls(response)
     except Exception as exc:
         latency = (time.monotonic() - start) * 1000
-        log_path = save_test_log(
+        log_path = evaluator.save_test_log(
             run_dir,
             test_id=test_id,
             category=category,
@@ -214,7 +222,7 @@ def _run_bfcl_case(
                 "finish_reason": None,
                 "completion_tokens": None,
                 "had_reasoning": False,
-                "log_file": f"{category}/{log_path.name}",
+                "log_file": _log_file_for_summary(run_dir, log_path),
                 "model": model,
                 "backend": backend,
             }
@@ -222,13 +230,13 @@ def _run_bfcl_case(
         pytest.fail(f"BFCL {test_id}: API call failed — {exc}")
 
     latency = (time.monotonic() - start) * 1000
-    passed, errors = evaluate_tool_calls(
+    passed, errors = evaluator.evaluate_tool_calls(
         actual,
         case.get("ground_truth", []),
         category=category,
     )
 
-    log_path = save_test_log(
+    log_path = evaluator.save_test_log(
         run_dir,
         test_id=test_id,
         category=category,
@@ -266,7 +274,7 @@ def _run_bfcl_case(
             "finish_reason": finish_reason,
             "completion_tokens": completion_tokens,
             "had_reasoning": had_reasoning,
-            "log_file": f"{category}/{log_path.name}",
+            "log_file": _log_file_for_summary(run_dir, log_path),
             "model": model,
             "backend": backend,
         }
@@ -278,7 +286,7 @@ def _run_bfcl_case(
         test_id,
         status,
         latency,
-        log_path.name,
+        _log_file_for_summary(run_dir, log_path),
     )
 
     if not passed:

@@ -37,17 +37,24 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]  # smg/
 _E2E_TEST = Path(__file__).resolve().parent  # e2e_test/
-_SRC = _ROOT / "bindings" / "python"
+_SRC = _ROOT / "bindings" / "python" / "src"
+_CLIENTS_PYTHON = _ROOT / "clients" / "python"
 
 # Add e2e_test to path so "from infra import ..." works
 if str(_E2E_TEST) not in sys.path:
     sys.path.insert(0, str(_E2E_TEST))
 
-# Add bindings/python to path if the wheel is not installed (for local development)
-_wheel_installed = find_spec("smg.smg_rs") is not None
+# Add bindings/python/src to path if the wheel is not installed (for local development)
+try:
+    _wheel_installed = find_spec("smg.smg_rs") is not None
+except ModuleNotFoundError:
+    _wheel_installed = False
 
 if not _wheel_installed and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+if str(_CLIENTS_PYTHON) not in sys.path:
+    sys.path.insert(0, str(_CLIENTS_PYTHON))
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +118,6 @@ from fixtures import (
     pytest_sessionfinish,
     setup_backend,
 )
-from smg_client import SmgClient
 
 
 @pytest.fixture
@@ -134,6 +140,8 @@ def api_client(request, setup_backend):
     if param == "openai":
         yield openai_client
     elif param == "smg":
+        from smg_client import SmgClient
+
         client = SmgClient(base_url=gateway.base_url, max_retries=0)
         yield client
         client.close()

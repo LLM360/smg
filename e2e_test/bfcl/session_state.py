@@ -12,39 +12,40 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .evaluator import BFCLEvaluator
+
 logger = logging.getLogger(__name__)
 
 _results_lock = threading.Lock()
 _all_results: list[dict[str, Any]] = []
-_run_dir: Path | None = None
+_evaluator = BFCLEvaluator()
+
+
+def get_evaluator() -> BFCLEvaluator:
+    """Return the shared session evaluator instance."""
+    return _evaluator
 
 
 def append_result(result: dict[str, Any]) -> None:
+    """Record a single BFCL case result for session summary generation."""
     with _results_lock:
         _all_results.append(result)
 
 
 def get_or_create_run_dir() -> Path:
     """Return the session's log directory, creating it exactly once."""
-    global _run_dir
     with _results_lock:
-        if _run_dir is None:
-            from .evaluator import get_run_dir
-
-            _run_dir = get_run_dir()
-        return _run_dir
+        return _evaluator.get_run_dir()
 
 
 def write_summary_if_needed() -> None:
     """Write summary.json — called from fixtures/hooks.py at session end."""
-    from .evaluator import save_summary
-
     with _results_lock:
         results = list(_all_results)
-        run_dir = _run_dir
+        run_dir = _evaluator.get_existing_run_dir()
     if not results or run_dir is None:
         return
-    summary = save_summary(run_dir, results)
+    summary = _evaluator.save_summary(run_dir, results)
     logger.info(
         "BFCL summary: %d/%d passed (%.1f%%) — %s/summary.json",
         summary["passed"],

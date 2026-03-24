@@ -37,6 +37,8 @@ _ANSWER_FILE_MAP = {
     "parallel_multiple": "BFCL_v3_parallel_multiple_answer.json",
 }
 
+DOWNLOAD_HINT = "Run: python e2e_test/bfcl/download_data.py"
+
 
 class MissingBFCLAnswerFileError(FileNotFoundError):
     """Raised when BFCL question data exists but the mapped answer file is missing."""
@@ -61,13 +63,10 @@ def load_bfcl_category(
 
     question_path = DATA_DIR / _FILE_MAP[category]
     if not question_path.exists():
-        raise FileNotFoundError(
-            f"BFCL data not found: {question_path}. "
-            "Run the download script or see e2e_test/bfcl/data/README.md"
-        )
+        raise FileNotFoundError(f"BFCL data not found: {question_path}. {DOWNLOAD_HINT}")
 
     questions_by_id: dict[str, dict] = {}
-    with open(question_path, encoding="utf-8") as f:
+    with question_path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -81,10 +80,9 @@ def load_bfcl_category(
         answer_path = DATA_DIR / answer_filename
         if not answer_path.exists():
             raise MissingBFCLAnswerFileError(
-                f"BFCL answer file not found: {answer_path}. "
-                "Run: python e2e_test/bfcl/download_data.py"
+                f"BFCL answer file not found: {answer_path}. {DOWNLOAD_HINT}"
             )
-        with open(answer_path, encoding="utf-8") as f:
+        with answer_path.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -120,39 +118,3 @@ def load_bfcl_category(
         results = results[:limit]
 
     return results
-
-
-def _fix_parameter_type(params: dict) -> dict:
-    """Convert BFCL's non-standard types to valid JSON Schema types recursively."""
-    result = dict(params)
-    ptype = result.get("type")
-    if ptype == "dict":
-        result["type"] = "object"
-    elif ptype == "float":
-        result["type"] = "number"
-    props = result.get("properties")
-    if isinstance(props, dict):
-        result["properties"] = {
-            k: _fix_parameter_type(v) if isinstance(v, dict) else v for k, v in props.items()
-        }
-    items = result.get("items")
-    if isinstance(items, dict):
-        result["items"] = _fix_parameter_type(items)
-    return result
-
-
-def bfcl_to_openai_tools(bfcl_functions: list[dict]) -> list[dict]:
-    """Convert BFCL function definitions to OpenAI tools format.
-
-    Handles the BFCL-specific quirks:
-      - parameters.type "dict" → "object"
-      - parameters.type "float" → "number"
-      - Wraps in {"type": "function", "function": ...}
-    """
-    tools = []
-    for fn in bfcl_functions:
-        fixed_fn = dict(fn)
-        if "parameters" in fixed_fn:
-            fixed_fn["parameters"] = _fix_parameter_type(fixed_fn["parameters"])
-        tools.append({"type": "function", "function": fixed_fn})
-    return tools
