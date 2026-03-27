@@ -210,8 +210,14 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
+        // Use per-model retry config if set by a worker, otherwise fall back to router default.
+        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
+        let retry_config = per_model_retry_config
+            .as_ref()
+            .unwrap_or(&self.retry_config);
+
         let response = RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+            retry_config,
             // operation per attempt
             |_: u32| async {
                 let res = self
@@ -808,8 +814,8 @@ mod tests {
         let worker2 = BasicWorkerBuilder::new("http://worker2:8080")
             .worker_type(WorkerType::Regular)
             .build();
-        worker_registry.register(Arc::new(worker1));
-        worker_registry.register(Arc::new(worker2));
+        worker_registry.register_or_replace(Arc::new(worker1));
+        worker_registry.register_or_replace(Arc::new(worker2));
 
         Router {
             worker_registry,

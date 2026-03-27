@@ -132,6 +132,9 @@ impl GrpcRouter {
             .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
             .clone();
 
+        // Capture storage request context from middleware task-local (before any spawn)
+        let storage_request_context = smg_data_connector::current_request_context();
+
         // Helper closure to create responses context with a given pipeline
         let create_responses_context = |pipeline: &RequestPipeline| {
             ResponsesContext::new(
@@ -141,6 +144,7 @@ impl GrpcRouter {
                 ctx.conversation_storage.clone(),
                 ctx.conversation_item_storage.clone(),
                 mcp_orchestrator.clone(),
+                storage_request_context.clone(),
             )
         };
 
@@ -190,8 +194,14 @@ impl GrpcRouter {
         let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
 
+        // Use per-model retry config if set by a worker, otherwise fall back to router default.
+        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
+        let retry_config = per_model_retry_config
+            .as_ref()
+            .unwrap_or(&self.retry_config);
+
         RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+            retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
                 let request = Arc::clone(&request);
@@ -241,8 +251,14 @@ impl GrpcRouter {
         let components = self.shared_components.clone();
         let pipeline = &self.pipeline;
 
+        // Use per-model retry config if set by a worker, otherwise fall back to router default.
+        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
+        let retry_config = per_model_retry_config
+            .as_ref()
+            .unwrap_or(&self.retry_config);
+
         RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+            retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
                 let request = Arc::clone(&request);
@@ -310,6 +326,7 @@ impl GrpcRouter {
                     .conversation_item_storage
                     .clone(),
                 self.harmony_responses_context.mcp_orchestrator.clone(),
+                smg_data_connector::current_request_context(),
             );
 
             if body.stream.unwrap_or(false) {
@@ -366,8 +383,14 @@ impl GrpcRouter {
         let components = self.shared_components.clone();
         let pipeline = &self.messages_pipeline;
 
+        // Use per-model retry config if set by a worker, otherwise fall back to router default.
+        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
+        let retry_config = per_model_retry_config
+            .as_ref()
+            .unwrap_or(&self.retry_config);
+
         RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+            retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
                 let headers = headers_cloned.clone();
