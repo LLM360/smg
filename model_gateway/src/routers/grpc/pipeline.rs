@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
+    completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
@@ -17,7 +18,7 @@ use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
-// Import embedding-specific, classify-specific, and messages-specific stages
+// Import embedding-specific, classify-specific, messages-specific, and completion-specific stages
 use super::regular::stages::classify::ClassifyResponseProcessingStage;
 use super::{
     common::{responses::ResponsesContext, stages::*},
@@ -26,6 +27,10 @@ use super::{
     regular::{
         processor,
         stages::{
+            completion::{
+                CompletionPreparationStage, CompletionRequestBuildingStage,
+                CompletionResponseProcessingStage,
+            },
             embedding::{
                 preparation::EmbeddingPreparationStage,
                 request_building::EmbeddingRequestBuildingStage,
@@ -42,7 +47,7 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
-    core::{WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::WorkerRegistry,
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     routers::error,
@@ -60,6 +65,48 @@ pub(crate) struct RequestPipeline {
 }
 
 impl RequestPipeline {
+    fn wrong_response_type(
+        &self,
+        function: &'static str,
+        expected: &'static str,
+        response_type: &FinalResponse,
+        model: &str,
+        endpoint: &'static str,
+    ) -> Response {
+        error!(
+            function = function,
+            response_type = %response_type,
+            "Wrong response type: expected {expected}, got {response_type}"
+        );
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            endpoint,
+            metrics_labels::ERROR_INTERNAL,
+        );
+        error::internal_error("wrong_response_type", "Internal error: wrong response type")
+    }
+
+    fn no_response_produced(
+        &self,
+        function: &'static str,
+        model: &str,
+        endpoint: &'static str,
+    ) -> Response {
+        error!(function = function, "No response produced by pipeline");
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            endpoint,
+            metrics_labels::ERROR_INTERNAL,
+        );
+        error::internal_error("no_response_produced", "No response produced")
+    }
+
     /// Create a regular (single-worker) pipeline
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
@@ -358,12 +405,80 @@ impl RequestPipeline {
         }
     }
 
+    /// Create a Completion API pipeline (single-worker)
+    ///
+    /// Uses Completion-specific stages for preparation, request building, and response
+    /// processing. Shares worker selection, client acquisition, dispatch metadata,
+    /// and request execution stages with other pipelines.
+    pub fn new_completion(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+    ) -> Self {
+        let processor = processor::ResponseProcessor::new(
+            ToolParserFactory::default(),
+            ReasoningParserFactory::default(),
+            None,
+            None,
+        );
+
+        let stages: Vec<Box<dyn PipelineStage>> = vec![
+            Box::new(CompletionPreparationStage),
+            Box::new(WorkerSelectionStage::new(
+                worker_registry,
+                policy_registry,
+                WorkerSelectionMode::Regular,
+            )),
+            Box::new(ClientAcquisitionStage),
+            Box::new(CompletionRequestBuildingStage::new(false)), // No PD metadata
+            Box::new(DispatchMetadataStage),
+            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(CompletionResponseProcessingStage::new(processor)),
+        ];
+
+        Self {
+            stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_REGULAR,
+        }
+    }
+
+    /// Create a Completion API PD (prefill-decode) pipeline
+    pub fn new_completion_pd(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+    ) -> Self {
+        let processor = processor::ResponseProcessor::new(
+            ToolParserFactory::default(),
+            ReasoningParserFactory::default(),
+            None,
+            None,
+        );
+
+        let stages: Vec<Box<dyn PipelineStage>> = vec![
+            Box::new(CompletionPreparationStage),
+            Box::new(WorkerSelectionStage::new(
+                worker_registry,
+                policy_registry,
+                WorkerSelectionMode::PrefillDecode,
+            )),
+            Box::new(ClientAcquisitionStage),
+            Box::new(CompletionRequestBuildingStage::new(true)), // Inject PD metadata
+            Box::new(DispatchMetadataStage),
+            Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
+            Box::new(CompletionResponseProcessingStage::new(processor)),
+        ];
+
+        Self {
+            stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_PD,
+        }
+    }
+
     /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
         request: Arc<ChatCompletionRequest>,
         headers: Option<http::HeaderMap>,
-        model_id: Option<String>,
+        model_id: String,
         components: Arc<SharedComponents>,
     ) -> Response {
         let start = Instant::now();
@@ -429,39 +544,24 @@ impl RequestPipeline {
                 );
                 axum::Json(response).into_response()
             }
-            Some(FinalResponse::Generate(_))
-            | Some(FinalResponse::Embedding(_))
-            | Some(FinalResponse::Classify(_))
-            | Some(FinalResponse::Messages(_)) => {
-                error!(
-                    function = "execute_chat",
-                    "Wrong response type: expected Chat, got Generate/Embedding/Classify/Messages"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &request_for_metrics.model,
-                    metrics_labels::ENDPOINT_CHAT,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("wrong_response_type", "Internal error: wrong response type")
-            }
-            None => {
-                error!(
-                    function = "execute_chat",
-                    "No response produced by pipeline"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &request_for_metrics.model,
-                    metrics_labels::ENDPOINT_CHAT,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
+            Some(
+                response_type @ (FinalResponse::Generate(_)
+                | FinalResponse::Completion(_)
+                | FinalResponse::Embedding(_)
+                | FinalResponse::Classify(_)
+                | FinalResponse::Messages(_)),
+            ) => self.wrong_response_type(
+                "execute_chat",
+                "Chat",
+                &response_type,
+                &request_for_metrics.model,
+                metrics_labels::ENDPOINT_CHAT,
+            ),
+            None => self.no_response_produced(
+                "execute_chat",
+                &request_for_metrics.model,
+                metrics_labels::ENDPOINT_CHAT,
+            ),
         }
     }
 
@@ -470,7 +570,7 @@ impl RequestPipeline {
         &self,
         request: Arc<GenerateRequest>,
         headers: Option<http::HeaderMap>,
-        model_id: Option<String>,
+        model_id: String,
         components: Arc<SharedComponents>,
     ) -> Response {
         let start = Instant::now();
@@ -481,7 +581,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            &model_id,
             metrics_labels::ENDPOINT_GENERATE,
             bool_to_static_str(streaming),
         );
@@ -495,7 +595,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                        &model_id,
                         metrics_labels::ENDPOINT_GENERATE,
                         start.elapsed(),
                     );
@@ -507,7 +607,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                        &model_id,
                         metrics_labels::ENDPOINT_GENERATE,
                         error_type_from_status(response.status()),
                     );
@@ -527,45 +627,119 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                    &model_id,
                     metrics_labels::ENDPOINT_GENERATE,
                     start.elapsed(),
                 );
                 axum::Json(response).into_response()
             }
-            Some(FinalResponse::Chat(_))
-            | Some(FinalResponse::Embedding(_))
-            | Some(FinalResponse::Classify(_))
-            | Some(FinalResponse::Messages(_)) => {
-                error!(
-                    function = "execute_generate",
-                    "Wrong response type: expected Generate, got Chat/Embedding/Classify/Messages"
-                );
-                Metrics::record_router_error(
+            Some(
+                response_type @ (FinalResponse::Chat(_)
+                | FinalResponse::Completion(_)
+                | FinalResponse::Embedding(_)
+                | FinalResponse::Classify(_)
+                | FinalResponse::Messages(_)),
+            ) => self.wrong_response_type(
+                "execute_generate",
+                "Generate",
+                &response_type,
+                &model_id,
+                metrics_labels::ENDPOINT_GENERATE,
+            ),
+            None => self.no_response_produced(
+                "execute_generate",
+                &model_id,
+                metrics_labels::ENDPOINT_GENERATE,
+            ),
+        }
+    }
+
+    /// Execute the complete pipeline for a completion request
+    pub async fn execute_completion(
+        &self,
+        request: Arc<CompletionRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Response {
+        let start = Instant::now();
+        let model = request.model.clone();
+        let streaming = request.stream;
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            &model,
+            metrics_labels::ENDPOINT_COMPLETIONS,
+            bool_to_static_str(streaming),
+        );
+
+        let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
+
+        for stage in self.stages.iter() {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        &model,
+                        metrics_labels::ENDPOINT_COMPLETIONS,
+                        start.elapsed(),
+                    );
+                    return response;
+                }
+                Ok(None) => continue,
+                Err(response) => {
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        &model,
+                        metrics_labels::ENDPOINT_COMPLETIONS,
+                        error_type_from_status(response.status()),
+                    );
+                    error!(
+                        "Stage {} failed with status {}",
+                        stage.name(),
+                        response.status()
+                    );
+                    return response;
+                }
+            }
+        }
+
+        match ctx.state.response.final_response {
+            Some(FinalResponse::Completion(response)) => {
+                Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
-                    metrics_labels::ENDPOINT_GENERATE,
-                    metrics_labels::ERROR_INTERNAL,
+                    &model,
+                    metrics_labels::ENDPOINT_COMPLETIONS,
+                    start.elapsed(),
                 );
-                error::internal_error("wrong_response_type", "Internal error: wrong response type")
+                axum::Json(response).into_response()
             }
-            None => {
-                error!(
-                    function = "execute_generate",
-                    "No response produced by pipeline"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
-                    metrics_labels::ENDPOINT_GENERATE,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
+            Some(
+                response_type @ (FinalResponse::Chat(_)
+                | FinalResponse::Generate(_)
+                | FinalResponse::Embedding(_)
+                | FinalResponse::Classify(_)
+                | FinalResponse::Messages(_)),
+            ) => self.wrong_response_type(
+                "execute_completion",
+                "Completion",
+                &response_type,
+                &model,
+                metrics_labels::ENDPOINT_COMPLETIONS,
+            ),
+            None => self.no_response_produced(
+                "execute_completion",
+                &model,
+                metrics_labels::ENDPOINT_COMPLETIONS,
+            ),
         }
     }
 
@@ -574,12 +748,12 @@ impl RequestPipeline {
         &self,
         request: Arc<EmbeddingRequest>,
         headers: Option<http::HeaderMap>,
-        model_id: Option<String>,
+        model_id: String,
         components: Arc<SharedComponents>,
     ) -> Response {
         debug!(
             "execute_embeddings: Starting execution for model: {}",
-            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID)
+            &model_id
         );
         let start = Instant::now();
 
@@ -588,7 +762,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            &model_id,
             metrics_labels::ENDPOINT_EMBEDDINGS,
             bool_to_static_str(false),
         );
@@ -607,7 +781,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                        &model_id,
                         metrics_labels::ENDPOINT_EMBEDDINGS,
                         start.elapsed(),
                     );
@@ -630,7 +804,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                        &model_id,
                         metrics_labels::ENDPOINT_EMBEDDINGS,
                         error_type_from_status(response.status()),
                     );
@@ -649,7 +823,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                    &model_id,
                     metrics_labels::ENDPOINT_EMBEDDINGS,
                     start.elapsed(),
                 );
@@ -674,12 +848,12 @@ impl RequestPipeline {
         &self,
         request: Arc<ClassifyRequest>,
         headers: Option<http::HeaderMap>,
-        model_id: Option<String>,
+        model_id: String,
         components: Arc<SharedComponents>,
     ) -> Response {
         debug!(
             "execute_classify: Starting execution for model: {}",
-            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID)
+            &model_id
         );
         let start = Instant::now();
 
@@ -688,7 +862,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            &model_id,
             metrics_labels::ENDPOINT_CLASSIFY,
             bool_to_static_str(false), // Classify is never streaming
         );
@@ -707,7 +881,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                        &model_id,
                         metrics_labels::ENDPOINT_CLASSIFY,
                         start.elapsed(),
                     );
@@ -730,7 +904,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                        &model_id,
                         metrics_labels::ENDPOINT_CLASSIFY,
                         error_type_from_status(response.status()),
                     );
@@ -749,7 +923,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+                    &model_id,
                     metrics_labels::ENDPOINT_CLASSIFY,
                     start.elapsed(),
                 );
@@ -774,7 +948,7 @@ impl RequestPipeline {
         &self,
         request: Arc<CreateMessageRequest>,
         headers: Option<http::HeaderMap>,
-        model_id: Option<String>,
+        model_id: String,
         components: Arc<SharedComponents>,
     ) -> Response {
         let start = Instant::now();
@@ -838,39 +1012,24 @@ impl RequestPipeline {
                 );
                 axum::Json(response).into_response()
             }
-            Some(FinalResponse::Chat(_))
-            | Some(FinalResponse::Generate(_))
-            | Some(FinalResponse::Embedding(_))
-            | Some(FinalResponse::Classify(_)) => {
-                error!(
-                    function = "execute_messages",
-                    "Wrong response type: expected Messages"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &request.model,
-                    metrics_labels::ENDPOINT_MESSAGES,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("wrong_response_type", "Internal error: wrong response type")
-            }
-            None => {
-                error!(
-                    function = "execute_messages",
-                    "No response produced by pipeline"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &request.model,
-                    metrics_labels::ENDPOINT_MESSAGES,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
+            Some(
+                response_type @ (FinalResponse::Chat(_)
+                | FinalResponse::Generate(_)
+                | FinalResponse::Completion(_)
+                | FinalResponse::Embedding(_)
+                | FinalResponse::Classify(_)),
+            ) => self.wrong_response_type(
+                "execute_messages",
+                "Messages",
+                &response_type,
+                &request.model,
+                metrics_labels::ENDPOINT_MESSAGES,
+            ),
+            None => self.no_response_produced(
+                "execute_messages",
+                &request.model,
+                metrics_labels::ENDPOINT_MESSAGES,
+            ),
         }
     }
 
@@ -884,7 +1043,7 @@ impl RequestPipeline {
         &self,
         request: Arc<ChatCompletionRequest>,
         headers: Option<http::HeaderMap>,
-        model_id: Option<String>,
+        model_id: String,
         components: Arc<SharedComponents>,
     ) -> Result<ChatCompletionResponse, Response> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
@@ -921,6 +1080,7 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
             Some(FinalResponse::Generate(_))
+            | Some(FinalResponse::Completion(_))
             | Some(FinalResponse::Embedding(_))
             | Some(FinalResponse::Classify(_))
             | Some(FinalResponse::Messages(_)) => {
@@ -969,8 +1129,8 @@ impl RequestPipeline {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
-            None, // No headers needed for internal pipeline execution
-            None, // Model ID already set in request
+            None,                  // No headers needed for internal pipeline execution
+            request.model.clone(), // Model ID from request
             harmony_ctx.components.clone(),
         );
 
@@ -1033,7 +1193,7 @@ impl RequestPipeline {
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
             None,
-            None,
+            request.model.clone(),
             harmony_ctx.components.clone(),
         );
 

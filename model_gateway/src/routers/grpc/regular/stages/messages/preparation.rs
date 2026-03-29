@@ -71,11 +71,75 @@ impl MessagePreparationStage {
             Some(filtered_tools.as_slice())
         };
 
+        // Resolve multimodal context once (see chat/preparation.rs for details).
+        let is_multimodal = multimodal::has_multimodal_content_messages(&request.messages);
+        let (image_placeholder, mm_context) = if is_multimodal {
+            if let Some(mm_components) = ctx.components.multimodal.as_ref() {
+                let model_id = ctx.input.model_id.as_str();
+                let tokenizer_source = ctx
+                    .components
+                    .tokenizer_registry
+                    .get_by_name(model_id)
+                    .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id))
+                    .map(|e| e.source)
+                    .unwrap_or_default();
+
+                if tokenizer_source.is_empty() {
+                    error!(
+                        function = "MessagePreparationStage::execute",
+                        model = %model_id,
+                        "Tokenizer source path not found for multimodal processing"
+                    );
+                    return Err(error::bad_request(
+                        "multimodal_config_missing",
+                        format!("Tokenizer source path not found for model: {model_id}"),
+                    ));
+                }
+
+                let placeholder = multimodal::resolve_placeholder_token(
+                    model_id,
+                    &*tokenizer,
+                    mm_components,
+                    &tokenizer_source,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        function = "MessagePreparationStage::execute",
+                        model = %model_id,
+                        error = %e,
+                        "Failed to resolve multimodal placeholder token"
+                    );
+                    error::internal_error(
+                        "multimodal_placeholder_resolution_failed",
+                        format!("Failed to resolve multimodal placeholder token: {e}"),
+                    )
+                })?;
+
+                (
+                    placeholder,
+                    Some((mm_components, model_id, tokenizer_source)),
+                )
+            } else {
+                error!(
+                    function = "MessagePreparationStage::execute",
+                    "Multimodal content detected but multimodal components not initialized"
+                );
+                return Err(error::bad_request(
+                    "multimodal_not_supported",
+                    "Multimodal content detected but multimodal processing is not available",
+                ));
+            }
+        } else {
+            (None, None)
+        };
+
         // Step 2: Process messages and apply chat template
         let processed_messages = match message_utils::process_messages(
             request,
             &*tokenizer,
             tools_for_template,
+            image_placeholder.as_deref(),
         ) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -98,71 +162,39 @@ impl MessagePreparationStage {
 
         let mut token_ids = encoding.token_ids().to_vec();
 
-        // Step 3.5: Multimodal processing (fetch + preprocess + expand tokens + hash)
+        // Step 4: Multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
-        if multimodal::has_multimodal_content_messages(&request.messages) {
-            if let Some(mm_components) = ctx.components.multimodal.as_ref() {
-                let model_id = ctx.input.model_id.as_deref().unwrap_or(&request.model);
-                let tokenizer_source = ctx
-                    .components
-                    .tokenizer_registry
-                    .get_by_name(model_id)
-                    .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id))
-                    .map(|e| e.source)
-                    .unwrap_or_default();
-
-                if tokenizer_source.is_empty() {
+        if let Some((mm_components, model_id, tokenizer_source)) = mm_context {
+            match multimodal::process_multimodal_messages(
+                &request.messages,
+                model_id,
+                &*tokenizer,
+                token_ids,
+                mm_components,
+                &tokenizer_source,
+            )
+            .await
+            {
+                Ok(output) => {
+                    debug!(
+                        function = "MessagePreparationStage::execute",
+                        expanded_tokens = output.expanded_token_ids.len(),
+                        "Multimodal processing complete"
+                    );
+                    token_ids = output.expanded_token_ids;
+                    multimodal_intermediate = Some(output.intermediate);
+                }
+                Err(e) => {
                     error!(
                         function = "MessagePreparationStage::execute",
-                        model = %model_id,
-                        "Tokenizer source path not found for multimodal processing"
+                        error = %e,
+                        "Multimodal processing failed"
                     );
                     return Err(error::bad_request(
-                        "multimodal_config_missing",
-                        format!("Tokenizer source path not found for model: {model_id}"),
+                        "multimodal_processing_failed",
+                        format!("Multimodal processing failed: {e}"),
                     ));
                 }
-
-                match multimodal::process_multimodal_messages(
-                    &request.messages,
-                    model_id,
-                    &*tokenizer,
-                    token_ids,
-                    mm_components,
-                    &tokenizer_source,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        debug!(
-                            function = "MessagePreparationStage::execute",
-                            expanded_tokens = output.expanded_token_ids.len(),
-                            "Multimodal processing complete"
-                        );
-                        token_ids = output.expanded_token_ids;
-                        multimodal_intermediate = Some(output.intermediate);
-                    }
-                    Err(e) => {
-                        error!(
-                            function = "MessagePreparationStage::execute",
-                            error = %e,
-                            "Multimodal processing failed"
-                        );
-                        return Err(error::bad_request(
-                            "multimodal_processing_failed",
-                            format!("Multimodal processing failed: {e}"),
-                        ));
-                    }
-                }
-            } else {
-                error!(
-                    function = "MessagePreparationStage::execute",
-                    "Multimodal content detected but multimodal components not initialized"
-                );
-                return Err(error::bad_request(
-                    "multimodal_not_supported",
-                    "Multimodal content detected but multimodal processing is not available",
-                ));
             }
         }
 

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
-    chat::ChatCompletionRequest, generate::GenerateRequest, messages::CreateMessageRequest,
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest,
 };
 use tracing::debug;
 
@@ -13,10 +14,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType,
-        UNKNOWN_MODEL_ID,
-    },
+    core::{is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType},
     observability::metrics::{metrics_labels, Metrics},
     routers::RouterTrait,
 };
@@ -27,6 +25,7 @@ pub struct GrpcPDRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
     messages_pipeline: RequestPipeline,
+    completion_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
     retry_config: RetryConfig,
 }
@@ -89,10 +88,15 @@ impl GrpcPDRouter {
             ctx.configured_reasoning_parser.clone(),
         );
 
+        // Create Completion PD pipeline
+        let completion_pipeline =
+            RequestPipeline::new_completion_pd(worker_registry.clone(), policy_registry.clone());
+
         Ok(GrpcPDRouter {
             worker_registry,
             pipeline,
             messages_pipeline,
+            completion_pipeline,
             shared_components,
             retry_config: ctx.router_config.effective_retry_config(),
         })
@@ -103,17 +107,17 @@ impl GrpcPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
-        model_id: Option<&str>,
+        model_id: &str,
     ) -> Response {
         debug!(
             "Processing generate request for model: {} (PD mode)",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+            model_id
         );
 
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.map(|s| s.to_string());
+        let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let pipeline = &self.pipeline;
 
@@ -171,7 +175,7 @@ impl GrpcPDRouter {
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
-        let model_id_cloned = Some(model_id.to_string());
+        let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let pipeline = &self.messages_pipeline;
 
@@ -214,22 +218,79 @@ impl GrpcPDRouter {
         .await
     }
 
+    /// Main route_completion implementation with PD dual dispatch
+    async fn route_completion_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: &str,
+    ) -> Response {
+        debug!(
+            "Processing completion request for model: {} (PD mode)",
+            model_id
+        );
+
+        let request = Arc::new(body.clone());
+        let headers_cloned = headers.cloned();
+        let model_id_cloned = model_id.to_string();
+        let components = self.shared_components.clone();
+        let pipeline = &self.completion_pipeline;
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_attempt| {
+                let request = Arc::clone(&request);
+                let headers = headers_cloned.clone();
+                let model_id = model_id_cloned.clone();
+                let components = Arc::clone(&components);
+                async move {
+                    pipeline
+                        .execute_completion(request, headers, model_id, components)
+                        .await
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::ENDPOINT_COMPLETIONS,
+                );
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::ENDPOINT_COMPLETIONS,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::ENDPOINT_COMPLETIONS,
+                );
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::ENDPOINT_COMPLETIONS,
+                );
+            },
+        )
+        .await
+    }
+
     /// Main route_chat implementation with PD dual dispatch
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        model_id: Option<&str>,
+        model_id: &str,
     ) -> Response {
         debug!(
             "Processing chat completion request for model: {} (PD mode)",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+            model_id
         );
 
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.map(|s| s.to_string());
+        let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let pipeline = &self.pipeline;
 
@@ -306,7 +367,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
-        model_id: Option<&str>,
+        model_id: &str,
     ) -> Response {
         self.route_generate_impl(headers, body, model_id).await
     }
@@ -315,9 +376,18 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        model_id: Option<&str>,
+        model_id: &str,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
+    }
+
+    async fn route_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_completion_impl(headers, body, model_id).await
     }
 
     async fn route_messages(
