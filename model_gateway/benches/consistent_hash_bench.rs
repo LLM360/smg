@@ -6,7 +6,7 @@ use smg_mesh::consistent_hash::ConsistentHashRing;
 fn build_ring(num_nodes: usize) -> ConsistentHashRing {
     let mut ring = ConsistentHashRing::new();
     for i in 0..num_nodes {
-        ring.add_node(&format!("node-{}", i));
+        ring.add_node(&format!("node-{i}"));
     }
     ring
 }
@@ -17,7 +17,7 @@ fn bench_is_owner(c: &mut Criterion) {
     let ring = build_ring(num_nodes);
 
     // Generate some keys to check
-    let keys: Vec<String> = (0..500).map(|i| format!("test-key-{}", i)).collect();
+    let keys: Vec<String> = (0..500).map(|i| format!("test-key-{i}")).collect();
 
     // Test a node that exists
     let node_true = "node-25";
@@ -26,12 +26,12 @@ fn bench_is_owner(c: &mut Criterion) {
 
     group.bench_function("is_owner_baseline", |b| {
         b.iter(|| {
-            for key in keys.iter() {
+            for key in &keys {
                 // We mix hits and misses to get an average runtime check
                 black_box(ring.is_owner(black_box(key), black_box(node_true)));
                 black_box(ring.is_owner(black_box(key), black_box(node_false)));
             }
-        })
+        });
     });
 
     group.finish();
