@@ -380,7 +380,7 @@ fn validate_chat_cross_parameters(
     // 4. Validate structured output conflicts
     let has_json_format = matches!(
         req.response_format,
-        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        Some(ResponseFormat::JsonObject { .. } | ResponseFormat::JsonSchema { .. })
     );
 
     if has_json_format && req.regex.is_some() {
@@ -397,6 +397,7 @@ fn validate_chat_cross_parameters(
 
     // 5. Validate mutually exclusive structured output constraints
     let constraint_count = [
+        matches!(req.response_format, Some(ResponseFormat::Regex { .. })),
         req.regex.is_some(),
         req.ebnf.is_some(),
         matches!(req.response_format, Some(ResponseFormat::JsonSchema { .. })),
@@ -418,6 +419,12 @@ fn validate_chat_cross_parameters(
             e.message = Some("JSON schema name cannot be empty".into());
             return Err(e);
         }
+    }
+
+    if matches!(req.response_format, Some(ResponseFormat::Regex { .. })) && req.regex.is_some() {
+        let mut e = validator::ValidationError::new("regex_duplicate_constraint");
+        e.message = Some("cannot use both response_format.regex and regex".into());
+        return Err(e);
     }
 
     // 7. Validate tool_choice requires tools (except for "none")

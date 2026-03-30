@@ -252,7 +252,7 @@ fn map_text_to_response_format(text: Option<&TextConfig>) -> Option<ResponseForm
 
     match format {
         TextFormat::Text => Some(ResponseFormat::Text),
-        TextFormat::JsonObject => Some(ResponseFormat::JsonObject),
+        TextFormat::JsonObject => Some(ResponseFormat::JsonObject { schema: None }),
         TextFormat::JsonSchema {
             name,
             schema,

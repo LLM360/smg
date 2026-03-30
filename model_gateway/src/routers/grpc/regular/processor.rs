@@ -11,10 +11,11 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-    common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
+    common::{FunctionCallResponse, Tool as OpenAITool, ToolCall, ToolChoice, ToolChoiceValue},
     generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use serde_json::Value;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -143,6 +144,7 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         &original_request.model,
+                        original_request.tools.as_deref(),
                         history_tool_calls_count,
                     )
                     .await;
@@ -282,10 +284,167 @@ impl ResponseProcessor {
     }
 
     /// Parse tool calls using model-specific parser
+    fn normalize_schema_type(type_name: &str) -> Option<&'static str> {
+        match type_name {
+            "integer" => Some("integer"),
+            "number" => Some("number"),
+            "string" => Some("string"),
+            "boolean" => Some("boolean"),
+            "object" => Some("object"),
+            "array" => Some("array"),
+            "null" => Some("string"),
+            _ => None,
+        }
+    }
+
+    fn infer_type_from_json_schema(schema: &Value) -> Option<&'static str> {
+        let Value::Object(schema_obj) = schema else {
+            return None;
+        };
+
+        if let Some(type_value) = schema_obj.get("type") {
+            match type_value {
+                Value::String(type_name) => return Self::normalize_schema_type(type_name),
+                Value::Array(type_names) => {
+                    for type_name in type_names {
+                        if let Some(type_name) = type_name.as_str() {
+                            if type_name != "null" {
+                                return Self::normalize_schema_type(type_name);
+                            }
+                        }
+                    }
+                    return Some("string");
+                }
+                _ => {}
+            }
+        }
+
+        for union_key in ["anyOf", "oneOf"] {
+            if let Some(Value::Array(schemas)) = schema_obj.get(union_key) {
+                let mut inferred_types = Vec::new();
+                for sub_schema in schemas {
+                    if let Some(inferred_type) = Self::infer_type_from_json_schema(sub_schema) {
+                        inferred_types.push(inferred_type);
+                    }
+                }
+                if let Some(first_type) = inferred_types.first().copied() {
+                    if inferred_types.iter().all(|ty| *ty == first_type) {
+                        return Some(first_type);
+                    }
+                    if inferred_types.contains(&"string") {
+                        return Some("string");
+                    }
+                    return Some(first_type);
+                }
+            }
+        }
+
+        if let Some(Value::Array(enum_values)) = schema_obj.get("enum") {
+            if enum_values.is_empty() {
+                return Some("string");
+            }
+
+            let inferred = enum_values
+                .iter()
+                .map(|value| match value {
+                    Value::Null => "null",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+                    Value::Number(_) => "number",
+                    Value::String(_) => "string",
+                    Value::Array(_) => "array",
+                    Value::Object(_) => "object",
+                })
+                .collect::<std::collections::HashSet<_>>();
+
+            if inferred.len() == 1 {
+                return inferred.iter().next().copied();
+            }
+            return Some("string");
+        }
+
+        if let Some(Value::Array(schemas)) = schema_obj.get("allOf") {
+            for sub_schema in schemas {
+                if let Some(inferred_type) = Self::infer_type_from_json_schema(sub_schema) {
+                    if inferred_type != "string" {
+                        return Some(inferred_type);
+                    }
+                }
+            }
+            return Some("string");
+        }
+
+        if schema_obj.contains_key("properties") {
+            return Some("object");
+        }
+        if schema_obj.contains_key("items") {
+            return Some("array");
+        }
+
+        None
+    }
+
+    fn get_argument_type(
+        tools: &[OpenAITool],
+        function_name: &str,
+        argument_name: &str,
+    ) -> Option<&'static str> {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.function.name == function_name)?;
+        let params = tool.function.parameters.as_object()?;
+        let properties = params.get("properties")?.as_object()?;
+        let schema = properties.get(argument_name)?;
+        Self::infer_type_from_json_schema(schema)
+    }
+
+    fn normalize_arguments_to_schema(
+        tools: &[OpenAITool],
+        function_name: &str,
+        arguments_json: &str,
+    ) -> String {
+        let Ok(Value::Object(arguments)) = serde_json::from_str::<Value>(arguments_json) else {
+            return arguments_json.to_string();
+        };
+
+        let mut normalized = serde_json::Map::with_capacity(arguments.len());
+        for (key, value) in arguments {
+            let normalized_value = match Self::get_argument_type(tools, function_name, &key) {
+                Some("string") => match value {
+                    Value::String(_) => value,
+                    Value::Array(array) => Value::String(Value::Array(array).to_string()),
+                    Value::Object(object) => Value::String(Value::Object(object).to_string()),
+                    Value::Null => Value::String("null".to_string()),
+                    Value::Bool(v) => Value::String(v.to_string()),
+                    Value::Number(v) => Value::String(v.to_string()),
+                },
+                Some("number") | Some("integer") => match value {
+                    Value::String(number_like) => {
+                        if let Ok(int_val) = number_like.parse::<i64>() {
+                            Value::Number(int_val.into())
+                        } else if let Ok(float_val) = number_like.parse::<f64>() {
+                            serde_json::Number::from_f64(float_val)
+                                .map(Value::Number)
+                                .unwrap_or(Value::String(number_like))
+                        } else {
+                            Value::String(number_like)
+                        }
+                    }
+                    other => other,
+                },
+                _ => value,
+            };
+            normalized.insert(key, normalized_value);
+        }
+
+        serde_json::to_string(&normalized).unwrap_or_else(|_| arguments_json.to_string())
+    }
+
     pub async fn parse_tool_calls(
         &self,
         processed_text: &str,
         model: &str,
+        request_tools: Option<&[OpenAITool]>,
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
@@ -312,10 +471,21 @@ impl ResponseProcessor {
                     .into_iter()
                     .enumerate()
                     .map(|(index, tc)| {
+                        let function_name = tc.function.name;
+                        let normalized_arguments = request_tools.map_or_else(
+                            || tc.function.arguments.clone(),
+                            |tools| {
+                                Self::normalize_arguments_to_schema(
+                                    tools,
+                                    &function_name,
+                                    &tc.function.arguments,
+                                )
+                            },
+                        );
                         // Generate ID for this tool call
                         let id = utils::generate_tool_call_id(
                             model,
-                            &tc.function.name,
+                            &function_name,
                             index,
                             history_tool_calls_count,
                         );
@@ -323,8 +493,8 @@ impl ResponseProcessor {
                             id,
                             tool_type: "function".to_string(),
                             function: FunctionCallResponse {
-                                name: tc.function.name,
-                                arguments: Some(tc.function.arguments),
+                                name: function_name,
+                                arguments: Some(normalized_arguments),
                             },
                         }
                     })
@@ -440,5 +610,75 @@ impl ResponseProcessor {
         }
 
         Ok(result_array)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResponseProcessor;
+    use openai_protocol::common::{Function, Tool};
+    use serde_json::json;
+
+    #[test]
+    fn normalize_arguments_respects_string_schema() {
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "invokeCallback".to_string(),
+                description: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "callback": {"type": "string"},
+                        "error": {"type": "string"},
+                        "value": {"type": "string"}
+                    }
+                }),
+                strict: None,
+            },
+        }];
+
+        let normalized = ResponseProcessor::normalize_arguments_to_schema(
+            &tools,
+            "invokeCallback",
+            r#"{"callback":"processResult","error":null,"value":"Operation successful"}"#,
+        );
+
+        assert_eq!(
+            normalized,
+            r#"{"callback":"processResult","error":"null","value":"Operation successful"}"#
+        );
+    }
+
+    #[test]
+    fn normalize_arguments_keeps_numeric_schema_for_numbers() {
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "calculate_density".to_string(),
+                description: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "country": {"type": "string"},
+                        "year": {"type": "string"},
+                        "population": {"type": "number"},
+                        "land_area": {"type": "number"}
+                    }
+                }),
+                strict: None,
+            },
+        }];
+
+        let normalized = ResponseProcessor::normalize_arguments_to_schema(
+            &tools,
+            "calculate_density",
+            r#"{"country":"China","year":2000,"population":1267000000,"land_area":9597000}"#,
+        );
+
+        assert_eq!(
+            normalized,
+            r#"{"country":"China","year":"2000","population":1267000000,"land_area":9597000}"#
+        );
     }
 }

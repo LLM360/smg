@@ -537,9 +537,11 @@ impl TrtllmServiceClient {
 
         // Handle response_format
         match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
+            Some(ResponseFormat::JsonObject { schema }) => {
+                let effective_schema = schema
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                let schema_str = serde_json::to_string(&effective_schema)
                     .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
                 return Ok(Some(proto::GuidedDecodingParams {
                     guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
@@ -552,6 +554,12 @@ impl TrtllmServiceClient {
                 return Ok(Some(proto::GuidedDecodingParams {
                     guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
                     guide: schema_str,
+                }));
+            }
+            Some(ResponseFormat::Regex { pattern }) => {
+                return Ok(Some(proto::GuidedDecodingParams {
+                    guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
+                    guide: pattern.clone(),
                 }));
             }
             Some(ResponseFormat::Text) | None => {}

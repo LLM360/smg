@@ -363,6 +363,32 @@ pub(crate) fn filter_chat_request_by_tool_choice(
     std::borrow::Cow::Borrowed(body)
 }
 
+fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> Option<HashMap<String, Value>> {
+    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
+
+    // Add reasoning_effort if present (like Python does)
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        combined_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    // Add any additional template kwargs from request first so explicit user values win.
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        for (key, value) in template_kwargs {
+            combined_template_kwargs.insert(key.clone(), value.clone());
+        }
+    }
+
+    if combined_template_kwargs.is_empty() {
+        None
+    } else {
+        Some(combined_template_kwargs)
+    }
+}
+
 /// Process chat messages and apply template (shared by both routers)
 /// Requires HuggingFace tokenizer with chat template support
 pub fn process_chat_messages(
@@ -390,34 +416,12 @@ pub fn process_chat_messages(
             .transpose()
             .map_err(|e| format!("Failed to serialize tools: {e}"))?;
 
-        let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-        let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
-
-        // Add reasoning_effort if present (like Python does)
-        if let Some(reasoning_effort) = &request.reasoning_effort {
-            combined_template_kwargs.insert(
-                "reasoning_effort".to_string(),
-                Value::String(reasoning_effort.clone()),
-            );
-        }
-
-        // Add any additional template kwargs from request
-        if let Some(template_kwargs) = &request.chat_template_kwargs {
-            for (key, value) in template_kwargs {
-                combined_template_kwargs.insert(key.clone(), value.clone());
-            }
-        }
-
-        let final_template_kwargs = if combined_template_kwargs.is_empty() {
-            None
-        } else {
-            Some(&combined_template_kwargs)
-        };
+        let template_kwargs = build_chat_template_kwargs(request);
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,
             tools: tools_json.as_deref(),
-            template_kwargs: final_template_kwargs,
+            template_kwargs: template_kwargs.as_ref(),
             ..Default::default()
         };
 
@@ -464,6 +468,75 @@ pub fn process_chat_messages(
         multimodal_intermediate: None,
         stop_sequences: request.stop.clone(),
     })
+}
+
+#[cfg(test)]
+mod template_kwargs_tests {
+    use std::collections::HashMap;
+
+    use openai_protocol::{
+        chat::ChatCompletionRequest,
+        common::{Function, Tool, ToolChoice, ToolChoiceValue},
+    };
+    use serde_json::{json, Value};
+
+    use super::build_chat_template_kwargs;
+
+    fn sample_tool() -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "write".to_string(),
+                description: Some("Write a file".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"}
+                    },
+                    "required": ["file_path"]
+                }),
+                strict: None,
+            },
+        }
+    }
+
+    #[test]
+    fn returns_none_when_no_reasoning_effort_or_template_kwargs_are_present() {
+        let request = ChatCompletionRequest {
+            tools: Some(vec![sample_tool()]),
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+            ..Default::default()
+        };
+
+        let kwargs = build_chat_template_kwargs(&request);
+        assert!(kwargs.is_none());
+    }
+
+    #[test]
+    fn preserves_user_supplied_template_kwargs() {
+        let mut chat_template_kwargs = HashMap::new();
+        chat_template_kwargs.insert("enable_thinking".to_string(), Value::Bool(true));
+        chat_template_kwargs.insert("custom_flag".to_string(), Value::String("x".to_string()));
+
+        let request = ChatCompletionRequest {
+            tools: Some(vec![sample_tool()]),
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+            reasoning_effort: Some("medium".to_string()),
+            chat_template_kwargs: Some(chat_template_kwargs),
+            ..Default::default()
+        };
+
+        let kwargs = build_chat_template_kwargs(&request).expect("template kwargs");
+        assert_eq!(kwargs.get("enable_thinking"), Some(&Value::Bool(true)));
+        assert_eq!(
+            kwargs.get("reasoning_effort"),
+            Some(&Value::String("medium".to_string()))
+        );
+        assert_eq!(
+            kwargs.get("custom_flag"),
+            Some(&Value::String("x".to_string()))
+        );
+    }
 }
 
 /// Create a StopSequenceDecoder from stop parameters

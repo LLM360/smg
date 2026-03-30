@@ -207,9 +207,14 @@ pub enum ResponseFormat {
     #[serde(rename = "text")]
     Text,
     #[serde(rename = "json_object")]
-    JsonObject,
+    JsonObject {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        schema: Option<Value>,
+    },
     #[serde(rename = "json_schema")]
     JsonSchema { json_schema: JsonSchemaFormat },
+    #[serde(rename = "regex")]
+    Regex { pattern: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]

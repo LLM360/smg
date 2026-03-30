@@ -41,10 +41,20 @@ impl BaseReasoningParser {
             || (self.config.think_end_token.starts_with(text)
                 && self.config.think_end_token != text)
     }
+
+    fn strip_orphan_think_end_tokens(&self, text: &str) -> String {
+        if self.in_reasoning || text.contains(&self.config.think_start_token) {
+            return text.to_string();
+        }
+
+        text.replace(&self.config.think_end_token, "")
+    }
 }
 
 impl ReasoningParser for BaseReasoningParser {
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
+        let text = self.strip_orphan_think_end_tokens(text);
+
         // Check input size against buffer limit
         if text.len() > self.config.max_buffer_size {
             return Err(ParseError::BufferOverflow(text.len()));
@@ -53,7 +63,7 @@ impl ReasoningParser for BaseReasoningParser {
         let in_reasoning = self.in_reasoning || text.contains(&self.config.think_start_token);
 
         if !in_reasoning {
-            return Ok(ParserResult::normal(text.to_string()));
+            return Ok(ParserResult::normal(text));
         }
 
         // The text is considered to be in a reasoning block.
@@ -97,6 +107,9 @@ impl ReasoningParser for BaseReasoningParser {
         if self.is_partial_token(&current_text) {
             return Ok(ParserResult::default());
         }
+
+        current_text = self.strip_orphan_think_end_tokens(&current_text);
+        self.buffer.clone_from(&current_text);
 
         // Strip start token if present
         if !self.stripped_think_start && current_text.contains(&self.config.think_start_token) {
@@ -242,6 +255,24 @@ mod tests {
             .unwrap();
         assert_eq!(result.normal_text, "");
         assert_eq!(result.reasoning_text, "with reasoning");
+    }
+
+    #[test]
+    fn test_parse_streaming_strips_orphan_end_token() {
+        let mut parser = create_test_parser(false, true);
+        let result = parser
+            .parse_reasoning_streaming_incremental("</think>answer")
+            .unwrap();
+        assert_eq!(result.normal_text, "answer");
+        assert_eq!(result.reasoning_text, "");
+    }
+
+    #[test]
+    fn test_detect_and_parse_strips_orphan_end_token() {
+        let mut parser = create_test_parser(false, true);
+        let result = parser.detect_and_parse_reasoning("</think>answer").unwrap();
+        assert_eq!(result.normal_text, "answer");
+        assert_eq!(result.reasoning_text, "");
     }
 
     #[test]
