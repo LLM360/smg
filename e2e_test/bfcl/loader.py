@@ -9,6 +9,7 @@ and converts it to OpenAI-compatible tool calling format.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -44,20 +45,23 @@ class MissingBFCLAnswerFileError(FileNotFoundError):
     """Raised when BFCL question data exists but the mapped answer file is missing."""
 
 
+@dataclass
+class BFCLCase:
+    """A single BFCL test case."""
+
+    id: str
+    question: list[dict[str, Any]]
+    function: list[dict[str, Any]]
+    ground_truth: list[dict[str, Any]] = field(default_factory=list)
+    category: str = ""
+
+
 def load_bfcl_category(
     category: str,
     *,
     limit: int | None = None,
-) -> list[dict[str, Any]]:
-    """Load BFCL test cases for a category, merged with ground truth answers.
-
-    Returns a list of dicts, each with:
-      - id: str
-      - question: list[dict]         (unwrapped messages)
-      - function: list[dict]         (original BFCL function defs)
-      - ground_truth: list[dict]     (structured: [{func: {param: [vals]}}])
-      - category: str
-    """
+) -> list[BFCLCase]:
+    """Load BFCL test cases for a category, merged with ground truth answers."""
     if category not in _FILE_MAP:
         raise ValueError(f"Unknown category: {category}. Choose from {BFCL_CATEGORIES}")
 
@@ -90,7 +94,7 @@ def load_bfcl_category(
                 entry = json.loads(line)
                 answers_by_id[entry["id"]] = entry.get("ground_truth", [])
 
-    results: list[dict[str, Any]] = []
+    results: list[BFCLCase] = []
     for test_id, entry in questions_by_id.items():
         if answer_filename and test_id not in answers_by_id:
             raise MissingBFCLAnswerFileError(
@@ -105,13 +109,13 @@ def load_bfcl_category(
         ground_truth = answers_by_id.get(test_id, [])
 
         results.append(
-            {
-                "id": test_id,
-                "question": messages,
-                "function": entry.get("function", []),
-                "ground_truth": ground_truth,
-                "category": category,
-            }
+            BFCLCase(
+                id=test_id,
+                question=messages,
+                function=entry.get("function", []),
+                ground_truth=ground_truth,
+                category=category,
+            )
         )
 
     if limit is not None:

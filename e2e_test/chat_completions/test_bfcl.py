@@ -37,6 +37,7 @@ from typing import Any
 import openai
 import pytest
 from bfcl import (
+    BFCLCase,
     MissingBFCLAnswerFileError,
     bfcl_to_openai_tools,
     extract_tool_calls,
@@ -56,7 +57,7 @@ BFCL_CATEGORIES = ("simple", "multiple", "parallel", "parallel_multiple", "irrel
 # ---------------------------------------------------------------------------
 
 
-def _load(category: str) -> list[dict]:
+def _load(category: str) -> list[BFCLCase]:
     try:
         return load_bfcl_category(category, limit=BFCL_LIMIT)
     except MissingBFCLAnswerFileError:
@@ -68,7 +69,7 @@ def _load(category: str) -> list[dict]:
 
 # Safe without a lock: pytest_generate_tests runs during collection,
 # which is single-threaded even under pytest-parallel (--tests-per-worker N).
-_cases_cache: dict[str, list[dict]] = {}
+_cases_cache: dict[str, list[BFCLCase]] = {}
 
 
 def _selected_categories(keyword: str | None) -> list[str]:
@@ -90,7 +91,7 @@ def _selected_categories(keyword: str | None) -> list[str]:
     return matched or list(BFCL_CATEGORIES)
 
 
-def _get_cases_for_category(category: str) -> list[dict]:
+def _get_cases_for_category(category: str) -> list[BFCLCase]:
     """Load and cache BFCL cases only for categories needed by this run."""
     if category not in _cases_cache:
         _cases_cache[category] = _load(category)
@@ -106,7 +107,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if not cases:
         metafunc.parametrize("case", [], ids=[])
         return
-    metafunc.parametrize("case", cases, ids=[c["id"] for c in cases])
+    metafunc.parametrize("case", cases, ids=[c.id for c in cases])
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +132,7 @@ def bfcl_run_dir() -> Path:
 
 def _run_bfcl_case(
     *,
-    case: dict,
+    case: BFCLCase,
     model: str,
     parser: str,
     backend: str,
@@ -140,10 +141,10 @@ def _run_bfcl_case(
 ) -> None:
     """Execute a single BFCL test case, log the result, assert on failure."""
     evaluator = get_evaluator()
-    category = case["category"]
-    test_id = case["id"]
-    messages = case["question"]
-    tools = bfcl_to_openai_tools(case["function"])
+    category = case.category
+    test_id = case.id
+    messages = case.question
+    tools = bfcl_to_openai_tools(case.function)
 
     request_payload = {
         "model": model,
@@ -173,7 +174,7 @@ def _run_bfcl_case(
             backend=backend,
             request_payload=request_payload,
             response_payload=None,
-            ground_truth=case.get("ground_truth", []),
+            ground_truth=case.ground_truth,
             actual_tool_calls=[],
             passed=False,
             errors=[f"API error: {exc}"],
@@ -199,7 +200,7 @@ def _run_bfcl_case(
     latency = (time.monotonic() - start) * 1000
     passed, errors = evaluator.evaluate_tool_calls(
         actual,
-        case.get("ground_truth", []),
+        case.ground_truth,
         category=category,
     )
 
@@ -212,7 +213,7 @@ def _run_bfcl_case(
         backend=backend,
         request_payload=request_payload,
         response_payload=response_payload,
-        ground_truth=case.get("ground_truth", []),
+        ground_truth=case.ground_truth,
         actual_tool_calls=actual,
         passed=passed,
         errors=errors,

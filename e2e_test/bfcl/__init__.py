@@ -8,12 +8,14 @@ from .converter import bfcl_to_openai_tools
 from .evaluator import BFCLEvaluator, extract_tool_calls, log_file_for_summary
 from .loader import (
     BFCL_CATEGORIES,
+    BFCLCase,
     MissingBFCLAnswerFileError,
     load_bfcl_category,
 )
 
 __all__ = [
     "BFCL_CATEGORIES",
+    "BFCLCase",
     "BFCLEvaluator",
     "MissingBFCLAnswerFileError",
     "bfcl_to_openai_tools",
