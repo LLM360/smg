@@ -6,7 +6,7 @@
 //! - Consistent hashing for request routing
 //! - Partition detection and recovery
 
-mod consistent_hash;
+pub mod consistent_hash;
 mod controller;
 mod crdt_kv;
 mod flow_control;
