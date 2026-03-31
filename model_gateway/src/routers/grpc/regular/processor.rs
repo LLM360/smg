@@ -11,9 +11,10 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-    common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
+    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
     generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
 };
+use serde_json::Value;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
@@ -146,6 +147,13 @@ impl ResponseProcessor {
                         history_tool_calls_count,
                     )
                     .await;
+
+                // Coerce argument types to match declared schema
+                if let (Some(ref mut tcs), Some(ref tools_list)) =
+                    (&mut tool_calls, &original_request.tools)
+                {
+                    Self::coerce_tool_call_arg_types(tcs, tools_list);
+                }
             }
         }
 
@@ -336,6 +344,67 @@ impl ResponseProcessor {
                 (None, processed_text.to_string())
             }
         }
+    }
+
+    /// Coerce tool call argument types to match the declared schema.
+    /// Handles common model type errors: integer/null → string when schema says string.
+    fn coerce_tool_call_arg_types(
+        tool_calls: &mut Vec<ToolCall>,
+        tools: &[Tool],
+    ) {
+        for tc in tool_calls.iter_mut() {
+            let name = &tc.function.name;
+            let Some(tool) = tools.iter().find(|t| t.function.name == *name) else { continue };
+            let Some(ref mut args_str) = tc.function.arguments else { continue };
+            let Ok(args) = serde_json::from_str::<Value>(args_str) else { continue };
+            let coerced = Self::coerce_value_to_schema(&args, &tool.function.parameters);
+            if let Ok(s) = serde_json::to_string(&coerced) {
+                *args_str = s;
+            }
+        }
+    }
+
+    fn coerce_value_to_schema(value: &Value, schema: &Value) -> Value {
+        let Value::Object(obj) = value else { return value.clone() };
+        let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+            return value.clone();
+        };
+        let mut result = serde_json::Map::new();
+        for (key, val) in obj {
+            let coerced = if let Some(prop) = props.get(key) {
+                let type_str = prop.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match type_str {
+                    "string" => match val {
+                        Value::String(_) => val.clone(),
+                        Value::Null => Value::String("null".to_string()),
+                        Value::Number(n) => Value::String(n.to_string()),
+                        Value::Bool(b) => Value::String(b.to_string()),
+                        _ => val.clone(),
+                    },
+                    "integer" => match val {
+                        Value::Number(n) if n.is_i64() => val.clone(),
+                        Value::String(s) => s.parse::<i64>()
+                            .map(|n| Value::Number(n.into()))
+                            .unwrap_or_else(|_| val.clone()),
+                        _ => val.clone(),
+                    },
+                    "number" => match val {
+                        Value::Number(_) => val.clone(),
+                        Value::String(s) => s.parse::<f64>()
+                            .ok()
+                            .and_then(serde_json::Number::from_f64)
+                            .map(Value::Number)
+                            .unwrap_or_else(|| val.clone()),
+                        _ => val.clone(),
+                    },
+                    _ => val.clone(),
+                }
+            } else {
+                val.clone()
+            };
+            result.insert(key.clone(), coerced);
+        }
+        Value::Object(result)
     }
 
     /// Process non-streaming generate response (collects all responses and builds final response array)

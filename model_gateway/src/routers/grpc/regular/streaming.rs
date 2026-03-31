@@ -13,14 +13,15 @@ use llm_tokenizer::{
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
     common::{
-        FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
+        FunctionCallDelta, ResponseFormat, StringOrArray, Tool, ToolCallDelta, ToolChoice,
+        ToolChoiceValue, Usage,
     },
     generate::GenerateRequest,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
-use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
+use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolCall, ToolParser};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -204,7 +205,8 @@ impl StreamingProcessor {
 
         type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
         let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
-        let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
+        // Tracks how many tool calls have been emitted per completion index
+        let mut emitted_tool_counts: HashMap<u32, usize> = HashMap::new();
 
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
@@ -357,7 +359,7 @@ impl StreamingProcessor {
                                 Self::process_specific_function_stream(
                                     &delta,
                                     index,
-                                    &mut has_tool_calls,
+                                    &mut emitted_tool_counts,
                                     tool_choice.as_ref(),
                                     request_id,
                                     model,
@@ -371,7 +373,7 @@ impl StreamingProcessor {
                                     &delta,
                                     index,
                                     &mut tool_parsers,
-                                    &mut has_tool_calls,
+                                    &mut emitted_tool_counts,
                                     tools_ref,
                                     request_id,
                                     model,
@@ -492,10 +494,129 @@ impl StreamingProcessor {
             }
         }
 
+        // Phase 3.5: Fallback parse_complete to catch any tool calls the incremental parser
+        // missed (e.g. model omitted </tool_call>, or the 3rd of 3 parallel calls was in the
+        // stop-decoder flush rather than a streaming chunk).
+        // Uses emitted_tool_counts to skip already-streamed calls and emit only new ones.
+        if tools.is_some() && tool_parser_available {
+            let mut fallback_emissions: Vec<(u32, Vec<ToolCall>, usize)> = Vec::new();
+
+            for (index, buffer_text) in &stream_buffers {
+                if let Some(pooled_parser) = tool_parsers.get(index) {
+                    let parser = pooled_parser.lock().await;
+                    if parser.has_tool_markers(buffer_text) {
+                        let already_done =
+                            *emitted_tool_counts.get(index).unwrap_or(&0);
+                        match parser.parse_complete(buffer_text).await {
+                            Ok((_, all_calls)) if all_calls.len() > already_done => {
+                                fallback_emissions.push((*index, all_calls, already_done));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            for (index, all_calls, skip) in fallback_emissions {
+                for (tool_idx, tool_call) in all_calls.iter().enumerate().skip(skip) {
+                    *emitted_tool_counts.entry(index).or_insert(0) += 1;
+
+                    let tool_call_id = utils::generate_tool_call_id(
+                        model,
+                        &tool_call.function.name,
+                        tool_idx,
+                        history_tool_calls_count,
+                    );
+
+                    let tool_call_delta = ToolCallDelta {
+                        index: tool_idx as u32,
+                        id: Some(tool_call_id),
+                        tool_type: Some("function".to_string()),
+                        function: Some(FunctionCallDelta {
+                            name: Some(tool_call.function.name.clone()),
+                            arguments: if tool_call.function.arguments.is_empty() {
+                                None
+                            } else {
+                                Some(tool_call.function.arguments.clone())
+                            },
+                        }),
+                    };
+
+                    let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_tool_call_delta(index, tool_call_delta)
+                        .maybe_system_fingerprint(system_fingerprint)
+                        .build();
+
+                    let sse_chunk = serde_json::to_string(&tool_chunk)
+                        .map_err(|e| format!("Failed to serialize fallback tool chunk: {e}"))?;
+                    tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                        .map_err(|_| "Failed to send fallback tool call".to_string())?;
+                }
+            }
+        }
+
+        // Phase 3.7: JSON repair for json_object streaming responses.
+        // Guided decoding can truncate long JSON outputs (premature EOS inside a string value).
+        // Detect and repair truncated JSON by closing unclosed structures.
+        if matches!(
+            original_request.response_format,
+            Some(ResponseFormat::JsonObject { .. })
+        ) {
+            for (index, buffer_text) in &stream_buffers {
+                if *emitted_tool_counts.get(index).unwrap_or(&0) == 0
+                    && serde_json::from_str::<Value>(buffer_text).is_err()
+                {
+                    if let Some(repair) = Self::repair_truncated_json(buffer_text) {
+                        if !repair.is_empty() {
+                            let repair_chunk =
+                                ChatCompletionStreamResponse::builder(request_id, model)
+                                    .created(created)
+                                    .add_choice_content(*index, "assistant", repair)
+                                    .maybe_system_fingerprint(system_fingerprint)
+                                    .build();
+                            let sse_chunk = serde_json::to_string(&repair_chunk).map_err(
+                                |e| format!("Failed to serialize JSON repair chunk: {e}"),
+                            )?;
+                            tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                                .map_err(|_| "Failed to send JSON repair chunk".to_string())?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 3.8: JSON repair for specific-function tool call arguments.
+        // When tool_choice specifies a single function, the model generates JSON args directly.
+        // Guided decoding can truncate the JSON if generation hits EOS mid-string.
+        if is_specific_function {
+            for (index, buffer_text) in &stream_buffers {
+                if *emitted_tool_counts.get(index).unwrap_or(&0) > 0
+                    && serde_json::from_str::<Value>(buffer_text).is_err()
+                {
+                    if let Some(repair) = Self::repair_truncated_json(buffer_text) {
+                        if !repair.is_empty() {
+                            let repair_chunk =
+                                ChatCompletionStreamResponse::builder(request_id, model)
+                                    .created(created)
+                                    .add_choice_tool_args(*index, repair)
+                                    .maybe_system_fingerprint(system_fingerprint)
+                                    .build();
+                            let sse_chunk = serde_json::to_string(&repair_chunk).map_err(
+                                |e| format!("Failed to serialize tool arg repair chunk: {e}"),
+                            )?;
+                            tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                                .map_err(|_| "Failed to send tool arg repair chunk".to_string())?;
+                        }
+                    }
+                }
+            }
+        }
+
         // Phase 4: Finish reason chunks
         for (index, finish_reason) in &finish_reasons {
             let final_finish_reason =
-                if has_tool_calls.get(index).copied().unwrap_or(false) && finish_reason == "stop" {
+                if *emitted_tool_counts.get(index).unwrap_or(&0) > 0 && finish_reason == "stop" {
                     "tool_calls".to_string()
                 } else {
                     finish_reason.clone()
@@ -1133,7 +1254,7 @@ impl StreamingProcessor {
     fn process_specific_function_stream(
         delta: &str,
         index: u32,
-        has_tool_calls: &mut HashMap<u32, bool>,
+        emitted_tool_counts: &mut HashMap<u32, usize>,
         tool_choice: Option<&ToolChoice>,
         request_id: &str,
         model: &str,
@@ -1144,11 +1265,11 @@ impl StreamingProcessor {
         let mut chunks = Vec::new();
 
         if let Some(ToolChoice::Function { function, .. }) = tool_choice {
-            let is_first_call = !has_tool_calls.contains_key(&index);
+            let is_first_call = *emitted_tool_counts.get(&index).unwrap_or(&0) == 0;
 
             if is_first_call {
                 // First chunk: send name and id
-                has_tool_calls.insert(index, true);
+                *emitted_tool_counts.entry(index).or_insert(0) += 1;
 
                 let tool_call_id = utils::generate_tool_call_id(
                     model,
@@ -1188,7 +1309,7 @@ impl StreamingProcessor {
         delta: &str,
         index: u32,
         tool_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>>,
-        has_tool_calls: &mut HashMap<u32, bool>,
+        emitted_tool_counts: &mut HashMap<u32, usize>,
         tools: &[Tool],
         request_id: &str,
         model: &str,
@@ -1237,7 +1358,7 @@ impl StreamingProcessor {
 
                     // Emit tool call chunks
                     for tool_call_item in calls {
-                        has_tool_calls.insert(index, true);
+                        *emitted_tool_counts.entry(index).or_insert(0) += 1;
 
                         let tool_call_id = if let Some(ref name) = tool_call_item.name {
                             Some(utils::generate_tool_call_id(
@@ -1286,6 +1407,51 @@ impl StreamingProcessor {
         }
 
         chunks
+    }
+
+    /// Compute the minimal suffix to repair a truncated JSON string.
+    /// Returns None if content is already valid JSON.
+    /// Returns Some("") if the content cannot be repaired (e.g., not JSON at all).
+    /// Returns Some(suffix) with closing characters needed to make the JSON valid.
+    fn repair_truncated_json(content: &str) -> Option<String> {
+        if serde_json::from_str::<Value>(content).is_ok() {
+            return None; // Already valid
+        }
+        // Walk through and track nested structure state
+        let mut stack: Vec<char> = Vec::new(); // stack of '{' or '['
+        let mut in_string = false;
+        let mut escape_next = false;
+        for c in content.chars() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' => in_string = !in_string,
+                '{' if !in_string => stack.push('{'),
+                '[' if !in_string => stack.push('['),
+                '}' if !in_string => { stack.pop(); }
+                ']' if !in_string => { stack.pop(); }
+                _ => {}
+            }
+        }
+        if stack.is_empty() {
+            return Some(String::new()); // Already balanced or nothing opened - can't simply repair
+        }
+        let mut repair = String::new();
+        if in_string {
+            repair.push('"'); // Close the open string value
+        }
+        // Close all open containers in reverse order
+        for opener in stack.iter().rev() {
+            match opener {
+                '{' => repair.push('}'),
+                '[' => repair.push(']'),
+                _ => {}
+            }
+        }
+        Some(repair)
     }
 
     /// Format a response as SSE chunk into a reusable buffer

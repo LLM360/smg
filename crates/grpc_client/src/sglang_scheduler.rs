@@ -499,17 +499,18 @@ impl SglangSchedulerClient {
 
         // Handle response_format constraints
         match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                // json_object mode - constrain to valid JSON object
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
+            Some(ResponseFormat::JsonObject { .. }) => {
+                // json_object mode - use generic object schema for guided decoding
+                let schema_str = r#"{"type":"object"}"#.to_string();
                 constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
             }
             Some(ResponseFormat::JsonSchema { json_schema }) => {
                 let schema_str = serde_json::to_string(&json_schema.schema)
                     .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
                 constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+            }
+            Some(ResponseFormat::Regex { pattern }) => {
+                constraints.push(proto::sampling_params::Constraint::Regex(pattern.clone()));
             }
             Some(ResponseFormat::Text) | None => {
                 // No constraint for text format

@@ -537,13 +537,11 @@ impl TrtllmServiceClient {
 
         // Handle response_format
         match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
+            Some(ResponseFormat::JsonObject { .. }) => {
+                // json_object mode - use generic object schema for guided decoding
                 return Ok(Some(proto::GuidedDecodingParams {
                     guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                    guide: schema_str,
+                    guide: r#"{"type":"object"}"#.to_string(),
                 }));
             }
             Some(ResponseFormat::JsonSchema { json_schema }) => {
@@ -554,7 +552,7 @@ impl TrtllmServiceClient {
                     guide: schema_str,
                 }));
             }
-            Some(ResponseFormat::Text) | None => {}
+            Some(ResponseFormat::Regex { .. }) | Some(ResponseFormat::Text) | None => {}
         }
 
         // Handle ebnf/regex from request

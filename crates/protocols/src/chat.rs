@@ -380,7 +380,7 @@ fn validate_chat_cross_parameters(
     // 4. Validate structured output conflicts
     let has_json_format = matches!(
         req.response_format,
-        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        Some(ResponseFormat::JsonObject { .. } | ResponseFormat::JsonSchema { .. } | ResponseFormat::Regex { .. })
     );
 
     if has_json_format && req.regex.is_some() {
