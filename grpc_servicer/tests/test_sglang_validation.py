@@ -49,3 +49,10 @@ class TestSGLangValidation:
         input_text, input_ids = validate_tokenized_input(req, "embed")
         assert input_text == "hello"
         assert input_ids == [1, 2]
+
+    def test_validate_tokenized_input_returns_text_and_ids_generate(self):
+        """Return original text and ids for valid generate tokenized payload."""
+        req = _GrpcReqStub(tokenized=_Tokenized("world", [3, 4, 5]))
+        input_text, input_ids = validate_tokenized_input(req, "generate")
+        assert input_text == "world"
+        assert input_ids == [3, 4, 5]
