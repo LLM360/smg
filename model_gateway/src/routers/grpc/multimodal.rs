@@ -156,6 +156,34 @@ pub(crate) struct MultimodalIntermediate {
     pub keep_on_cpu_keys: Vec<String>,
 }
 
+/// Resolve the placeholder token string for a multimodal model.
+///
+/// Loads the model config and looks up the model spec to get the placeholder
+/// token (e.g. `"<|image|>"` for Phi-3-vision). Returns `None` if the model
+/// is not recognized as multimodal.
+pub(crate) async fn resolve_placeholder_token(
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    components: &MultimodalComponents,
+    tokenizer_source: &str,
+) -> Result<Option<String>> {
+    let model_config = components
+        .get_or_load_config(model_id, tokenizer_source)
+        .await?;
+    let metadata = ModelMetadata {
+        model_id,
+        tokenizer,
+        config: &model_config.config,
+    };
+    let spec = match components.model_registry.lookup(&metadata) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    Ok(Some(spec.placeholder_token(&metadata).map_err(|e| {
+        anyhow::anyhow!("Failed to get placeholder token: {e}")
+    })?))
+}
+
 /// Check if any messages in the request contain multimodal content (images).
 pub(crate) fn has_multimodal_content(messages: &[ChatMessage]) -> bool {
     messages.iter().any(|msg| {
@@ -381,6 +409,7 @@ async fn process_multimodal_parts(
 
     debug!(
         image_count = images.len(),
+        image_sizes = ?images.iter().map(|f| (f.image.width(), f.image.height())).collect::<Vec<_>>(),
         "Fetched images for multimodal processing"
     );
 
@@ -656,7 +685,18 @@ fn serialize_pixel_values(preprocessed: &PreprocessedImages) -> (Vec<u8>, Vec<u3
         .as_slice()
         .or_else(|| preprocessed.pixel_values.as_slice_memory_order())
     {
-        pixel_slice.iter().flat_map(|v| v.to_le_bytes()).collect()
+        // Zero-copy reinterpret: &[f32] → &[u8] on little-endian (x86).
+        // This replaces the per-element flat_map(to_le_bytes) which was the
+        // #1 CPU hotspot (13% of SMG CPU in profiling).
+        #[cfg(target_endian = "little")]
+        {
+            let byte_slice: &[u8] = bytemuck::cast_slice(pixel_slice);
+            byte_slice.to_vec()
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            pixel_slice.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
     } else {
         // Fallback for non-contiguous arrays
         preprocessed
