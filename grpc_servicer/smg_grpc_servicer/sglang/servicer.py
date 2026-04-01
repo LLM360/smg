@@ -221,6 +221,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 grpc_context=context,
             )
 
+            # Track tokens sent as streaming chunks so we can flush any
+            # held-back tail tokens before sending the Complete message.
+            # Stop-string prefix matching can delay the last few tokens
+            # (e.g. </arg_value></tool_call>) which would otherwise never
+            # reach the consumer as decoded text.
+            sent_token_count = 0
+
             async for output in response_generator:
                 # Handle batch responses (for n>1 non-streaming)
                 if isinstance(output, list):
@@ -241,9 +248,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                             output["error"],
                         )
                     elif request.stream:
-                        yield self._create_chunk_response(request.request_id, output)
                         if output.get("finished", False):
+                            # Flush any tokens held back by stop-string prefix
+                            # matching as a final chunk before Complete.
+                            all_ids = output.get("token_ids", [])
+                            if len(all_ids) > sent_token_count:
+                                tail_output = dict(output)
+                                tail_output["token_ids"] = all_ids[sent_token_count:]
+                                yield self._create_chunk_response(
+                                    request.request_id, tail_output
+                                )
                             yield self._create_completion_response(request.request_id, output)
+                        else:
+                            sent_token_count += len(output.get("token_ids", []))
+                            yield self._create_chunk_response(request.request_id, output)
                     else:
                         # Non-streaming n=1: single completion response
                         yield self._create_completion_response(request.request_id, output)
