@@ -134,18 +134,32 @@ fn detect_arguments_format_from_text(template: &str) -> ToolCallArgumentsFormat 
 
     // Pattern 2: Direct dict iteration without pipe filter (Llama 4 style)
     //   {% for param in tool_call.arguments %}  →  iterates over dict keys
-    // We look for "in" followed by something ending in "arguments" then "%}"
-    // This catches: `for X in tool_call.arguments`, `for X in tc.arguments`, etc.
-    if template.contains("in") {
+    // We check that " in " (or " in\t") appears immediately before the
+    // dot-access chain ending in "arguments" (e.g. " in tool_call.arguments").
+    // We scan backwards from each "arguments" occurrence: first skip the
+    // identifier.dot prefix (e.g. "tool_call."), then check for " in ".
+    {
         let mut pos2 = 0;
         while let Some(idx) = template[pos2..].find("arguments") {
             let arg_start = pos2 + idx;
-            // Look backwards from "arguments" for "in " preceded by a variable name and "for "
-            // We just need to verify this "arguments" is preceded by " in " somewhere on the same line
-            let line_start = template[..arg_start].rfind('\n').map_or(0, |p| p + 1);
-            let line_before = &template[line_start..arg_start];
-            if line_before.contains(" in ") && line_before.contains("for ") {
-                return ToolCallArgumentsFormat::Dict;
+            // Walk backwards over the dot-access prefix: identifiers and dots
+            // e.g. "tool_call." in "tool_call.arguments"
+            let prefix = &template.as_bytes()[..arg_start];
+            let mut back = arg_start;
+            while back > 0
+                && (prefix[back - 1].is_ascii_alphanumeric()
+                    || prefix[back - 1] == b'_'
+                    || prefix[back - 1] == b'.')
+            {
+                back -= 1;
+            }
+            // Now check if the chars before the dot-access are " in "
+            // back points to the first char of the dot-access prefix
+            if back >= 4 {
+                let before = &template[back.saturating_sub(4)..back];
+                if before == " in " || before.ends_with(" in ") {
+                    return ToolCallArgumentsFormat::Dict;
+                }
             }
             pos2 = arg_start + "arguments".len();
         }
@@ -978,16 +992,6 @@ mod tests {
     }
 
     #[test]
-    fn test_args_format_deepseek_real_snippet() {
-        // Real DeepSeek V3 template snippet
-        let template = r"'```json' + '\n' + tool['function']['arguments'] + '\n' + '```'";
-        assert_eq!(
-            detect_tool_call_arguments_format(template),
-            ToolCallArgumentsFormat::String,
-        );
-    }
-
-    #[test]
     fn test_args_format_empty_template() {
         assert_eq!(
             detect_tool_call_arguments_format(""),
@@ -1023,6 +1027,18 @@ mod tests {
         assert_eq!(
             detect_tool_call_arguments_format(template),
             ToolCallArgumentsFormat::Dict,
+        );
+    }
+
+    #[test]
+    fn test_args_format_deepseek_single_line_no_false_positive() {
+        // DeepSeek V3.1 template is a single long line. It has:
+        //   {%- for tool in message['tool_calls'] %} ... tool['function']['arguments'] + ...
+        // Pattern 2 must NOT match: the "for ... in ..." loop is over tool_calls, not arguments.
+        let template = "{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if message['content'] is none %}{{'<tool_calls_begin>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```'}}{%- endif %}{%- endfor %}";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::String,
         );
     }
 }
