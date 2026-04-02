@@ -29,6 +29,23 @@ pub enum ChatTemplateContentFormat {
     OpenAI,
 }
 
+/// Tool call arguments format expected by the chat template.
+///
+/// Per Transformers/HuggingFace guidance, new templates should expect arguments
+/// as dicts and render them with `|tojson`. However, some templates (DeepSeek V3.1)
+/// still use plain string concatenation and expect arguments to be JSON strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolCallArgumentsFormat {
+    /// Arguments should be passed as parsed JSON objects (dicts).
+    /// Templates use `|tojson` or `|items` to render them.
+    /// This is the Transformers convention and the default.
+    #[default]
+    Dict,
+    /// Arguments should be left as JSON strings.
+    /// Templates use plain string concatenation (e.g., DeepSeek V3.1).
+    String,
+}
+
 impl std::fmt::Display for ChatTemplateContentFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -36,6 +53,87 @@ impl std::fmt::Display for ChatTemplateContentFormat {
             Self::OpenAI => write!(f, "openai"),
         }
     }
+}
+
+/// Detect the tool call arguments format expected by a Jinja2 chat template.
+///
+/// Inspects the template text for how `arguments` is used:
+/// - If a dict-consuming filter (`|tojson`, `|items`, `|dictsort`, `|tojson(...)`) is applied,
+///   the template expects arguments as dicts → return `Dict`.
+/// - If `arguments` appears in the template without such filters (plain string concatenation),
+///   the template expects arguments as JSON strings → return `String`.
+/// - If `arguments` does not appear at all (no tool support), default to `Dict`
+///   (the Transformers convention).
+pub fn detect_tool_call_arguments_format(template: &str) -> ToolCallArgumentsFormat {
+    detect_template_formats(template).1
+}
+
+/// Detect both content format and tool call arguments format in a single pass.
+///
+/// The content format detection parses the AST, while the arguments format
+/// detection is a lightweight string scan. Combining them avoids redundant work
+/// when both are needed (e.g., during tokenizer initialization).
+pub fn detect_template_formats(
+    template: &str,
+) -> (ChatTemplateContentFormat, ToolCallArgumentsFormat) {
+    let content_format = detect_chat_template_content_format(template);
+    let arguments_format = detect_arguments_format_from_text(template);
+    (content_format, arguments_format)
+}
+
+/// Lightweight string-scan detection of tool call arguments format.
+fn detect_arguments_format_from_text(template: &str) -> ToolCallArgumentsFormat {
+    // No mention of arguments at all → default to dict (Transformers convention)
+    if !template.contains("arguments") {
+        return ToolCallArgumentsFormat::Dict;
+    }
+
+    // Check for dict-consuming filters applied to arguments.
+    // These patterns indicate the template expects arguments as a dict/object.
+    //
+    // In Jinja templates, the expression accessing arguments may look like:
+    //   tool['function']['arguments']|tojson
+    //   tool['function']['arguments'] | tojson
+    //   tool_call.arguments|items
+    // So after "arguments" there may be closing brackets/quotes before the pipe.
+    // We scan forward from each "arguments" occurrence, skip closing syntax chars
+    // and whitespace, then look for "|" followed by a dict filter.
+    const DICT_FILTERS: &[&str] = &[
+        "tojson", "items", "dictsort", "to_json", "pprint", "xmlattr",
+    ];
+
+    let bytes = template.as_bytes();
+    let mut pos = 0;
+    while let Some(idx) = template[pos..].find("arguments") {
+        let start = pos + idx + "arguments".len();
+        let mut i = start;
+        // Skip closing syntax chars: ']  '  "  )  }  and whitespace
+        while i < bytes.len()
+            && matches!(
+                bytes[i],
+                b']' | b'\'' | b'"' | b')' | b'}' | b' ' | b'\t' | b'\n' | b'\r'
+            )
+        {
+            i += 1;
+        }
+        // Check for pipe "|"
+        if i < bytes.len() && bytes[i] == b'|' {
+            i += 1;
+            // Skip whitespace after "|"
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            // Check if the next chars match a dict filter
+            let remaining = &template[i..];
+            if DICT_FILTERS.iter().any(|f| remaining.starts_with(f)) {
+                return ToolCallArgumentsFormat::Dict;
+            }
+        }
+        pos = start;
+    }
+
+    // Template mentions `arguments` but doesn't use dict filters → string concat style
+    ToolCallArgumentsFormat::String
 }
 
 /// Detect the content format expected by a Jinja2 chat template
@@ -630,6 +728,7 @@ pub struct ChatTemplateState {
     /// Cached, fully-configured environment. `None` when no template is set.
     env: Option<Environment<'static>>,
     content_format: ChatTemplateContentFormat,
+    arguments_format: ToolCallArgumentsFormat,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -637,20 +736,22 @@ impl std::fmt::Debug for ChatTemplateState {
         f.debug_struct("ChatTemplateState")
             .field("has_template", &self.env.is_some())
             .field("content_format", &self.content_format)
+            .field("arguments_format", &self.arguments_format)
             .finish()
     }
 }
 
 impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
-        let content_format = template
+        let (content_format, arguments_format) = template
             .as_ref()
-            .map(|t| detect_chat_template_content_format(t))
+            .map(|t| detect_template_formats(t))
             .unwrap_or_default();
         let env = template.map(build_environment).transpose()?;
         Ok(Self {
             env,
             content_format,
+            arguments_format,
         })
     }
 
@@ -662,6 +763,7 @@ impl ChatTemplateState {
         Self {
             env: None,
             content_format: ChatTemplateContentFormat::default(),
+            arguments_format: ToolCallArgumentsFormat::default(),
         }
     }
 
@@ -682,15 +784,20 @@ impl ChatTemplateState {
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {
-        let content_format = detect_chat_template_content_format(&template);
+        let (content_format, arguments_format) = detect_template_formats(&template);
         let env = build_environment(template)?;
         self.content_format = content_format;
+        self.arguments_format = arguments_format;
         self.env = Some(env);
         Ok(())
     }
 
     pub fn content_format(&self) -> ChatTemplateContentFormat {
         self.content_format
+    }
+
+    pub fn arguments_format(&self) -> ToolCallArgumentsFormat {
+        self.arguments_format
     }
 }
 
@@ -787,5 +894,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, "<s>hello");
+    }
+
+    // ========================================================================
+    // Tool call arguments format detection tests
+    // ========================================================================
+
+    #[test]
+    fn test_args_format_no_arguments_keyword() {
+        // Template with no mention of "arguments" → default to Dict
+        let template = "{% for message in messages %}{{ message.content }}{% endfor %}";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::Dict,
+        );
+    }
+
+    #[test]
+    fn test_args_format_tojson_filter() {
+        // Llama-style: arguments|tojson
+        let template = r"{{ tool['function']['arguments']|tojson }}";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::Dict,
+        );
+    }
+
+    #[test]
+    fn test_args_format_tojson_with_spaces() {
+        // arguments | tojson (with spaces around pipe)
+        let template = r"{{ tool['function']['arguments'] | tojson }}";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::Dict,
+        );
+    }
+
+    #[test]
+    fn test_args_format_items_filter() {
+        // Qwen3.5-style: arguments|items
+        let template = r"{%- for args_name, args_value in tool_call.arguments|items %}";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::Dict,
+        );
+    }
+
+    #[test]
+    fn test_args_format_plain_string_concat() {
+        // DeepSeek V3.1-style: plain string concatenation, no filter
+        let template = r"tool['function']['arguments'] + '\n'";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::String,
+        );
+    }
+
+    #[test]
+    fn test_args_format_deepseek_real_snippet() {
+        // Real DeepSeek V3 template snippet
+        let template = r"'```json' + '\n' + tool['function']['arguments'] + '\n' + '```'";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::String,
+        );
+    }
+
+    #[test]
+    fn test_args_format_empty_template() {
+        assert_eq!(
+            detect_tool_call_arguments_format(""),
+            ToolCallArgumentsFormat::Dict,
+        );
     }
 }
