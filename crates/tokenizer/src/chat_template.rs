@@ -82,32 +82,25 @@ pub fn detect_template_formats(
 }
 
 /// Lightweight string-scan detection of tool call arguments format.
+///
+/// Dict is the Transformers convention and the overwhelming majority of models.
+/// Only DeepSeek V3/R1 family templates use plain string concatenation.
+/// So we detect the string pattern and default to dict.
 fn detect_arguments_format_from_text(template: &str) -> ToolCallArgumentsFormat {
-    // No mention of arguments at all → default to dict (Transformers convention)
+    // No mention of arguments at all → default to dict
     if !template.contains("arguments") {
         return ToolCallArgumentsFormat::Dict;
     }
 
-    // Check for dict-consuming filters applied to arguments.
-    // These patterns indicate the template expects arguments as a dict/object.
-    //
-    // In Jinja templates, the expression accessing arguments may look like:
-    //   tool['function']['arguments']|tojson
-    //   tool['function']['arguments'] | tojson
-    //   tool_call.arguments|items
-    // So after "arguments" there may be closing brackets/quotes before the pipe.
-    // We scan forward from each "arguments" occurrence, skip closing syntax chars
-    // and whitespace, then look for "|" followed by a dict filter.
-    const DICT_FILTERS: &[&str] = &[
-        "tojson", "items", "dictsort", "to_json", "pprint", "xmlattr",
-    ];
-
+    // Detect the string-concat pattern: `arguments` followed (after closing
+    // brackets/quotes/whitespace) by `+` (Jinja string concatenation).
+    // All known DeepSeek templates use: tool['function']['arguments'] + '...'
     let bytes = template.as_bytes();
     let mut pos = 0;
     while let Some(idx) = template[pos..].find("arguments") {
         let start = pos + idx + "arguments".len();
         let mut i = start;
-        // Skip closing syntax chars: ']  '  "  )  }  and whitespace
+        // Skip closing syntax chars: ] ' " ) } and whitespace
         while i < bytes.len()
             && matches!(
                 bytes[i],
@@ -116,65 +109,14 @@ fn detect_arguments_format_from_text(template: &str) -> ToolCallArgumentsFormat 
         {
             i += 1;
         }
-        // Check for pipe "|"
-        if i < bytes.len() && bytes[i] == b'|' {
-            i += 1;
-            // Skip whitespace after "|"
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            // Check if the next chars match a dict filter
-            let remaining = &template[i..];
-            if DICT_FILTERS.iter().any(|f| remaining.starts_with(f)) {
-                return ToolCallArgumentsFormat::Dict;
-            }
+        if i < bytes.len() && bytes[i] == b'+' {
+            return ToolCallArgumentsFormat::String;
         }
         pos = start;
     }
 
-    // Pattern 2: Direct dict iteration without pipe filter (Llama 4 style)
-    //   {% for param in tool_call.arguments %}  →  iterates over dict keys
-    // We check that " in " (or " in\t") appears immediately before the
-    // dot-access chain ending in "arguments" (e.g. " in tool_call.arguments").
-    // We scan backwards from each "arguments" occurrence: first skip the
-    // identifier.dot prefix (e.g. "tool_call."), then check for " in ".
-    {
-        let mut pos2 = 0;
-        while let Some(idx) = template[pos2..].find("arguments") {
-            let arg_start = pos2 + idx;
-            // Walk backwards over the dot-access prefix: identifiers and dots
-            // e.g. "tool_call." in "tool_call.arguments"
-            let prefix = &template.as_bytes()[..arg_start];
-            let mut back = arg_start;
-            while back > 0
-                && (prefix[back - 1].is_ascii_alphanumeric()
-                    || prefix[back - 1] == b'_'
-                    || prefix[back - 1] == b'.')
-            {
-                back -= 1;
-            }
-            // Now check if the chars before the dot-access are " in "
-            // back points to the first char of the dot-access prefix
-            if back >= 4 {
-                let before = &template[back.saturating_sub(4)..back];
-                if before == " in " || before.ends_with(" in ") {
-                    return ToolCallArgumentsFormat::Dict;
-                }
-            }
-            pos2 = arg_start + "arguments".len();
-        }
-    }
-
-    // Pattern 3: Alias-then-dict-method pattern (GLM, MiniMax style)
-    //   {% set _args = tc.arguments %} ... _args.items()
-    // If the template mentions both "arguments" and ".items()" it's treating
-    // arguments as a dict through an intermediate variable.
-    if template.contains(".items()") {
-        return ToolCallArgumentsFormat::Dict;
-    }
-
-    // Template mentions `arguments` but doesn't use dict filters or iteration → string concat
-    ToolCallArgumentsFormat::String
+    // Default: dict (Transformers convention, used by Llama, Qwen, GLM, MiniMax, etc.)
+    ToolCallArgumentsFormat::Dict
 }
 
 /// Detect the content format expected by a Jinja2 chat template
@@ -952,39 +894,19 @@ mod tests {
     }
 
     #[test]
-    fn test_args_format_tojson_filter() {
-        // Llama-style: arguments|tojson
-        let template = r"{{ tool['function']['arguments']|tojson }}";
-        assert_eq!(
-            detect_tool_call_arguments_format(template),
-            ToolCallArgumentsFormat::Dict,
-        );
-    }
-
-    #[test]
-    fn test_args_format_tojson_with_spaces() {
-        // arguments | tojson (with spaces around pipe)
-        let template = r"{{ tool['function']['arguments'] | tojson }}";
-        assert_eq!(
-            detect_tool_call_arguments_format(template),
-            ToolCallArgumentsFormat::Dict,
-        );
-    }
-
-    #[test]
-    fn test_args_format_items_filter() {
-        // Qwen3.5-style: arguments|items
-        let template = r"{%- for args_name, args_value in tool_call.arguments|items %}";
-        assert_eq!(
-            detect_tool_call_arguments_format(template),
-            ToolCallArgumentsFormat::Dict,
-        );
-    }
-
-    #[test]
-    fn test_args_format_plain_string_concat() {
-        // DeepSeek V3.1-style: plain string concatenation, no filter
+    fn test_args_format_string_concat_deepseek() {
+        // DeepSeek V3.1-style: plain string concatenation
         let template = r"tool['function']['arguments'] + '\n'";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::String,
+        );
+    }
+
+    #[test]
+    fn test_args_format_string_concat_real_deepseek() {
+        // Real DeepSeek single-line template snippet with for-loop and arguments + concat
+        let template = "{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if message['content'] is none %}{{'<tool_calls_begin>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```'}}{%- endif %}{%- endfor %}";
         assert_eq!(
             detect_tool_call_arguments_format(template),
             ToolCallArgumentsFormat::String,
@@ -1000,45 +922,23 @@ mod tests {
     }
 
     #[test]
-    fn test_args_format_direct_dict_iteration_llama4() {
-        // Llama 4 style: iterates directly over dict keys, no |items filter
+    fn test_args_format_dict_tojson() {
+        // Llama/Qwen style: arguments|tojson → defaults to dict (no + concat)
+        let template = r"{{ tool['function']['arguments']|tojson }}";
+        assert_eq!(
+            detect_tool_call_arguments_format(template),
+            ToolCallArgumentsFormat::Dict,
+        );
+    }
+
+    #[test]
+    fn test_args_format_dict_iteration() {
+        // Llama 4 / GLM / MiniMax: dict iteration → defaults to dict (no + concat)
         let template =
             r"{%- for param in tool_call.arguments %}{{ tool_call.arguments[param] }}{%- endfor %}";
         assert_eq!(
             detect_tool_call_arguments_format(template),
             ToolCallArgumentsFormat::Dict,
-        );
-    }
-
-    #[test]
-    fn test_args_format_alias_then_items_glm() {
-        // GLM-4.6/minimax-m2 style: alias to local var, then .items()
-        let template = r"{% set _args = tc.arguments %}{% for k, v in _args.items() %}{{ k }}={{ v }}{% endfor %}";
-        assert_eq!(
-            detect_tool_call_arguments_format(template),
-            ToolCallArgumentsFormat::Dict,
-        );
-    }
-
-    #[test]
-    fn test_args_format_is_string_check_qwen3() {
-        // Qwen3 style: checks if arguments is string, falls back to |tojson
-        let template = r"{%- if tool_call.arguments is string %}{{ tool_call.arguments }}{%- else %}{{ tool_call.arguments | tojson }}{%- endif %}";
-        assert_eq!(
-            detect_tool_call_arguments_format(template),
-            ToolCallArgumentsFormat::Dict,
-        );
-    }
-
-    #[test]
-    fn test_args_format_deepseek_single_line_no_false_positive() {
-        // DeepSeek V3.1 template is a single long line. It has:
-        //   {%- for tool in message['tool_calls'] %} ... tool['function']['arguments'] + ...
-        // Pattern 2 must NOT match: the "for ... in ..." loop is over tool_calls, not arguments.
-        let template = "{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if message['content'] is none %}{{'<tool_calls_begin>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```'}}{%- endif %}{%- endfor %}";
-        assert_eq!(
-            detect_tool_call_arguments_format(template),
-            ToolCallArgumentsFormat::String,
         );
     }
 }
