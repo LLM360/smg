@@ -1,6 +1,7 @@
 """Tests for MlxEngineServicer: __init__, generation loop, Generate, Abort."""
 
 import asyncio
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -100,7 +101,7 @@ def _make_servicer(fake_bg):
     servicer.start_time = time.time()
     servicer._request_uid_map = {}
     servicer._uid_queues = {}
-    servicer._shutdown_event = asyncio.Event()
+    servicer._shutdown_event = threading.Event()
     servicer._loop = None
     servicer._gen_thread = None
     fake_bg._servicer = servicer

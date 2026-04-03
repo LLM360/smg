@@ -35,7 +35,7 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._active_requests = 0
         self._request_uid_map = {}
         self._uid_queues = {}
-        self._shutdown_event = asyncio.Event()
+        self._shutdown_event = threading.Event()
         self._loop = None
         self._gen_thread = None
         logger.info("MlxEngineServicer initialized for model %s", model_path)
@@ -263,8 +263,7 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 continue
 
             if not prompt_responses and not gen_responses:
-                import time as _time
-                _time.sleep(0.001)
+                time.sleep(0.001)
                 continue
 
             for r in gen_responses:
