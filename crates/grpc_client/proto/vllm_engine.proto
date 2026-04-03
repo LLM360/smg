@@ -176,6 +176,28 @@ message KvTransferParams {
 }
 
 // =====================
+// Score/Rerank Request
+// =====================
+
+message ScoreRequest {
+  string request_id = 1;
+  string text_1 = 2;               // The query
+  repeated string text_2 = 3;      // The documents to rank against the query
+  optional uint32 truncate_prompt_tokens = 4;
+}
+
+message ScoreResponse {
+  repeated ScoreData data = 1;      // The scored results
+  uint32 prompt_tokens = 2;
+  uint32 total_tokens = 3;
+}
+
+message ScoreData {
+  uint32 index = 1;                 // Index of the document in text_2
+  float score = 2;                  // The calculated relevancy score
+}
+
+// =====================
 // Logprobs Types
 // =====================
 
