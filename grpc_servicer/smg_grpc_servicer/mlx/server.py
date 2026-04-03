@@ -4,3 +4,168 @@ MLX gRPC Server
 Standalone gRPC server entrypoint for MLX inference.
 CLI: python -m smg_grpc_servicer.mlx.server --model <path> --port 50051
 """
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import signal
+import time
+from concurrent import futures
+
+import grpc
+from grpc_health.v1 import health_pb2_grpc
+from grpc_reflection.v1alpha import reflection
+from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+
+from smg_grpc_servicer.mlx.health_servicer import MlxHealthServicer
+from smg_grpc_servicer.mlx.servicer import MlxEngineServicer
+
+logger = logging.getLogger(__name__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="MLX gRPC inference server")
+    parser.add_argument("--model", required=True, help="Model path or HuggingFace repo ID")
+    parser.add_argument("--port", type=int, default=50051, help="gRPC listen port")
+    parser.add_argument("--host", default="0.0.0.0", help="gRPC listen address")
+    parser.add_argument("--prefill-batch-size", type=int, default=8, help="Max concurrent prefill requests")
+    parser.add_argument("--completion-batch-size", type=int, default=32, help="Max concurrent generation requests")
+    parser.add_argument("--adapter-path", default=None, help="LoRA adapter path")
+    return parser.parse_args()
+
+
+def load_model(args):
+    """Load model and tokenizer via mlx-lm."""
+    from mlx_lm import load
+
+    logger.info("Loading model: %s", args.model)
+    model, tokenizer = load(args.model, adapter_path=args.adapter_path)
+    logger.info("Model loaded successfully")
+
+    from huggingface_hub import snapshot_download
+    model_dir = args.model
+    if not os.path.isdir(model_dir):
+        model_dir = snapshot_download(args.model, allow_patterns=["config.json", "tokenizer*", "special_tokens*", "merges.txt", "vocab.json", "added_tokens.json"])
+
+    config_path = os.path.join(model_dir, "config.json")
+    with open(config_path) as f:
+        model_config = json.load(f)
+
+    eos = model_config.get("eos_token_id")
+    if isinstance(eos, int):
+        eos_token_ids = [eos]
+    elif isinstance(eos, list):
+        eos_token_ids = eos
+    else:
+        eos_token_ids = list(tokenizer.eos_token_ids) if hasattr(tokenizer, "eos_token_ids") else []
+
+    return model, tokenizer, model_dir, model_config, eos_token_ids
+
+
+async def serve_grpc(args):
+    """Start the MLX gRPC server."""
+    start_time = time.time()
+
+    model, tokenizer, model_dir, model_config, eos_token_ids = load_model(args)
+
+    from mlx_lm.generate import BatchGenerator
+
+    batch_generator = BatchGenerator(
+        model,
+        completion_batch_size=args.completion_batch_size,
+        prefill_batch_size=args.prefill_batch_size,
+    )
+    logger.info(
+        "BatchGenerator created (prefill=%d, completion=%d)",
+        args.prefill_batch_size,
+        args.completion_batch_size,
+    )
+
+    server = grpc.aio.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=[
+            ("grpc.max_send_message_length", 1024 * 1024 * 256),
+            ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+            ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+            ("grpc.keepalive_permit_without_calls", True),
+        ],
+    )
+
+    health_servicer = MlxHealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+
+    servicer = MlxEngineServicer(
+        batch_generator=batch_generator,
+        model_path=args.model,
+        model_dir=model_dir,
+        model_config=model_config,
+        eos_token_ids=eos_token_ids,
+        start_time=start_time,
+    )
+    vllm_engine_pb2_grpc.add_VllmEngineServicer_to_server(servicer, server)
+
+    SERVICE_NAMES = (
+        vllm_engine_pb2.DESCRIPTOR.services_by_name["VllmEngine"].full_name,
+        "grpc.health.v1.Health",
+        reflection.SERVICE_NAME,
+    )
+    reflection.enable_server_reflection(SERVICE_NAMES, server)
+
+    listen_addr = f"{args.host}:{args.port}"
+    server.add_insecure_port(listen_addr)
+    await server.start()
+    logger.info("gRPC server listening on %s", listen_addr)
+
+    servicer.start_generation_loop()
+
+    logger.info("Running warmup generation...")
+    try:
+        warmup_ids = [1]
+        uids = batch_generator.insert(prompts=[warmup_ids], max_tokens=[1])
+        for _ in range(10):
+            _, gen_responses = batch_generator.next()
+            done = any(r.finish_reason is not None for r in gen_responses if r.uid == uids[0])
+            if done:
+                break
+        batch_generator.remove(uids)
+        logger.info("Warmup complete")
+    except Exception:
+        logger.warning("Warmup failed (non-fatal)", exc_info=True)
+
+    health_servicer.set_serving()
+    logger.info("Server ready — model: %s", args.model)
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def signal_handler():
+        logger.info("Received shutdown signal")
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, signal_handler)
+
+    try:
+        await stop_event.wait()
+    finally:
+        logger.info("Shutting down...")
+        health_servicer.set_not_serving()
+        servicer.stop_generation_loop()
+        batch_generator.close()
+        await server.stop(5.0)
+        logger.info("Server stopped")
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    args = parse_args()
+    asyncio.run(serve_grpc(args))
+
+
+if __name__ == "__main__":
+    main()
