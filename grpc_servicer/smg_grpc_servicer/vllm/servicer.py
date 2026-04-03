@@ -15,6 +15,7 @@ from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
 from vllm.engine.protocol import EngineClient
+
 try:
     from vllm.inputs import token_inputs
 except ImportError:
@@ -26,9 +27,10 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     PlaceholderRange,
 )
+
 try:
-    from vllm.multimodal.inputs import mm_inputs
     from vllm.multimodal.inputs import MultiModalInputs as VllmMultiModalInputs
+    from vllm.multimodal.inputs import mm_inputs
 except ImportError:
     mm_inputs = None
     VllmMultiModalInputs = None
@@ -322,11 +324,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 data = final_output.outputs.data
                 logger.info("Score data type=%s repr=%s", type(data).__name__, repr(data)[:200])
                 raw = data
-                if hasattr(raw, 'detach'):
+                if hasattr(raw, "detach"):
                     raw = raw.detach().cpu()
-                if hasattr(raw, 'numpy'):
+                if hasattr(raw, "numpy"):
                     raw = raw.numpy()
-                if hasattr(raw, 'tolist'):
+                if hasattr(raw, "tolist"):
                     raw = raw.tolist()
                 while isinstance(raw, (list, tuple)) and len(raw) > 0:
                     raw = raw[0]

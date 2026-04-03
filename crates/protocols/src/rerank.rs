@@ -305,7 +305,7 @@ impl StringOrVec {
     /// Return true if empty.
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::Single(s) => s.is_empty(),
+            Self::Single(_) => false,
             Self::Array(v) => v.is_empty(),
         }
     }
