@@ -297,15 +297,19 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     await context.abort(grpc.StatusCode.INTERNAL, msg)
 
                 # The output data for score is a relevance score wrapped in a tensor.
-                # Depending on vLLM version it may be [0.85] or [[0.85]] — flatten to scalar.
+                # vLLM versions return different structures — normalize to scalar.
                 data = final_output.outputs.data
-                if hasattr(data, "item"):
-                    score_value = data.flatten()[0].item()
-                else:
-                    flat = data.tolist() if hasattr(data, "tolist") else data
-                    while isinstance(flat, list):
-                        flat = flat[0]
-                    score_value = flat
+                logger.info("Score data type=%s repr=%s", type(data).__name__, repr(data)[:200])
+                raw = data
+                if hasattr(raw, 'detach'):
+                    raw = raw.detach().cpu()
+                if hasattr(raw, 'numpy'):
+                    raw = raw.numpy()
+                if hasattr(raw, 'tolist'):
+                    raw = raw.tolist()
+                while isinstance(raw, (list, tuple)) and len(raw) > 0:
+                    raw = raw[0]
+                score_value = float(raw)
 
                 results.append(
                     vllm_engine_pb2.ScoreResult(
