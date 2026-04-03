@@ -5,7 +5,11 @@ Implements the VllmEngine proto service backed by mlx-lm's BatchGenerator
 for Apple Silicon inference.
 """
 
+import hashlib
+import io
 import logging
+import os
+import zipfile
 
 from mlx_lm.generate import SequenceStateMachine
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
@@ -123,3 +127,40 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if output_logprobs is not None:
             complete.output_logprobs.CopyFrom(output_logprobs)
         return vllm_engine_pb2.GenerateResponse(complete=complete)
+
+    _TOKENIZER_FILES = {
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+        "merges.txt",
+        "vocab.json",
+        "added_tokens.json",
+    }
+
+    @staticmethod
+    def _build_tokenizer_zip(model_dir):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for filename in sorted(os.listdir(model_dir)):
+                if filename in MlxEngineServicer._TOKENIZER_FILES:
+                    filepath = os.path.join(model_dir, filename)
+                    if os.path.isfile(filepath):
+                        zf.write(filepath, filename)
+        zip_bytes = buf.getvalue()
+        sha256 = hashlib.sha256(zip_bytes).hexdigest()
+        return zip_bytes, sha256
+
+    @staticmethod
+    def _chunk_tokenizer_zip(zip_bytes, sha256, chunk_size=512 * 1024):
+        from smg_grpc_proto.generated import common_pb2
+        total = len(zip_bytes)
+        offset = 0
+        while offset < total:
+            end = min(offset + chunk_size, total)
+            is_last = end == total
+            yield common_pb2.GetTokenizerChunk(
+                data=zip_bytes[offset:end],
+                sha256=sha256 if is_last else "",
+            )
+            offset = end
