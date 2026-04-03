@@ -127,12 +127,9 @@ impl GrpcRouter {
         let completion_pipeline =
             RequestPipeline::new_completion(worker_registry.clone(), _policy_registry.clone());
 
-        // Create Score pipeline (HTTP forward for vLLM /v1/score)
-        let score_pipeline = RequestPipeline::new_score(
-            worker_registry.clone(),
-            _policy_registry.clone(),
-            ctx.client.clone(), // Reuse the shared reqwest::Client from AppContext
-        );
+        // Create Score pipeline (native gRPC for vLLM /v1/score)
+        let score_pipeline =
+            RequestPipeline::new_score(worker_registry.clone(), _policy_registry.clone());
 
         // Extract shared dependencies for responses contexts
         let mcp_orchestrator = ctx

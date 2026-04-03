@@ -317,21 +317,17 @@ impl RequestPipeline {
 
     /// Create a Score API pipeline for vLLM `/v1/score` endpoint.
     ///
-    /// The `/v1/score` endpoint is HTTP REST only — vLLM does not expose a gRPC
-    /// equivalent even when running in gRPC connection mode. This pipeline uses
-    /// only two stages:
+    /// The `/v1/score` endpoint was added to the vLLM gRPC specs. This pipeline uses
+    /// three stages:
     ///
     /// 1. `WorkerSelectionStage` — picks the target worker from the registry
-    /// 2. `ScoreHttpForwardStage` — converts the worker URL from gRPC to HTTP
-    ///    scheme and forwards the request body verbatim, then returns
-    ///    `Ok(Some(response))` to short-circuit the pipeline.
-    ///
-    /// No gRPC client acquisition, proto building, or response processing stages
-    /// are needed because the HTTP forwarding combines all of that.
+    /// 2. `ClientAcquisitionStage` - obtains the gRPC client wrapper
+    /// 3. `ScoreNativeStage` — executes the Native Score RPC via the client,
+    ///    builds the Protocol response, and returns `Ok(Some(response))` to
+    ///    short-circuit the pipeline.
     pub fn new_score(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        http_client: reqwest::Client,
     ) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(WorkerSelectionStage::new(
@@ -339,7 +335,8 @@ impl RequestPipeline {
                 policy_registry,
                 WorkerSelectionMode::Regular, // Score is always single-worker
             )),
-            Box::new(ScoreHttpForwardStage::new(http_client)),
+            Box::new(ClientAcquisitionStage),
+            Box::new(super::regular::stages::score::ScoreNativeStage::new()),
         ];
 
         Self {
