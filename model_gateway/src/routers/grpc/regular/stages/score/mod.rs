@@ -3,20 +3,18 @@
 //! This stage handles native gRPC scoring by using the populated GrpcClient
 //! to directly dispatch to the backend vLLM worker's `Score` RPC.
 
-use std::sync::Arc;
-
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use openai_protocol::common::StringOrArray;
 use tracing::{debug, error};
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::PipelineStage,
-        context::{ClientState, RequestContext},
+        context::{ClientSelection, RequestContext},
+        utils::tonic_ext::TonicStatusExt,
     },
 };
 
@@ -43,8 +41,8 @@ impl PipelineStage for ScoreNativeStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         let score_req = ctx.score_request_arc();
 
-        let mut client = match ctx.state.client.take() {
-            Some(ClientState::Single(c)) => c,
+        let mut client = match ctx.state.clients.take() {
+            Some(ClientSelection::Single { client: c }) => c,
             _ => {
                 error!(stage = self.name(), "Missing client for ScoreNativeStage");
                 return Err(error::internal_error(
@@ -57,11 +55,8 @@ impl PipelineStage for ScoreNativeStage {
         // Convert request into vLLM ScoreRequest proto
         let request_id = "score_id".to_string(); // or capture from elsewhere
 
-        // text_2 is StringOrArray, normalize it to Vec<String>
-        let text_2 = match &score_req.text_2 {
-            StringOrArray::String(s) => vec![s.clone()],
-            StringOrArray::Array(arr) => arr.clone(),
-        };
+        // `score_req.text_2` is a `StringOrVec`. `into_vec()` will give us the vector of contents.
+        let text_2 = score_req.text_2.clone().into_vec();
 
         let proto_req =
             match client.build_score_request(request_id, score_req.text_1.clone(), text_2) {
@@ -85,17 +80,20 @@ impl PipelineStage for ScoreNativeStage {
             Ok(r) => r,
             Err(e) => {
                 error!(stage = self.name(), error = %e, "native gRPC Score failed");
-                return Err(crate::routers::grpc::utils::handle_grpc_error(e));
+                return Err(e.to_http_error(
+                    "native_grpc_score_failed",
+                    format!("Native grpc score failed: {}", e.message()),
+                ));
             }
         };
 
         // Put the client back into context so it drops with the right lifetime optionally
-        ctx.state.client = Some(ClientState::Single(client));
+        ctx.state.clients = Some(ClientSelection::Single { client });
 
         // Assemble protocol response
         let mut results = Vec::with_capacity(grpc_response.data.len());
         for res in grpc_response.data {
-            results.push(openai_protocol::rerank::ScoreResult {
+            results.push(openai_protocol::rerank::ScoreData {
                 index: res.index as usize,
                 score: res.score,
                 object: "score".to_string(),
@@ -103,17 +101,16 @@ impl PipelineStage for ScoreNativeStage {
         }
 
         let resp = openai_protocol::rerank::ScoreResponse {
-            id: format!("score-{}", uuid::Uuid::new_v4()),
             object: "list".to_string(),
-            created: chrono::Utc::now().timestamp(),
             model: score_req.model.clone(),
             data: results,
-            usage: openai_protocol::rerank::ScoreUsage {
+            usage: Some(openai_protocol::common::UsageInfo {
                 prompt_tokens: grpc_response.prompt_tokens,
-                total_tokens: grpc_response.total_tokens,
                 completion_tokens: 0,
+                total_tokens: grpc_response.total_tokens,
+                reasoning_tokens: None,
                 prompt_tokens_details: None,
-            },
+            }),
         };
 
         let axum_response = (StatusCode::OK, axum::Json(resp)).into_response();

@@ -42,7 +42,7 @@ use super::{
                 MessageResponseProcessingStage,
             },
             ChatGeneratePreparationStage, ChatGenerateRequestBuildingStage,
-            ChatGenerateResponseProcessingStage, ScoreHttpForwardStage,
+            ChatGenerateResponseProcessingStage,
         },
         streaming,
     },
