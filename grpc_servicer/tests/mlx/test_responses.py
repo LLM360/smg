@@ -5,7 +5,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytest.importorskip("mlx_lm")
 
-from smg_grpc_proto import vllm_engine_pb2
+from smg_grpc_proto import mlx_engine_pb2
 
 from smg_grpc_servicer.mlx.servicer import MlxEngineServicer
 
@@ -52,7 +52,7 @@ class TestChunkResponse:
         assert chunk.index == 0
 
     def test_chunk_with_logprobs(self):
-        logprobs_proto = vllm_engine_pb2.OutputLogProbs(
+        logprobs_proto = mlx_engine_pb2.OutputLogProbs(
             token_ids=[42], token_logprobs=[-0.5]
         )
         resp = MlxEngineServicer._chunk_response(
@@ -88,4 +88,4 @@ class TestCompleteResponse:
             prompt_tokens=10, completion_tokens=2, cached_tokens=0, index=0,
             matched_token_id=128001,
         )
-        assert resp.complete.matched_token_id == 128001
+        assert resp.complete.matched_stop_token_id == 128001

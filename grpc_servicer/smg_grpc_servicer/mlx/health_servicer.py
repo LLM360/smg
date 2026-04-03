@@ -17,7 +17,7 @@ class MlxHealthServicer(health_pb2_grpc.HealthServicer):
     """Standard gRPC health check for MLX inference server."""
 
     OVERALL_SERVER = ""
-    VLLM_SERVICE = "vllm.grpc.engine.VllmEngine"
+    MLX_SERVICE = "mlx.grpc.engine.MlxEngine"
 
     def __init__(self):
         self._serving = False
@@ -38,7 +38,7 @@ class MlxHealthServicer(health_pb2_grpc.HealthServicer):
     ) -> health_pb2.HealthCheckResponse:
         service_name = request.service
 
-        if service_name in (self.OVERALL_SERVER, self.VLLM_SERVICE):
+        if service_name in (self.OVERALL_SERVER, self.MLX_SERVICE):
             status = (
                 health_pb2.HealthCheckResponse.SERVING
                 if self._serving
@@ -59,7 +59,7 @@ class MlxHealthServicer(health_pb2_grpc.HealthServicer):
     ) -> AsyncIterator[health_pb2.HealthCheckResponse]:
         service_name = request.service
 
-        if service_name in (self.OVERALL_SERVER, self.VLLM_SERVICE):
+        if service_name in (self.OVERALL_SERVER, self.MLX_SERVICE):
             status = (
                 health_pb2.HealthCheckResponse.SERVING
                 if self._serving

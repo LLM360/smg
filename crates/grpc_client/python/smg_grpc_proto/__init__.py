@@ -8,6 +8,8 @@ __version__ = version("smg-grpc-proto")
 # These imports will work after the package is built (stubs generated at build time)
 try:
     from smg_grpc_proto.generated import (
+        mlx_engine_pb2,
+        mlx_engine_pb2_grpc,
         sglang_encoder_pb2,
         sglang_encoder_pb2_grpc,
         sglang_scheduler_pb2,
@@ -19,6 +21,8 @@ try:
     )
 
     __all__ = [
+        "mlx_engine_pb2",
+        "mlx_engine_pb2_grpc",
         "sglang_scheduler_pb2",
         "sglang_scheduler_pb2_grpc",
         "sglang_encoder_pb2",

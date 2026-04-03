@@ -9,7 +9,7 @@ from typing import Optional
 import grpc
 import pytest
 import pytest_asyncio
-from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+from smg_grpc_proto import mlx_engine_pb2, mlx_engine_pb2_grpc
 
 from smg_grpc_servicer.mlx.health_servicer import MlxHealthServicer
 from smg_grpc_servicer.mlx.servicer import MlxEngineServicer
@@ -90,7 +90,7 @@ async def grpc_server():
     health = MlxHealthServicer()
 
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
-    vllm_engine_pb2_grpc.add_VllmEngineServicer_to_server(servicer, server)
+    mlx_engine_pb2_grpc.add_MlxEngineServicer_to_server(servicer, server)
     port = server.add_insecure_port("[::]:0")
     await server.start()
 
@@ -109,12 +109,12 @@ async def test_streaming_round_trip(grpc_server):
     port, servicer, health = grpc_server
 
     async with grpc.aio.insecure_channel(f"localhost:{port}") as channel:
-        stub = vllm_engine_pb2_grpc.VllmEngineStub(channel)
+        stub = mlx_engine_pb2_grpc.MlxEngineStub(channel)
 
-        request = vllm_engine_pb2.GenerateRequest(
+        request = mlx_engine_pb2.GenerateRequest(
             request_id="int-test-1",
-            tokenized=vllm_engine_pb2.TokenizedInput(input_ids=[1, 2, 3]),
-            sampling_params=vllm_engine_pb2.SamplingParams(),
+            tokenized=mlx_engine_pb2.TokenizedInput(input_ids=[1, 2, 3]),
+            sampling_params=mlx_engine_pb2.SamplingParams(),
             stream=True,
         )
 
@@ -136,12 +136,12 @@ async def test_non_streaming_round_trip(grpc_server):
     port, servicer, health = grpc_server
 
     async with grpc.aio.insecure_channel(f"localhost:{port}") as channel:
-        stub = vllm_engine_pb2_grpc.VllmEngineStub(channel)
+        stub = mlx_engine_pb2_grpc.MlxEngineStub(channel)
 
-        request = vllm_engine_pb2.GenerateRequest(
+        request = mlx_engine_pb2.GenerateRequest(
             request_id="int-test-2",
-            tokenized=vllm_engine_pb2.TokenizedInput(input_ids=[1, 2, 3]),
-            sampling_params=vllm_engine_pb2.SamplingParams(),
+            tokenized=mlx_engine_pb2.TokenizedInput(input_ids=[1, 2, 3]),
+            sampling_params=mlx_engine_pb2.SamplingParams(),
             stream=False,
         )
 

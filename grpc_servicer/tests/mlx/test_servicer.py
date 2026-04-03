@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from smg_grpc_proto import vllm_engine_pb2
+from smg_grpc_proto import mlx_engine_pb2
 
 from smg_grpc_servicer.mlx.servicer import MlxEngineServicer
 
@@ -125,10 +125,10 @@ class TestGenerateStreaming:
 
         servicer.start_generation_loop()
 
-        request = vllm_engine_pb2.GenerateRequest(
+        request = mlx_engine_pb2.GenerateRequest(
             request_id="req-1",
-            tokenized=vllm_engine_pb2.TokenizedInput(input_ids=[1, 5, 7]),
-            sampling_params=vllm_engine_pb2.SamplingParams(),
+            tokenized=mlx_engine_pb2.TokenizedInput(input_ids=[1, 5, 7]),
+            sampling_params=mlx_engine_pb2.SamplingParams(),
             stream=True,
         )
         context = MagicMock()
@@ -165,10 +165,10 @@ class TestGenerateNonStreaming:
         servicer._loop = loop
         servicer.start_generation_loop()
 
-        request = vllm_engine_pb2.GenerateRequest(
+        request = mlx_engine_pb2.GenerateRequest(
             request_id="req-2",
-            tokenized=vllm_engine_pb2.TokenizedInput(input_ids=[1, 5]),
-            sampling_params=vllm_engine_pb2.SamplingParams(),
+            tokenized=mlx_engine_pb2.TokenizedInput(input_ids=[1, 5]),
+            sampling_params=mlx_engine_pb2.SamplingParams(),
             stream=False,
         )
         context = MagicMock()
@@ -193,35 +193,12 @@ class TestAbort:
         servicer._request_uid_map["req-1"] = 0
         servicer._uid_queues[0] = asyncio.Queue()
 
-        request = vllm_engine_pb2.AbortRequest(request_ids=["req-1"])
+        request = mlx_engine_pb2.AbortRequest(request_ids=["req-1"])
         context = MagicMock()
         resp = await servicer.Abort(request, context)
 
-        assert isinstance(resp, vllm_engine_pb2.AbortResponse)
+        assert isinstance(resp, mlx_engine_pb2.AbortResponse)
         assert "req-1" not in servicer._request_uid_map
         assert 0 in fake_bg._removed_uids
 
 
-class TestStubRPCs:
-    @pytest.mark.asyncio
-    async def test_embed_returns_unimplemented(self):
-        fake_bg = FakeBatchGenerator()
-        servicer = _make_servicer(fake_bg)
-        request = vllm_engine_pb2.EmbedRequest(request_id="e-1")
-        context = MagicMock()
-        context.abort = MagicMock(side_effect=Exception("UNIMPLEMENTED"))
-        with pytest.raises(Exception, match="UNIMPLEMENTED"):
-            await servicer.Embed(request, context)
-
-    @pytest.mark.asyncio
-    async def test_subscribe_kv_events_returns_unimplemented(self):
-        from smg_grpc_proto.generated import common_pb2
-
-        fake_bg = FakeBatchGenerator()
-        servicer = _make_servicer(fake_bg)
-        request = common_pb2.SubscribeKvEventsRequest()
-        context = MagicMock()
-        context.abort = MagicMock(side_effect=Exception("UNIMPLEMENTED"))
-        with pytest.raises(Exception, match="UNIMPLEMENTED"):
-            async for _ in servicer.SubscribeKvEvents(request, context):
-                pass

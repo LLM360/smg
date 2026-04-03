@@ -1,7 +1,7 @@
 """
 MLX Engine gRPC Servicer
 
-Implements the VllmEngine proto service backed by mlx-lm's BatchGenerator
+Implements the MlxEngine proto service backed by mlx-lm's BatchGenerator
 for Apple Silicon inference.
 """
 
@@ -17,13 +17,13 @@ import zipfile
 
 from mlx_lm.generate import SequenceStateMachine
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
-from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+from smg_grpc_proto import mlx_engine_pb2, mlx_engine_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
 
-class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
-    """gRPC servicer implementing the VllmEngine service for MLX backends."""
+class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
+    """gRPC servicer implementing the MlxEngine service for MLX backends."""
 
     def __init__(self, batch_generator, model_path, model_dir, model_config, eos_token_ids, start_time):
         self.batch_generator = batch_generator
@@ -102,12 +102,12 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         top_indices = top_indices[sort_order]
         top_values = top_values[sort_order]
 
-        top_logprobs = vllm_engine_pb2.TopLogProbs(
+        top_logprobs = mlx_engine_pb2.TopLogProbs(
             token_ids=[int(i) for i in top_indices.tolist()],
             values=[float(v) for v in top_values.tolist()],
         )
 
-        return vllm_engine_pb2.OutputLogProbs(
+        return mlx_engine_pb2.OutputLogProbs(
             token_ids=[token_id],
             token_logprobs=[token_logprob],
             top_logprobs=[top_logprobs],
@@ -116,7 +116,7 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     @staticmethod
     def _chunk_response(token_ids, prompt_tokens, completion_tokens, cached_tokens, index, output_logprobs=None):
         """Build a GenerateStreamChunk response."""
-        chunk = vllm_engine_pb2.GenerateStreamChunk(
+        chunk = mlx_engine_pb2.GenerateStreamChunk(
             token_ids=token_ids,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -125,16 +125,16 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
         if output_logprobs is not None:
             chunk.output_logprobs.CopyFrom(output_logprobs)
-        return vllm_engine_pb2.GenerateResponse(chunk=chunk)
+        return mlx_engine_pb2.GenerateResponse(chunk=chunk)
 
     @staticmethod
     def _complete_response(output_ids, finish_reason, prompt_tokens, completion_tokens, cached_tokens, index, output_logprobs=None, matched_token_id=None):
         """Build a GenerateComplete response."""
         kwargs = {}
         if matched_token_id is not None:
-            kwargs["matched_token_id"] = matched_token_id
+            kwargs["matched_stop_token_id"] = matched_token_id
 
-        complete = vllm_engine_pb2.GenerateComplete(
+        complete = mlx_engine_pb2.GenerateComplete(
             output_ids=output_ids,
             finish_reason=finish_reason,
             prompt_tokens=prompt_tokens,
@@ -145,7 +145,7 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
         if output_logprobs is not None:
             complete.output_logprobs.CopyFrom(output_logprobs)
-        return vllm_engine_pb2.GenerateResponse(complete=complete)
+        return mlx_engine_pb2.GenerateResponse(complete=complete)
 
     _TOKENIZER_FILES = {
         "tokenizer.json",
@@ -186,9 +186,9 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
     async def GetModelInfo(
         self,
-        request: vllm_engine_pb2.GetModelInfoRequest,
+        request: mlx_engine_pb2.GetModelInfoRequest,
         context: grpc.aio.ServicerContext,
-    ) -> vllm_engine_pb2.GetModelInfoResponse:
+    ) -> mlx_engine_pb2.GetModelInfoResponse:
         config = self.model_config
 
         eos = config.get("eos_token_id")
@@ -199,14 +199,12 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         else:
             eos_token_ids = []
 
-        return vllm_engine_pb2.GetModelInfoResponse(
+        return mlx_engine_pb2.GetModelInfoResponse(
             model_path=self.model_path,
             is_generation=True,
             max_context_length=config.get("max_position_embeddings", 0),
             vocab_size=config.get("vocab_size", 0),
-            supports_vision=False,
             served_model_name=self.model_path,
-            tokenizer_path=self.model_path,
             model_type=config.get("model_type", ""),
             architectures=config.get("architectures", []),
             eos_token_ids=eos_token_ids,
@@ -217,15 +215,13 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
     async def GetServerInfo(
         self,
-        request: vllm_engine_pb2.GetServerInfoRequest,
+        request: mlx_engine_pb2.GetServerInfoRequest,
         context: grpc.aio.ServicerContext,
-    ) -> vllm_engine_pb2.GetServerInfoResponse:
-        return vllm_engine_pb2.GetServerInfoResponse(
+    ) -> mlx_engine_pb2.GetServerInfoResponse:
+        return mlx_engine_pb2.GetServerInfoResponse(
             server_type="mlx-grpc",
             active_requests=self._active_requests,
             uptime_seconds=time.time() - self.start_time,
-            kv_connector="",
-            kv_role="",
         )
 
     def start_generation_loop(self):
@@ -285,14 +281,6 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
             token_ids = list(request.tokenized.input_ids)
             sp = request.sampling_params
-
-            if sp.n > 1:
-                raise ValueError("n > 1 not supported by MLX backend")
-            constraint = sp.WhichOneof("constraint")
-            if constraint is not None:
-                raise ValueError(f"Structured output ({constraint}) not supported by MLX backend")
-            if sp.HasField("prompt_logprobs"):
-                raise ValueError("prompt_logprobs not supported by MLX backend")
 
             sampler = self._build_sampler(sp)
             logits_processors = self._build_logits_processors(sp)
@@ -392,13 +380,10 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     self.batch_generator.remove([uid])
                 except Exception:
                     logger.warning("Failed to remove uid %d for request %s", uid, request_id)
-        return vllm_engine_pb2.AbortResponse()
+        return mlx_engine_pb2.AbortResponse()
 
     async def HealthCheck(self, request, context):
-        return vllm_engine_pb2.HealthCheckResponse(healthy=True, message="OK")
-
-    async def Embed(self, request, context):
-        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Embed not supported by MLX backend")
+        return mlx_engine_pb2.HealthCheckResponse(healthy=True, message="OK")
 
     async def GetTokenizer(self, request, context):
         try:
@@ -412,8 +397,3 @@ class MlxEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     async def _async_chunk_tokenizer(self, zip_bytes, sha256):
         for chunk in self._chunk_tokenizer_zip(zip_bytes, sha256):
             yield chunk
-
-    async def SubscribeKvEvents(self, request, context):
-        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "SubscribeKvEvents not supported by MLX backend")
-        # yield is never reached but makes this an async generator for gRPC streaming
-        yield  # pragma: no cover

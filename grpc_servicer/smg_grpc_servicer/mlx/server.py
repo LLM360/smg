@@ -17,7 +17,7 @@ from concurrent import futures
 import grpc
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
-from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+from smg_grpc_proto import mlx_engine_pb2, mlx_engine_pb2_grpc
 
 from smg_grpc_servicer.mlx.health_servicer import MlxHealthServicer
 from smg_grpc_servicer.mlx.servicer import MlxEngineServicer
@@ -104,10 +104,10 @@ async def serve_grpc(args):
         eos_token_ids=eos_token_ids,
         start_time=start_time,
     )
-    vllm_engine_pb2_grpc.add_VllmEngineServicer_to_server(servicer, server)
+    mlx_engine_pb2_grpc.add_MlxEngineServicer_to_server(servicer, server)
 
     SERVICE_NAMES = (
-        vllm_engine_pb2.DESCRIPTOR.services_by_name["VllmEngine"].full_name,
+        mlx_engine_pb2.DESCRIPTOR.services_by_name["MlxEngine"].full_name,
         "grpc.health.v1.Health",
         reflection.SERVICE_NAME,
     )

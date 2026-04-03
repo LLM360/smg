@@ -45,9 +45,9 @@ class TestCheck:
         assert resp.status == health_pb2.HealthCheckResponse.NOT_SERVING
 
     @pytest.mark.asyncio
-    async def test_vllm_service_name(self, servicer, context):
+    async def test_mlx_service_name(self, servicer, context):
         servicer.set_serving()
-        request = health_pb2.HealthCheckRequest(service="vllm.grpc.engine.VllmEngine")
+        request = health_pb2.HealthCheckRequest(service="mlx.grpc.engine.MlxEngine")
         resp = await servicer.Check(request, context)
         assert resp.status == health_pb2.HealthCheckResponse.SERVING
 

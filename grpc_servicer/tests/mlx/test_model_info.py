@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from smg_grpc_proto import vllm_engine_pb2
+from smg_grpc_proto import mlx_engine_pb2
 
 from smg_grpc_servicer.mlx.servicer import MlxEngineServicer
 
@@ -37,7 +37,7 @@ def context():
 class TestGetModelInfo:
     @pytest.mark.asyncio
     async def test_basic_fields(self, mock_servicer, context):
-        request = vllm_engine_pb2.GetModelInfoRequest()
+        request = mlx_engine_pb2.GetModelInfoRequest()
         resp = await MlxEngineServicer.GetModelInfo(mock_servicer, request, context)
         assert resp.model_path == "mlx-community/SmolLM-135M-4bit"
         assert resp.vocab_size == 32000
@@ -53,7 +53,7 @@ class TestGetModelInfo:
     async def test_eos_as_list(self, mock_servicer, context):
         mock_servicer.model_config["eos_token_id"] = [2, 128001]
         mock_servicer._eos_token_ids = [2, 128001]
-        request = vllm_engine_pb2.GetModelInfoRequest()
+        request = mlx_engine_pb2.GetModelInfoRequest()
         resp = await MlxEngineServicer.GetModelInfo(mock_servicer, request, context)
         assert list(resp.eos_token_ids) == [2, 128001]
 
@@ -61,7 +61,7 @@ class TestGetModelInfo:
     async def test_missing_optional_fields(self, mock_servicer, context):
         del mock_servicer.model_config["pad_token_id"]
         del mock_servicer.model_config["bos_token_id"]
-        request = vllm_engine_pb2.GetModelInfoRequest()
+        request = mlx_engine_pb2.GetModelInfoRequest()
         resp = await MlxEngineServicer.GetModelInfo(mock_servicer, request, context)
         assert resp.pad_token_id == 0
         assert resp.bos_token_id == 0
@@ -70,22 +70,20 @@ class TestGetModelInfo:
 class TestGetServerInfo:
     @pytest.mark.asyncio
     async def test_returns_mlx_server_type(self, mock_servicer, context):
-        request = vllm_engine_pb2.GetServerInfoRequest()
+        request = mlx_engine_pb2.GetServerInfoRequest()
         resp = await MlxEngineServicer.GetServerInfo(mock_servicer, request, context)
         assert resp.server_type == "mlx-grpc"
-        assert resp.kv_connector == ""
-        assert resp.kv_role == ""
 
     @pytest.mark.asyncio
     async def test_active_requests(self, mock_servicer, context):
         mock_servicer._active_requests = 5
-        request = vllm_engine_pb2.GetServerInfoRequest()
+        request = mlx_engine_pb2.GetServerInfoRequest()
         resp = await MlxEngineServicer.GetServerInfo(mock_servicer, request, context)
         assert resp.active_requests == 5
 
     @pytest.mark.asyncio
     async def test_uptime(self, mock_servicer, context):
         mock_servicer.start_time = time.time() - 60.0
-        request = vllm_engine_pb2.GetServerInfoRequest()
+        request = mlx_engine_pb2.GetServerInfoRequest()
         resp = await MlxEngineServicer.GetServerInfo(mock_servicer, request, context)
         assert resp.uptime_seconds >= 59.0
