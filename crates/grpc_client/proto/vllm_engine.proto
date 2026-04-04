@@ -287,6 +287,8 @@ message ScoreResponse {
   repeated ScoreResult data = 1;
   uint32 prompt_tokens = 2;
   uint32 total_tokens = 3;
+  string request_id = 4;
+  int64 created = 5;
 }
 
 // =====================

@@ -327,8 +327,12 @@ pub struct ScoreData {
 /// Mirrors the structure returned by vLLM's `ScoringResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ScoreResponse {
+    /// Unique identifier for this score response
+    pub id: String,
     /// Always `"list"`
     pub object: String,
+    /// Unix timestamp (seconds) when the response was created
+    pub created: i64,
     /// The scored results, one per input in `text_2`
     pub data: Vec<ScoreData>,
     /// The model that produced the scores

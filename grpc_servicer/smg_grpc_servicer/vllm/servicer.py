@@ -336,6 +336,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 data=results,
                 prompt_tokens=total_prompt_tokens,
                 total_tokens=total_prompt_tokens,
+                request_id=request_id,
+                created=int(time.time()),
             )
 
         except grpc.aio.AbortError:

@@ -131,7 +131,9 @@ impl PipelineStage for ScoreNativeStage {
         }
 
         let resp = openai_protocol::rerank::ScoreResponse {
+            id: grpc_response.request_id,
             object: "list".to_string(),
+            created: grpc_response.created,
             model: score_req.model.clone(),
             data: results,
             usage: Some(openai_protocol::common::UsageInfo {
