@@ -148,7 +148,16 @@ impl ResponseProcessor {
                 _ => false,
             };
 
-            if used_json_schema {
+            if self.configured_tool_parser.is_some() && tool_parser_available {
+                // Explicitly configured parser takes priority (models may emit native tokens regardless of tool_choice)
+                (tool_calls, processed_text) = self
+                    .parse_tool_calls(
+                        &processed_text,
+                        &original_request.model,
+                        history_tool_calls_count,
+                    )
+                    .await;
+            } else if used_json_schema {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     original_request.tool_choice.as_ref(),
@@ -621,7 +630,17 @@ impl ResponseProcessor {
                 Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
             );
 
-            if used_json_schema {
+            if self.configured_tool_parser.is_some() && tool_parser_available {
+                (tool_calls, processed_text) = self
+                    .parse_tool_calls(
+                        &processed_text,
+                        &messages_request.model,
+                        utils::message_utils::get_history_tool_calls_count_messages(
+                            &messages_request,
+                        ),
+                    )
+                    .await;
+            } else if used_json_schema {
                 // Bridge Messages ToolChoice to Chat ToolChoice for reuse
                 let chat_tool_choice = messages_request
                     .tool_choice

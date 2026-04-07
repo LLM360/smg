@@ -377,8 +377,10 @@ impl StreamingProcessor {
                             && tool_choice_enabled
                             && (tool_parser_available || used_json_schema)
                         {
-                            let tool_chunks = if is_specific_function {
-                                // Handle specific function case - emit tool call deltas with arguments
+                            let tool_chunks = if is_specific_function
+                                && !(self.configured_tool_parser.is_some()
+                                    && tool_parser_available)
+                            {
                                 Self::process_specific_function_stream(
                                     &delta,
                                     index,
@@ -391,7 +393,6 @@ impl StreamingProcessor {
                                     history_tool_calls_count,
                                 )
                             } else {
-                                // Use incremental parser for regular/required modes
                                 self.process_tool_calls_stream(
                                     &delta,
                                     index,
@@ -1753,8 +1754,9 @@ impl StreamingProcessor {
 
                     // Tool call handling: incremental streaming parser
                     if !in_reasoning && streaming_tool_parser.is_some() {
-                        if is_specific_function {
-                            // Specific function: entire output is arguments for one tool
+                        if is_specific_function
+                            && !(self.configured_tool_parser.is_some() && tool_parser_available)
+                        {
                             if !has_tool_calls {
                                 has_tool_calls = true;
                                 // Close text block if open before starting tool block

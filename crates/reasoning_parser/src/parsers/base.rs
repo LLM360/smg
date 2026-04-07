@@ -63,7 +63,12 @@ impl ReasoningParser for BaseReasoningParser {
             .to_string();
 
         if !processed_text.contains(&self.config.think_end_token) {
-            // Assume reasoning was truncated before end token
+            // Don't consume tool call markers as reasoning content
+            if let Some(tool_pos) = processed_text.find("<|tool_calls_section_begin|>") {
+                let reasoning_text = processed_text[..tool_pos].trim().to_string();
+                let normal_text = processed_text[tool_pos..].to_string();
+                return Ok(ParserResult::new(normal_text, reasoning_text));
+            }
             return Ok(ParserResult::reasoning(processed_text));
         }
 
@@ -133,7 +138,14 @@ impl ReasoningParser for BaseReasoningParser {
 
         // Continue with reasoning content
         if self.in_reasoning && self.config.stream_reasoning {
-            // Stream the content immediately
+            // Some models skip </think> and go straight to tool calls
+            if let Some(tool_pos) = current_text.find("<|tool_calls_section_begin|>") {
+                let reasoning_text = current_text[..tool_pos].trim().to_string();
+                let normal_text = current_text[tool_pos..].to_string();
+                self.buffer.clear();
+                self.in_reasoning = false;
+                return Ok(ParserResult::new(normal_text, reasoning_text));
+            }
             let reasoning_text = current_text;
             self.buffer.clear();
             Ok(ParserResult::reasoning(reasoning_text))
