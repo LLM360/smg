@@ -273,6 +273,7 @@ impl TrtllmServiceClient {
         token_ids: Vec<u32>,
         multimodal_input: Option<proto::MultimodalInput>,
         tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
+        eos_token_ids: &[u32],
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling config
         let sampling_config = Self::build_sampling_config_from_chat(body);
@@ -283,16 +284,14 @@ impl TrtllmServiceClient {
         // Build guided decoding params if needed
         let guided_decoding = Self::build_guided_decoding_from_chat(body, tool_call_constraint)?;
 
-        let mut stop = Self::extract_stop_strings(body.stop.as_ref());
-        // TRT-LLM gRPC does not reliably apply generation_config.eos_token_id
-        // in its _setup() path.  Chatml models use <|im_end|> as the turn
-        // delimiter, which differs from tokenizer.eos_token_id.  Explicitly
-        // include it so the engine stops generating at turn boundaries.
-        if !stop.iter().any(|s| s == "<|im_end|>") {
-            stop.push("<|im_end|>".to_string());
-        }
+        let stop = Self::extract_stop_strings(body.stop.as_ref());
 
         let max_tokens = body.max_completion_tokens.unwrap_or(2048);
+
+        // Pass merged EOS token IDs from config.json + generation_config.json.
+        // TRT-LLM's gRPC path does not reliably merge these internally,
+        // so we provide them explicitly via the standard stop_token_ids field.
+        let stop_token_ids: Vec<u32> = eos_token_ids.to_vec();
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -306,7 +305,7 @@ impl TrtllmServiceClient {
             max_tokens,
             streaming: body.stream,
             stop,
-            stop_token_ids: vec![],
+            stop_token_ids,
             ignore_eos: body.ignore_eos,
             bad: vec![],
             bad_token_ids: vec![],
@@ -370,11 +369,8 @@ impl TrtllmServiceClient {
             .and_then(|p| p.max_new_tokens)
             .unwrap_or(2048);
 
-        let mut stop =
+        let stop =
             Self::extract_stop_strings(body.sampling_params.as_ref().and_then(|p| p.stop.as_ref()));
-        if !stop.iter().any(|s| s == "<|im_end|>") {
-            stop.push("<|im_end|>".to_string());
-        }
 
         let grpc_request = proto::GenerateRequest {
             request_id,

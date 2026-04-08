@@ -443,7 +443,7 @@ impl StreamingProcessor {
                         for token in [
                             "<|im_end|>", "<|im_start|>", "<|im_user|>",
                             "<|im_assistant|>", "<|im_system|>", "<|im_middle|>",
-                            "</think>",
+                            "</think>", "[EOS]", "[BOS]",
                         ] {
                             delta = delta.replace(token, "");
                         }
@@ -1220,7 +1220,7 @@ impl StreamingProcessor {
                 "<|im_assistant|>",
                 "<|im_system|>",
                 "<|im_middle|>",
-                "</think>",
+                "</think>", "[EOS]", "[BOS]",
             ] {
                 clean_delta = clean_delta.replace(token, "");
             }
