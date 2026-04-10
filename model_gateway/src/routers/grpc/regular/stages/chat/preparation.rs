@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::chat::ChatCompletionRequest;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::routers::{
     error,
@@ -101,11 +101,14 @@ impl ChatPreparationStage {
                     Some((mm_components, model_id, tokenizer_source)),
                 )
             } else {
-                warn!(
+                error!(
                     function = "ChatPreparationStage::execute",
-                    "Multimodal content detected but multimodal components not initialized; image content will be stripped"
+                    "Multimodal content detected but multimodal components not initialized"
                 );
-                (None, None)
+                return Err(error::bad_request(
+                    "multimodal_not_supported",
+                    "Multimodal content detected but multimodal processing is not available",
+                ));
             }
         } else {
             (None, None)
@@ -148,7 +151,7 @@ impl ChatPreparationStage {
                 &request.messages,
                 model_id,
                 &*tokenizer,
-                token_ids.clone(),
+                token_ids,
                 mm_components,
                 &tokenizer_source,
             )
@@ -164,11 +167,15 @@ impl ChatPreparationStage {
                     multimodal_intermediate = Some(output.intermediate);
                 }
                 Err(e) => {
-                    warn!(
+                    error!(
                         function = "ChatPreparationStage::execute",
                         error = %e,
-                        "Multimodal processing failed; proceeding with text-only content"
+                        "Multimodal processing failed"
                     );
+                    return Err(error::bad_request(
+                        "multimodal_processing_failed",
+                        format!("Multimodal processing failed: {e}"),
+                    ));
                 }
             }
         }
