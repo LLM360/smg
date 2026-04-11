@@ -96,9 +96,7 @@ class TestMlxBackend:
         # First chunk has the role, subsequent chunks carry content deltas.
         assert len(chunks) >= 2
         text_pieces = [
-            c.choices[0].delta.content
-            for c in chunks
-            if c.choices and c.choices[0].delta.content
+            c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content
         ]
         assert len(text_pieces) > 0
         assert "".join(text_pieces).strip()
@@ -151,7 +149,9 @@ class TestMlxBackend:
         content = msg.content or ""
         reasoning = getattr(msg, "reasoning_content", None) or ""
         full = content + reasoning
-        assert "3" in full, f"Expected '3' in response, got content={content!r} reasoning={reasoning!r}"
+        assert "3" in full, (
+            f"Expected '3' in response, got content={content!r} reasoning={reasoning!r}"
+        )
 
     def test_max_tokens_finish_reason(self, model, api_client):
         """When max_tokens is reached, finish_reason is 'length'."""

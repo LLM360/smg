@@ -6,7 +6,6 @@ for Apple Silicon inference.
 """
 
 import asyncio
-import grpc
 import hashlib
 import io
 import logging
@@ -15,6 +14,7 @@ import threading
 import time
 import zipfile
 
+import grpc
 from mlx_lm.generate import SequenceStateMachine
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from smg_grpc_proto import mlx_engine_pb2, mlx_engine_pb2_grpc
@@ -25,7 +25,9 @@ logger = logging.getLogger(__name__)
 class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
     """gRPC servicer implementing the MlxEngine service for MLX backends."""
 
-    def __init__(self, batch_generator, model_path, model_dir, model_config, eos_token_ids, start_time):
+    def __init__(
+        self, batch_generator, model_path, model_dir, model_config, eos_token_ids, start_time
+    ):
         self.batch_generator = batch_generator
         self.model_path = model_path
         self.model_dir = model_dir
@@ -114,7 +116,9 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
         )
 
     @staticmethod
-    def _chunk_response(token_ids, prompt_tokens, completion_tokens, cached_tokens, index, output_logprobs=None):
+    def _chunk_response(
+        token_ids, prompt_tokens, completion_tokens, cached_tokens, index, output_logprobs=None
+    ):
         """Build a GenerateStreamChunk response."""
         chunk = mlx_engine_pb2.GenerateStreamChunk(
             token_ids=token_ids,
@@ -128,7 +132,16 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
         return mlx_engine_pb2.GenerateResponse(chunk=chunk)
 
     @staticmethod
-    def _complete_response(output_ids, finish_reason, prompt_tokens, completion_tokens, cached_tokens, index, output_logprobs=None, matched_token_id=None):
+    def _complete_response(
+        output_ids,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+        index,
+        output_logprobs=None,
+        matched_token_id=None,
+    ):
         """Build a GenerateComplete response."""
         kwargs = {}
         if matched_token_id is not None:
@@ -173,6 +186,7 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
     @staticmethod
     def _chunk_tokenizer_zip(zip_bytes, sha256, chunk_size=512 * 1024):
         from smg_grpc_proto.generated import common_pb2
+
         total = len(zip_bytes)
         offset = 0
         while offset < total:
@@ -243,7 +257,9 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
         try:
             import mlx.core as _mx
             from mlx_lm.generate import generation_stream
-            _stream_ctx = lambda: _mx.stream(generation_stream)
+
+            def _stream_ctx():
+                return _mx.stream(generation_stream)
         except ImportError:
             pass
 
@@ -290,6 +306,7 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
 
             if sp.HasField("seed"):
                 import mlx.core as mx
+
                 mx.random.seed(sp.seed)
 
             uids = self.batch_generator.insert(
@@ -320,16 +337,22 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                                 token_ids=[r.token],
                                 prompt_tokens=prompt_tokens,
                                 completion_tokens=1,
-                                cached_tokens=0, index=0,
+                                cached_tokens=0,
+                                index=0,
                                 output_logprobs=output_logprobs,
                             )
                             matched_token_id = None
                             if r.match_sequence:
-                                matched_token_id = r.match_sequence[0] if len(r.match_sequence) == 1 else None
+                                matched_token_id = (
+                                    r.match_sequence[0] if len(r.match_sequence) == 1 else None
+                                )
                             yield self._complete_response(
-                                output_ids=[], finish_reason=r.finish_reason,
+                                output_ids=[],
+                                finish_reason=r.finish_reason,
                                 prompt_tokens=prompt_tokens,
-                                completion_tokens=0, cached_tokens=0, index=0,
+                                completion_tokens=0,
+                                cached_tokens=0,
+                                index=0,
                                 matched_token_id=matched_token_id,
                             )
                             break
@@ -338,7 +361,8 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                                 token_ids=[r.token],
                                 prompt_tokens=prompt_tokens,
                                 completion_tokens=1,
-                                cached_tokens=0, index=0,
+                                cached_tokens=0,
+                                index=0,
                                 output_logprobs=output_logprobs,
                             )
                 else:
@@ -349,13 +373,16 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                         if r.finish_reason is not None:
                             matched_token_id = None
                             if r.match_sequence:
-                                matched_token_id = r.match_sequence[0] if len(r.match_sequence) == 1 else None
+                                matched_token_id = (
+                                    r.match_sequence[0] if len(r.match_sequence) == 1 else None
+                                )
                             yield self._complete_response(
                                 output_ids=all_output_ids,
                                 finish_reason=r.finish_reason,
                                 prompt_tokens=prompt_tokens,
                                 completion_tokens=len(all_output_ids),
-                                cached_tokens=0, index=0,
+                                cached_tokens=0,
+                                index=0,
                                 matched_token_id=matched_token_id,
                             )
                             break

@@ -30,8 +30,12 @@ def parse_args():
     parser.add_argument("--model", required=True, help="Model path or HuggingFace repo ID")
     parser.add_argument("--port", type=int, default=50051, help="gRPC listen port")
     parser.add_argument("--host", default="0.0.0.0", help="gRPC listen address")
-    parser.add_argument("--prefill-batch-size", type=int, default=8, help="Max concurrent prefill requests")
-    parser.add_argument("--completion-batch-size", type=int, default=32, help="Max concurrent generation requests")
+    parser.add_argument(
+        "--prefill-batch-size", type=int, default=8, help="Max concurrent prefill requests"
+    )
+    parser.add_argument(
+        "--completion-batch-size", type=int, default=32, help="Max concurrent generation requests"
+    )
     parser.add_argument("--adapter-path", default=None, help="LoRA adapter path")
     return parser.parse_args()
 
@@ -45,9 +49,20 @@ def load_model(args):
     logger.info("Model loaded successfully")
 
     from huggingface_hub import snapshot_download
+
     model_dir = args.model
     if not os.path.isdir(model_dir):
-        model_dir = snapshot_download(args.model, allow_patterns=["config.json", "tokenizer*", "special_tokens*", "merges.txt", "vocab.json", "added_tokens.json"])
+        model_dir = snapshot_download(
+            args.model,
+            allow_patterns=[
+                "config.json",
+                "tokenizer*",
+                "special_tokens*",
+                "merges.txt",
+                "vocab.json",
+                "added_tokens.json",
+            ],
+        )
 
     config_path = os.path.join(model_dir, "config.json")
     with open(config_path) as f:

@@ -86,13 +86,16 @@ jobs:
       - name: Install grpc_servicer with MLX extra (mlx + mlx-lm)
         run: pip install -e "./grpc_servicer[mlx]"
 
-      - name: Install SMG Python bindings (maturin develop, debug)
+      - name: Build and install SMG Python bindings (debug)
         working-directory: bindings/python
         run: |
           pip install maturin
           # Debug build — correctness test, not performance test.
           # Saves ~5 min per run vs --release.
-          maturin develop
+          # Use `maturin build` + `pip install` (not `maturin develop`)
+          # because the GitHub-hosted runner's Python is not in a virtualenv.
+          maturin build --out dist
+          pip install dist/*.whl
 
       - name: Generate Python client types (required by e2e_test/conftest.py)
         run: make generate-python-types

@@ -48,9 +48,7 @@ class MlxHealthServicer(health_pb2_grpc.HealthServicer):
 
         context.set_code(grpc.StatusCode.NOT_FOUND)
         context.set_details(f"Unknown service: {service_name}")
-        return health_pb2.HealthCheckResponse(
-            status=health_pb2.HealthCheckResponse.SERVICE_UNKNOWN
-        )
+        return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVICE_UNKNOWN)
 
     async def Watch(
         self,
