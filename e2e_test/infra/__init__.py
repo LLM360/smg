@@ -32,6 +32,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     Runtime,
     WorkerType,
     get_runtime,
+    is_mlx,
     is_sglang,
     is_trtllm,
     is_vllm,
@@ -108,6 +109,7 @@ __all__ = [
     "is_vllm",
     "is_sglang",
     "is_trtllm",
+    "is_mlx",
     # Port utilities
     "get_open_port",
     "release_port",
