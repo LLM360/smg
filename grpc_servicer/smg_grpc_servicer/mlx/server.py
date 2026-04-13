@@ -129,7 +129,9 @@ async def serve_grpc(args):
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
     listen_addr = f"{args.host}:{args.port}"
-    server.add_insecure_port(listen_addr)
+    bound_port = server.add_insecure_port(listen_addr)
+    if bound_port == 0:
+        raise RuntimeError(f"Failed to bind gRPC server to {listen_addr}")
     await server.start()
     logger.info("gRPC server listening on %s", listen_addr)
 

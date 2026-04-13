@@ -387,21 +387,35 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                             )
                 else:
                     all_output_ids = []
-                    last_logprobs = None
+                    # Aggregate per-token logprobs across the whole sequence so
+                    # the final GenerateComplete carries logprobs for every
+                    # generated token (not just the last step).
+                    agg_token_ids: list[int] = []
+                    agg_token_logprobs: list[float] = []
+                    agg_top: list = []
                     while True:
                         r = await queue.get()
                         if r is None:
                             # Sentinel from Abort — terminate without emitting.
                             break
                         all_output_ids.append(r.token)
-                        last_logprobs = self._build_output_logprobs(
-                            r.token, r.logprobs, num_logprobs
-                        )
+                        step = self._build_output_logprobs(r.token, r.logprobs, num_logprobs)
+                        if step is not None:
+                            agg_token_ids.extend(step.token_ids)
+                            agg_token_logprobs.extend(step.token_logprobs)
+                            agg_top.extend(step.top_logprobs)
                         if r.finish_reason is not None:
                             matched_token_id = None
                             if r.match_sequence:
                                 matched_token_id = (
                                     r.match_sequence[0] if len(r.match_sequence) == 1 else None
+                                )
+                            seq_logprobs = None
+                            if agg_token_ids:
+                                seq_logprobs = mlx_engine_pb2.OutputLogProbs(
+                                    token_ids=agg_token_ids,
+                                    token_logprobs=agg_token_logprobs,
+                                    top_logprobs=agg_top,
                                 )
                             yield self._complete_response(
                                 output_ids=all_output_ids,
@@ -410,7 +424,7 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                                 completion_tokens=len(all_output_ids),
                                 cached_tokens=0,
                                 index=0,
-                                output_logprobs=last_logprobs,
+                                output_logprobs=seq_logprobs,
                                 matched_token_id=matched_token_id,
                             )
                             break
