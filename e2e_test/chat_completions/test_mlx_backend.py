@@ -12,6 +12,7 @@ See .github/workflows/pr-test-mlx.yml.
 
 from __future__ import annotations
 
+import json
 import platform
 import sys
 
@@ -122,9 +123,7 @@ class TestMlxBackend:
         call = msg.tool_calls[0]
         assert call.function.name == "get_weather"
         # arguments is a JSON string per OpenAI spec
-        import json as _json
-
-        args = _json.loads(call.function.arguments)
+        args = json.loads(call.function.arguments)
         assert "tokyo" in args.get("location", "").lower()
 
     def test_reasoning_thinking_mode(self, model, api_client):
@@ -149,9 +148,9 @@ class TestMlxBackend:
         content = msg.content or ""
         reasoning = getattr(msg, "reasoning_content", None) or ""
         full = content + reasoning
-        assert "3" in full, (
-            f"Expected '3' in response, got content={content!r} reasoning={reasoning!r}"
-        )
+        assert (
+            "3" in full
+        ), f"Expected '3' in response, got content={content!r} reasoning={reasoning!r}"
 
     def test_max_tokens_finish_reason(self, model, api_client):
         """When max_tokens is reached, finish_reason is 'length'."""
