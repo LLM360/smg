@@ -23,7 +23,20 @@ logger = logging.getLogger(__name__)
 
 
 class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
-    """gRPC servicer implementing the MlxEngine service for MLX backends."""
+    """gRPC servicer implementing the MlxEngine service for MLX backends.
+
+    TODO(mlx-threadsafety): mlx-lm's BatchGenerator is accessed from two
+    threads — the asyncio event loop (insert/remove via Generate and Abort)
+    and the background generation thread (next/remove). In practice the
+    current E2E tests pass because next() is always active so insert/remove
+    from the event loop naturally interleave with next()'s own internal
+    state transitions, but this is not guaranteed. A follow-up should either:
+      1. Upstream a thread-safety contract into mlx-lm's BatchGenerator, or
+      2. Serialize insert/next/remove through a single dedicated thread using
+         a request queue (so the event loop only enqueues work).
+    A naive lock around next() would block prefill and crush throughput, so
+    don't add one without thinking through the contention model first.
+    """
 
     def __init__(
         self, batch_generator, model_path, model_dir, model_config, eos_token_ids, start_time
@@ -45,7 +58,10 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
     @staticmethod
     def _build_sampler(sampling_params):
         """Convert proto SamplingParams to an mlx-lm sampler callable."""
-        temp = sampling_params.temperature if sampling_params.HasField("temperature") else 0.0
+        # When temperature is unset, default to 1.0 to match vLLM/SGLang/TRT-LLM
+        # behavior. mlx-lm's make_sampler defaults to 0.0 (greedy), which would
+        # silently diverge for requests that omit temperature.
+        temp = sampling_params.temperature if sampling_params.HasField("temperature") else 1.0
         return make_sampler(
             temp=temp,
             top_p=sampling_params.top_p,
@@ -90,7 +106,9 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
     @staticmethod
     def _build_output_logprobs(token_id, logprobs_array, num_logprobs):
         """Build OutputLogProbs proto from an mlx logprobs array."""
-        if num_logprobs is None:
+        # num_logprobs == 0 would make top_k == 0 and `[-0:]` would slice the
+        # entire vocabulary — guard explicitly.
+        if num_logprobs is None or num_logprobs <= 0:
             return None
 
         import mlx.core as mx
@@ -205,13 +223,10 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
     ) -> mlx_engine_pb2.GetModelInfoResponse:
         config = self.model_config
 
-        eos = config.get("eos_token_id")
-        if isinstance(eos, int):
-            eos_token_ids = [eos]
-        elif isinstance(eos, list):
-            eos_token_ids = eos
-        else:
-            eos_token_ids = []
+        # Reuse the resolved EOS IDs so GetModelInfo agrees with the stop
+        # behavior we actually apply in generation (server.py falls back to
+        # tokenizer-derived IDs when config.json has none).
+        eos_token_ids = list(self._eos_token_ids)
 
         return mlx_engine_pb2.GetModelInfoResponse(
             model_path=self.model_path,
@@ -239,7 +254,7 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
         )
 
     def start_generation_loop(self):
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
         self._gen_thread = threading.Thread(
             target=self._generation_loop, daemon=True, name="mlx-gen-loop"
         )
@@ -326,8 +341,13 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
 
             try:
                 if request.stream:
+                    completion_tokens = 0
                     while True:
                         r = await queue.get()
+                        if r is None:
+                            # Sentinel from Abort — terminate the stream.
+                            break
+                        completion_tokens += 1
                         output_logprobs = self._build_output_logprobs(
                             r.token, r.logprobs, num_logprobs
                         )
@@ -336,7 +356,7 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                             yield self._chunk_response(
                                 token_ids=[r.token],
                                 prompt_tokens=prompt_tokens,
-                                completion_tokens=1,
+                                completion_tokens=completion_tokens,
                                 cached_tokens=0,
                                 index=0,
                                 output_logprobs=output_logprobs,
@@ -350,7 +370,7 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                                 output_ids=[],
                                 finish_reason=r.finish_reason,
                                 prompt_tokens=prompt_tokens,
-                                completion_tokens=0,
+                                completion_tokens=completion_tokens,
                                 cached_tokens=0,
                                 index=0,
                                 matched_token_id=matched_token_id,
@@ -360,16 +380,23 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                             yield self._chunk_response(
                                 token_ids=[r.token],
                                 prompt_tokens=prompt_tokens,
-                                completion_tokens=1,
+                                completion_tokens=completion_tokens,
                                 cached_tokens=0,
                                 index=0,
                                 output_logprobs=output_logprobs,
                             )
                 else:
                     all_output_ids = []
+                    last_logprobs = None
                     while True:
                         r = await queue.get()
+                        if r is None:
+                            # Sentinel from Abort — terminate without emitting.
+                            break
                         all_output_ids.append(r.token)
+                        last_logprobs = self._build_output_logprobs(
+                            r.token, r.logprobs, num_logprobs
+                        )
                         if r.finish_reason is not None:
                             matched_token_id = None
                             if r.match_sequence:
@@ -383,6 +410,7 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
                                 completion_tokens=len(all_output_ids),
                                 cached_tokens=0,
                                 index=0,
+                                output_logprobs=last_logprobs,
                                 matched_token_id=matched_token_id,
                             )
                             break
@@ -402,7 +430,11 @@ class MlxEngineServicer(mlx_engine_pb2_grpc.MlxEngineServicer):
         for request_id in request.request_ids:
             uid = self._request_uid_map.pop(request_id, None)
             if uid is not None:
-                self._uid_queues.pop(uid, None)
+                queue = self._uid_queues.pop(uid, None)
+                # Wake the Generate waiter blocked on queue.get() so it can
+                # exit cleanly instead of hanging until transport cancellation.
+                if queue is not None:
+                    queue.put_nowait(None)
                 try:
                     self.batch_generator.remove([uid])
                 except Exception:
