@@ -244,31 +244,70 @@ pub async fn ensure_mcp_servers(
     }
 }
 
-/// Convenience wrapper for OpenAI Responses API routers.
+/// Convenience wrapper for request-level MCP resolution.
 ///
-/// Extracts MCP server inputs and builtin types from `ResponseTool` array,
-/// then delegates to [`ensure_mcp_servers`].
+/// Explicit MCP tools are validated one server at a time so that any failure
+/// aborts the request. Built-in tool routing still uses the existing
+/// best-effort lookup.
+///
+/// Returns:
+/// - `Ok(Some(...))` when MCP interception should run with the returned bindings.
+/// - `Ok(None)` when no MCP interception is required and the request can continue upstream.
+/// - `Err(message)` when an explicit MCP server could not be connected.
 pub async fn ensure_request_mcp_client(
     mcp_orchestrator: &Arc<McpOrchestrator>,
     tools: &[ResponseTool],
-) -> Option<Vec<McpServerBinding>> {
-    let inputs: Vec<McpServerInput> = tools
-        .iter()
-        .filter_map(|tool| match tool {
-            ResponseTool::Mcp(mcp) => Some(McpServerInput {
-                label: mcp.server_label.clone(),
-                url: mcp.server_url.clone(),
-                authorization: mcp.authorization.clone(),
-                headers: mcp.headers.clone().unwrap_or_default(),
-                allowed_tools: mcp.allowed_tools.clone(),
-            }),
-            _ => None,
-        })
-        .collect();
+) -> Result<Option<Vec<McpServerBinding>>, String> {
+    let mut mcp_servers: Vec<McpServerBinding> = Vec::new();
+
+    for tool in tools {
+        let ResponseTool::Mcp(mcp) = tool else {
+            continue;
+        };
+
+        let input = McpServerInput {
+            label: mcp.server_label.clone(),
+            url: mcp.server_url.clone(),
+            authorization: mcp.authorization.clone(),
+            headers: mcp.headers.clone().unwrap_or_default(),
+            allowed_tools: mcp.allowed_tools.clone(),
+        };
+
+        let connected = connect_mcp_servers(mcp_orchestrator, std::slice::from_ref(&input)).await;
+        if connected.is_empty() {
+            return Err(format!(
+                "Error retrieving tool list from MCP server: '{}'. Check server_url and authorization.",
+                mcp.server_label
+            ));
+        }
+
+        for binding in connected {
+            if !mcp_servers
+                .iter()
+                .any(|existing| existing.server_key == binding.server_key)
+            {
+                mcp_servers.push(binding);
+            }
+        }
+    }
 
     let builtin_types = extract_builtin_types(tools);
+    if let Some(builtin_servers) = ensure_mcp_servers(mcp_orchestrator, &[], &builtin_types).await {
+        for binding in builtin_servers {
+            if !mcp_servers
+                .iter()
+                .any(|existing| existing.server_key == binding.server_key)
+            {
+                mcp_servers.push(binding);
+            }
+        }
+    }
 
-    ensure_mcp_servers(mcp_orchestrator, &inputs, &builtin_types).await
+    if mcp_servers.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(mcp_servers))
+    }
 }
 
 #[cfg(test)]
@@ -525,9 +564,9 @@ mod tests {
         let result = ensure_request_mcp_client(&orchestrator, &tools).await;
 
         // Should return Some because built-in routing is configured
-        assert!(result.is_some());
+        assert!(result.is_ok());
 
-        let mcp_servers = result.unwrap();
+        let mcp_servers = result.unwrap().unwrap();
         assert_eq!(mcp_servers.len(), 1);
 
         // The server key should be the static server name
@@ -548,7 +587,7 @@ mod tests {
         let result = ensure_request_mcp_client(&orchestrator, &tools).await;
 
         // Should return None because no MCP or built-in routing is available
-        assert!(result.is_none());
+        assert!(matches!(result, Ok(None)));
     }
 
     #[tokio::test]
@@ -568,7 +607,7 @@ mod tests {
         let result = ensure_request_mcp_client(&orchestrator, &tools).await;
 
         // Should return None - function tools don't need MCP processing
-        assert!(result.is_none());
+        assert!(matches!(result, Ok(None)));
     }
 
     #[tokio::test]
@@ -592,10 +631,45 @@ mod tests {
         let result = ensure_request_mcp_client(&orchestrator, &tools).await;
 
         // Should return Some because web_search_preview has built-in routing
-        assert!(result.is_some());
+        assert!(result.is_ok());
 
-        let mcp_servers = result.unwrap();
+        let mcp_servers = result.unwrap().unwrap();
         assert_eq!(mcp_servers.len(), 1);
         assert_eq!(mcp_servers[0].label, "search-server");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_request_mcp_client_fails_when_any_explicit_mcp_fails() {
+        let orchestrator = create_test_orchestrator_no_builtin().await;
+
+        let tools = vec![
+            ResponseTool::Mcp(McpTool {
+                server_url: None,
+                authorization: None,
+                headers: None,
+                server_label: "static-ok".to_string(),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            }),
+            ResponseTool::Mcp(McpTool {
+                server_url: Some("http://127.0.0.1:1/mcp".to_string()),
+                authorization: None,
+                headers: None,
+                server_label: "broken".to_string(),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            }),
+        ];
+
+        let result = ensure_request_mcp_client(&orchestrator, &tools).await;
+
+        assert!(matches!(
+            result,
+            Err(ref message)
+                if message
+                    == "Error retrieving tool list from MCP server: 'broken'. Check server_url and authorization."
+        ));
     }
 }
