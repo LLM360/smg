@@ -50,4 +50,5 @@ def build_tokenizer_zip(tokenizer_dir: Path) -> io.BytesIO:
                     added.add(match.name)
     if not added:
         raise FileNotFoundError(f"No tokenizer files found in {tokenizer_dir}")
+    buf.seek(0)
     return buf
