@@ -5,13 +5,18 @@ vLLM gRPC Servicer
 Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 """
 
+import hashlib
+import io
 import itertools
 import time
-from collections.abc import AsyncGenerator
+import zipfile
+from collections.abc import AsyncGenerator, AsyncIterator
+from pathlib import Path
 
 import grpc
 import torch
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
 from vllm.engine.protocol import EngineClient
@@ -28,6 +33,25 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 logger = init_logger(__name__)
+
+# Tokenizer bundle streaming constants (aligned with Rust grpc_client limits)
+_TOKENIZER_CHUNK_SIZE = 64 * 1024  # 64 KB per gRPC chunk
+# Files to include in the tokenizer ZIP bundle.
+# Aligned with crates/tokenizer/src/hub.rs:is_tokenizer_file() plus model config files.
+_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "config.json",
+    "generation_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer.model",  # SentencePiece
+    "tiktoken.model",  # tiktoken
+    "chat_template.json",
+]
+# Glob patterns for additional tokenizer-related files
+_TOKENIZER_GLOBS = ["*.tiktoken", "*.jinja", "*.model"]
 
 # Proto dtype string → torch dtype
 _PROTO_DTYPE_MAP: dict[str, torch.dtype] = {
@@ -49,13 +73,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     """
     gRPC servicer implementing the VllmEngine service.
 
-    Handles 6 RPCs:
+    Handles 7 RPCs:
     - Generate: Streaming text generation
     - Embed: Embeddings
     - HealthCheck: Health probe
     - Abort: Cancel requests out-of-band
     - GetModelInfo: Model metadata
     - GetServerInfo: Server state
+    - GetTokenizer: Stream tokenizer artifacts
     """
 
     def __init__(self, async_llm: EngineClient, start_time: float):
@@ -357,6 +382,77 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_connector=kv_connector,
             kv_role=kv_role,
         )
+
+    async def GetTokenizer(
+        self,
+        request: common_pb2.GetTokenizerRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[common_pb2.GetTokenizerChunk]:
+        """Stream tokenizer artifacts as a ZIP bundle.
+
+        Resolves the tokenizer directory from model_config, zips all relevant
+        tokenizer files, and streams them as GetTokenizerChunk messages.
+        The final chunk carries the SHA-256 fingerprint of the full archive.
+        """
+        logger.info("Receive GetTokenizer request")
+
+        tokenizer_path = self.engine.model_config.tokenizer
+        if not tokenizer_path:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Tokenizer path is not configured on this server.",
+            )
+        tokenizer_dir = Path(tokenizer_path)
+
+        # Build ZIP archive in memory
+        try:
+            zip_buffer = self._build_tokenizer_zip(tokenizer_dir)
+        except Exception as e:
+            logger.exception("Failed to build tokenizer ZIP")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        zip_data = zip_buffer.getbuffer()
+        sha256 = hashlib.sha256(zip_data).hexdigest()
+
+        logger.info(
+            "Streaming tokenizer bundle: %d bytes, sha256=%s",
+            len(zip_data),
+            sha256,
+        )
+
+        # Stream chunks; SHA-256 only on the final chunk
+        offset = 0
+        total = len(zip_data)
+        while offset < total:
+            end = min(offset + _TOKENIZER_CHUNK_SIZE, total)
+            is_last = end == total
+            yield common_pb2.GetTokenizerChunk(
+                data=bytes(zip_data[offset:end]),
+                sha256=sha256 if is_last else "",
+            )
+            offset = end
+
+    @staticmethod
+    def _build_tokenizer_zip(tokenizer_dir: Path) -> io.BytesIO:
+        """Create an in-memory ZIP archive of tokenizer files from a directory."""
+        buf = io.BytesIO()
+        added: set[str] = set()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Exact-name files
+            for name in _TOKENIZER_FILES:
+                filepath = tokenizer_dir / name
+                if filepath.is_file():
+                    zf.write(filepath, name)
+                    added.add(name)
+            # Glob patterns (*.tiktoken, *.jinja, *.model)
+            for pattern in _TOKENIZER_GLOBS:
+                for match in tokenizer_dir.glob(pattern):
+                    if match.is_file() and match.name not in added:
+                        zf.write(match, match.name)
+                        added.add(match.name)
+        if not added:
+            raise FileNotFoundError(f"No tokenizer files found in {tokenizer_dir}")
+        return buf
 
     # ========== Helper methods ==========
 
