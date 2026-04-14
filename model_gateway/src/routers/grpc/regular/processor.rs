@@ -179,9 +179,13 @@ impl ResponseProcessor {
         let matched_stop = complete.matched_stop_json();
 
         // Step 4: Convert output logprobs if present
-        let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+        let mut logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
         });
+
+        // Step 5: Post-processing cleanup.
+        // Track whether text is mutated so we can invalidate logprobs.
+        let pre_cleanup_len = processed_text.len();
 
         if self.configured_tool_parser.is_some() || self.configured_reasoning_parser.is_some() {
             utils::strip_leaked_special_tokens(&mut processed_text, tokenizer.as_ref());
@@ -194,6 +198,10 @@ impl ResponseProcessor {
         );
         if is_json_response {
             utils::clean_json_response(&mut processed_text);
+        }
+
+        if processed_text.len() != pre_cleanup_len {
+            logprobs = None;
         }
 
         // Build ChatCompletionMessage (proper response message type)

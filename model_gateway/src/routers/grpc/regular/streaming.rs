@@ -421,12 +421,18 @@ impl StreamingProcessor {
                         }
                     }
 
+                    let original_len = delta.len();
                     let delta = if self.configured_tool_parser.is_some()
                         || self.configured_reasoning_parser.is_some()
                     {
                         utils::strip_leaked_special_tokens_from_delta(delta, tokenizer.as_ref())
                     } else {
                         delta
+                    };
+                    let choice_logprobs = if delta.len() < original_len {
+                        None
+                    } else {
+                        choice_logprobs
                     };
                     if !delta.is_empty() {
                         let content_chunk =
@@ -451,6 +457,16 @@ impl StreamingProcessor {
                     // Flush any remaining text for this index's stop_decoder
                     if let Some(decoder) = stop_decoders.get_mut(&index) {
                         if let SequenceDecoderOutput::Text(text) = decoder.flush() {
+                            let text = if self.configured_tool_parser.is_some()
+                                || self.configured_reasoning_parser.is_some()
+                            {
+                                utils::strip_leaked_special_tokens_from_delta(
+                                    text,
+                                    tokenizer.as_ref(),
+                                )
+                            } else {
+                                text
+                            };
                             if !text.is_empty() {
                                 let stream_buffer = stream_buffers.entry(index).or_default();
                                 stream_buffer.push_str(&text);
@@ -1727,6 +1743,18 @@ impl StreamingProcessor {
                             (chunk_text, String::new(), false)
                         };
 
+                    // Strip leaked special tokens from the text portion
+                    let normal_text = if self.configured_tool_parser.is_some()
+                        || self.configured_reasoning_parser.is_some()
+                    {
+                        utils::strip_leaked_special_tokens_from_delta(
+                            normal_text,
+                            tokenizer.as_ref(),
+                        )
+                    } else {
+                        normal_text
+                    };
+
                     // Emit thinking content block deltas
                     if !reasoning_chunk_text.is_empty() {
                         if !thinking_block_open {
@@ -1958,6 +1986,13 @@ impl StreamingProcessor {
                 ProtoResponseVariant::Complete(complete) => {
                     // Flush stop decoder
                     if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
+                        let text = if self.configured_tool_parser.is_some()
+                            || self.configured_reasoning_parser.is_some()
+                        {
+                            utils::strip_leaked_special_tokens_from_delta(text, tokenizer.as_ref())
+                        } else {
+                            text
+                        };
                         if !text.is_empty() {
                             if !text_block_open {
                                 Self::send_messages_event(
