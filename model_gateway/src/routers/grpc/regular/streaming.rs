@@ -355,6 +355,7 @@ impl StreamingProcessor {
                                 model,
                                 created,
                                 system_fingerprint,
+                                tokenizer.as_ref(),
                             )
                             .await;
                         if let Some(chunk) = reasoning_chunk {
@@ -1112,6 +1113,7 @@ impl StreamingProcessor {
         model: &str,
         created: u64,
         system_fingerprint: Option<&str>,
+        tokenizer: &dyn Tokenizer,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         #[expect(
@@ -1150,13 +1152,28 @@ impl StreamingProcessor {
                     let chunk = if reasoning_text.is_empty() {
                         None
                     } else {
-                        Some(
-                            ChatCompletionStreamResponse::builder(request_id, model)
-                                .created(created)
-                                .add_choice_reasoning(index, reasoning_text)
-                                .maybe_system_fingerprint(system_fingerprint)
-                                .build(),
-                        )
+                        let reasoning_text =
+                            if self.configured_tool_parser.is_some()
+                                || self.configured_reasoning_parser.is_some()
+                            {
+                                utils::strip_leaked_special_tokens_from_delta(
+                                    reasoning_text,
+                                    tokenizer,
+                                )
+                            } else {
+                                reasoning_text
+                            };
+                        if reasoning_text.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                ChatCompletionStreamResponse::builder(request_id, model)
+                                    .created(created)
+                                    .add_choice_reasoning(index, reasoning_text)
+                                    .maybe_system_fingerprint(system_fingerprint)
+                                    .build(),
+                            )
+                        }
                     };
                     return (normal_text, chunk, in_reasoning);
                 }
@@ -1743,17 +1760,24 @@ impl StreamingProcessor {
                             (chunk_text, String::new(), false)
                         };
 
-                    // Strip leaked special tokens from the text portion
-                    let normal_text = if self.configured_tool_parser.is_some()
-                        || self.configured_reasoning_parser.is_some()
-                    {
-                        utils::strip_leaked_special_tokens_from_delta(
-                            normal_text,
-                            tokenizer.as_ref(),
-                        )
-                    } else {
-                        normal_text
-                    };
+                    // Strip leaked special tokens from both text and reasoning portions
+                    let (normal_text, reasoning_chunk_text) =
+                        if self.configured_tool_parser.is_some()
+                            || self.configured_reasoning_parser.is_some()
+                        {
+                            (
+                                utils::strip_leaked_special_tokens_from_delta(
+                                    normal_text,
+                                    tokenizer.as_ref(),
+                                ),
+                                utils::strip_leaked_special_tokens_from_delta(
+                                    reasoning_chunk_text,
+                                    tokenizer.as_ref(),
+                                ),
+                            )
+                        } else {
+                            (normal_text, reasoning_chunk_text)
+                        };
 
                     // Emit thinking content block deltas
                     if !reasoning_chunk_text.is_empty() {
