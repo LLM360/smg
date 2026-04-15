@@ -7,15 +7,15 @@ use llm_tokenizer::registry::TokenizerRegistry;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
-    create_storage, ConversationItemStorage, ConversationMemoryWriter, ConversationStorage,
-    ResponseStorage, StorageFactoryConfig,
+    backend_supports_memory_writer, create_storage, ConversationItemStorage,
+    ConversationMemoryWriter, ConversationStorage, ResponseStorage, StorageFactoryConfig,
 };
 use smg_mcp::McpOrchestrator;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::debug;
 
 use crate::{
-    config::{HistoryBackend, RouterConfig},
+    config::RouterConfig,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -394,7 +394,7 @@ impl AppContextBuilder {
     ) -> Result<Self, String> {
         validate_memory_writer_configuration(
             &router_config,
-            history_backend_supports_memory_writer(&router_config.history_backend),
+            backend_supports_memory_writer(&router_config.history_backend),
         )?;
 
         Ok(Self::new()
@@ -713,8 +713,4 @@ fn validate_memory_writer_configuration(
     }
 
     Ok(())
-}
-
-fn history_backend_supports_memory_writer(history_backend: &HistoryBackend) -> bool {
-    matches!(history_backend, HistoryBackend::Memory)
 }

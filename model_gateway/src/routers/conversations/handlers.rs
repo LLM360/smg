@@ -392,7 +392,6 @@ pub async fn create_conversation_items_with_headers(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-/// Process a single item for creation/linking
 /// Process a single item for creation. Returns (json, item_id, warning).
 /// Linking is deferred to the caller for batch operation.
 async fn process_item(

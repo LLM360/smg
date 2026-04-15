@@ -29,7 +29,6 @@ pub struct MemoryConversationStorage {
 }
 
 impl MemoryConversationStorage {
-    /// Create an empty in-memory conversation storage backend.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
@@ -99,7 +98,6 @@ pub struct MemoryConversationItemStorage {
 }
 
 impl MemoryConversationItemStorage {
-    /// Create an empty in-memory conversation item storage backend.
     pub fn new() -> Self {
         Self::default()
     }
@@ -326,7 +324,6 @@ pub struct MemoryResponseStorage {
 }
 
 impl MemoryResponseStorage {
-    /// Create an empty in-memory response storage backend.
     pub fn new() -> Self {
         Self {
             store: Arc::new(RwLock::new(InnerStore::default())),
@@ -622,6 +619,34 @@ mod tests {
             .unwrap();
         assert!(!asc_after.is_empty());
         assert_eq!(asc_after[0].id, i3.id);
+    }
+
+    #[tokio::test]
+    async fn test_memory_conversation_memory_writer_happy_path() {
+        let writer = MemoryConversationMemoryWriter::new();
+        let input = NewConversationMemory {
+            conversation_id: ConversationId::from("conv_mem_test"),
+            conversation_version: Some(1),
+            response_id: None,
+            memory_type: ConversationMemoryType::Ltm,
+            status: ConversationMemoryStatus::Ready,
+            attempt: 1,
+            owner_id: Some("owner_1".to_string()),
+            next_run_at: Utc::now(),
+            lease_until: None,
+            content: Some("memory content".to_string()),
+            memory_config: Some("{\"k\":\"v\"}".to_string()),
+            scope_id: Some("scope_1".to_string()),
+            error_msg: None,
+        };
+
+        let id = writer.create_memory(input.clone()).await.unwrap();
+        let _typed_id: ConversationMemoryId = id.clone();
+        assert!(id.0.starts_with("mem_"));
+
+        let store = writer.inner.read();
+        let stored = store.get(&id.clone()).expect("memory should be present");
+        assert_eq!(stored, &input);
     }
 
     // ========================================================================

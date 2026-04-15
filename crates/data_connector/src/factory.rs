@@ -29,13 +29,9 @@ use crate::{
 
 /// Complete storage handles returned by the factory, including optional memory writer.
 pub struct StorageBundle {
-    /// Storage backend for responses.
     pub response_storage: Arc<dyn ResponseStorage>,
-    /// Storage backend for conversations.
     pub conversation_storage: Arc<dyn ConversationStorage>,
-    /// Storage backend for conversation items.
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
-    /// Optional writer used by long-term-memory store flows.
     pub conversation_memory_writer: Option<Arc<dyn ConversationMemoryWriter>>,
 }
 
@@ -49,6 +45,11 @@ pub struct StorageFactoryConfig<'a> {
     /// wrapped in `Hooked*Storage` that runs before/after hooks around every
     /// storage operation.
     pub hook: Option<Arc<dyn StorageHook>>,
+}
+
+/// Returns whether a backend currently provides `ConversationMemoryWriter`.
+pub const fn backend_supports_memory_writer(backend: &HistoryBackend) -> bool {
+    matches!(backend, HistoryBackend::Memory)
 }
 
 /// Create all configured storage handles, including optional conversation memory writer.

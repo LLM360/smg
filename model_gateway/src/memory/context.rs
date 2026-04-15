@@ -1,38 +1,35 @@
 use axum::http::HeaderMap;
+use tracing::warn;
 
 use crate::{config::MemoryRuntimeConfig, routers::common::header_utils::MemoryHeaderView};
 
-/// Normalized per-request memory execution context derived from request headers
-/// and runtime configuration flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryExecutionContext {
-    /// Caller requested LTM store via policy.
     pub store_ltm_requested: bool,
-    /// Store is effectively enabled after runtime gates are applied.
     pub store_ltm_active: bool,
-    /// Caller requested recall via policy.
     pub recall_requested: bool,
-    /// Recall is effectively enabled after runtime gates are applied.
     pub recall_active: bool,
-    /// Subject key used by downstream memory systems.
     pub subject_id: Option<String>,
-    /// Optional embedding model override.
     pub embedding_model: Option<String>,
-    /// Optional extraction model override.
     pub extraction_model: Option<String>,
 }
 
 impl MemoryExecutionContext {
-    /// Builds memory context by reading HTTP headers and applying runtime gates.
     pub fn from_http_headers(headers: &HeaderMap, runtime: &MemoryRuntimeConfig) -> Self {
         let header_view = MemoryHeaderView::from_http_headers(headers);
         Self::from_headers(&header_view, runtime)
     }
 
-    /// Builds memory context from a normalized header view and runtime gates.
     pub fn from_headers(headers: &MemoryHeaderView, runtime: &MemoryRuntimeConfig) -> Self {
         let policy = Policy::from_value(headers.policy.as_deref());
-        // `none` is an explicit per-request opt-out of LTM behavior.
+        if let Some(raw_policy) = headers.policy.as_deref() {
+            if matches!(policy, Policy::Unspecified) {
+                warn!(
+                    policy = raw_policy,
+                    "Unrecognized x-smg-ltm-memory-policy value; falling back to unspecified policy"
+                );
+            }
+        }
         let store_ltm_requested = if policy.disables_ltm() {
             false
         } else {
@@ -58,21 +55,15 @@ impl MemoryExecutionContext {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Policy {
-    /// Store memory only (no recall in this request).
     StoreOnly,
-    /// Store new memory and enable recall.
     StoreAndRecall,
-    /// Recall only; do not create new memory.
     RecallOnly,
-    /// Explicitly disable LTM behavior for this conversation.
     None,
-    /// Header missing or unknown value; treated as "no explicit request".
     #[default]
     Unspecified,
 }
 
 impl Policy {
-    /// Parse policy header values; unknown values are treated as unspecified.
     fn from_value(value: Option<&str>) -> Self {
         let Some(value) = value.map(normalize) else {
             return Self::Unspecified;
@@ -88,12 +79,10 @@ impl Policy {
     }
 
     fn allows_ltm_store(self) -> bool {
-        // Unspecified/None both resolve to no store request.
         matches!(self, Self::StoreOnly | Self::StoreAndRecall)
     }
 
     fn allows_recall(self) -> bool {
-        // Unspecified/None both resolve to no recall request.
         matches!(self, Self::StoreAndRecall | Self::RecallOnly)
     }
 
@@ -102,7 +91,6 @@ impl Policy {
     }
 }
 
-/// Trim values before policy/boolean matching.
 fn normalize(value: &str) -> &str {
     value.trim()
 }
