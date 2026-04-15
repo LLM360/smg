@@ -392,13 +392,15 @@ async fn v1_conversations_create_items(
     headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    let memory_execution_context =
+        middleware::build_memory_execution_context(&state.context.router_config, &headers);
+
     conversations::create_conversation_items_with_headers(
-        &state.context.router_config,
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
         &conversation_id,
-        &headers,
         body,
+        memory_execution_context,
     )
     .await
 }

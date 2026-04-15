@@ -279,8 +279,8 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 // PART 3: MemoryConversationMemoryWriter
 // ============================================================================
 
-#[derive(Default, Clone)]
 /// In-memory conversation memory writer used only by `HistoryBackend::Memory`.
+#[derive(Default, Clone)]
 pub struct MemoryConversationMemoryWriter {
     inner: Arc<RwLock<HashMap<ConversationMemoryId, NewConversationMemory>>>,
 }

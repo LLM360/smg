@@ -72,12 +72,6 @@ enum Policy {
 }
 
 impl Policy {
-    fn disables_ltm(self) -> bool {
-        matches!(self, Self::None)
-    }
-}
-
-impl Policy {
     /// Parse policy header values; unknown values are treated as unspecified.
     fn from_value(value: Option<&str>) -> Self {
         let Some(value) = value.map(normalize) else {
@@ -101,6 +95,10 @@ impl Policy {
     fn allows_recall(self) -> bool {
         // Unspecified/None both resolve to no recall request.
         matches!(self, Self::StoreAndRecall | Self::RecallOnly)
+    }
+
+    fn disables_ltm(self) -> bool {
+        matches!(self, Self::None)
     }
 }
 
