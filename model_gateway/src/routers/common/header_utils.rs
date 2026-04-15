@@ -310,6 +310,8 @@ pub fn should_forward_request_header(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
 
     #[test]
@@ -405,5 +407,80 @@ mod tests {
         let auth = ApiProvider::Anthropic.extract_auth_header(Some(&headers), None);
 
         assert_eq!(auth.unwrap(), "anthropic-key");
+    }
+
+    #[test]
+    fn test_memory_header_view_policy_empty_other_headers_absent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_LTM_MEMORY_POLICY.clone(),
+            HeaderValue::from_static(""),
+        );
+
+        let view = MemoryHeaderView::from_http_headers(&headers);
+
+        assert_eq!(view.policy.as_deref(), Some(""));
+        assert_eq!(view.subject_id, None);
+        assert_eq!(view.embedding_model, None);
+        assert_eq!(view.extraction_model, None);
+    }
+
+    #[test]
+    fn test_memory_header_view_policy_empty_other_headers_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_LTM_MEMORY_POLICY.clone(),
+            HeaderValue::from_static("   "),
+        );
+        headers.insert(
+            HEADER_LTM_MEMORY_SUBJECT_ID.clone(),
+            HeaderValue::from_static("  "),
+        );
+        headers.insert(
+            HEADER_LTM_MEMORY_EMBEDDING_MODEL.clone(),
+            HeaderValue::from_static(" "),
+        );
+        headers.insert(
+            HEADER_LTM_MEMORY_EXTRACTION_MODEL.clone(),
+            HeaderValue::from_static("   "),
+        );
+
+        let view = MemoryHeaderView::from_http_headers(&headers);
+
+        assert_eq!(view.policy.as_deref(), Some(""));
+        assert_eq!(view.subject_id, None);
+        assert_eq!(view.embedding_model, None);
+        assert_eq!(view.extraction_model, None);
+    }
+
+    #[test]
+    fn test_memory_header_view_all_headers_non_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_LTM_MEMORY_POLICY.clone(),
+            HeaderValue::from_static(" store_and_recall "),
+        );
+        headers.insert(
+            HEADER_LTM_MEMORY_SUBJECT_ID.clone(),
+            HeaderValue::from_static(" subject_1 "),
+        );
+        headers.insert(
+            HEADER_LTM_MEMORY_EMBEDDING_MODEL.clone(),
+            HeaderValue::from_static(" text-embedding-3-small "),
+        );
+        headers.insert(
+            HEADER_LTM_MEMORY_EXTRACTION_MODEL.clone(),
+            HeaderValue::from_static(" gpt-4.1-mini "),
+        );
+
+        let view = MemoryHeaderView::from_http_headers(&headers);
+
+        assert_eq!(view.policy.as_deref(), Some("store_and_recall"));
+        assert_eq!(view.subject_id.as_deref(), Some("subject_1"));
+        assert_eq!(
+            view.embedding_model.as_deref(),
+            Some("text-embedding-3-small")
+        );
+        assert_eq!(view.extraction_model.as_deref(), Some("gpt-4.1-mini"));
     }
 }
