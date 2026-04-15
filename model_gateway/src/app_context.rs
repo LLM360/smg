@@ -392,6 +392,13 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        // Fail fast before storage initialization to avoid side effects
+        // (e.g., migrations) for invalid memory_runtime/backend combinations.
+        validate_memory_writer_configuration(
+            &router_config,
+            backend_supports_memory_writer(&router_config.history_backend),
+        )?;
+
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
