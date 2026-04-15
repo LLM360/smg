@@ -133,7 +133,9 @@ mod tests {
             config: &config,
         };
         let registry = ModelRegistry::new();
-        let spec = registry.lookup(&metadata).expect("should match kimi by name");
+        let spec = registry
+            .lookup(&metadata)
+            .expect("should match kimi by name");
         assert_eq!(spec.name(), "kimi_k25");
     }
 

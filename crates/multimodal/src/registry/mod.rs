@@ -134,6 +134,7 @@ pub(super) mod test_helpers {
                 cls_token: None,
                 mask_token: None,
                 additional_special_tokens: vec![],
+                eos_token_ids: vec![],
             });
             &TOKENS
         }

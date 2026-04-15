@@ -254,13 +254,29 @@ impl ResponseProcessor {
                 let mut escape = false;
                 let mut json_end = None;
                 for (i, ch) in processed_text.char_indices() {
-                    if escape { escape = false; continue; }
-                    if ch == '\\' && in_string { escape = true; continue; }
-                    if ch == '"' { in_string = !in_string; continue; }
-                    if in_string { continue; }
-                    if ch == '{' { depth += 1; } else if ch == '}' {
+                    if escape {
+                        escape = false;
+                        continue;
+                    }
+                    if ch == '\\' && in_string {
+                        escape = true;
+                        continue;
+                    }
+                    if ch == '"' {
+                        in_string = !in_string;
+                        continue;
+                    }
+                    if in_string {
+                        continue;
+                    }
+                    if ch == '{' {
+                        depth += 1;
+                    } else if ch == '}' {
                         depth -= 1;
-                        if depth == 0 { json_end = Some(i + 1); break; }
+                        if depth == 0 {
+                            json_end = Some(i + 1);
+                            break;
+                        }
                     }
                 }
                 if let Some(end) = json_end {

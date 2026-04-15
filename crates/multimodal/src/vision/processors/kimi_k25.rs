@@ -17,6 +17,12 @@ pub struct KimiK25Processor {
     inner: QwenVLProcessorBase,
 }
 
+impl Default for KimiK25Processor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KimiK25Processor {
     pub fn new() -> Self {
         Self {

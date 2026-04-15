@@ -265,6 +265,10 @@ impl TrtllmServiceClient {
         clippy::unused_self,
         reason = "method receiver kept for consistent public API across gRPC backends"
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vLLM backend API; refactoring to a params struct is tracked separately"
+    )]
     pub fn build_generate_request_from_chat(
         &self,
         request_id: String,

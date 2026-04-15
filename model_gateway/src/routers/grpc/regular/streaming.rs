@@ -435,15 +435,19 @@ impl StreamingProcessor {
                         }
                     }
 
-                    // Strip leaked chatml/think tokens when a parser is configured
-                    let mut delta = delta;
                     if self.configured_tool_parser.is_some()
                         || self.configured_reasoning_parser.is_some()
                     {
                         for token in [
-                            "<|im_end|>", "<|im_start|>", "<|im_user|>",
-                            "<|im_assistant|>", "<|im_system|>", "<|im_middle|>",
-                            "</think>", "[EOS]", "[BOS]",
+                            "<|im_end|>",
+                            "<|im_start|>",
+                            "<|im_user|>",
+                            "<|im_assistant|>",
+                            "<|im_system|>",
+                            "<|im_middle|>",
+                            "</think>",
+                            "[EOS]",
+                            "[BOS]",
                         ] {
                             delta = delta.replace(token, "");
                         }
@@ -1220,7 +1224,9 @@ impl StreamingProcessor {
                 "<|im_assistant|>",
                 "<|im_system|>",
                 "<|im_middle|>",
-                "</think>", "[EOS]", "[BOS]",
+                "</think>",
+                "[EOS]",
+                "[BOS]",
             ] {
                 clean_delta = clean_delta.replace(token, "");
             }
@@ -1286,8 +1292,12 @@ impl StreamingProcessor {
                         || self.configured_reasoning_parser.is_some()
                     {
                         for token in [
-                            "<|im_end|>", "<|im_start|>", "<|im_user|>",
-                            "<|im_assistant|>", "<|im_system|>", "<|im_middle|>",
+                            "<|im_end|>",
+                            "<|im_start|>",
+                            "<|im_user|>",
+                            "<|im_assistant|>",
+                            "<|im_system|>",
+                            "<|im_middle|>",
                         ] {
                             normal_text = normal_text.replace(token, "");
                         }
