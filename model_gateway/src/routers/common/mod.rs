@@ -17,6 +17,8 @@
 //!   used by every router for transport-level retries. Has zero
 //!   coupling to the `Worker` trait — it lived in `worker/` for
 //!   historical reasons before this extraction.
+//! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
+//!   responses to clients and parsing upstream SSE byte streams
 
 pub mod header_utils;
 pub mod mcp_utils;
