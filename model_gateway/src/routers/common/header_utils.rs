@@ -19,6 +19,8 @@ static HEADER_LTM_MEMORY_EXTRACTION_MODEL: HeaderName =
 /// Parsed and normalized memory-related request headers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryHeaderView {
+    /// Trimmed policy header value.
+    /// `Some("")` means header was present but blank/whitespace.
     pub policy: Option<String>,
     pub subject_id: Option<String>,
     pub embedding_model: Option<String>,
@@ -26,10 +28,11 @@ pub struct MemoryHeaderView {
 }
 
 impl MemoryHeaderView {
-    /// Extract known memory headers as trimmed non-empty strings.
+    /// Extract known memory headers.
+    /// Policy preserves present-but-blank as `Some("")` for validation/warnings.
     pub fn from_http_headers(headers: &HeaderMap) -> Self {
         Self {
-            policy: extract_header_value_owned(headers, &HEADER_LTM_MEMORY_POLICY),
+            policy: extract_header_value_owned_allow_empty(headers, &HEADER_LTM_MEMORY_POLICY),
             subject_id: extract_header_value_owned(headers, &HEADER_LTM_MEMORY_SUBJECT_ID),
             embedding_model: extract_header_value_owned(
                 headers,
@@ -56,6 +59,17 @@ fn extract_header_value_owned(headers: &HeaderMap, name: &HeaderName) -> Option<
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_header_value_owned_allow_empty(
+    headers: &HeaderMap,
+    name: &HeaderName,
+) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
         .map(ToOwned::to_owned)
 }
 
