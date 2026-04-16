@@ -42,8 +42,9 @@ class _SamplingParamsBase:
         assert resp.max_output_tokens == 256
 
         assert resp.usage is not None
-        assert resp.usage.output_tokens is not None
-        assert resp.usage.output_tokens > 0
+        tokens = resp.usage.output_tokens or resp.usage.completion_tokens
+        assert tokens is not None
+        assert tokens > 0
 
     def test_temperature_zero_is_deterministic(self, model, api_client):
         """temperature=0 reaches the backend — same prompt yields identical output."""
@@ -87,8 +88,9 @@ class _SamplingParamsBase:
         assert resp.temperature == pytest.approx(0.5)
         assert resp.top_p == pytest.approx(0.9, abs=1e-4)
         assert resp.usage is not None
-        assert resp.usage.output_tokens is not None
-        assert resp.usage.output_tokens > 0
+        tokens = resp.usage.output_tokens or resp.usage.completion_tokens
+        assert tokens is not None
+        assert tokens > 0
 
 
 @pytest.mark.engine("sglang")
