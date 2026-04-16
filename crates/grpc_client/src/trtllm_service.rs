@@ -594,7 +594,7 @@ impl TrtllmServiceClient {
         proto::SamplingConfig {
             beam_width: 1,
             num_return_sequences: 1,
-            top_k: Some(request.top_k.max(0)),
+            top_k: (request.top_k >= 0).then_some(request.top_k),
             top_p: Some(request.top_p.unwrap_or(1.0)),
             top_p_min: None,
             top_p_reset_ids: None,
@@ -610,7 +610,7 @@ impl TrtllmServiceClient {
             length_penalty: None,
             early_stopping: None,
             no_repeat_ngram_size: None,
-            min_p: Some(request.min_p),
+            min_p: (request.min_p != 0.0).then_some(request.min_p),
             beam_width_array: vec![],
         }
     }
@@ -1033,13 +1033,15 @@ mod tests {
         assert_eq!(cfg.frequency_penalty, Some(0.3));
         assert_eq!(cfg.presence_penalty, Some(-0.4));
 
-        // Negative top_k is clamped to 0 (TRT-LLM's disabled sentinel).
+        // Default top_k (-1) maps to None, letting TRT-LLM use its own default.
         let disabled = ResponsesRequest {
             top_k: -1,
             ..Default::default()
         };
         let disabled_cfg = TrtllmServiceClient::build_sampling_config_from_responses(&disabled);
-        assert_eq!(disabled_cfg.top_k, Some(0));
+        assert_eq!(disabled_cfg.top_k, None);
+        // Default min_p (0.0) maps to None for the same reason.
+        assert_eq!(disabled_cfg.min_p, None);
     }
 
     #[tokio::test]
