@@ -1,0 +1,377 @@
+syntax = "proto3";
+
+package tokenspeed.grpc.scheduler;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+import "common.proto";
+
+// TokenSpeed scheduler gRPC service.
+// This protocol bridges the frontend (SMG Router or any gRPC client)
+// and the TokenSpeed inference scheduler.
+service TokenSpeedScheduler {
+  // Submit a generation request (supports streaming).
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+
+  // Submit an embedding request.
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+
+  // Health check.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Abort a running request.
+  rpc Abort(AbortRequest) returns (AbortResponse);
+
+  // Get model information.
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+
+  // Get server information.
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+
+  // Get load metrics per DP rank.
+  rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
+
+  // Get tokenizer artifacts for remote construction.
+  rpc GetTokenizer(smg.grpc.common.GetTokenizerRequest) returns (stream smg.grpc.common.GetTokenizerChunk);
+
+  // Subscribe to KV cache events (server-streaming).
+  rpc SubscribeKvEvents(smg.grpc.common.SubscribeKvEventsRequest)
+      returns (stream smg.grpc.common.KvEventBatch);
+}
+
+// =====================
+// Common Types
+// =====================
+
+// Sampling parameters.
+//
+// IMPORTANT: proto3 defaults (0 for numeric fields) do NOT match the
+// semantic defaults (temperature=1.0, top_p=1.0, top_k=-1, etc.).
+// Always construct with explicit values.
+message SamplingParams {
+  float temperature = 1;
+  float top_p = 2;
+  int32 top_k = 3;
+  float min_p = 4;
+  float frequency_penalty = 5;
+  float presence_penalty = 6;
+  float repetition_penalty = 7;
+
+  optional uint32 max_new_tokens = 8;
+  repeated string stop = 9;
+  repeated uint32 stop_token_ids = 10;
+  bool skip_special_tokens = 11;
+  bool spaces_between_special_tokens = 12;
+
+  // Structured generation constraint.
+  oneof constraint {
+    string regex = 13;
+    string json_schema = 14;
+    string ebnf_grammar = 15;
+    string structural_tag = 16;
+  }
+
+  uint32 n = 17;
+  uint32 min_new_tokens = 18;
+  bool ignore_eos = 19;
+  bool no_stop_trim = 20;
+  optional int32 stream_interval = 21;
+  map<string, float> logit_bias = 22;
+  google.protobuf.Struct custom_params = 23;
+}
+
+// Disaggregated serving parameters.
+message DisaggregatedParams {
+  string bootstrap_host = 1;
+  int32 bootstrap_port = 2;
+  int32 bootstrap_room = 3;
+}
+
+// =====================
+// Generate Request
+// =====================
+
+message GenerateRequest {
+  string request_id = 1;
+  TokenizedInput tokenized = 2;
+  MultimodalInputs mm_inputs = 3;
+  SamplingParams sampling_params = 4;
+
+  bool return_logprob = 5;
+  int32 logprob_start_len = 6;
+  int32 top_logprobs_num = 7;
+  repeated uint32 token_ids_logprob = 8;
+  bool return_hidden_states = 9;
+
+  DisaggregatedParams disaggregated_params = 10;
+  string custom_logit_processor = 11;
+  google.protobuf.Timestamp timestamp = 12;
+  bool log_metrics = 13;
+  repeated float input_embeds = 14;
+  reserved 15;  // was lora_id in SGLang proto — removed for TokenSpeed
+  int32 data_parallel_rank = 16;
+  bool stream = 17;
+}
+
+message TokenizedInput {
+  string original_text = 1;
+  repeated uint32 input_ids = 2;
+}
+
+message TensorData {
+  bytes data = 1;
+  repeated uint32 shape = 2;
+  string dtype = 3;
+}
+
+message MultimodalInputs {
+  repeated string image_urls = 1;
+  repeated string video_urls = 2;
+  repeated string audio_urls = 3;
+  TensorData pixel_values = 4;
+  repeated bytes image_data = 5;
+  repeated bytes video_data = 6;
+  repeated bytes audio_data = 7;
+  repeated string modalities = 8;
+  map<string, TensorData> model_specific_tensors = 9;
+  optional uint32 im_token_id = 10;
+  repeated PlaceholderRange mm_placeholders = 11;
+}
+
+message PlaceholderRange {
+  uint32 offset = 1;
+  uint32 length = 2;
+}
+
+// =====================
+// Generate Response
+// =====================
+
+message GenerateResponse {
+  string request_id = 1;
+  oneof response {
+    GenerateStreamChunk chunk = 2;
+    GenerateComplete complete = 3;
+  }
+}
+
+message GenerateStreamChunk {
+  repeated uint32 token_ids = 1;
+  uint32 prompt_tokens = 2;
+  uint32 completion_tokens = 3;
+  uint32 cached_tokens = 4;
+  OutputLogProbs output_logprobs = 5;
+  repeated float hidden_states = 6;
+  InputLogProbs input_logprobs = 7;
+  uint32 index = 8;
+
+  // TokenSpeed-specific: speculative decoding metrics per chunk.
+  uint32 spec_verify_ct = 9;
+  float accept_draft_tokens = 10;
+}
+
+message GenerateComplete {
+  repeated uint32 output_ids = 1;
+  string finish_reason = 2;
+  uint32 prompt_tokens = 3;
+  uint32 completion_tokens = 4;
+  uint32 cached_tokens = 5;
+  OutputLogProbs output_logprobs = 6;
+  repeated HiddenStates all_hidden_states = 7;
+
+  oneof matched_stop {
+    uint32 matched_token_id = 8;
+    string matched_stop_str = 9;
+  }
+
+  InputLogProbs input_logprobs = 10;
+  uint32 index = 11;
+
+  // TokenSpeed-specific: speculative decoding metrics.
+  uint32 spec_verify_ct = 12;
+  float accept_draft_tokens = 13;
+}
+
+message OutputLogProbs {
+  repeated float token_logprobs = 1;
+  repeated uint32 token_ids = 2;
+  repeated TopLogProbs top_logprobs = 3;
+}
+
+message InputLogProbs {
+  repeated InputTokenLogProb token_logprobs = 1;
+  repeated uint32 token_ids = 2;
+  repeated TopLogProbs top_logprobs = 3;
+}
+
+message InputTokenLogProb {
+  optional float value = 1;
+}
+
+message TopLogProbs {
+  repeated float values = 1;
+  repeated uint32 token_ids = 2;
+}
+
+message HiddenStates {
+  repeated float values = 1;
+  int32 layer = 2;
+  int32 position = 3;
+}
+
+// =====================
+// Embedding
+// =====================
+
+message EmbedRequest {
+  string request_id = 1;
+  TokenizedInput tokenized = 2;
+  reserved 3;
+  MultimodalInputs mm_inputs = 4;
+  SamplingParams sampling_params = 5;
+  reserved 6;
+  repeated int32 token_type_ids = 7;
+  int32 data_parallel_rank = 8;
+  bool is_cross_encoder = 9;
+  repeated string texts = 10;
+}
+
+message EmbedResponse {
+  reserved 1, 2, 3;
+  uint32 embedding_dim = 4;
+  repeated float embedding = 5;
+  uint32 prompt_tokens = 6;
+}
+
+// =====================
+// Management
+// =====================
+
+message HealthCheckRequest {}
+message HealthCheckResponse {
+  bool healthy = 1;
+  string message = 2;
+}
+
+message AbortRequest {
+  string request_id = 1;
+  string reason = 2;
+}
+message AbortResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetModelInfoRequest {}
+message GetModelInfoResponse {
+  string model_path = 1;
+  string tokenizer_path = 2;
+  bool is_generation = 3;
+  string preferred_sampling_params = 4;
+  string weight_version = 5;
+  string served_model_name = 6;
+  int32 max_context_length = 7;
+  int32 vocab_size = 8;
+  bool supports_vision = 9;
+  string model_type = 10;
+  repeated int32 eos_token_ids = 11;
+  int32 pad_token_id = 12;
+  int32 bos_token_id = 13;
+  int32 max_req_input_len = 14;
+  repeated string architectures = 15;
+  string id2label_json = 16;
+  int32 num_labels = 17;
+}
+
+message GetServerInfoRequest {}
+message GetServerInfoResponse {
+  google.protobuf.Struct server_args = 1;
+  google.protobuf.Struct scheduler_info = 2;
+  int32 active_requests = 3;
+  bool is_paused = 4;
+  double last_receive_timestamp = 5;
+  double uptime_seconds = 6;
+  string version = 7;
+  string server_type = 8;
+  google.protobuf.Timestamp start_time = 9;
+  int32 max_total_num_tokens = 10;
+}
+
+// =====================
+// Load Metrics
+// =====================
+
+message GetLoadsRequest {
+  optional int32 dp_rank = 1;
+  repeated string include = 2;
+}
+
+message GetLoadsResponse {
+  string timestamp = 1;
+  string version = 2;
+  int32 dp_rank_count = 3;
+  repeated SchedulerLoad loads = 4;
+  AggregateMetrics aggregate = 5;
+}
+
+message SchedulerLoad {
+  int32 dp_rank = 1;
+  int32 num_running_reqs = 2;
+  int32 num_waiting_reqs = 3;
+  int32 num_total_reqs = 4;
+  int32 num_used_tokens = 5;
+  int32 max_total_num_tokens = 6;
+  double token_usage = 7;
+  double gen_throughput = 8;
+  double cache_hit_rate = 9;
+  double utilization = 10;
+  int32 max_running_requests = 11;
+  optional MemoryMetrics memory = 12;
+  optional SpeculativeMetrics speculative = 13;
+  reserved 14;  // was LoRAMetrics in SGLang proto — removed for TokenSpeed
+  optional DisaggregationMetrics disaggregation = 15;
+  optional QueueMetrics queues = 16;
+}
+
+message MemoryMetrics {
+  double weight_gb = 1;
+  double kv_cache_gb = 2;
+  double graph_gb = 3;
+  int32 token_capacity = 4;
+}
+
+message SpeculativeMetrics {
+  double accept_length = 1;
+  double accept_rate = 2;
+}
+
+message DisaggregationMetrics {
+  string mode = 1;
+  int32 prefill_prealloc_queue_reqs = 2;
+  int32 prefill_inflight_queue_reqs = 3;
+  int32 decode_prealloc_queue_reqs = 4;
+  int32 decode_transfer_queue_reqs = 5;
+  int32 decode_retracted_queue_reqs = 6;
+  double kv_transfer_speed_gb_s = 7;
+  double kv_transfer_latency_ms = 8;
+}
+
+message QueueMetrics {
+  int32 waiting = 1;
+  int32 grammar = 2;
+  int32 paused = 3;
+  int32 retracted = 4;
+}
+
+message AggregateMetrics {
+  int32 total_running_reqs = 1;
+  int32 total_waiting_reqs = 2;
+  int32 total_reqs = 3;
+  double avg_token_usage = 4;
+  double avg_throughput = 5;
+  double avg_utilization = 6;
+}
+
+// GetTokenizer and KvEvents use shared types from common.proto.
+// See smg.grpc.common.GetTokenizerRequest, GetTokenizerChunk,
+// SubscribeKvEventsRequest, KvEventBatch, etc.
