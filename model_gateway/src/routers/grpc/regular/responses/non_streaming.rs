@@ -254,10 +254,9 @@ pub(super) async fn execute_tool_loop(
 
             // Separate MCP and function tool calls using session-exposed names.
             let (mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
-                tool_calls.into_iter().partition(|tc| {
-                    let name = tc.name.as_str();
-                    session.has_exposed_tool(name) && !user_function_names.contains(name)
-                });
+                tool_calls
+                    .into_iter()
+                    .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
 
             trace!(
                 "Separated tool calls: {} MCP, {} function",

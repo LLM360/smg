@@ -82,6 +82,8 @@ pub struct McpToolSession<'a> {
     internal_server_keys: HashSet<String>,
     /// Builtin-routed server keys for this request snapshot.
     builtin_server_keys: HashSet<String>,
+    /// Internal, non-builtin server labels for this request snapshot.
+    internal_non_builtin_server_labels: HashSet<String>,
 }
 
 impl<'a> McpToolSession<'a> {
@@ -150,6 +152,14 @@ impl<'a> McpToolSession<'a> {
                 }
             })
             .collect();
+        let internal_non_builtin_server_labels: HashSet<String> = mcp_servers
+            .iter()
+            .filter(|binding| {
+                internal_server_keys.contains(&binding.server_key)
+                    && !builtin_server_keys.contains(&binding.server_key)
+            })
+            .map(|binding| binding.label.clone())
+            .collect();
         // Filter out servers configured with builtin_type from the visible list.
         let visible_mcp_servers: Vec<McpServerBinding> = mcp_servers
             .iter()
@@ -167,6 +177,7 @@ impl<'a> McpToolSession<'a> {
             exposed_name_by_qualified,
             internal_server_keys,
             builtin_server_keys,
+            internal_non_builtin_server_labels,
         }
     }
 
@@ -295,11 +306,8 @@ impl<'a> McpToolSession<'a> {
     /// Use this helper in redaction paths so internal filtering behavior stays
     /// consistent across response assembly code paths.
     pub fn is_internal_non_builtin_server_label(&self, server_label: &str) -> bool {
-        self.all_mcp_servers.iter().any(|binding| {
-            binding.label == server_label
-                && self.is_internal_server_key(&binding.server_key)
-                && !self.builtin_server_keys.contains(&binding.server_key)
-        })
+        self.internal_non_builtin_server_labels
+            .contains(server_label)
     }
 
     /// Returns true if the given tool resolves to an internal server.
@@ -435,9 +443,9 @@ impl<'a> McpToolSession<'a> {
         user_function_names: &HashSet<String>,
     ) {
         let existing = std::mem::take(output);
-        output.reserve(self.mcp_servers.len() + tool_call_items.len() + existing.len());
+        output.reserve(self.all_mcp_servers.len() + tool_call_items.len() + existing.len());
 
-        for binding in &self.mcp_servers {
+        for binding in &self.all_mcp_servers {
             if !self.is_internal_non_builtin_server_label(&binding.label) {
                 output.push(self.build_mcp_list_tools_item(&binding.label, &binding.server_key));
             }
@@ -490,9 +498,8 @@ impl<'a> McpToolSession<'a> {
         user_function_names: &HashSet<String>,
     ) -> bool {
         match tool.get("type").and_then(|value| value.as_str()) {
-            Some("function") => Self::function_tool_name_json(tool).is_some_and(|name| {
-                self.is_internal_tool(name) && !user_function_names.contains(name)
-            }),
+            Some("function") => Self::function_tool_name_json(tool)
+                .is_some_and(|name| self.should_hide_function_call_like(name, user_function_names)),
             // MCP tool entries are keyed by server metadata, so function-name collision
             // handling does not apply to this arm.
             Some("mcp") => tool

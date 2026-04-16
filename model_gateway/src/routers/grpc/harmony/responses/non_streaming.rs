@@ -174,11 +174,9 @@ async fn execute_with_mcp_loop(
                 // Separate MCP and function tool calls based on session exposure.
                 // MCP tools are exposed to the model as function tools, so the only reliable
                 // discriminator is whether the name belongs to the MCP session.
-                let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) =
-                    tool_calls.into_iter().partition(|tc| {
-                        let name = tc.function.name.as_str();
-                        session.has_exposed_tool(name) && !user_function_names.contains(name)
-                    });
+                let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                    .into_iter()
+                    .partition(|tc| session.has_exposed_tool(tc.function.name.as_str()));
 
                 debug!(
                     mcp_calls = mcp_tool_calls.len(),
