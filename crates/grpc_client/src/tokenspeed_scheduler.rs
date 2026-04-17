@@ -136,7 +136,11 @@ impl TokenSpeedSchedulerClient {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to TokenSpeed scheduler at {}", endpoint);
 
-        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {
+        // Accept `grpc://` (→ http) and `grpcs://` (→ https) prefixes so TLS
+        // endpoints work without the caller having to rewrite the scheme.
+        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpcs://") {
+            format!("https://{addr}")
+        } else if let Some(addr) = endpoint.strip_prefix("grpc://") {
             format!("http://{addr}")
         } else {
             endpoint.to_string()
@@ -178,10 +182,7 @@ impl TokenSpeedSchedulerClient {
         let request_id = req.request_id.clone();
         let mut client = self.client.clone();
         let mut request = Request::new(req);
-
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
+        self.inject_trace(&mut request);
 
         let response = client.generate(request).await?;
 
@@ -199,19 +200,24 @@ impl TokenSpeedSchedulerClient {
     ) -> Result<proto::EmbedResponse, tonic::Status> {
         let mut client = self.client.clone();
         let mut request = Request::new(req);
-
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
+        self.inject_trace(&mut request);
 
         let response = client.embed(request).await?;
         Ok(response.into_inner())
     }
 
+    /// Inject trace context into the request metadata.
+    fn inject_trace(&self, request: &mut Request<impl Sized>) {
+        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+            warn!("Failed to inject trace context: {}", e);
+        }
+    }
+
     /// Perform health check.
     pub async fn health_check(&self) -> Result<proto::HealthCheckResponse, tonic::Status> {
         debug!("Sending health check request");
-        let request = Request::new(proto::HealthCheckRequest {});
+        let mut request = Request::new(proto::HealthCheckRequest {});
+        self.inject_trace(&mut request);
         let mut client = self.client.clone();
         let response = client.health_check(request).await?;
         Ok(response.into_inner())
@@ -223,10 +229,11 @@ impl TokenSpeedSchedulerClient {
         request_id: String,
         reason: String,
     ) -> Result<(), tonic::Status> {
-        let request = Request::new(proto::AbortRequest {
+        let mut request = Request::new(proto::AbortRequest {
             request_id,
             reason,
         });
+        self.inject_trace(&mut request);
         let mut client = self.client.clone();
         client.abort(request).await?;
         Ok(())
@@ -236,7 +243,8 @@ impl TokenSpeedSchedulerClient {
     pub async fn get_model_info(
         &self,
     ) -> Result<proto::GetModelInfoResponse, tonic::Status> {
-        let request = Request::new(proto::GetModelInfoRequest {});
+        let mut request = Request::new(proto::GetModelInfoRequest {});
+        self.inject_trace(&mut request);
         let mut client = self.client.clone();
         let response = client.get_model_info(request).await?;
         Ok(response.into_inner())
@@ -246,7 +254,8 @@ impl TokenSpeedSchedulerClient {
     pub async fn get_server_info(
         &self,
     ) -> Result<proto::GetServerInfoResponse, tonic::Status> {
-        let request = Request::new(proto::GetServerInfoRequest {});
+        let mut request = Request::new(proto::GetServerInfoRequest {});
+        self.inject_trace(&mut request);
         let mut client = self.client.clone();
         let response = client.get_server_info(request).await?;
         Ok(response.into_inner())
@@ -257,7 +266,8 @@ impl TokenSpeedSchedulerClient {
         &self,
         req: proto::GetLoadsRequest,
     ) -> Result<proto::GetLoadsResponse, tonic::Status> {
-        let request = Request::new(req);
+        let mut request = Request::new(req);
+        self.inject_trace(&mut request);
         let mut client = self.client.clone();
         let response = client.get_loads(request).await?;
         Ok(response.into_inner())
