@@ -123,9 +123,7 @@ pub struct TokenSpeedSchedulerClient {
 
 impl TokenSpeedSchedulerClient {
     /// Create a new client and connect to the TokenSpeed scheduler.
-    pub async fn connect(
-        endpoint: &str,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::connect_with_trace_injector(endpoint, Arc::new(NoopTraceInjector)).await
     }
 
@@ -158,8 +156,7 @@ impl TokenSpeedSchedulerClient {
             .connect()
             .await?;
 
-        let client =
-            proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
+        let client = proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
 
         Ok(Self {
             client,
@@ -229,10 +226,7 @@ impl TokenSpeedSchedulerClient {
         request_id: String,
         reason: String,
     ) -> Result<(), tonic::Status> {
-        let mut request = Request::new(proto::AbortRequest {
-            request_id,
-            reason,
-        });
+        let mut request = Request::new(proto::AbortRequest { request_id, reason });
         self.inject_trace(&mut request);
         let mut client = self.client.clone();
         client.abort(request).await?;
@@ -240,9 +234,7 @@ impl TokenSpeedSchedulerClient {
     }
 
     /// Get model information.
-    pub async fn get_model_info(
-        &self,
-    ) -> Result<proto::GetModelInfoResponse, tonic::Status> {
+    pub async fn get_model_info(&self) -> Result<proto::GetModelInfoResponse, tonic::Status> {
         let mut request = Request::new(proto::GetModelInfoRequest {});
         self.inject_trace(&mut request);
         let mut client = self.client.clone();
@@ -251,9 +243,7 @@ impl TokenSpeedSchedulerClient {
     }
 
     /// Get server information.
-    pub async fn get_server_info(
-        &self,
-    ) -> Result<proto::GetServerInfoResponse, tonic::Status> {
+    pub async fn get_server_info(&self) -> Result<proto::GetServerInfoResponse, tonic::Status> {
         let mut request = Request::new(proto::GetServerInfoRequest {});
         self.inject_trace(&mut request);
         let mut client = self.client.clone();

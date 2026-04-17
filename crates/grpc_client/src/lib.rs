@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{proto as sglang_proto, SglangSchedulerClient};
-use tonic::metadata::MetadataMap;
 pub use tokenspeed_scheduler::{proto as tokenspeed_proto, TokenSpeedSchedulerClient};
+use tonic::metadata::MetadataMap;
 pub use trtllm_service::{proto as trtllm_proto, TrtllmServiceClient};
 pub use vllm_engine::{proto as vllm_proto, VllmEngineClient};
 
