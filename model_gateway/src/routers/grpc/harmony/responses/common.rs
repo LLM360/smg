@@ -1,5 +1,7 @@
 //! Shared helpers and state tracking for Harmony Responses
 
+use std::collections::HashSet;
+
 use axum::response::Response;
 use openai_protocol::{
     common::{ToolCall, ToolChoice, ToolChoiceValue},
@@ -15,7 +17,11 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::execution::ToolResult;
-use crate::routers::{error, grpc::common::responses::ResponsesContext};
+use crate::routers::{
+    common::mcp_utils::{extract_mcp_list_tools_labels, inject_mcp_output_items},
+    error,
+    grpc::common::responses::ResponsesContext,
+};
 
 /// Record of a single MCP tool call execution
 ///
@@ -35,6 +41,11 @@ pub(super) struct McpCallRecord {
 pub(super) struct McpCallTracking {
     /// All tool call records across all iterations
     pub tool_calls: Vec<McpCallRecord>,
+}
+
+pub(super) struct LoadedResponsesHistory {
+    pub request: ResponsesRequest,
+    pub existing_mcp_list_tools_labels: HashSet<String>,
 }
 
 impl McpCallTracking {
@@ -164,6 +175,7 @@ pub(super) fn inject_mcp_metadata(
     response: &mut ResponsesResponse,
     tracking: &McpCallTracking,
     session: &McpToolSession<'_>,
+    existing_labels: &HashSet<String>,
 ) {
     let tool_output_items: Vec<ResponseOutputItem> = tracking
         .tool_calls
@@ -171,7 +183,12 @@ pub(super) fn inject_mcp_metadata(
         .map(|record| record.output_item.clone())
         .collect();
 
-    session.inject_mcp_output_items(&mut response.output, tool_output_items);
+    inject_mcp_output_items(
+        &mut response.output,
+        tool_output_items,
+        existing_labels,
+        session,
+    );
 }
 
 /// Load previous conversation messages from storage
@@ -181,10 +198,13 @@ pub(super) fn inject_mcp_metadata(
 pub(super) async fn load_previous_messages(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
-) -> Result<ResponsesRequest, Response> {
+) -> Result<LoadedResponsesHistory, Response> {
     let Some(ref prev_id_str) = request.previous_response_id else {
         // No previous_response_id, return request as-is
-        return Ok(request);
+        return Ok(LoadedResponsesHistory {
+            request,
+            existing_mcp_list_tools_labels: HashSet::new(),
+        });
     };
 
     let prev_id = ResponseId::from(prev_id_str.as_str());
@@ -225,6 +245,7 @@ pub(super) async fn load_previous_messages(
 
     // Build conversation history from stored responses
     let mut history_items = Vec::new();
+    let mut existing_mcp_list_tools_labels = HashSet::new();
 
     // Helper to deserialize and collect items from a JSON array
     let deserialize_items = |arr: &Value, item_type: &str| -> Vec<ResponseInputOutputItem> {
@@ -245,6 +266,10 @@ pub(super) async fn load_previous_messages(
     };
 
     for stored in &chain.responses {
+        existing_mcp_list_tools_labels.extend(extract_mcp_list_tools_labels(
+            stored.raw_response.get("output").unwrap_or(&Value::Null),
+        ));
+
         history_items.extend(deserialize_items(&stored.input, "input"));
         history_items.extend(deserialize_items(
             stored
@@ -287,5 +312,8 @@ pub(super) async fn load_previous_messages(
     modified_request.input = ResponseInput::Items(all_items);
     modified_request.previous_response_id = None;
 
-    Ok(modified_request)
+    Ok(LoadedResponsesHistory {
+        request: modified_request,
+        existing_mcp_list_tools_labels,
+    })
 }

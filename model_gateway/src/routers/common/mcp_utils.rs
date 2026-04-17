@@ -1,16 +1,71 @@
 //! Shared MCP utilities for routers.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use openai_protocol::responses::ResponseTool;
+use openai_protocol::responses::{ResponseOutputItem, ResponseTool};
+use serde_json::Value;
 use smg_mcp::{
-    BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport,
-    ResponseFormat,
+    BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpToolSession,
+    McpTransport, ResponseFormat,
 };
 use tracing::{debug, warn};
 
 /// Default maximum tool loop iterations (safety limit).
 pub const DEFAULT_MAX_ITERATIONS: usize = 10;
+
+/// Return only the MCP bindings that have not already been listed in prior output.
+pub fn mcp_list_tools_bindings_to_emit(
+    existing_labels: &HashSet<String>,
+    bindings: &[McpServerBinding],
+) -> Vec<(String, String)> {
+    bindings
+        .iter()
+        .filter(|binding| !existing_labels.contains(&binding.label))
+        .map(|binding| (binding.label.clone(), binding.server_key.clone()))
+        .collect()
+}
+
+/// Extract `mcp_list_tools.server_label` values from a stored response output array.
+pub fn extract_mcp_list_tools_labels(output: &Value) -> Vec<String> {
+    output
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    (item.get("type").and_then(|t| t.as_str()) == Some("mcp_list_tools"))
+                        .then(|| item.get("server_label").and_then(|v| v.as_str()))
+                        .flatten()
+                        .map(ToOwned::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Prepend filtered `mcp_list_tools` items and current-turn MCP calls to response output.
+pub fn inject_mcp_output_items(
+    output: &mut Vec<ResponseOutputItem>,
+    tool_call_items: Vec<ResponseOutputItem>,
+    existing_labels: &HashSet<String>,
+    session: &McpToolSession<'_>,
+) {
+    let existing = std::mem::take(output);
+    let list_tools_bindings =
+        mcp_list_tools_bindings_to_emit(existing_labels, session.mcp_servers());
+
+    output.reserve(list_tools_bindings.len() + tool_call_items.len() + existing.len());
+
+    for (server_label, server_key) in list_tools_bindings {
+        output.push(session.build_mcp_list_tools_item(&server_label, &server_key));
+    }
+
+    output.extend(tool_call_items);
+    output.extend(existing);
+}
 
 /// Protocol-agnostic MCP server descriptor for connection setup.
 ///
@@ -273,12 +328,16 @@ pub async fn ensure_request_mcp_client(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use openai_protocol::{
         common::Function,
         responses::{
-            CodeInterpreterTool, FunctionTool, McpTool, ResponseTool, WebSearchPreviewTool,
+            CodeInterpreterTool, FunctionTool, McpTool, ResponseOutputItem, ResponseTool,
+            WebSearchPreviewTool,
         },
     };
     use serde_json::json;
@@ -506,6 +565,53 @@ mod tests {
             code_routing.response_format,
             ResponseFormat::CodeInterpreterCall
         );
+    }
+
+    #[tokio::test]
+    async fn test_inject_mcp_output_items_only_emits_new_bindings() {
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![
+                McpServerBinding {
+                    label: "brave".to_string(),
+                    server_key: "server-brave".to_string(),
+                    allowed_tools: None,
+                },
+                McpServerBinding {
+                    label: "deepwiki".to_string(),
+                    server_key: "server-deepwiki".to_string(),
+                    allowed_tools: None,
+                },
+            ],
+            "test-request",
+        );
+
+        let mut output = vec![ResponseOutputItem::Message {
+            id: "msg_123".to_string(),
+            role: "assistant".to_string(),
+            content: vec![],
+            status: "completed".to_string(),
+        }];
+
+        inject_mcp_output_items(
+            &mut output,
+            Vec::new(),
+            &HashSet::from(["brave".to_string()]),
+            &session,
+        );
+
+        let labels: Vec<&str> = output
+            .iter()
+            .filter_map(|item| match item {
+                ResponseOutputItem::McpListTools { server_label, .. } => {
+                    Some(server_label.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(labels, vec!["deepwiki"]);
     }
 
     // =========================================================================

@@ -1,6 +1,7 @@
 //! Non-streaming Harmony Responses API implementation
 
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -56,14 +57,22 @@ pub(crate) async fn serve_harmony_responses(
     let original_request = request.clone();
 
     // Load previous conversation history if previous_response_id is set
-    let current_request = load_previous_messages(ctx, request).await?;
+    let loaded_history = load_previous_messages(ctx, request).await?;
+    let current_request = loaded_history.request;
+    let existing_mcp_list_tools_labels = loaded_history.existing_mcp_list_tools_labels;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) =
         ensure_mcp_connection(&ctx.mcp_orchestrator, current_request.tools.as_deref()).await?;
 
     let response = if has_mcp_tools {
-        execute_with_mcp_loop(ctx, current_request, mcp_servers).await?
+        execute_with_mcp_loop(
+            ctx,
+            current_request,
+            mcp_servers,
+            existing_mcp_list_tools_labels,
+        )
+        .await?
     } else {
         // No MCP tools - execute pipeline once (may have function tools or no tools)
         execute_without_mcp_loop(ctx, current_request).await?
@@ -90,6 +99,7 @@ async fn execute_with_mcp_loop(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
     mcp_servers: Vec<McpServerBinding>,
+    existing_mcp_list_tools_labels: HashSet<String>,
 ) -> Result<ResponsesResponse, Response> {
     let mut iteration_count = 0;
 
@@ -225,10 +235,12 @@ async fn execute_with_mcp_loop(
                     response.status = ResponseStatus::Completed;
                     response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
 
-                    // Inject MCP metadata if any calls were executed
-                    if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &session);
-                    }
+                    inject_mcp_metadata(
+                        &mut response,
+                        &mcp_tracking,
+                        &session,
+                        &existing_mcp_list_tools_labels,
+                    );
 
                     return Ok(response);
                 }
@@ -270,10 +282,12 @@ async fn execute_with_mcp_loop(
                         Arc::new(response_request),
                     );
 
-                    // Inject MCP metadata for all executed calls
-                    if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &session);
-                    }
+                    inject_mcp_metadata(
+                        &mut response,
+                        &mcp_tracking,
+                        &session,
+                        &existing_mcp_list_tools_labels,
+                    );
 
                     return Ok(response);
                 }
@@ -304,7 +318,12 @@ async fn execute_with_mcp_loop(
                 );
 
                 // Inject MCP metadata into final response
-                inject_mcp_metadata(&mut response, &mcp_tracking, &session);
+                inject_mcp_metadata(
+                    &mut response,
+                    &mcp_tracking,
+                    &session,
+                    &existing_mcp_list_tools_labels,
+                );
 
                 // Restore original tools (hide internal MCP tools from response)
                 response.tools = original_tools.take().unwrap_or_default();
