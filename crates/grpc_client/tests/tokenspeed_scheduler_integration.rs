@@ -11,6 +11,12 @@
 //! * `TOKENSPEED_TEST_INPUT_IDS` — comma-separated prompt token IDs for the
 //!   Generate tests. Default: `1,2,3`.
 
+// Workspace clippy auto-allows expect/unwrap inside `#[test]` functions, but
+// `#[tokio::test]` expands too late for that detection — so we opt the whole
+// file in explicitly. This is a test file; a panic on a missing env var or a
+// dead server is the correct way to fail.
+#![expect(clippy::expect_used)]
+
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
