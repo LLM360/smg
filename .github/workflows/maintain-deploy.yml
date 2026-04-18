@@ -2,7 +2,7 @@ name: Maintain deploy branch
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       force:
@@ -131,6 +131,21 @@ jobs:
             echo "::warning::Failed to merge (conflicts):$FAILED"
           fi
           echo "FAILED_BRANCHES=$FAILED" >> "$GITHUB_ENV"
+
+      - name: Preserve fork-local .github/workflows
+        # GitHub Actions only reads workflow files on the branch where the trigger
+        # fires. Fork-local CI (e.g. release-binary.yml that triggers on push to
+        # deploy) lives on fork main, not upstream. Overlay fork-main workflows
+        # onto the deploy tree so those workflows survive the rebuild.
+        run: |
+          git fetch origin main
+          if git ls-tree -r origin/main -- .github/workflows/ 2>/dev/null | grep -q .
+          then
+            git checkout origin/main -- .github/workflows/
+            git add .github/workflows/
+            git diff --cached --quiet || \
+              git commit -m "Deploy: preserve fork-local .github/workflows from main"
+          fi
 
       - name: Stamp fingerprint and push
         env:
