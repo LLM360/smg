@@ -1,4 +1,7 @@
-use openai_protocol::skills::{ResponsesSkillEntry, ResponsesSkillRef, SkillVersionRef};
+use openai_protocol::skills::{
+    OpaqueOpenAIObject, ResponsesSkillEntry, ResponsesSkillRef, SkillVersionRef,
+};
+use schemars::schema_for;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -43,6 +46,14 @@ fn skill_version_ref_rejects_unknown_string() {
 }
 
 #[test]
+fn skill_version_ref_rejects_zero_padded_timestamp_string() {
+    let err = serde_json::from_value::<SkillVersionRef>(json!("0000000001")).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("leading zeros are not allowed in timestamp strings"));
+}
+
+#[test]
 fn optional_skill_version_ref_accepts_null_and_absent() {
     let null_value: OptionalVersionHolder =
         serde_json::from_value(json!({"version": null})).unwrap();
@@ -72,6 +83,27 @@ fn responses_skill_entry_deserializes_typed_reference() {
 }
 
 #[test]
+fn responses_skill_entry_deserializes_typed_local_reference() {
+    let raw = json!({
+        "type": "local",
+        "name": "map",
+        "description": "Map the codebase",
+        "path": "./skills/map"
+    });
+
+    let parsed: ResponsesSkillEntry = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(
+        parsed,
+        ResponsesSkillEntry::Typed(ResponsesSkillRef::Local {
+            name: "map".to_string(),
+            description: "Map the codebase".to_string(),
+            path: "./skills/map".to_string(),
+        })
+    );
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), raw);
+}
+
+#[test]
 fn responses_skill_entry_round_trips_opaque_openai_entry() {
     let raw = json!({
         "type": "inline_skill",
@@ -81,7 +113,29 @@ fn responses_skill_entry_round_trips_opaque_openai_entry() {
     });
 
     let parsed: ResponsesSkillEntry = serde_json::from_value(raw.clone()).unwrap();
-    assert_eq!(parsed, ResponsesSkillEntry::OpaqueOpenAI(raw.clone()));
+    let expected = ResponsesSkillEntry::OpaqueOpenAI(
+        serde_json::from_value::<OpaqueOpenAIObject>(raw.clone()).unwrap(),
+    );
+    assert_eq!(parsed, expected);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), raw);
+}
+
+#[test]
+fn responses_skill_entry_preserves_provider_fields_on_typed_tags() {
+    let raw = json!({
+        "type": "skill_reference",
+        "skill_id": "skill_123",
+        "version": 2,
+        "provider_feature": true,
+        "custom_config": {"trace": "abc"}
+    });
+
+    let parsed: ResponsesSkillEntry = serde_json::from_value(raw.clone()).unwrap();
+
+    let expected = ResponsesSkillEntry::OpaqueOpenAI(
+        serde_json::from_value::<OpaqueOpenAIObject>(raw.clone()).unwrap(),
+    );
+    assert_eq!(parsed, expected);
     assert_eq!(serde_json::to_value(&parsed).unwrap(), raw);
 }
 
@@ -103,4 +157,24 @@ fn responses_skill_entry_rejects_non_object_payloads() {
             .to_string()
             .contains("responses skill entries must be JSON objects"));
     }
+}
+
+#[test]
+fn skill_version_ref_schema_matches_runtime_contract() {
+    let schema = serde_json::to_value(schema_for!(SkillVersionRef)).unwrap();
+    let one_of = schema
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+
+    assert!(one_of
+        .iter()
+        .any(|branch| branch.get("enum") == Some(&json!(["latest"]))));
+    assert!(one_of
+        .iter()
+        .any(|branch| branch.get("type") == Some(&json!("integer"))));
+    assert!(one_of.iter().any(|branch| {
+        branch.get("type") == Some(&json!("string"))
+            && branch.get("pattern") == Some(&json!("^[1-9][0-9]{9,}$"))
+    }));
 }

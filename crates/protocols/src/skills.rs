@@ -7,7 +7,7 @@ use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Accepted in `/v1/messages` -> `container.skills[]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -49,6 +49,14 @@ pub enum ResponsesSkillRef {
     },
 }
 
+/// Opaque provider-owned Responses skill payload.
+///
+/// This wrapper keeps the public type aligned with the runtime contract:
+/// opaque skill entries must still be JSON objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct OpaqueOpenAIObject(pub Map<String, Value>);
+
 /// One entry in `/v1/responses` -> `tools[].environment.skills[]`.
 ///
 /// SMG interprets the typed subset directly and preserves all other JSON
@@ -57,7 +65,7 @@ pub enum ResponsesSkillRef {
 #[serde(untagged)]
 pub enum ResponsesSkillEntry {
     Typed(ResponsesSkillRef),
-    OpaqueOpenAI(Value),
+    OpaqueOpenAI(OpaqueOpenAIObject),
 }
 
 impl<'de> Deserialize<'de> for ResponsesSkillEntry {
@@ -66,20 +74,19 @@ impl<'de> Deserialize<'de> for ResponsesSkillEntry {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-
-        if !value.is_object() {
+        let Value::Object(object) = value else {
             return Err(de::Error::custom(
                 "responses skill entries must be JSON objects",
             ));
-        }
+        };
 
-        if matches_typed_responses_skill_ref(&value) {
-            return serde_json::from_value::<ResponsesSkillRef>(value)
+        if matches_typed_responses_skill_ref(&object) {
+            return serde_json::from_value::<ResponsesSkillRef>(Value::Object(object.clone()))
                 .map(Self::Typed)
                 .map_err(de::Error::custom);
         }
 
-        Ok(Self::OpaqueOpenAI(value))
+        Ok(Self::OpaqueOpenAI(OpaqueOpenAIObject(object)))
     }
 }
 
@@ -196,8 +203,39 @@ impl schemars::JsonSchema for SkillVersionRef {
         "SkillVersionRef".to_string()
     }
 
-    fn json_schema(r#gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        SkillVersionRefWire::json_schema(r#gen)
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::*;
+
+        let latest_schema = SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            enum_values: Some(vec!["latest".into()]),
+            ..Default::default()
+        };
+        let integer_schema = SchemaObject {
+            instance_type: Some(InstanceType::Integer.into()),
+            ..Default::default()
+        };
+        let timestamp_schema = SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                pattern: Some("^[1-9][0-9]{9,}$".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        SchemaObject {
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    latest_schema.into(),
+                    integer_schema.into(),
+                    timestamp_schema.into(),
+                ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .into()
     }
 }
 
@@ -246,18 +284,18 @@ pub(crate) enum SkillOrigin {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
-enum SkillVersionRefWire {
-    String(String),
-    Integer(u32),
+fn matches_typed_responses_skill_ref(value: &Map<String, Value>) -> bool {
+    // Keep this tag/field matching in sync with ResponsesSkillRef's
+    // `#[serde(rename = "...")]` values and allowed field sets.
+    match value.get("type").and_then(Value::as_str) {
+        Some("skill_reference") => has_only_keys(value, &["type", "skill_id", "version"]),
+        Some("local") => has_only_keys(value, &["type", "name", "description", "path"]),
+        _ => false,
+    }
 }
 
-fn matches_typed_responses_skill_ref(value: &Value) -> bool {
-    matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("skill_reference" | "local")
-    )
+fn has_only_keys(value: &Map<String, Value>, allowed_keys: &[&str]) -> bool {
+    value.keys().all(|key| allowed_keys.contains(&key.as_str()))
 }
 
 fn parse_skill_version_str(value: &str) -> Result<SkillVersionRef, String> {
@@ -272,14 +310,16 @@ fn parse_skill_version_str(value: &str) -> Result<SkillVersionRef, String> {
             ));
         }
 
-        if value.bytes().all(|byte| byte == b'0') {
-            return Err("timestamp skill version string must be a positive integer".to_string());
+        if value.starts_with('0') {
+            return Err(format!(
+                "ambiguous skill version string `{value}`: leading zeros are not allowed in timestamp strings"
+            ));
         }
 
         return Ok(SkillVersionRef::Timestamp(value.to_string()));
     }
 
     Err(format!(
-        "invalid skill version string `{value}`: expected `latest` or a 10+ digit timestamp string"
+        "invalid skill version string `{value}`: expected `latest` or a 10+ digit timestamp string without leading zeros"
     ))
 }
