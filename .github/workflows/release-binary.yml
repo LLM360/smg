@@ -1,0 +1,85 @@
+name: Publish smg binary to GitHub Releases
+
+# Rebuilds the smg binary on every push to the `deploy` branch and publishes
+# it as a GitHub Release asset tagged with the commit SHA. The RL360 image
+# build reads versions.env to get the pinned smg SHA and curls the binary
+# from the corresponding release.
+#
+# Run history: each deploy commit produces exactly one release. Older
+# releases stay around as rollback targets; the RL360 image can pin any
+# historical SHA.
+
+on:
+  push:
+    branches: [deploy]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA to build and release (defaults to current ref)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-4core-150gb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install system deps for native crates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev protobuf-compiler cmake
+
+      - name: Build smg binary
+        run: |
+          set -euo pipefail
+          cargo build --release --bin smg
+          ls -lh target/release/smg
+          test -f target/release/smg
+
+      - name: Prepare release artifacts
+        id: prepare
+        run: |
+          set -euo pipefail
+          cp target/release/smg sgl-model-gateway-bin
+          sha256sum sgl-model-gateway-bin > sgl-model-gateway-bin.sha256
+          FULL_SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short=8 HEAD)
+          echo "sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+
+      - name: Create or replace release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.prepare.outputs.sha }}
+          SHORT: ${{ steps.prepare.outputs.short }}
+        run: |
+          set -euo pipefail
+          # Idempotent: delete-if-exists before create, so re-runs of the
+          # same workflow produce a single release per commit.
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --title "deploy snapshot ${SHORT}" \
+            --notes "Auto-built from the deploy branch commit ${TAG}. Binary is ready for docker build --build-arg SMG_SHA=${TAG} in the RL360 image." \
+            --target "$TAG" \
+            sgl-model-gateway-bin sgl-model-gateway-bin.sha256
