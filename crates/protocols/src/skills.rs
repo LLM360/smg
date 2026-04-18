@@ -52,7 +52,7 @@ pub enum ResponsesSkillRef {
 /// One entry in `/v1/responses` -> `tools[].environment.skills[]`.
 ///
 /// SMG interprets the typed subset directly and preserves all other JSON
-/// entries as opaque provider-owned payloads.
+/// object entries as opaque provider-owned payloads.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ResponsesSkillEntry {
@@ -66,6 +66,12 @@ impl<'de> Deserialize<'de> for ResponsesSkillEntry {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+
+        if !value.is_object() {
+            return Err(de::Error::custom(
+                "responses skill entries must be JSON objects",
+            ));
+        }
 
         if matches_typed_responses_skill_ref(&value) {
             return serde_json::from_value::<ResponsesSkillRef>(value)
@@ -195,22 +201,30 @@ impl schemars::JsonSchema for SkillVersionRef {
     }
 }
 
+#[expect(
+    dead_code,
+    reason = "Skill resolution lands in follow-up PRs, but these internal protocol-side types stay crate-private now"
+)]
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedSkillRef {
-    pub public_skill_id: String,
-    pub origin: SkillOrigin,
-    pub requested_version: Option<SkillVersionRef>,
-    pub pinned: Option<PinnedSkillVersion>,
+pub(crate) struct ResolvedSkillRef {
+    pub(crate) public_skill_id: String,
+    pub(crate) origin: SkillOrigin,
+    pub(crate) requested_version: Option<SkillVersionRef>,
+    pub(crate) pinned: Option<PinnedSkillVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PinnedSkillVersion {
-    pub version: String,
-    pub version_number: u32,
+pub(crate) struct PinnedSkillVersion {
+    pub(crate) version: String,
+    pub(crate) version_number: u32,
 }
 
+#[expect(
+    dead_code,
+    reason = "Skill resolution lands in follow-up PRs, but origin tracking belongs with the other crate-private resolver types"
+)]
 #[derive(Debug, Clone, PartialEq)]
-pub enum SkillOrigin {
+pub(crate) enum SkillOrigin {
     AnthropicProvider {
         skill_id: String,
         raw_version: Option<String>,

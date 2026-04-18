@@ -94,3 +94,13 @@ fn responses_skill_entry_rejects_malformed_typed_reference() {
 
     assert!(err.to_string().contains("missing field `skill_id`"));
 }
+
+#[test]
+fn responses_skill_entry_rejects_non_object_payloads() {
+    for raw in [json!(null), json!("inline_skill"), json!(["inline_skill"])] {
+        let err = serde_json::from_value::<ResponsesSkillEntry>(raw).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("responses skill entries must be JSON objects"));
+    }
+}
