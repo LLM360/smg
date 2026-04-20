@@ -1,12 +1,23 @@
+use std::{collections::BTreeMap, fmt};
+
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use smg_blob_storage::BlobKey;
 
 /// Top-level skill metadata stored in the control-plane database.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillRecord {
     pub tenant_id: String,
     pub skill_id: String,
-    pub display_name: String,
+    pub name: String,
+    pub short_description: Option<String>,
+    pub description: Option<String>,
+    pub source: String,
+    pub has_code_files: bool,
+    pub latest_version: Option<String>,
     pub default_version: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Metadata for a single immutable skill version.
@@ -15,7 +26,16 @@ pub struct SkillVersionRecord {
     pub skill_id: String,
     pub version: String,
     pub version_number: u32,
-    pub has_code_files: bool,
+    pub name: String,
+    pub short_description: Option<String>,
+    pub description: String,
+    pub interface: Option<SkillInterfaceMetadata>,
+    pub dependencies: Option<SkillSidecarDependencies>,
+    pub policy: Option<SkillPolicyMetadata>,
+    pub deprecated: bool,
+    pub file_manifest: Vec<SkillFileRecord>,
+    pub instruction_token_counts: BTreeMap<String, u32>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// File-level manifest entry stored alongside a normalized skill bundle.
@@ -24,6 +44,39 @@ pub struct SkillFileRecord {
     pub relative_path: String,
     pub media_type: Option<String>,
     pub size_bytes: u64,
+    pub blob_key: Option<BlobKey>,
+}
+
+/// Tenant-alias mapping for request-time tenant resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantAliasRecord {
+    pub alias_tenant_id: String,
+    pub canonical_tenant_id: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Persisted bundle-token claims keyed by a deterministic secret hash.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleTokenClaim {
+    pub token_hash: String,
+    pub tenant_id: String,
+    pub exec_id: String,
+    pub skill_id: String,
+    pub skill_version: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Persisted continuation-cookie claims keyed by a deterministic secret hash.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinuationCookieClaim {
+    pub cookie_hash: String,
+    pub tenant_id: String,
+    pub exec_id: String,
+    pub request_id: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Canonical in-memory representation of a validated skill bundle.
@@ -33,6 +86,33 @@ pub struct NormalizedSkillBundle {
     pub skill_md_path: String,
     pub openai_sidecar_path: Option<String>,
     pub has_code_files: bool,
+}
+
+impl fmt::Debug for BundleTokenClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BundleTokenClaim")
+            .field("token_hash", &"<redacted>")
+            .field("tenant_id", &self.tenant_id)
+            .field("exec_id", &self.exec_id)
+            .field("skill_id", &self.skill_id)
+            .field("skill_version", &self.skill_version)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ContinuationCookieClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContinuationCookieClaim")
+            .field("cookie_hash", &"<redacted>")
+            .field("tenant_id", &self.tenant_id)
+            .field("exec_id", &self.exec_id)
+            .field("request_id", &self.request_id)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl NormalizedSkillBundle {
@@ -45,6 +125,7 @@ impl NormalizedSkillBundle {
                 relative_path: file.relative_path.clone(),
                 media_type: None,
                 size_bytes: file.size_bytes(),
+                blob_key: None,
             })
             .collect()
     }
