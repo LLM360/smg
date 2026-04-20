@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::Result;
+use bytes::Bytes;
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -17,6 +18,10 @@ use tracing as log;
 use tracing::instrument;
 
 use super::{
+    chunking::{
+        build_stream_batches, chunk_value, dispatch_stream_batch, next_generation,
+        DEFAULT_MAX_CHUNKS_PER_BATCH, MAX_STREAM_CHUNK_BYTES,
+    },
     flow_control::{MessageSizeValidator, MAX_MESSAGE_SIZE},
     metrics::{
         record_ack, record_batch_sent, record_nack, record_peer_reconnect, record_snapshot_bytes,
@@ -56,6 +61,15 @@ pub struct GossipService {
     /// the MeshController's central collector. Server-side sync_stream handlers
     /// read from this and apply per-peer watermark filtering.
     current_batch: Option<Arc<parking_lot::RwLock<Arc<RoundBatch>>>>,
+    /// Shared reference to the current stream RoundBatch, drained once
+    /// per round by the MeshController. Server-side handlers read
+    /// broadcast entries from this (drain_entries); targeted entries
+    /// are handled client-side where peer_name is known at spawn.
+    current_stream_batch: Option<Arc<parking_lot::RwLock<Arc<crate::kv::RoundBatch>>>>,
+    /// Node-wide MeshKV handle. Owns the stream buffers, subscriber
+    /// registry, and chunk assembler shared with the client-side
+    /// SyncStream handlers.
+    mesh_kv: Option<Arc<crate::kv::MeshKV>>,
 }
 
 impl GossipService {
@@ -282,6 +296,8 @@ impl GossipService {
             partition_detector: None,
             mtls_manager: None,
             current_batch: None,
+            current_stream_batch: None,
+            mesh_kv: None,
         }
     }
 
@@ -293,6 +309,26 @@ impl GossipService {
         current_batch: Arc<parking_lot::RwLock<Arc<RoundBatch>>>,
     ) -> Self {
         self.current_batch = Some(current_batch);
+        self
+    }
+
+    /// Attach the shared stream RoundBatch reference. Server-side
+    /// handlers emit broadcast drain_entries to their peer — targeted
+    /// entries stay on the client side where peer_name is known.
+    pub fn with_current_stream_batch(
+        mut self,
+        current_stream_batch: Arc<parking_lot::RwLock<Arc<crate::kv::RoundBatch>>>,
+    ) -> Self {
+        self.current_stream_batch = Some(current_stream_batch);
+        self
+    }
+
+    /// Attach the node-wide MeshKV handle. Plumbed from the server
+    /// builder so stream buffers, subscribers, and the chunk assembler
+    /// are shared between the client-side (outbound) and server-side
+    /// (inbound) SyncStream handlers.
+    pub fn with_mesh_kv(mut self, mesh_kv: Arc<crate::kv::MeshKV>) -> Self {
+        self.mesh_kv = Some(mesh_kv);
         self
     }
 
@@ -435,6 +471,7 @@ impl Gossip for GossipService {
         let state = self.state.clone();
         let stores = self.stores.clone();
         let sync_manager = self.sync_manager.clone();
+        let mesh_kv = self.mesh_kv.clone();
 
         // Create output stream with flow control
         const CHANNEL_CAPACITY: usize = 128;
@@ -453,6 +490,7 @@ impl Gossip for GossipService {
             // arrives. Use a placeholder label for debug output — this doesn't
             // affect filtering correctness (each task has its own watermark).
             let peer_name_for_watermark = "server-inbound".to_string();
+            let stream_batch_handle = self.current_stream_batch.clone();
             #[expect(
                 clippy::disallowed_methods,
                 reason = "server-side incremental sender that runs for the lifetime of the sync_stream; terminates when the channel closes or handle is aborted"
@@ -461,6 +499,7 @@ impl Gossip for GossipService {
                 let mut watermark = PeerWatermark::new(peer_name_for_watermark);
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 let mut sequence_counter: u64 = 0;
+                let mut last_stream_batch: Option<Arc<crate::kv::RoundBatch>> = None;
 
                 loop {
                     interval.tick().await;
@@ -528,6 +567,75 @@ impl Gossip for GossipService {
                                 updates.len()
                             );
                         }
+                    }
+
+                    // Server-side stream emission: broadcast drain_entries
+                    // only. Targeted entries stay on the client-side
+                    // (controller.rs) where peer_name is known at task
+                    // spawn. At-most-once: on channel full, drop without
+                    // retry (spec §4.4).
+                    if let Some(sbh) = &stream_batch_handle {
+                        let stream_batch = sbh.read().clone();
+                        let fresh_batch = last_stream_batch
+                            .as_ref()
+                            .is_none_or(|last| !Arc::ptr_eq(last, &stream_batch));
+                        if fresh_batch {
+                            // Advance the tracker for every fresh Arc, not just
+                            // ones that produced work — otherwise a batch with
+                            // empty drain_entries stays "fresh" across ticks and
+                            // we keep re-checking it.
+                            last_stream_batch = Some(stream_batch.clone());
+                        }
+                        if fresh_batch && !stream_batch.drain_entries.is_empty() {
+                            let mut entries = Vec::new();
+                            // Generation is per-value so concurrent publishes
+                            // to the same key get distinct tags.
+                            for (key, value) in &stream_batch.drain_entries {
+                                entries.extend(chunk_value(
+                                    key.clone(),
+                                    next_generation(),
+                                    Bytes::from(value.clone()),
+                                    MAX_STREAM_CHUNK_BYTES,
+                                ));
+                            }
+                            if !entries.is_empty() {
+                                for batch in build_stream_batches(
+                                    entries,
+                                    DEFAULT_MAX_CHUNKS_PER_BATCH,
+                                    MAX_STREAM_CHUNK_BYTES,
+                                ) {
+                                    sequence_counter += 1;
+                                    let msg = StreamMessage {
+                                        message_type: StreamMessageType::StreamBatch as i32,
+                                        payload: Some(
+                                            gossip::stream_message::Payload::StreamBatch(batch),
+                                        ),
+                                        sequence: sequence_counter,
+                                        peer_id: self_name_incremental.clone(),
+                                    };
+                                    match tx_incremental.try_send(Ok(msg)) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            log::debug!(
+                                                "server-side stream batch dropped on backpressure"
+                                            );
+                                            // TODO(metrics): bump
+                                            // stream_dropped_on_backpressure
+                                            break;
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            log::warn!(
+                                                "server-side stream sender: channel closed, stopping"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if last_stream_batch.is_some() {
+                        // If handle became None (shouldn't normally), clear state.
+                        last_stream_batch = None;
                     }
                 }
             }))
@@ -942,6 +1050,8 @@ impl Gossip for GossipService {
                                         partition_detector: None,
                                         mtls_manager: None,
                                         current_batch: None,
+                                        current_stream_batch: None,
+                                        mesh_kv: None,
                                     };
                                     let chunks = service.create_snapshot_chunks(store_type, 100); // chunk_size = 100 entries
                                     let total_chunks = chunks.len() as u64;
@@ -1240,6 +1350,16 @@ impl Gossip for GossipService {
                                 };
                                 if tx.send(Ok(heartbeat)).await.is_err() {
                                     break;
+                                }
+                            }
+                            StreamMessageType::StreamBatch => {
+                                if let Some(mesh_kv) = &mesh_kv {
+                                    if let Some(gossip::stream_message::Payload::StreamBatch(
+                                        batch,
+                                    )) = msg.payload
+                                    {
+                                        dispatch_stream_batch(mesh_kv, &msg.peer_id, batch.entries);
+                                    }
                                 }
                             }
                             _ => {

@@ -19,7 +19,7 @@ use dashmap::{mapref::entry::Entry as DashMapEntry, DashMap};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
-use crate::crdt_kv::CrdtOrMap;
+use crate::{chunk_assembler::ChunkAssembler, crdt_kv::CrdtOrMap};
 
 // ============================================================================
 // Type Definitions
@@ -132,7 +132,15 @@ impl Drop for DrainHandle {
 // ============================================================================
 
 /// A single subscription event: (key, value). `None` value means deletion.
-type SubscriptionEvent = (String, Option<Bytes>);
+///
+/// Values are a `Vec<Bytes>` — a list of zero-copy buffer fragments. For
+/// single-value writes this is a 1-element Vec; for reassembled chunked
+/// stream receives it is an N-element Vec where each element wraps one
+/// chunk's original allocation. Subscribers that need a contiguous buffer
+/// can concat; those that fan out further can clone the Bytes cheaply.
+/// The fragmented shape avoids the 2× peak a contiguous reassembly would
+/// impose when a near-cap multi-chunk value completes.
+type SubscriptionEvent = (String, Option<Vec<Bytes>>);
 
 /// Tracks all active subscriptions by prefix.
 struct SubscriberRegistry {
@@ -157,7 +165,7 @@ impl SubscriberRegistry {
     /// Notify all subscribers whose prefix matches the given key.
     /// Uses try_send to never block the gossip loop.
     /// `value` is `Some(bytes)` for puts, `None` for deletes.
-    fn notify(&self, key: &str, value: Option<Bytes>) {
+    fn notify(&self, key: &str, value: Option<Vec<Bytes>>) {
         for entry in &self.subscribers {
             let prefix = entry.key();
             if key.starts_with(prefix.as_str()) {
@@ -267,7 +275,7 @@ impl CrdtNamespace {
         );
         self.store.insert(key.to_string(), value.clone());
         self.subscriber_registry
-            .notify(key, Some(Bytes::from(value)));
+            .notify(key, Some(vec![Bytes::from(value)]));
     }
 
     /// Get the current value for a key, or None if not present or tombstoned.
@@ -424,7 +432,7 @@ impl StreamNamespace {
 // ============================================================================
 
 /// A batch of entries collected once per gossip round by the central collector.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RoundBatch {
     /// Targeted stream entries: (peer_id, key, value). Sent to one specific peer.
     pub targeted_entries: Vec<(String, String, Bytes)>,
@@ -436,6 +444,15 @@ pub struct RoundBatch {
 /// Generic, application-agnostic mesh transport. Provides explicit namespace
 /// handles for CRDT and stream modes. Application code MUST use namespace
 /// handles, not MeshKV directly.
+impl std::fmt::Debug for MeshKV {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshKV")
+            .field("server_name", &self.server_name)
+            .field("replica_id", &self.replica_id)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct MeshKV {
     /// CRDT store shared across all CRDT namespaces.
     store: Arc<CrdtOrMap>,
@@ -447,6 +464,9 @@ pub struct MeshKV {
     subscriber_registry: Arc<SubscriberRegistry>,
     /// Shared drain registry.
     drain_registry: Arc<DrainRegistry>,
+    /// Receiver-side chunk reassembly buffer shared across all inbound
+    /// SyncStream connections on this node.
+    chunk_assembler: Arc<ChunkAssembler>,
     /// Server name for this node (used to derive replica_id).
     server_name: String,
     /// Replica ID: hash(server_name) as u64.
@@ -463,9 +483,25 @@ impl MeshKV {
             stream_namespaces: RwLock::new(Vec::new()),
             subscriber_registry: Arc::new(SubscriberRegistry::new()),
             drain_registry: Arc::new(DrainRegistry::new()),
+            chunk_assembler: Arc::new(ChunkAssembler::new()),
             server_name,
             replica_id,
         }
+    }
+
+    /// Handle to the node-wide chunk reassembly buffer. Used by the
+    /// gossip receive path to route `StreamBatch` chunks through
+    /// reassembly before firing subscribers.
+    pub(crate) fn chunk_assembler(&self) -> Arc<ChunkAssembler> {
+        self.chunk_assembler.clone()
+    }
+
+    /// Fire subscribers whose prefix matches `key`. Used by the gossip
+    /// receive path when a chunked value completes (or a single-chunk
+    /// entry arrives), so handlers can deliver into adapter-owned
+    /// mpsc channels without reaching into internal registries.
+    pub(crate) fn notify_subscribers(&self, key: &str, value: Option<Vec<Bytes>>) {
+        self.subscriber_registry.notify(key, value);
     }
 
     /// Derive replica_id from server_name using blake3 hash truncated to u64.
@@ -722,7 +758,9 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(key, "worker:7");
-        assert_eq!(value.as_deref(), Some(b"healthy".as_slice()));
+        let frags = value.expect("put yields Some");
+        assert_eq!(frags.len(), 1, "single local write is a single fragment");
+        assert_eq!(frags[0].as_ref(), b"healthy");
     }
 
     #[tokio::test]
