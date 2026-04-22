@@ -62,6 +62,7 @@ pub(crate) fn convert_harmony_logprobs(proto_logprobs: &ProtoOutputLogProbs) -> 
 /// Built-in tools that are added to the system message
 const BUILTIN_TOOLS: &[&str] = &[
     "web_search_preview",
+    "web_search",
     "code_interpreter",
     "container",
     "file_search",
@@ -107,7 +108,9 @@ impl ToolLike for ResponseTool {
     fn is_builtin(&self) -> bool {
         matches!(
             self,
-            ResponseTool::WebSearchPreview(_) | ResponseTool::CodeInterpreter(_)
+            ResponseTool::WebSearchPreview(_)
+                | ResponseTool::WebSearch(_)
+                | ResponseTool::CodeInterpreter(_)
         )
     }
 
@@ -429,6 +432,7 @@ impl HarmonyBuilder {
                         .map(|tool| match tool {
                             ResponseTool::Function(_) => "function",
                             ResponseTool::WebSearchPreview(_) => "web_search_preview",
+                            ResponseTool::WebSearch(_) => "web_search",
                             ResponseTool::CodeInterpreter(_) => "code_interpreter",
                             ResponseTool::Mcp(_) => "mcp",
                             ResponseTool::FileSearch(_) => "file_search",
