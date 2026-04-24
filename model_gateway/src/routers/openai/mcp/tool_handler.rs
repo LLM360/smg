@@ -15,9 +15,27 @@ use crate::routers::openai::responses::{
 /// Action to take based on streaming event processing
 #[derive(Debug)]
 pub(crate) enum StreamAction {
-    Forward,      // Pass event to client
-    Buffer,       // Accumulate for tool execution
-    ExecuteTools, // Function call complete, execute now
+    /// Pass this event to the client.
+    Forward,
+    /// Accumulate the event for tool execution, do not send downstream.
+    Buffer,
+    /// The upstream signalled tool-call completion — run the MCP tool now.
+    ///
+    /// `forward_triggering_event` distinguishes two upstream shapes:
+    ///
+    /// * When the upstream emits `function_call_arguments.done` we want to
+    ///   forward the event (it becomes `mcp_call_arguments.done`, a sub-event
+    ///   that belongs BEFORE `response.<type>.completed`).
+    /// * When the upstream skips the delta/done arguments events and signals
+    ///   tool completion with `output_item.done` for the `function_call`
+    ///   item, forwarding it would emit a duplicate umbrella
+    ///   `response.output_item.done` event that fires BEFORE the sub-event
+    ///   `response.<type>.completed` — violating the spec sub-event ordering
+    ///   (spec §streaming: the umbrella `output_item.done` is always the
+    ///   LAST event for a given item). The tool_loop's
+    ///   `send_tool_call_completion_events` emits the correct umbrella
+    ///   `output_item.done` in its proper position.
+    ExecuteTools { forward_triggering_event: bool },
 }
 
 /// Maps upstream output indices to sequential downstream indices
@@ -177,8 +195,23 @@ impl StreamingToolHandler {
                 if let Some(output_index) = extract_output_index(&parsed) {
                     self.ensure_output_index(output_index);
                 }
-                if self.has_complete_calls() {
-                    StreamAction::ExecuteTools
+                // Only suppress the umbrella `output_item.done` when it is
+                // closing a function_call item that we are intercepting —
+                // an unrelated `output_item.done` for a message, reasoning
+                // item, or mcp_list_tools block must reach the client
+                // untouched even when a pending tool call is queued.
+                let is_function_call_done = parsed
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(is_function_call_type);
+                if is_function_call_done && self.has_complete_calls() {
+                    // Suppress the upstream umbrella event — the tool loop
+                    // will emit its own `output_item.done` at the correct
+                    // position, AFTER `response.<type>.completed`.
+                    StreamAction::ExecuteTools {
+                        forward_triggering_event: false,
+                    }
                 } else {
                     StreamAction::Forward
                 }
@@ -260,7 +293,13 @@ impl StreamingToolHandler {
         }
 
         if self.has_complete_calls() {
-            StreamAction::ExecuteTools
+            // Forward the triggering event — `function_call_arguments.done`
+            // becomes `mcp_call_arguments.done` which is a sub-event
+            // belonging BEFORE `response.<type>.completed` and therefore
+            // safe to forward inline here.
+            StreamAction::ExecuteTools {
+                forward_triggering_event: true,
+            }
         } else {
             StreamAction::Forward
         }
@@ -352,5 +391,175 @@ impl StreamingToolHandler {
 
     pub fn take_pending_calls(&mut self) -> Vec<FunctionCallInProgress> {
         std::mem::take(&mut self.pending_calls)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for R6.7 Gap B — streaming event ordering for
+    //! image-generation-style built-in tool calls.
+    //!
+    //! The bug: when the upstream signalled tool completion with a direct
+    //! `response.output_item.done` event (no preceding
+    //! `response.function_call_arguments.done`), the streaming layer used
+    //! to forward that upstream event to the client. The tool loop then
+    //! emitted its own umbrella `output_item.done` AFTER emitting the
+    //! `<tool>.completed` sub-event — producing the wire sequence
+    //!
+    //!     response.output_item.added
+    //!     response.<tool>.in_progress
+    //!     response.output_item.done       ← duplicate (upstream-forwarded)
+    //!     response.<tool>.generating
+    //!     response.<tool>.completed
+    //!     response.output_item.done       ← tool-loop synthesized
+    //!
+    //! which violates the spec invariant that `response.output_item.done`
+    //! is the LAST event emitted for a given item (see
+    //! `.claude/_audit/openai-responses-api-spec.md` §streaming, events
+    //! L1054-L1072).
+
+    use super::*;
+
+    /// Feed an `output_item.added` for a function_call item so the handler
+    /// has a complete pending call registered.
+    fn bootstrap_function_call_added(handler: &mut StreamingToolHandler) {
+        let data = r#"{
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_test",
+            "call_id": "call_test",
+            "name": "image_generation"
+          }
+        }"#;
+        let _ = handler.process_event(Some("response.output_item.added"), data);
+    }
+
+    #[test]
+    fn output_item_done_triggers_execute_tools_without_forwarding() {
+        // Gap B: when the upstream signals tool-call completion via
+        // `output_item.done` for a function_call item (no preceding
+        // `function_call_arguments.done`), the handler must ask the
+        // caller NOT to forward the triggering event — the tool loop
+        // will emit its own umbrella `output_item.done` at the correct
+        // position after `response.<tool>.completed`.
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        bootstrap_function_call_added(&mut handler);
+
+        let done_event = r#"{
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_test",
+            "call_id": "call_test",
+            "name": "image_generation",
+            "arguments": "{}",
+            "status": "completed"
+          }
+        }"#;
+
+        let action = handler.process_event(Some("response.output_item.done"), done_event);
+
+        match action {
+            StreamAction::ExecuteTools {
+                forward_triggering_event,
+            } => assert!(
+                !forward_triggering_event,
+                "output_item.done must be suppressed to avoid a duplicate umbrella event"
+            ),
+            other => panic!("expected ExecuteTools, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arguments_done_triggers_execute_tools_with_forwarding() {
+        // Forwarding is safe for `function_call_arguments.done` because it
+        // becomes `mcp_call_arguments.done` — a sub-event that belongs
+        // BEFORE `response.<tool>.completed` per spec sub-event ordering.
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        bootstrap_function_call_added(&mut handler);
+
+        let args_done = r#"{
+          "type": "response.function_call_arguments.done",
+          "output_index": 0,
+          "item_id": "fc_test",
+          "arguments": "{}"
+        }"#;
+
+        let action =
+            handler.process_event(Some("response.function_call_arguments.done"), args_done);
+
+        match action {
+            StreamAction::ExecuteTools {
+                forward_triggering_event,
+            } => assert!(
+                forward_triggering_event,
+                "function_call_arguments.done forwards as mcp_call_arguments.done"
+            ),
+            other => panic!("expected ExecuteTools, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_item_done_for_unrelated_item_forwards_even_with_pending_call() {
+        // Regression for PR #1369 review (chatgpt-codex-connector P1):
+        // suppression must be gated on the done event's item type. When a
+        // function_call is queued AND an unrelated `output_item.done` for a
+        // message / reasoning / mcp_list_tools block arrives, the umbrella
+        // event for that sibling item must pass through untouched so the
+        // client sees its completion. Only the function_call's own
+        // `output_item.done` should be suppressed (the tool loop will emit
+        // the correct umbrella at its proper position).
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        bootstrap_function_call_added(&mut handler);
+
+        let done_event = r#"{
+          "type": "response.output_item.done",
+          "output_index": 1,
+          "item": {
+            "type": "message",
+            "id": "msg_sibling",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello"}]
+          }
+        }"#;
+
+        let action = handler.process_event(Some("response.output_item.done"), done_event);
+
+        assert!(
+            matches!(action, StreamAction::Forward),
+            "sibling output_item.done must forward even while a function_call is pending; got {action:?}"
+        );
+    }
+
+    #[test]
+    fn output_item_done_without_pending_calls_forwards() {
+        // Non-function-call umbrella `output_item.done` events (messages,
+        // mcp_list_tools items, etc.) must pass through unchanged. This
+        // prevents regressing the path where the assistant emits a plain
+        // text message after tool execution completes.
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+
+        let done_event = r#"{
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "message",
+            "id": "msg_test",
+            "status": "completed",
+            "role": "assistant",
+            "content": []
+          }
+        }"#;
+
+        let action = handler.process_event(Some("response.output_item.done"), done_event);
+
+        assert!(
+            matches!(action, StreamAction::Forward),
+            "expected Forward for an umbrella output_item.done on a non-tool item, got {action:?}"
+        );
     }
 }
