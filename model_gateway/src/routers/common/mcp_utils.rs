@@ -6,9 +6,10 @@ use std::{
 };
 
 use openai_protocol::responses::{McpAllowedTools, ResponseTool, ResponsesRequest};
+use serde_json::{json, Value};
 use smg_mcp::{
-    BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport,
-    ResponseFormat,
+    apply_hosted_tool_overrides, extract_hosted_tool_overrides, BuiltinToolType, McpOrchestrator,
+    McpServerBinding, McpServerConfig, McpTransport, ResponseFormat,
 };
 use tracing::{debug, warn};
 
@@ -320,6 +321,89 @@ pub async fn ensure_request_mcp_client(
     let builtin_types = extract_builtin_types(tools);
 
     ensure_mcp_servers(mcp_orchestrator, &inputs, &builtin_types).await
+}
+
+/// Forward the caller's `user` identifier into hosted-tool dispatch arguments.
+///
+/// OpenAI's Responses API takes a top-level `user` field for end-user
+/// attribution. We mirror that into the MCP dispatch payload for hosted
+/// tools (image_generation, web_search_preview, web_search, code_interpreter,
+/// file_search) so a downstream MCP server can attribute usage and enforce
+/// per-user quotas.
+///
+/// Scope is hosted-tools only — `ResponseFormat::Passthrough` (plain MCP
+/// function tools) is a no-op because plain tool schemas are caller-defined
+/// and may not expect a `user` key. Surprising those servers with an
+/// unsolicited field is worse than missing the feature.
+///
+/// Behavior:
+/// - No-op if `response_format` is `Passthrough` (non-hosted).
+/// - No-op if `user` is `None` or an empty string.
+/// - No-op if `arguments` is not a JSON object.
+/// - No-op if `arguments` already contains a `user` key — model-supplied
+///   values win over the request-level identifier.
+/// - Otherwise inserts `arguments["user"] = json!(user)`.
+pub(crate) fn inject_user_into_hosted_args(
+    arguments: &mut Value,
+    response_format: &ResponseFormat,
+    user: Option<&str>,
+) {
+    if response_format.to_builtin_tool_type().is_none() {
+        return;
+    }
+    let Some(user_value) = user.filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let Value::Object(args_map) = arguments else {
+        return;
+    };
+    // Preserve a real model-supplied identifier, but treat an explicit
+    // null (or absent key) as "no value" — when the synthesized function
+    // tool exposes `user` as a parameter the model dutifully emits
+    // `{"user": null}` even though the caller provided no value, and that
+    // null should not block the request-level forwarding.
+    if let Some(existing) = args_map.get("user") {
+        if !existing.is_null() {
+            debug!(
+                "Hosted-tool dispatch args already include a non-null 'user'; \
+                 preserving model-supplied value over request-level identifier"
+            );
+            return;
+        }
+    }
+    args_map.insert("user".to_string(), json!(user_value));
+}
+
+/// Prepare an MCP dispatch payload for a hosted-tool call.
+///
+/// One call collapses the two per-dispatch mutations every router used to
+/// repeat:
+/// 1. Merge caller-declared hosted-tool overrides from `request_tools` into
+///    `arguments` (e.g. an `image_generation` request's `size`/`quality`
+///    pinning the model's tool-call args).
+/// 2. Forward the request-level `user` identifier into `arguments` for
+///    hosted tools so a downstream MCP server can attribute usage.
+///
+/// Both steps are no-ops when `response_format` is `Passthrough` (plain MCP
+/// function tools); they are also no-ops on individual missing inputs
+/// (no overrides, no `user`, non-object args, pre-existing `user`).
+///
+/// Routers should call this in place of the inline override + injection
+/// pair. Keeping it here (in `routers/common/mcp_utils.rs`) avoids leaking
+/// gateway-side concerns into `crates/mcp` while still giving every router
+/// a single chokepoint.
+pub(crate) fn prepare_hosted_dispatch_args(
+    arguments: &mut Value,
+    response_format: &ResponseFormat,
+    request_tools: &[ResponseTool],
+    request_user: Option<&str>,
+) {
+    if let Some(kind) = response_format.to_builtin_tool_type() {
+        if let Some(overrides) = extract_hosted_tool_overrides(request_tools, kind) {
+            apply_hosted_tool_overrides(arguments, &overrides);
+        }
+    }
+    inject_user_into_hosted_args(arguments, response_format, request_user);
 }
 
 #[cfg(test)]
@@ -771,5 +855,94 @@ mod tests {
             tool_names: Some(vec!["mutating_tool".to_string()]),
         });
         assert_eq!(project_allowed_tools(Some(&value)), Some(Vec::new()));
+    }
+
+    /// When the synthesized function tool exposes `user` as a parameter,
+    /// the model emits `{"user": null}` even though no value is supplied.
+    /// That null must not block request-level forwarding — the helper
+    /// treats absent and null as equivalent for injection purposes.
+    #[test]
+    fn inject_user_hosted_format_overwrites_model_supplied_null() {
+        let mut args = json!({"prompt": "a cat", "user": null});
+        inject_user_into_hosted_args(
+            &mut args,
+            &ResponseFormat::ImageGenerationCall,
+            Some("user-123"),
+        );
+        assert_eq!(args.get("user"), Some(&json!("user-123")));
+    }
+
+    #[test]
+    fn inject_user_hosted_format_inserts_user_into_clean_args() {
+        let mut args = json!({"prompt": "a cat"});
+        inject_user_into_hosted_args(
+            &mut args,
+            &ResponseFormat::ImageGenerationCall,
+            Some("user-123"),
+        );
+        assert_eq!(args.get("user"), Some(&json!("user-123")));
+        assert_eq!(args.get("prompt"), Some(&json!("a cat")));
+    }
+
+    #[test]
+    fn inject_user_hosted_format_preserves_existing_user_key() {
+        // Model-supplied `user` wins over the request-level identifier; the
+        // helper must not clobber it.
+        let mut args = json!({"prompt": "a cat", "user": "model-supplied"});
+        inject_user_into_hosted_args(
+            &mut args,
+            &ResponseFormat::ImageGenerationCall,
+            Some("request-level"),
+        );
+        assert_eq!(args.get("user"), Some(&json!("model-supplied")));
+    }
+
+    #[test]
+    fn inject_user_passthrough_format_is_noop() {
+        // Plain MCP function tools have caller-defined schemas; injecting
+        // `user` could surprise tools that don't expect that key.
+        let mut args = json!({"q": "weather"});
+        inject_user_into_hosted_args(&mut args, &ResponseFormat::Passthrough, Some("user-123"));
+        assert!(
+            !args.as_object().unwrap().contains_key("user"),
+            "passthrough format must not receive an injected user key"
+        );
+    }
+
+    #[test]
+    fn inject_user_empty_or_missing_user_is_noop() {
+        let mut args_none = json!({"prompt": "x"});
+        inject_user_into_hosted_args(&mut args_none, &ResponseFormat::WebSearchCall, None);
+        assert!(!args_none.as_object().unwrap().contains_key("user"));
+
+        let mut args_empty = json!({"prompt": "x"});
+        inject_user_into_hosted_args(&mut args_empty, &ResponseFormat::WebSearchCall, Some(""));
+        assert!(!args_empty.as_object().unwrap().contains_key("user"));
+    }
+
+    #[test]
+    fn inject_user_non_object_args_is_noop() {
+        let mut args = json!("not-an-object");
+        inject_user_into_hosted_args(&mut args, &ResponseFormat::FileSearchCall, Some("u1"));
+        assert_eq!(args, json!("not-an-object"));
+    }
+
+    #[test]
+    fn inject_user_covers_every_hosted_format() {
+        // All four hosted formats should accept the injection identically.
+        for format in [
+            ResponseFormat::ImageGenerationCall,
+            ResponseFormat::WebSearchCall,
+            ResponseFormat::CodeInterpreterCall,
+            ResponseFormat::FileSearchCall,
+        ] {
+            let mut args = json!({});
+            inject_user_into_hosted_args(&mut args, &format, Some("user-xyz"));
+            assert_eq!(
+                args.get("user"),
+                Some(&json!("user-xyz")),
+                "expected user injection for format {format:?}"
+            );
+        }
     }
 }

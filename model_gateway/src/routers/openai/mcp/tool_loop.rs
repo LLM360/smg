@@ -21,9 +21,8 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 use smg_mcp::{
-    apply_hosted_tool_overrides, extract_embedded_openai_responses, extract_hosted_tool_overrides,
-    mcp_response_item_id, McpServerBinding, McpToolSession, ResponseFormat, ResponseTransformer,
-    ToolExecutionInput, ToolExecutionResult,
+    extract_embedded_openai_responses, mcp_response_item_id, McpServerBinding, McpToolSession,
+    ResponseFormat, ResponseTransformer, ToolExecutionInput, ToolExecutionResult,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -32,7 +31,10 @@ use super::tool_handler::FunctionCallInProgress;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::{header_utils::ApiProvider, mcp_utils::DEFAULT_MAX_ITERATIONS},
+        common::{
+            header_utils::ApiProvider,
+            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
+        },
         error,
     },
 };
@@ -155,7 +157,17 @@ fn build_message_from_openai_response(openai_response: Value) -> Option<Value> {
 /// request so per-kind hosted-tool overrides can be merged into dispatch args
 /// before [`McpToolSession::execute_tool`].
 ///
+/// `request_user` is the request-level `user` identifier (OpenAI Responses API
+/// `user` field), forwarded into hosted-tool dispatch args so the MCP server
+/// can attribute usage. Plain MCP function tools (Passthrough format) are
+/// not affected.
+///
 /// Returns false if client disconnected during execution
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Streaming tool dispatch threads channel + state + per-request inputs \
+              (tools, user) directly to the loop without an intermediate context struct."
+)]
 pub(crate) async fn execute_streaming_tool_calls(
     pending_calls: Vec<FunctionCallInProgress>,
     session: &McpToolSession<'_>,
@@ -164,6 +176,7 @@ pub(crate) async fn execute_streaming_tool_calls(
     sequence_number: &mut u64,
     model_id: &str,
     request_tools: &[ResponseTool],
+    request_user: Option<&str>,
 ) -> bool {
     for call in pending_calls {
         if call.name.is_empty() {
@@ -240,12 +253,15 @@ pub(crate) async fn execute_streaming_tool_calls(
             arguments = json!({});
         }
         // Merge caller-declared hosted-tool configuration (e.g. `size`, `quality`
-        // on image_generation) into dispatch args. No-op for non-hosted tools.
-        if let Some(kind) = response_format.to_builtin_tool_type() {
-            if let Some(overrides) = extract_hosted_tool_overrides(request_tools, kind) {
-                apply_hosted_tool_overrides(&mut arguments, &overrides);
-            }
-        }
+        // on image_generation) into dispatch args, then forward the request-
+        // level `user` so a downstream MCP server can attribute per-user usage.
+        // Both steps are no-ops for plain MCP function tools.
+        prepare_hosted_dispatch_args(
+            &mut arguments,
+            &response_format,
+            request_tools,
+            request_user,
+        );
 
         // Log the effective (post-merge) args so the log reflects what the
         // MCP server actually receives, not the pre-merge string from the model.
@@ -920,17 +936,16 @@ pub(crate) async fn execute_tool_loop(
                 arguments = json!({});
             }
             // Merge caller-declared hosted-tool configuration into dispatch args
-            // for this tool's hosted-tool kind, if any. `original_body.tools` is
-            // the caller's tool declarations; empty / None = no-op.
+            // and forward the request-level `user` so a downstream MCP server
+            // can attribute per-user usage. Both steps are no-ops for plain
+            // MCP function tools (Passthrough format).
             let response_format = session.tool_response_format(&call.name);
-            if let Some(kind) = response_format.to_builtin_tool_type() {
-                if let Some(overrides) = extract_hosted_tool_overrides(
-                    original_body.tools.as_deref().unwrap_or(&[]),
-                    kind,
-                ) {
-                    apply_hosted_tool_overrides(&mut arguments, &overrides);
-                }
-            }
+            prepare_hosted_dispatch_args(
+                &mut arguments,
+                &response_format,
+                original_body.tools.as_deref().unwrap_or(&[]),
+                original_body.user.as_deref(),
+            );
 
             // Serialize the post-merge args once so downstream logging + the
             // approval payload show the effective (dispatched) payload rather
