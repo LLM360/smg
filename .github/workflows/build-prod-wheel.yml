@@ -1,0 +1,106 @@
+name: Build prod wheel
+
+# Builds the smg Python wheel from the prod branch and publishes it to
+# GitHub Releases so consumers (notably the LLM360/RL360 agentic-rl
+# image build) can install it without re-compiling on every image build.
+#
+# Tag scheme: wheel/prod-<commit-sha[:8]>
+# A release with the same tag is reused, so a no-op push (commit SHA
+# already built) is a fast skip.
+#
+# Source-of-truth: the prod branch already contains the agentic-rl
+# modifications baked in as a commit on top of the upstream base.
+# No git-apply step is needed in this workflow.
+
+on:
+  push:
+    branches: [prod]
+  workflow_dispatch:
+
+concurrency:
+  group: build-prod-wheel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Pin to 24.04 so the manylinux tag on the wheel matches the glibc in
+    # the agentic-rl image base (also 24.04). If ubuntu-latest jumps to
+    # 26.04 someday, an older wheel built on this runner still works in
+    # a 24.04 container; the opposite direction would not.
+    runs-on: ubuntu-latest-96-cores
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tag from commit SHA
+        id: pin
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          SHORT="${SHA:0:8}"
+          TAG="wheel/prod-${SHORT}"
+          echo "sha=${SHA}"     >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"     >> "$GITHUB_OUTPUT"
+          echo "Computed tag: $TAG"
+
+      - name: Skip if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        if: steps.check.outputs.exists == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev libssl-dev pkg-config
+          python3 -m pip install --upgrade pip maturin
+
+      - name: Build wheel (maturin)
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          cd bindings/python
+          ulimit -n 65536
+          maturin build \
+            --release \
+            --features vendored-openssl \
+            --out /tmp/wheels
+          ls -la /tmp/wheels/
+
+      - name: Create GitHub Release with wheel
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pin.outputs.tag }}
+          SHA: ${{ steps.pin.outputs.sha }}
+          SHORT: ${{ steps.pin.outputs.short }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" /tmp/wheels/*.whl \
+            --title "smg wheel: prod ${SHORT}" \
+            --notes "Built from LLM360/smg@${SHA} (prod branch). Source workflow run: ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
