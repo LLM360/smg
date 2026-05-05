@@ -201,6 +201,7 @@ impl ResponseProcessor {
             },
             tool_calls,
             reasoning_content: reasoning_text,
+            other: serde_json::Map::new(),
         };
 
         // Step 6: Build ChatChoice
@@ -211,6 +212,7 @@ impl ResponseProcessor {
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
+            other: serde_json::Map::new(),
         })
     }
 

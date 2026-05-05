@@ -104,6 +104,7 @@ impl HarmonyResponseProcessor {
                 content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
                 tool_calls: parsed.commentary,
                 reasoning_content: parsed.analysis,
+                other: ::serde_json::Map::new(),
             };
 
             let finish_reason = parsed.finish_reason;
@@ -118,6 +119,7 @@ impl HarmonyResponseProcessor {
                 finish_reason: Some(finish_reason),
                 matched_stop,
                 hidden_states: None,
+                other: ::serde_json::Map::new(),
             });
         }
 

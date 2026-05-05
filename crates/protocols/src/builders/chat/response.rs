@@ -101,6 +101,7 @@ impl ChatCompletionResponseBuilder {
             choices: self.choices,
             usage: self.usage,
             system_fingerprint: self.system_fingerprint,
+            other: ::serde_json::Map::new(),
         }
     }
 }

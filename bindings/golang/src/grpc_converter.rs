@@ -388,12 +388,15 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                             content: None,
                             tool_calls: None,
                             reasoning_content: None,
+                            other: serde_json::Map::new(),
                         },
                         logprobs: None,
                         finish_reason: None,
                         matched_stop: None,
+                        other: serde_json::Map::new(),
                     }],
                     usage: None,
+                    other: serde_json::Map::new(),
                 };
                 return Ok(Some(first_response));
             }
@@ -469,12 +472,15 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                                             content: None,
                                             tool_calls: Some(tool_call_deltas),
                                             reasoning_content: None,
+                                            other: serde_json::Map::new(),
                                         },
                                         logprobs: None,
                                         finish_reason: None,
                                         matched_stop: None,
+                                        other: serde_json::Map::new(),
                                     }],
                                     usage: None,
+                                    other: serde_json::Map::new(),
                                 };
                                 return Ok(Some(tool_response));
                             }
@@ -501,12 +507,15 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                         content: Some(chunk_text),
                         tool_calls: None,
                         reasoning_content: None,
+                        other: serde_json::Map::new(),
                     },
                     logprobs: None,
                     finish_reason: None,
                     matched_stop: None,
+                    other: serde_json::Map::new(),
                 }],
                 usage: None,
+                other: serde_json::Map::new(),
             };
 
             Ok(Some(content_response))
@@ -607,12 +616,15 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                         },
                         tool_calls: None,
                         reasoning_content: None,
+                        other: serde_json::Map::new(),
                     },
                     logprobs: None,
                     finish_reason: Some(finish_reason),
                     matched_stop,
+                    other: serde_json::Map::new(),
                 }],
                 usage,
+                other: serde_json::Map::new(),
             };
 
             Ok(Some(finish_response))

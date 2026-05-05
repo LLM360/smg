@@ -381,6 +381,7 @@ impl HarmonyStreamingProcessor {
                 }]
             }),
             reasoning_content: delta.analysis_delta.clone(),
+            other: serde_json::Map::new(),
         };
 
         // Build and emit chunk
@@ -393,6 +394,7 @@ impl HarmonyStreamingProcessor {
                     logprobs,
                     finish_reason: None,
                     matched_stop: None,
+                    other: serde_json::Map::new(),
                 })
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();

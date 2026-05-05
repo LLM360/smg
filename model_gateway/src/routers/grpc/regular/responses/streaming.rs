@@ -1054,11 +1054,13 @@ impl ChatResponseAccumulator {
                         Some(tool_calls)
                     },
                     reasoning_content: self.reasoning_content,
+                    other: serde_json::Map::new(),
                 },
                 finish_reason: self.finish_reason,
                 logprobs: None,
                 matched_stop: None,
                 hidden_states: None,
+                other: serde_json::Map::new(),
             }])
             .maybe_usage(self.usage)
             .build()

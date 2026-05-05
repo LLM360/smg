@@ -110,10 +110,12 @@ impl ChatCompletionStreamResponseBuilder {
                 content: Some(content.into()),
                 tool_calls: None,
                 reasoning_content: None,
+                other: serde_json::Map::new(),
             },
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -133,10 +135,12 @@ impl ChatCompletionStreamResponseBuilder {
                 content: Some(content.into()),
                 tool_calls: None,
                 reasoning_content: None,
+                other: serde_json::Map::new(),
             },
             logprobs,
             finish_reason: None,
             matched_stop: None,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -150,10 +154,12 @@ impl ChatCompletionStreamResponseBuilder {
                 content: None,
                 tool_calls: None,
                 reasoning_content: None,
+                other: serde_json::Map::new(),
             },
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -180,10 +186,12 @@ impl ChatCompletionStreamResponseBuilder {
                     }),
                 }]),
                 reasoning_content: None,
+                other: serde_json::Map::new(),
             },
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -197,10 +205,12 @@ impl ChatCompletionStreamResponseBuilder {
                 content: None,
                 tool_calls: None,
                 reasoning_content: Some(reasoning.into()),
+                other: serde_json::Map::new(),
             },
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -227,10 +237,12 @@ impl ChatCompletionStreamResponseBuilder {
                     }),
                 }]),
                 reasoning_content: None,
+                other: serde_json::Map::new(),
             },
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -249,10 +261,12 @@ impl ChatCompletionStreamResponseBuilder {
                 content: None,
                 tool_calls: Some(vec![tool_call_delta]),
                 reasoning_content: None,
+                other: serde_json::Map::new(),
             },
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -272,10 +286,12 @@ impl ChatCompletionStreamResponseBuilder {
                 content: None,
                 tool_calls: None,
                 reasoning_content: None,
+                other: serde_json::Map::new(),
             },
             logprobs: None,
             finish_reason: Some(finish_reason.into()),
             matched_stop,
+            other: serde_json::Map::new(),
         });
         self
     }
@@ -290,6 +306,7 @@ impl ChatCompletionStreamResponseBuilder {
             system_fingerprint: self.system_fingerprint,
             choices: self.choices,
             usage: self.usage,
+            other: serde_json::Map::new(),
         }
     }
 }
