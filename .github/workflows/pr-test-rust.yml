@@ -233,15 +233,6 @@ jobs:
           pytest -q tests --cov=smg --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
   unit-tests:
-    needs: [detect-changes]
-    if: >-
-      always()
-      && !cancelled()
-      && needs.detect-changes.result == 'success'
-      && (
-        github.event_name != 'pull_request'
-        || needs.detect-changes.outputs.rust-ci == 'true'
-      )
     runs-on: k8s-runner-cpu
     permissions:
       contents: read
@@ -295,6 +286,7 @@ jobs:
 
   benchmarks:
     needs: build-wheel
+    if: github.actor != 'dependabot[bot]'
     runs-on: 4-gpu-h100
     timeout-minutes: 30
     permissions:
@@ -368,6 +360,7 @@ jobs:
 
   detect-changes:
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       pull-requests: read
@@ -378,7 +371,6 @@ jobs:
       agentic: ${{ steps.filter.outputs.agentic }}
       embeddings: ${{ steps.filter.outputs.embeddings }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
-      rust-ci: ${{ steps.filter.outputs.rust-ci }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -398,7 +390,6 @@ jobs:
               - '.github/workflows/e2e-gpu-job.yml'
               - 'scripts/ci_setup_python_venv.sh'
               - 'scripts/ci_install_sglang.sh'
-              - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_e2e_deps.sh'
               - 'scripts/ci_killall_sglang.sh'
               - 'scripts/ci_build_wheel.sh'
@@ -428,28 +419,6 @@ jobs:
               - 'e2e_test/embeddings/**'
             go-bindings:
               - 'e2e_test/bindings_go/**'
-            rust-ci:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rustfmt.toml'
-              - 'clippy.toml'
-              - 'crates/**'
-              - 'test_support/**'
-              - 'model_gateway/**'
-              - 'bindings/python/Cargo.toml'
-              - 'bindings/python/build.rs'
-              - 'bindings/python/src/**'
-              - 'bindings/golang/Cargo.toml'
-              - 'bindings/golang/src/**'
-              - 'clients/rust/**'
-              - 'clients/openapi-gen/**'
-              - 'tui/**'
-              - '.cargo/**'
-              - '.github/actions/setup-rust/**'
-              - 'scripts/ci_install_rust.sh'
-              - '.github/workflows/pr-test-rust.yml'
-              - 'examples/wasm/wasm-guest-storage-hook/**'
-              - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
 
   # --- GPU E2E: organized by GPU tier + API, engine as matrix axis ---
 
@@ -462,6 +431,7 @@ jobs:
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && github.actor != 'dependabot[bot]'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
@@ -492,6 +462,7 @@ jobs:
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && github.actor != 'dependabot[bot]'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
@@ -520,6 +491,7 @@ jobs:
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && github.actor != 'dependabot[bot]'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
@@ -536,7 +508,7 @@ jobs:
     with:
       engine: ${{ matrix.engine }}
       gpu_tier: "1"
-      runner: 1-gpu-h100
+      runner: 1-gpu
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/embeddings
       extra_deps: "sentence-transformers"
@@ -549,6 +521,7 @@ jobs:
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && github.actor != 'dependabot[bot]'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
@@ -601,6 +574,7 @@ jobs:
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && github.actor != 'dependabot[bot]'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
@@ -689,6 +663,7 @@ jobs:
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && github.actor != 'dependabot[bot]'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
@@ -835,6 +810,7 @@ jobs:
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
+      && github.actor != 'dependabot[bot]'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
