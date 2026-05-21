@@ -18,7 +18,7 @@ jobs:
   build-and-push:
     name: Build nightly Docker image
     if: github.repository == 'lightseekorg/smg'
-    runs-on: ["cpu-e5"]
+    runs-on: ["8-gpu-h200"]
     permissions:
       contents: read
       packages: write
