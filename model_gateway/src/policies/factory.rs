@@ -26,6 +26,7 @@ impl PolicyFactory {
                 eviction_interval_secs,
                 max_tree_size,
                 block_size,
+                engine_load,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -34,6 +35,7 @@ impl PolicyFactory {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
                     block_size: *block_size,
+                    engine_load: *engine_load,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -117,6 +119,7 @@ mod tests {
             eviction_interval_secs: 30,
             max_tree_size: 1000,
             block_size: 16,
+            engine_load: Default::default(),
         });
         assert_eq!(policy.name(), "cache_aware");
 

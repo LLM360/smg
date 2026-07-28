@@ -75,6 +75,22 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use load information
     }
 
+    /// Update loads for a complete monitored worker group.
+    ///
+    /// Policies that need to discard missing samples can override this method.
+    fn update_loads_for_workers(
+        &self,
+        loads: &std::collections::HashMap<String, WorkerLoadResponse>,
+        _worker_urls: &[String],
+    ) {
+        self.update_loads(loads);
+    }
+
+    /// Whether the worker monitor should poll engine load for this policy.
+    fn needs_load_updates(&self) -> bool {
+        false
+    }
+
     /// Set mesh sync manager
     fn set_mesh_sync(&mut self, _mesh_sync: OptionalMeshSyncManager) {
         // Default: no-op for policies that don't use mesh sync
@@ -107,6 +123,8 @@ pub struct CacheAwareConfig {
     /// Used by `compute_request_content_hashes` to chunk request tokens into blocks.
     /// Must match the backend's block size. Default: 16 (SGLang page size).
     pub block_size: usize,
+    /// Use engine-reported KV and utilization pressure to bound cache affinity.
+    pub engine_load: bool,
 }
 
 impl Default for CacheAwareConfig {
@@ -118,6 +136,7 @@ impl Default for CacheAwareConfig {
             eviction_interval_secs: 30,
             max_tree_size: 10000,
             block_size: 16,
+            engine_load: false,
         }
     }
 }

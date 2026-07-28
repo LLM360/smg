@@ -119,6 +119,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         }
     }
 
+    fn needs_load_updates(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -239,6 +239,10 @@ pub(crate) fn init_metrics() {
         "Worker selection events by worker_type, connection_mode, model, policy"
     );
     describe_counter!(
+        "smg_cache_aware_engine_decisions_total",
+        "Cache-aware engine-pressure decisions by result"
+    );
+    describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
@@ -867,6 +871,15 @@ impl Metrics {
             "connection_mode" => connection_mode,
             "model" => model,
             "policy" => policy
+        )
+        .increment(1);
+    }
+
+    /// Record the outcome of the cache-aware engine-pressure guard.
+    pub fn record_cache_aware_engine_decision(result: &'static str) {
+        counter!(
+            "smg_cache_aware_engine_decisions_total",
+            "result" => result
         )
         .increment(1);
     }

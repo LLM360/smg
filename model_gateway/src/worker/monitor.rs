@@ -588,9 +588,8 @@ async fn group_monitor_loop(
             return;
         };
 
-        let power_of_two_policies = monitor.policy_registry.get_all_power_of_two_policies();
-        if power_of_two_policies.is_empty()
-            && monitor.policy_registry.get_dp_rank_policy().is_none()
+        let load_aware_policies = monitor.policy_registry.get_all_load_aware_policies();
+        if load_aware_policies.is_empty() && monitor.policy_registry.get_dp_rank_policy().is_none()
         {
             debug!("No load-aware policies, skipping load fetch for group {group_key}");
             drop(monitor);
@@ -657,6 +656,9 @@ async fn group_monitor_loop(
 
         if group_loads.is_empty() {
             debug!("No loads fetched for group {group_key}, pruning stale entries");
+            for policy in &load_aware_policies {
+                policy.update_loads_for_workers(&group_loads, &all_group_urls);
+            }
             monitor.load_tx.send_modify(|map| {
                 for url in &all_group_urls {
                     map.remove(url);
@@ -675,8 +677,8 @@ async fn group_monitor_loop(
             workers.len()
         );
 
-        for policy in &power_of_two_policies {
-            policy.update_loads(&group_loads);
+        for policy in &load_aware_policies {
+            policy.update_loads_for_workers(&group_loads, &all_group_urls);
         }
         monitor.worker_load_manager.update_dp_loads(&group_dp_loads);
 

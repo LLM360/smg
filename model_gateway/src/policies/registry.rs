@@ -358,12 +358,12 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
-    /// Get all PowerOfTwo policies that need load updates (lock-free)
-    pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        let mut power_of_two_policies = Vec::new();
+    /// Get all policies that need engine load updates (lock-free).
+    pub fn get_all_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut load_aware_policies = Vec::new();
 
-        if self.default_policy.name() == "power_of_two" {
-            power_of_two_policies.push(Arc::clone(&self.default_policy));
+        if self.default_policy.needs_load_updates() {
+            load_aware_policies.push(Arc::clone(&self.default_policy));
         }
 
         // Get prefill and decode policies (lock-free via OnceLock::get)
@@ -371,31 +371,42 @@ impl PolicyRegistry {
         let decode_policy_opt = self.decode_policy.get();
 
         if let Some(policy) = prefill_policy_opt {
-            if policy.name() == "power_of_two" && !Arc::ptr_eq(policy, &self.default_policy) {
-                power_of_two_policies.push(Arc::clone(policy));
+            if policy.needs_load_updates() && !Arc::ptr_eq(policy, &self.default_policy) {
+                load_aware_policies.push(Arc::clone(policy));
             }
         }
 
         if let Some(policy) = decode_policy_opt {
-            if policy.name() == "power_of_two"
+            if policy.needs_load_updates()
                 && !Arc::ptr_eq(policy, &self.default_policy)
                 && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
             {
-                power_of_two_policies.push(Arc::clone(policy));
+                load_aware_policies.push(Arc::clone(policy));
             }
         }
 
         for entry in self.model_policies.iter() {
             let policy = entry.value();
-            if policy.name() == "power_of_two" {
-                let already_added = power_of_two_policies.iter().any(|p| Arc::ptr_eq(p, policy));
+            if policy.needs_load_updates() {
+                let already_added = load_aware_policies.iter().any(|p| Arc::ptr_eq(p, policy));
                 if !already_added {
-                    power_of_two_policies.push(Arc::clone(policy));
+                    load_aware_policies.push(Arc::clone(policy));
                 }
             }
         }
 
-        power_of_two_policies
+        load_aware_policies
+    }
+
+    /// Get all PowerOfTwo policies that need load updates (lock-free).
+    ///
+    /// Kept for compatibility with callers that only want the original
+    /// PowerOfTwo subset.
+    pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        self.get_all_load_aware_policies()
+            .into_iter()
+            .filter(|policy| policy.name() == "power_of_two")
+            .collect()
     }
 
     /// Initialize cache-aware policy with workers if applicable
@@ -774,6 +785,7 @@ mod tests {
             eviction_interval_secs: 0,
             max_tree_size: 10_000,
             block_size: 16,
+            engine_load: Default::default(),
         });
 
         let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
@@ -824,6 +836,7 @@ mod tests {
             eviction_interval_secs: 0,
             max_tree_size: 10_000,
             block_size: 16,
+            engine_load: Default::default(),
         }));
 
         let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
