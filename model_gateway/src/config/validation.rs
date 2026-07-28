@@ -214,6 +214,7 @@ impl ConfigValidator {
                 eviction_interval_secs,
                 max_tree_size,
                 block_size,
+                engine_load: _,
             } => {
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -797,6 +798,7 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                engine_load: Default::default(),
             },
         );
 
@@ -817,6 +819,7 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                engine_load: Default::default(),
             },
         );
 
@@ -872,6 +875,7 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                engine_load: Default::default(),
             },
         );
 
@@ -917,6 +921,7 @@ mod tests {
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
                     block_size: 16,
+                    engine_load: Default::default(),
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

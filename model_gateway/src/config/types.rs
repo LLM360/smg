@@ -264,6 +264,8 @@ pub enum PolicyConfig {
         max_tree_size: usize,
         #[serde(default = "default_block_size")]
         block_size: usize,
+        #[serde(default)]
+        engine_load: bool,
     },
 
     #[serde(rename = "power_of_two")]
@@ -803,6 +805,7 @@ mod tests {
             eviction_interval_secs: 300,
             max_tree_size: 1000,
             block_size: 16,
+            engine_load: Default::default(),
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -825,6 +828,7 @@ mod tests {
             eviction_interval_secs: 300,
             max_tree_size: 1000,
             block_size: 16,
+            engine_load: Default::default(),
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -848,6 +852,7 @@ mod tests {
             eviction_interval_secs: 600,
             max_tree_size: 5000,
             block_size: 16,
+            engine_load: Default::default(),
         };
 
         match cache_aware {
@@ -1254,6 +1259,7 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                engine_load: Default::default(),
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1285,6 +1291,7 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                engine_load: Default::default(),
             }),
             decode_policy: None,
         };
@@ -1342,6 +1349,7 @@ mod tests {
             eviction_interval_secs: 300,
             max_tree_size: 2000,
             block_size: 16,
+            engine_load: Default::default(),
         };
 
         match pd.get_prefill_policy(&main_policy) {

@@ -31,6 +31,13 @@
     When the system is imbalanced, routes to the least busy worker regardless
     of cache affinity.
 
+    Engine Pressure Guard (Optional)
+    -------------------------------------------
+    Restricts cache-aware candidates to workers within 10 percentage points of
+    the least-pressured engine and below 90% pressure. Pressure is the larger of
+    KV token usage and utilization; waiting requests break ties. Missing or
+    stale telemetry falls back to the existing request-count behavior.
+
     Configuration Parameters:
     ------------------------
     cache_threshold:         Min prefix match ratio for highest-match routing (0.0-1.0)
@@ -39,12 +46,18 @@
     eviction_interval_secs:  Interval between LRU eviction cycles
     max_tree_size:           Max nodes per approximate tree before eviction
     block_size:              Backend KV cache block size for event-driven routing
+    engine_load:             Enable the engine pressure guard
 */
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
+use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::Rng;
 use smg_mesh::{OptionalMeshSyncManager, TreeInsertOp, TreeKey, TreeOperation};
@@ -54,7 +67,33 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, CacheAwareConfig,
     LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::worker::{KvEventMonitor, Worker, UNKNOWN_MODEL_ID};
+use crate::{
+    observability::metrics::Metrics,
+    worker::{KvEventMonitor, Worker, UNKNOWN_MODEL_ID},
+};
+
+const ENGINE_LOAD_MAX_AGE: Duration = Duration::from_secs(30);
+const ENGINE_PRESSURE_SLACK: f64 = 0.10;
+const ENGINE_PRESSURE_HIGH_WATERMARK: f64 = 0.90;
+
+#[derive(Debug, Clone)]
+struct TimedWorkerLoad {
+    response: WorkerLoadResponse,
+    observed_at: Instant,
+}
+
+#[derive(Debug)]
+struct EnginePressurePlan {
+    allowed_indices: Vec<usize>,
+    best_index: usize,
+    pressure_by_index: HashMap<usize, WorkerPressure>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerPressure {
+    pressure: f64,
+    waiting_requests: i64,
+}
 
 /// Cache-aware routing policy
 ///
@@ -89,6 +128,8 @@ pub struct CacheAwarePolicy {
     /// compound key `(model_id, hash)` or hashing `model_id\0text` would be
     /// correct.  Deferring to a follow-up to avoid changing the wire format.
     path_hash_index: Arc<DashMap<u64, String>>,
+    /// Last successful engine load snapshot per worker.
+    engine_loads: RwLock<HashMap<String, TimedWorkerLoad>>,
 }
 
 impl CacheAwarePolicy {
@@ -168,6 +209,125 @@ impl CacheAwarePolicy {
             _eviction_task: eviction_task,
             kv_monitor: RwLock::new(None),
             path_hash_index,
+            engine_loads: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn engine_pressure_plan(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> Option<EnginePressurePlan> {
+        if !self.config.engine_load {
+            return None;
+        }
+
+        let loads = self.engine_loads.read();
+        let mut pressure_by_index = HashMap::with_capacity(healthy_indices.len());
+
+        // Degrade the whole decision to legacy request-count routing unless all
+        // candidates have comparable, fresh engine telemetry.
+        for &idx in healthy_indices {
+            let worker = &workers[idx];
+            let load = loads.get(worker.url())?;
+            if load.observed_at.elapsed() > ENGINE_LOAD_MAX_AGE || load.response.loads.is_empty() {
+                return None;
+            }
+
+            let pressure = load
+                .response
+                .loads
+                .iter()
+                .map(|rank| rank.token_usage.max(rank.utilization))
+                .fold(0.0_f64, f64::max);
+            if !pressure.is_finite() || pressure < 0.0 {
+                return None;
+            }
+            let waiting_requests = load
+                .response
+                .loads
+                .iter()
+                .map(|rank| i64::from(rank.num_waiting_reqs.max(0)))
+                .sum();
+
+            pressure_by_index.insert(
+                idx,
+                WorkerPressure {
+                    pressure,
+                    waiting_requests,
+                },
+            );
+        }
+
+        let best_pressure = pressure_by_index
+            .values()
+            .map(|load| load.pressure)
+            .min_by(f64::total_cmp)?;
+        let pressure_limit = if best_pressure > ENGINE_PRESSURE_HIGH_WATERMARK {
+            best_pressure
+        } else {
+            (best_pressure + ENGINE_PRESSURE_SLACK).min(ENGINE_PRESSURE_HIGH_WATERMARK)
+        };
+        let mut allowed_indices: Vec<usize> = healthy_indices
+            .iter()
+            .copied()
+            .filter(|idx| pressure_by_index[idx].pressure <= pressure_limit)
+            .collect();
+        allowed_indices.sort_by(|&left_idx, &right_idx| {
+            let left = pressure_by_index[&left_idx];
+            let right = pressure_by_index[&right_idx];
+            left.pressure
+                .total_cmp(&right.pressure)
+                .then_with(|| left.waiting_requests.cmp(&right.waiting_requests))
+                .then_with(|| workers[left_idx].load().cmp(&workers[right_idx].load()))
+        });
+        let best_index = *allowed_indices.first()?;
+
+        Some(EnginePressurePlan {
+            allowed_indices,
+            best_index,
+            pressure_by_index,
+        })
+    }
+
+    fn select_worker_legacy(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+    ) -> Option<usize> {
+        let request_text = info.request_text;
+        let request_tokens = info.tokens;
+        let model_id = normalize_model_key(workers[*healthy_indices.first()?].model_id());
+
+        let (min_load, max_load) =
+            healthy_indices
+                .iter()
+                .fold((usize::MAX, 0usize), |(min, max), &idx| {
+                    let load = workers[idx].load();
+                    (min.min(load), max.max(load))
+                });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+
+        if is_imbalanced {
+            return self.select_worker_min_load(workers, info, healthy_indices, model_id);
+        }
+
+        if let Some(tokens) = request_tokens {
+            if self.has_event_indexer(model_id) {
+                self.select_worker_event_driven(workers, tokens, healthy_indices, model_id)
+            } else {
+                self.select_worker_with_tokens(workers, tokens, healthy_indices, model_id)
+            }
+        } else {
+            self.select_worker_with_text(
+                workers,
+                request_text.unwrap_or(""),
+                healthy_indices,
+                model_id,
+            )
         }
     }
 
@@ -189,8 +349,7 @@ impl CacheAwarePolicy {
     /// Initializes both string trees (HTTP) and token trees (gRPC) for each model.
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
-        let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
-            std::collections::HashMap::new();
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
             let tree_key = normalize_model_key(worker.model_id());
             model_workers
@@ -594,47 +753,68 @@ impl CacheAwarePolicy {
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let request_text = info.request_text;
-        let request_tokens = info.tokens;
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
             return None;
         }
 
-        // Determine the model for this set of workers (router pre-filters by model)
-        // All workers should be from the same model
-        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+        let pressure_plan = self.engine_pressure_plan(workers, &healthy_indices);
+        let selection_indices = match pressure_plan.as_ref() {
+            Some(plan) => &plan.allowed_indices,
+            _ => &healthy_indices,
+        };
+        let selected_idx = self.select_worker_legacy(workers, info, selection_indices)?;
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
-
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
-
-        if is_imbalanced {
-            return self.select_worker_min_load(workers, info, &healthy_indices, model_id);
-        }
-
-        // Cache-aware routing when balanced — three types (mutually exclusive):
-        //   1. Event-driven: PositionalIndexer overlap scoring (gRPC + KV events)
-        //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
-        //   3. Approximate string tree: Tree prefix matching (HTTP)
-        if let Some(tokens) = request_tokens {
-            if self.has_event_indexer(model_id) {
-                self.select_worker_event_driven(workers, tokens, &healthy_indices, model_id)
+        if let Some(plan) = pressure_plan {
+            let result = if plan.allowed_indices.len() == healthy_indices.len() {
+                "all_candidates_allowed"
             } else {
-                self.select_worker_with_tokens(workers, tokens, &healthy_indices, model_id)
-            }
-        } else {
-            let text = request_text.unwrap_or("");
-            self.select_worker_with_text(workers, text, &healthy_indices, model_id)
+                "candidate_set_restricted"
+            };
+            Metrics::record_cache_aware_engine_decision(result);
+            debug!(
+                selected_worker = workers[selected_idx].url(),
+                selected_pressure = plan.pressure_by_index[&selected_idx].pressure,
+                least_pressure_worker = workers[plan.best_index].url(),
+                least_pressure = plan.pressure_by_index[&plan.best_index].pressure,
+                result,
+                "Cache-aware engine-pressure decision"
+            );
+        } else if self.config.engine_load {
+            Metrics::record_cache_aware_engine_decision("telemetry_fallback");
         }
+
+        Some(selected_idx)
+    }
+
+    fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+        let observed_at = Instant::now();
+        let mut cached = self.engine_loads.write();
+        for (url, response) in loads {
+            cached.insert(
+                url.clone(),
+                TimedWorkerLoad {
+                    response: response.clone(),
+                    observed_at,
+                },
+            );
+        }
+    }
+
+    fn update_loads_for_workers(
+        &self,
+        loads: &HashMap<String, WorkerLoadResponse>,
+        worker_urls: &[String],
+    ) {
+        self.update_loads(loads);
+        self.engine_loads
+            .write()
+            .retain(|url, _| !worker_urls.contains(url) || loads.contains_key(url));
+    }
+
+    fn needs_load_updates(&self) -> bool {
+        self.config.engine_load
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
@@ -804,7 +984,7 @@ impl CacheAwarePolicy {
                 workers
                     .iter()
                     .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
+                    .filter(|idx| healthy_indices.contains(idx))
             } else {
                 healthy_indices
                     .iter()
@@ -865,7 +1045,7 @@ impl CacheAwarePolicy {
                 workers
                     .iter()
                     .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
+                    .filter(|idx| healthy_indices.contains(idx))
             } else {
                 healthy_indices
                     .iter()
@@ -918,7 +1098,7 @@ impl Default for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerStatus};
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, WorkerType};
@@ -928,6 +1108,160 @@ mod tests {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    fn engine_load(token_usage: f64, utilization: f64, waiting: i32) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                token_usage,
+                utilization,
+                num_waiting_reqs: waiting,
+                ..Default::default()
+            }],
+            dp_rank_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn two_workers() -> Vec<Arc<dyn Worker>> {
+        vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+        ]
+    }
+
+    fn engine_aware_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            engine_load: true,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        })
+    }
+
+    fn prime_worker_one_affinity(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        text: &str,
+    ) {
+        policy.init_workers(workers);
+        let selected = policy
+            .select_worker(
+                workers,
+                &SelectWorkerInfo {
+                    request_text: Some(text),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn test_engine_load_keeps_cache_affinity_when_pressure_is_close() {
+        let policy = engine_aware_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.50, 0.40, 0)),
+            ("http://w2:8000".to_string(), engine_load(0.45, 0.40, 0)),
+        ]));
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("shared prefix"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn test_engine_load_overrides_affinity_for_hot_worker() {
+        let policy = engine_aware_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.85, 0.70, 0)),
+            ("http://w2:8000".to_string(), engine_load(0.40, 0.50, 0)),
+        ]));
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("shared prefix"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn test_engine_load_falls_back_when_telemetry_is_partial() {
+        let policy = engine_aware_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.95, 0.95, 10)),
+            ("http://w2:8000".to_string(), engine_load(0.10, 0.10, 0)),
+        ]));
+        let partial = HashMap::from([("http://w1:8000".to_string(), engine_load(0.95, 0.95, 10))]);
+        policy.update_loads_for_workers(
+            &partial,
+            &["http://w1:8000".to_string(), "http://w2:8000".to_string()],
+        );
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("shared prefix"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn test_engine_load_falls_back_when_telemetry_is_stale() {
+        let policy = engine_aware_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.95, 0.95, 10)),
+            ("http://w2:8000".to_string(), engine_load(0.10, 0.10, 0)),
+        ]));
+        for load in policy.engine_loads.write().values_mut() {
+            load.observed_at = Instant::now() - ENGINE_LOAD_MAX_AGE - Duration::from_secs(1);
+        }
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("shared prefix"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 0);
     }
 
     #[test]
@@ -1003,6 +1337,7 @@ mod tests {
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
             block_size: 16,
+            engine_load: false,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")

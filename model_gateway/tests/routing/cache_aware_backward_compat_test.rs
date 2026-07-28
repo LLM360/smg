@@ -24,6 +24,7 @@ fn test_backward_compatibility_with_empty_model_id() {
         eviction_interval_secs: 0, // Disable background eviction for testing
         max_tree_size: 100,
         block_size: 16,
+        engine_load: false,
     };
 
     let policy = CacheAwarePolicy::with_config(config);
@@ -76,6 +77,7 @@ fn test_mixed_model_ids() {
         eviction_interval_secs: 0,
         max_tree_size: 100,
         block_size: 16,
+        engine_load: false,
     };
 
     let policy = CacheAwarePolicy::with_config(config);
