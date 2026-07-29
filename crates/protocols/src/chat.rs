@@ -595,6 +595,11 @@ impl GenerationRequest for ChatCompletionRequest {
         Some(&self.model)
     }
 
+    #[allow(deprecated)]
+    fn max_output_tokens_for_routing(&self) -> Option<u32> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
+
     fn extract_text_for_routing(&self) -> String {
         // Extract text from messages for routing decisions
         // Use a single buffer to avoid intermediate Vec<String> allocations
@@ -696,7 +701,6 @@ pub struct ChatCompletionMessage {
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
     // Note: refusal, annotations, audio are not added yet
-
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
     pub other: Map<String, Value>,

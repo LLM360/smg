@@ -149,8 +149,12 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "size_aware_power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
+
+    /// Gateway-wide output estimate for size-aware power-of-two routing
+    #[arg(long, default_value_t = 4096, help_heading = "Routing Policy")]
+    output_token_estimate: u64,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
     #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
@@ -893,6 +897,9 @@ impl CliArgs {
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
+            },
+            "size_aware_power_of_two" => PolicyConfig::SizeAwarePowerOfTwo {
+                output_token_estimate: self.output_token_estimate,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,

@@ -207,6 +207,12 @@ impl GenerationRequest for GenerateRequest {
         Some(self.model.as_str())
     }
 
+    fn max_output_tokens_for_routing(&self) -> Option<u32> {
+        self.sampling_params
+            .as_ref()
+            .and_then(|params| params.max_new_tokens)
+    }
+
     fn extract_text_for_routing(&self) -> String {
         // Check fields in priority order: text, input_ids
         if let Some(ref text) = self.text {

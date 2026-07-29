@@ -46,6 +46,14 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Caller-declared output-token ceiling.
+    ///
+    /// Non-generative requests default to zero. Generative implementations
+    /// return `None` when the caller did not provide a ceiling.
+    fn max_output_tokens_for_routing(&self) -> Option<u32> {
+        Some(0)
+    }
 }
 
 // ============================================================================

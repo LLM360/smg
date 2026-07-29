@@ -23,6 +23,7 @@ use tokio::{sync::OnceCell, time};
 use super::{CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
+    policies::LoadBalancingPolicy,
     routers::{common::header_utils::extract_routing_key, grpc::client::GrpcClient},
 };
 
@@ -1062,6 +1063,7 @@ impl Worker for BasicWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    policy_reservation: Option<(Arc<dyn LoadBalancingPolicy>, u64)>,
 }
 
 impl WorkerLoadGuard {
@@ -1077,12 +1079,29 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            policy_reservation: None,
         }
+    }
+
+    /// Create a request-lifetime guard for a reservation already made by the
+    /// selected policy.
+    pub fn with_policy_reservation(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        policy: Arc<dyn LoadBalancingPolicy>,
+        cost: u64,
+    ) -> Self {
+        let mut guard = Self::new(worker, headers);
+        guard.policy_reservation = Some((policy, cost));
+        guard
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
+        if let Some((policy, cost)) = &self.policy_reservation {
+            policy.release_reservation(self.worker.url(), *cost);
+        }
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.decrement_routing_key_load(key);

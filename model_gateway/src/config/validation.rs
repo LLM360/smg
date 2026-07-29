@@ -267,6 +267,17 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::SizeAwarePowerOfTwo {
+                output_token_estimate,
+            } => {
+                if *output_token_estimate == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "output_token_estimate".to_string(),
+                        value: output_token_estimate.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::Bucket {
                 balance_abs_threshold: _,
                 balance_rel_threshold,
