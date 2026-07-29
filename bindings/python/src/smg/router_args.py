@@ -31,6 +31,7 @@ class RouterArgs:
     worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
     load_monitor_interval: int = 10
+    output_token_estimate: int = 4096
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
@@ -287,7 +288,14 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "size_aware_power_of_two",
+                "manual",
+            ],
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
@@ -318,6 +326,15 @@ class RouterArgs:
             help=(
                 "Specific policy for decode nodes in PD mode."
                 " If not specified, uses the main policy"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}output-token-estimate",
+            type=int,
+            default=RouterArgs.output_token_estimate,
+            help=(
+                "Gateway-wide output token estimate for size-aware power-of-two routing; "
+                "capped by each request's output-token limit"
             ),
         )
         routing_group.add_argument(

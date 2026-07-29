@@ -107,6 +107,12 @@ impl GenerationRequest for InteractionsRequest {
         self.model.as_deref()
     }
 
+    fn max_output_tokens_for_routing(&self) -> Option<u32> {
+        self.generation_config
+            .as_ref()
+            .and_then(|config| config.max_output_tokens)
+    }
+
     fn extract_text_for_routing(&self) -> String {
         fn extract_from_content(content: &Content) -> Option<String> {
             match content {

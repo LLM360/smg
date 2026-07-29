@@ -23,6 +23,7 @@ class TestRouterArgs:
         assert args.host == "0.0.0.0"
         assert args.port == 30000
         assert args.policy == "cache_aware"
+        assert args.output_token_estimate == 4096
         assert args.worker_urls == []
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
@@ -464,6 +465,10 @@ class TestPolicyFromStr:
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
+        assert (
+            policy_from_str("size_aware_power_of_two")
+            == PolicyType.SizeAwarePowerOfTwo
+        )
 
     def test_invalid_policy(self):
         """Test conversion of invalid policy string."""
@@ -494,6 +499,19 @@ class TestParseRouterArgs:
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
+
+    def test_parse_size_aware_power_of_two_args(self):
+        router_args = parse_router_args(
+            [
+                "--policy",
+                "size_aware_power_of_two",
+                "--output-token-estimate",
+                "2048",
+            ]
+        )
+
+        assert router_args.policy == "size_aware_power_of_two"
+        assert router_args.output_token_estimate == 2048
 
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""

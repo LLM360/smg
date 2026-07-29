@@ -271,6 +271,12 @@ pub enum PolicyConfig {
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
+    #[serde(rename = "size_aware_power_of_two")]
+    SizeAwarePowerOfTwo {
+        #[serde(default = "default_output_token_estimate")]
+        output_token_estimate: u64,
+    },
+
     #[serde(rename = "bucket")]
     Bucket {
         /// Absolute load difference threshold for load balancing
@@ -327,6 +333,10 @@ fn default_block_size() -> usize {
     16
 }
 
+fn default_output_token_estimate() -> u64 {
+    4096
+}
+
 fn default_prefix_token_count() -> usize {
     256
 }
@@ -350,6 +360,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::SizeAwarePowerOfTwo { .. } => "size_aware_power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",

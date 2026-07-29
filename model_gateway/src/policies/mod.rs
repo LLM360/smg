@@ -21,6 +21,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod size_aware_power_of_two;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
@@ -36,6 +37,7 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use size_aware_power_of_two::{SizeAwarePowerOfTwoPolicy, DEFAULT_OUTPUT_TOKEN_ESTIMATE};
 
 /// Core trait for load balancing policies
 ///
@@ -58,6 +60,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
         // Default: no-op for stateless policies
+    }
+
+    /// Return the router-local work reserved by this request, if this policy
+    /// reserves work during selection.
+    fn reservation_cost(&self, _info: &SelectWorkerInfo<'_>) -> Option<u64> {
+        None
+    }
+
+    /// Release router-local work when the selected request finishes or fails.
+    fn release_reservation(&self, _worker_url: &str, _cost: u64) {
+        // Default: no-op for policies without router-local reservations
     }
 
     /// Get policy name for metrics and debugging
@@ -197,6 +210,11 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// Caller-declared output-token ceiling, when the endpoint exposes one.
+    pub max_output_tokens: Option<u64>,
+    /// Whether this request path attaches a completion guard that can release
+    /// router-local work reserved during selection.
+    pub reserve_work: bool,
 }
 
 #[cfg(test)]

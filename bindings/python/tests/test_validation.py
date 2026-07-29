@@ -318,7 +318,13 @@ class TestConfigurationValidation:
     def test_policy_validation(self):
         """Test policy configuration validation."""
         # Valid policies
-        valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
+        valid_policies = [
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "size_aware_power_of_two",
+        ]
 
         for policy in valid_policies:
             args = RouterArgs(policy=policy)

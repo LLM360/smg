@@ -777,6 +777,20 @@ mod tests {
     }
 
     #[test]
+    fn test_size_aware_default_applies_to_every_model_without_a_hint() {
+        let registry = PolicyRegistry::new(PolicyConfig::SizeAwarePowerOfTwo {
+            output_token_estimate: 2048,
+        });
+
+        let model_a = registry.on_worker_added("model-a", None);
+        let model_b = registry.on_worker_added("model-b", None);
+
+        assert_eq!(model_a.name(), "size_aware_power_of_two");
+        assert_eq!(model_b.name(), "size_aware_power_of_two");
+        assert!(Arc::ptr_eq(&model_a, &model_b));
+    }
+
+    #[test]
     fn test_set_mesh_sync_propagates_to_default_cache_aware_policy() {
         let registry = PolicyRegistry::new(PolicyConfig::CacheAware {
             cache_threshold: 0.5,

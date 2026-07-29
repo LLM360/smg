@@ -842,6 +842,10 @@ impl GenerationRequest for ResponsesRequest {
         Some(self.model.as_str())
     }
 
+    fn max_output_tokens_for_routing(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
     fn extract_text_for_routing(&self) -> String {
         match &self.input {
             ResponseInput::Text(text) => text.clone(),

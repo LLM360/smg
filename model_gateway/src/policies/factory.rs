@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SizeAwarePowerOfTwoPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -19,6 +19,9 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::SizeAwarePowerOfTwo {
+                output_token_estimate,
+            } => Arc::new(SizeAwarePowerOfTwoPolicy::new(*output_token_estimate)),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -83,6 +86,9 @@ impl PolicyFactory {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
+            "size_aware_power_of_two" | "sizeawarepoweroftwo" => {
+                Some(Arc::new(SizeAwarePowerOfTwoPolicy::default()))
+            }
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
@@ -111,6 +117,11 @@ mod tests {
             load_check_interval_secs: 60,
         });
         assert_eq!(policy.name(), "power_of_two");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::SizeAwarePowerOfTwo {
+            output_token_estimate: 4096,
+        });
+        assert_eq!(policy.name(), "size_aware_power_of_two");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
             cache_threshold: 0.7,
@@ -149,6 +160,7 @@ mod tests {
         assert!(PolicyFactory::create_by_name("RoundRobin").is_some());
         assert!(PolicyFactory::create_by_name("power_of_two").is_some());
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
+        assert!(PolicyFactory::create_by_name("size_aware_power_of_two").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("bucket").is_some());

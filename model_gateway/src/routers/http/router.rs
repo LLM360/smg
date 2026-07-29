@@ -31,7 +31,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
             header_utils,
@@ -50,6 +50,12 @@ pub struct Router {
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     retry_config: RetryConfig,
+}
+
+struct WorkerSelection {
+    worker: Arc<dyn Worker>,
+    policy: Arc<dyn LoadBalancingPolicy>,
+    reservation_cost: Option<u64>,
 }
 
 impl std::fmt::Debug for Router {
@@ -137,7 +143,8 @@ impl Router {
         model_id: &str,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+        max_output_tokens: Option<u64>,
+    ) -> Option<WorkerSelection> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
             None
@@ -167,15 +174,16 @@ impl Router {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                headers,
-                hash_ring,
-            },
-        )?;
+        let info = SelectWorkerInfo {
+            request_text: text,
+            tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+            headers,
+            hash_ring,
+            max_output_tokens,
+            reserve_work: true,
+        };
+        let reservation_cost = policy.reservation_cost(&info);
+        let idx = policy.select_worker(&available, &info)?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -185,7 +193,11 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some(WorkerSelection {
+            worker: available[idx].clone(),
+            policy,
+            reservation_cost,
+        })
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -282,8 +294,13 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
-            Some(w) => w,
+        let selection = match self.select_worker_for_model(
+            model_id,
+            Some(text),
+            headers,
+            typed_req.max_output_tokens_for_routing().map(u64::from),
+        ) {
+            Some(selection) => selection,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
                 let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
@@ -308,12 +325,20 @@ impl Router {
                 };
             }
         };
+        let worker = selection.worker;
 
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard = if let Some(cost) = selection.reservation_cost {
+            Some(WorkerLoadGuard::with_policy_reservation(
+                worker.clone(),
+                headers,
+                selection.policy,
+                cost,
+            ))
+        } else {
+            ["cache_aware", "manual"]
+                .contains(&selection.policy.name())
+                .then(|| WorkerLoadGuard::new(worker.clone(), headers))
+        };
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();

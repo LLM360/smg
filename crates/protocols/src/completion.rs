@@ -217,6 +217,10 @@ impl GenerationRequest for CompletionRequest {
         Some(&self.model)
     }
 
+    fn max_output_tokens_for_routing(&self) -> Option<u32> {
+        self.max_tokens
+    }
+
     fn extract_text_for_routing(&self) -> String {
         match &self.prompt {
             StringOrArray::String(s) => s.clone(),
