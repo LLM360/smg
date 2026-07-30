@@ -10,6 +10,9 @@ use http::header::HeaderName;
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 static HEADER_MCP: HeaderName = HeaderName::from_static("x-smg-mcp");
+static HEADER_TARGET_WORKER_URL: HeaderName = HeaderName::from_static("x-smg-target-worker-url");
+static HEADER_EXCLUDED_WORKER_URLS: HeaderName =
+    HeaderName::from_static("x-smg-excluded-worker-urls");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -24,6 +27,18 @@ pub fn extract_target_worker(headers: Option<&HeaderMap>) -> Option<&str> {
 
 pub fn extract_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_header_value(headers, &HEADER_ROUTING_KEY)
+}
+
+/// Apply trusted Comet worker URL constraints.
+///
+/// Comet strips these headers from client input and injects them only after
+/// authenticating the API key. A target takes precedence over exclusions.
+pub fn worker_url_is_allowed(headers: Option<&HeaderMap>, worker_url: &str) -> bool {
+    if let Some(target) = extract_header_value(headers, &HEADER_TARGET_WORKER_URL) {
+        return target == worker_url;
+    }
+    !extract_header_value(headers, &HEADER_EXCLUDED_WORKER_URLS)
+        .is_some_and(|excluded| excluded.split(',').any(|url| url.trim() == worker_url))
 }
 
 /// Check if SMG MCP orchestration is enabled via `X-SMG-MCP: enabled` header.
@@ -324,6 +339,28 @@ mod tests {
     fn test_extract_target_worker_missing() {
         let headers = HeaderMap::new();
         assert_eq!(extract_target_worker(Some(&headers)), None);
+    }
+
+    #[test]
+    fn test_comet_worker_target_and_exclusions() {
+        let mut target = HeaderMap::new();
+        target.insert(
+            "x-smg-target-worker-url",
+            "http://reserved:8000".parse().unwrap(),
+        );
+        assert!(worker_url_is_allowed(Some(&target), "http://reserved:8000"));
+        assert!(!worker_url_is_allowed(Some(&target), "http://shared:8000"));
+
+        let mut excluded = HeaderMap::new();
+        excluded.insert(
+            "x-smg-excluded-worker-urls",
+            "http://reserved:8000,http://other:8000".parse().unwrap(),
+        );
+        assert!(!worker_url_is_allowed(
+            Some(&excluded),
+            "http://reserved:8000"
+        ));
+        assert!(worker_url_is_allowed(Some(&excluded), "http://shared:8000"));
     }
 
     #[test]
