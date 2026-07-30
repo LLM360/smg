@@ -124,6 +124,47 @@ rate(smg_http_rate_limit_total{result="rejected"}[5m]) / sum(rate(smg_http_rate_
 
 ---
 
+### Admission lifecycle metrics
+
+The concurrency middleware exposes a complete request lifecycle with unlabeled,
+low-cardinality metrics:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `smg_http_admission_received_total` | Counter | Requests entering admission |
+| `smg_http_admission_admitted_total` | Counter | Requests granted concurrency capacity |
+| `smg_http_admission_rejected_total` | Counter | Requests rejected or timed out before admission |
+| `smg_http_admission_success_total` | Counter | Admitted responses fully delivered with HTTP 2xx or 3xx |
+| `smg_http_admission_http_4xx_total` | Counter | Admitted responses fully delivered with HTTP 4xx |
+| `smg_http_admission_http_5xx_total` | Counter | Admitted responses fully delivered with HTTP 5xx |
+| `smg_http_admission_interrupted_total` | Counter | Admitted response bodies dropped before completion |
+| `smg_http_admission_pre_admission_interrupted_total` | Counter | Requests dropped while admission was unresolved |
+| `smg_http_admission_active` | Gauge | Admitted requests still holding capacity |
+| `smg_http_admission_queued` | Gauge | Requests waiting for capacity |
+| `smg_http_admission_limit` | Gauge | Configured active limit, or `-1` when unbounded |
+| `smg_http_admission_queue_capacity` | Gauge | Configured maximum number of waiters |
+| `smg_http_admission_process_start_time_seconds` | Gauge | Process epoch for reset-safe counter deltas |
+
+The configured queue capacity bounds all outstanding waiters, including
+requests already handed from the channel to an asynchronous token waiter.
+
+```promql
+# Admission rate
+rate(smg_http_admission_admitted_total[5m])
+
+# Current pressure
+smg_http_admission_active / smg_http_admission_limit
+
+# Admission accounting residual
+rate(smg_http_admission_received_total[5m])
+- rate(smg_http_admission_admitted_total[5m])
+- rate(smg_http_admission_rejected_total[5m])
+- rate(smg_http_admission_pre_admission_interrupted_total[5m])
+- deriv(smg_http_admission_queued[5m])
+```
+
+---
+
 ## Layer 2: Router Metrics
 
 Metrics for request routing and processing.

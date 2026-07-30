@@ -101,6 +101,7 @@ pub fn create_test_app(
         router,
         context: app_context,
         concurrency_queue_tx: None,
+        concurrency_queue_slots: None,
         router_manager: None,
         mesh_handler: None,
     });
@@ -138,6 +139,7 @@ pub fn create_test_app_with_context(
         router,
         context: app_context.clone(),
         concurrency_queue_tx: None,
+        concurrency_queue_slots: None,
         router_manager: None,
         mesh_handler: None,
     });
