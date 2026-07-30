@@ -488,6 +488,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_guard_body_preserves_exact_size_hint() {
+        let inner = Body::from("measured response");
+        let expected = inner.size_hint().exact();
+        let guarded = TokenGuardBody::new(inner, Arc::new(TokenBucket::new(1, 0)), 1.0);
+
+        assert_eq!(guarded.size_hint().exact(), expected);
+    }
+
+    #[test]
     fn configured_queue_capacity_bounds_all_outstanding_waiters() {
         let bucket = Arc::new(TokenBucket::new(1, 0));
         let (limiter, _processor) =
