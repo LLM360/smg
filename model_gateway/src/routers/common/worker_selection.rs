@@ -13,7 +13,9 @@ use openai_protocol::models::ListModelsResponse;
 
 use crate::{
     routers::{
-        common::header_utils::{apply_provider_headers, extract_auth_header},
+        common::header_utils::{
+            apply_provider_headers, extract_auth_header, worker_url_is_allowed,
+        },
         error,
     },
     worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
@@ -116,7 +118,10 @@ impl<'a> WorkerSelector<'a> {
             false, // we filter availability ourselves for consistent behavior
         );
 
-        let candidates: Vec<_> = workers.into_iter().filter(|w| w.is_available()).collect();
+        let candidates: Vec<_> = workers
+            .into_iter()
+            .filter(|w| w.is_available() && worker_url_is_allowed(req.headers, w.url()))
+            .collect();
 
         match &req.provider {
             Some(provider) => filter_by_provider(candidates, provider),
@@ -147,7 +152,8 @@ impl<'a> WorkerSelector<'a> {
             None => workers,
         };
         candidates.iter().any(|w| {
-            w.supports_model(req.model_id)
+            worker_url_is_allowed(req.headers, w.url())
+                && w.supports_model(req.model_id)
                 && (!req.require_realtime_capable || w.is_realtime_capable())
         })
     }

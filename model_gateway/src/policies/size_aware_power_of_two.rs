@@ -7,7 +7,7 @@ use rand::RngExt;
 use tracing::{debug, warn};
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
+use crate::{routers::common::header_utils::worker_url_is_allowed, worker::Worker};
 
 pub const DEFAULT_OUTPUT_TOKEN_ESTIMATE: u64 = 4096;
 const APPROX_BYTES_PER_TOKEN: u64 = 4;
@@ -70,7 +70,10 @@ impl LoadBalancingPolicy for SizeAwarePowerOfTwoPolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
-        let healthy_indices = get_healthy_worker_indices(workers);
+        let healthy_indices: Vec<_> = get_healthy_worker_indices(workers)
+            .into_iter()
+            .filter(|idx| worker_url_is_allowed(info.headers, workers[*idx].url()))
+            .collect();
         if healthy_indices.is_empty() {
             return None;
         }
@@ -235,6 +238,47 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(policy.reserved_for(workers[first].url()), 1_500);
         assert_eq!(policy.reserved_for(workers[second].url()), 1_500);
+    }
+
+    #[test]
+    fn trusted_target_and_exclusions_partition_workers() {
+        let policy = SizeAwarePowerOfTwoPolicy::new(4_000);
+        let workers = workers();
+        let mut target_headers = http::HeaderMap::new();
+        target_headers.insert("x-smg-target-worker-url", "http://w2:8000".parse().unwrap());
+        let target_info = SelectWorkerInfo {
+            headers: Some(&target_headers),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &target_info), Some(1));
+
+        let mut excluded_headers = http::HeaderMap::new();
+        excluded_headers.insert(
+            "x-smg-excluded-worker-urls",
+            "http://w2:8000".parse().unwrap(),
+        );
+        let shared_info = SelectWorkerInfo {
+            headers: Some(&excluded_headers),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &shared_info), Some(0));
+    }
+
+    #[test]
+    fn missing_target_fails_closed() {
+        let policy = SizeAwarePowerOfTwoPolicy::new(4_000);
+        let workers = workers();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-target-worker-url",
+            "http://missing:8000".parse().unwrap(),
+        );
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        assert_eq!(policy.select_worker(&workers, &info), None);
     }
 
     #[test]
