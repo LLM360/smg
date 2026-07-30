@@ -70,12 +70,10 @@ impl MessageContent {
     /// Returns the text content, cloning only when necessary.
     /// For simple text, returns a clone of the string.
     /// For parts, concatenates text parts with spaces.
-    /// Optimized to avoid intermediate Vec allocation.
     pub fn to_simple_string(&self) -> String {
         match self {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(parts) => {
-                // Use fold to build string directly without intermediate Vec allocation
                 let mut result = String::new();
                 let mut first = true;
                 for part in parts {
@@ -184,6 +182,9 @@ pub struct ChatCompletionRequest {
     /// Output types that you would like the model to generate for this request
     pub modalities: Option<Vec<String>>,
 
+    /// Whether to return audio output.
+    pub return_audio: Option<bool>,
+
     /// How many chat completion choices to generate for each input message
     #[validate(range(min = 1, max = 10))]
     pub n: Option<u32>,
@@ -198,7 +199,13 @@ pub struct ChatCompletionRequest {
     /// Cache key for prompts (beta feature)
     pub prompt_cache_key: Option<String>,
 
-    /// Effort level for reasoning models (low, medium, high)
+    /// Effort level for reasoning models.
+    ///
+    /// OpenAI-compatible callers normally send a named string, while some
+    /// model integrations accept a numeric value. Keep the public Rust shape
+    /// as a string for compatibility, but accept either JSON representation at
+    /// the HTTP boundary; model-specific normalization happens in the gateway.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
     pub reasoning_effort: Option<String>,
 
     /// An object specifying the format that the model must output
@@ -261,7 +268,7 @@ pub struct ChatCompletionRequest {
     pub min_p: Option<f32>,
 
     /// Minimum number of tokens to generate
-    #[validate(range(min = 1))]
+    #[validate(range(min = 0))]
     pub min_tokens: Option<u32>,
 
     /// Repetition penalty for reducing repetitive text
@@ -317,9 +324,46 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     pub sampling_seed: Option<u64>,
 
+    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    pub rid: Option<String>,
+
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+/// Map an OpenAI `reasoning_effort` to a thinking on/off preference.
+///
+/// This is the protocol-level interpretation of "does the caller want
+/// reasoning?" — independent of any model/template. `reasoning_effort` is a
+/// *level* (`"low"`/`"medium"`/`"high"`) plus the vendor-extension `"none"`.
+///
+/// Both `"none"` and `"minimal"` map to thinking OFF (`Some(false)`).
+/// `"minimal"` is treated as an off-signal deliberately: templates that expose
+/// only a boolean thinking toggle (GLM/Qwen3) cannot do "a little" reasoning,
+/// so the lowest OpenAI level is the closest available "do not reason".
+/// Level values return `None` — no opinion, defer to the template default or an
+/// explicit thinking kwarg.
+pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<bool> {
+    match reasoning_effort {
+        Some("none") | Some("minimal") => Some(false),
+        _ => None,
+    }
+}
+
+fn deserialize_reasoning_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(serde::de::Error::custom(
+            "reasoning_effort must be a string, number, or null",
+        )),
+    }
 }
 
 // ============================================================================
@@ -779,4 +823,98 @@ pub struct ChatStreamChoice {
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::{thinking_from_reasoning_effort, ChatCompletionRequest};
+
+    fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let object = value.as_object_mut().expect("request must be an object");
+        for (name, field_value) in fields {
+            object.insert((*name).to_string(), field_value.clone());
+        }
+        serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    #[test]
+    fn thinking_from_reasoning_effort_maps_disable_values() {
+        // "none"/"minimal" mean do-not-reason -> thinking OFF.
+        assert_eq!(thinking_from_reasoning_effort(Some("none")), Some(false));
+        assert_eq!(thinking_from_reasoning_effort(Some("minimal")), Some(false));
+        // Level values do not toggle thinking on their own.
+        assert_eq!(thinking_from_reasoning_effort(Some("low")), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("medium")), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("high")), None);
+        // Unspecified / unknown -> defer.
+        assert_eq!(thinking_from_reasoning_effort(None), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("bogus")), None);
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_scalar_json_and_rejects_other_types() {
+        for (value, expected) in [
+            (json!("high"), Some("high")),
+            (json!(0.2), Some("0.2")),
+            (json!(0.99), Some("0.99")),
+            (Value::Null, None),
+        ] {
+            let request = request_with_output_fields(&[("reasoning_effort", value)]);
+            assert_eq!(request.reasoning_effort.as_deref(), expected);
+        }
+
+        for value in [json!(true), json!([]), json!({"level": "high"})] {
+            let mut request = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            request["reasoning_effort"] = value;
+            let error = serde_json::from_value::<ChatCompletionRequest>(request).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("reasoning_effort must be a string, number, or null"));
+        }
+    }
+
+    #[test]
+    fn return_audio_preserves_explicit_values() {
+        for fields in [vec![], vec![("return_audio", Value::Null)]] {
+            let request = request_with_output_fields(&fields);
+            assert_eq!(request.return_audio, None);
+            assert!(!request.other.contains_key("return_audio"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert!(serialized.get("return_audio").is_none());
+        }
+
+        for value in [false, true] {
+            let request = request_with_output_fields(&[("return_audio", json!(value))]);
+            assert_eq!(request.return_audio, Some(value));
+            assert!(!request.other.contains_key("return_audio"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert_eq!(serialized.get("return_audio"), Some(&Value::Bool(value)));
+        }
+    }
+
+    #[test]
+    fn chat_request_accepts_function_tool_without_parameters() {
+        // https://github.com/lightseekorg/smg/issues/1974 — omitting
+        // `parameters` is spec-legal and must not reject the request.
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "web_search", "description": ""}}
+            ],
+        });
+        let request: ChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let tools = request.tools.expect("tools must be present");
+        assert_eq!(tools[0].function.parameters, json!({}));
+    }
 }

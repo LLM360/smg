@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use tracing::{debug, warn};
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};

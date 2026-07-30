@@ -7,7 +7,6 @@ pub const UNKNOWN_SERVER_KEY: &str = "unknown";
 pub mod config;
 pub mod handler;
 pub mod metrics;
-pub mod oauth;
 pub mod orchestrator;
 pub mod pool;
 pub mod proxy;
@@ -22,7 +21,8 @@ pub use config::{
 pub use handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler};
 pub use metrics::{LatencySnapshot, McpMetrics, MetricsSnapshot};
 pub use orchestrator::{
-    McpOrchestrator, McpRequestContext, ToolCallResult, ToolExecutionInput, ToolExecutionOutput,
+    McpOrchestrator, McpRequestContext, PendingToolExecution, ToolExecutionInput,
+    ToolExecutionOutput, ToolExecutionResult,
 };
 pub use pool::{McpConnectionPool, PoolKey};
 pub use reconnect::ReconnectionManager;

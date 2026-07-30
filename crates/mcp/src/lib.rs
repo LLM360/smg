@@ -1,59 +1,41 @@
 //! Model Context Protocol (MCP) client implementation.
 //!
-//! ## Modules
+//! Crate is OpenAI-protocol-free; gateway-side adapter logic lives in
+//! `model_gateway::routers::common::openai_bridge`.
 //!
-//! - [`core`]: MCP client infrastructure (manager, config, connections)
-//! - [`inventory`]: Tool storage and indexing
-//! - [`approval`]: Approval system for tool execution
-//!
-//! ## Shared Types
-//!
-//! - [`ToolAnnotations`]: Tool behavior hints (read_only, destructive, etc.)
-//! - [`TenantContext`]: Per-tenant isolation and configuration
+//! Modules:
+//! - [`core`] — orchestrator, sessions, transports, config
+//! - [`inventory`] — tool registry + qualified naming
+//! - [`approval`] — interactive/policy approval engine
+//! - [`annotations`], [`tenant`], [`error`] — shared cross-module types
 
-// Shared types (used across modules)
 pub mod annotations;
-pub mod error;
-pub mod tenant;
-pub mod transform;
-
-// Subsystems
 pub mod approval;
 pub mod core;
+pub mod error;
 pub mod inventory;
-pub mod responses_bridge;
-
-// Backward-compatible re-exports (old module paths)
-// These allow `mcp::config::*` to continue working
-pub use core::{config, pool as connection_pool};
+pub mod tenant;
 // Re-export from core
 pub use core::{
     ArgMappingConfig, BuiltinToolType, ConfigValidationError, HandlerRequestContext,
     LatencySnapshot, McpConfig, McpMetrics, McpOrchestrator, McpRequestContext, McpServerBinding,
-    McpServerConfig, McpToolSession, McpTransport, MetricsSnapshot, PolicyConfig,
-    PolicyDecisionConfig, PoolKey, RefreshRequest, ResponseFormatConfig, ServerPolicyConfig,
-    SmgClientHandler, Tool, ToolCallResult, ToolConfig, ToolExecutionInput, ToolExecutionOutput,
-    TrustLevelConfig, DEFAULT_SERVER_LABEL,
+    McpServerConfig, McpToolSession, McpTransport, MetricsSnapshot, PendingToolExecution,
+    PolicyConfig, PolicyDecisionConfig, PoolKey, RefreshRequest, ResponseFormatConfig,
+    ServerPolicyConfig, SmgClientHandler, Tool, ToolConfig, ToolExecutionInput,
+    ToolExecutionOutput, ToolExecutionResult, TrustLevelConfig, DEFAULT_SERVER_LABEL,
 };
 
 // Re-export shared types
 pub use annotations::{AnnotationType, ToolAnnotations};
-// Re-export from approval
-pub use approval::{
-    ApprovalDecision, ApprovalKey, ApprovalManager, ApprovalMode, ApprovalOutcome, ApprovalParams,
-    AuditEntry, AuditLog, DecisionResult, DecisionSource, McpApprovalRequest, McpApprovalResponse,
-    PolicyDecision, PolicyEngine, PolicyRule, RuleCondition, RulePattern, ServerPolicy, TrustLevel,
-};
+// Re-export from approval. Only `ApprovalMode` is surfaced at the crate root —
+// production gateway code never instantiates `ApprovalManager`, `PolicyEngine`,
+// `AuditLog`, etc. directly (those are reached through `McpOrchestrator`).
+// The remaining symbols stay accessible via `smg_mcp::approval::*` for code
+// that genuinely needs them, but they no longer pollute the flat root namespace.
+pub use approval::ApprovalMode;
 pub use error::{ApprovalError, McpError, McpResult};
 // Re-export from inventory
 pub use inventory::{
     AliasTarget, ArgMapping, QualifiedToolName, ToolCategory, ToolEntry, ToolInventory,
 };
-pub use responses_bridge::{
-    build_chat_function_tools, build_chat_function_tools_with_names, build_function_tools_json,
-    build_function_tools_json_with_names, build_mcp_list_tools_item, build_mcp_list_tools_json,
-    build_mcp_tool_infos, build_response_tools, build_response_tools_with_names,
-};
 pub use tenant::{SessionId, TenantContext, TenantId};
-// Re-export from transform
-pub use transform::{mcp_response_item_id, ResponseFormat, ResponseTransformer};

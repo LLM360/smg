@@ -9,6 +9,60 @@ use crate::{
     types::{StreamingParseResult, ToolCallItem},
 };
 
+/// `param_name -> declared JSON-schema type` for the named function (empty if the
+/// function or its `properties` are absent). Lets XML-style parsers coerce by the
+/// declared type instead of guessing from text (e.g. keep a numeric-looking
+/// `string` as a string). Only scalar `type` is read; unions/nullable schemas
+/// have no single type, so they fall back to the caller's inference.
+pub fn param_types_for_function(tools: &[Tool], func_name: &str) -> HashMap<String, String> {
+    let mut types = HashMap::new();
+    let Some(tool) = tools.iter().find(|t| t.function.name == func_name) else {
+        return types;
+    };
+    if let Some(props) = tool
+        .function
+        .parameters
+        .get("properties")
+        .and_then(Value::as_object)
+    {
+        for (key, schema) in props {
+            if let Some(ty) = schema.get("type").and_then(Value::as_str) {
+                types.insert(key.clone(), ty.to_string());
+            }
+        }
+    }
+    types
+}
+
+/// Coerce a raw value by its declared JSON-schema type. For `string`, a JSON
+/// string literal (`"4"`) is unwrapped while bare text (`4`, `true`) is kept
+/// verbatim; other types are parsed. `None` (unknown type or parse failure)
+/// means the caller should infer.
+pub fn coerce_by_schema_type(text: &str, declared_type: Option<&str>) -> Option<Value> {
+    match declared_type? {
+        "string" => Some(Value::String(
+            serde_json::from_str::<String>(text).unwrap_or_else(|_| text.to_string()),
+        )),
+        "integer" => text
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|n| Value::Number(n.into())),
+        // Parse as JSON so large integers keep their precision (a plain f64 parse
+        // would round e.g. 9007199254740993).
+        "number" => serde_json::from_str::<Value>(text.trim())
+            .ok()
+            .filter(Value::is_number),
+        "boolean" => match text.trim() {
+            "true" | "True" => Some(Value::Bool(true)),
+            "false" | "False" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        "object" | "array" => serde_json::from_str::<Value>(text).ok(),
+        _ => None,
+    }
+}
+
 /// Get a mapping of tool names to their indices
 pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
     tools
@@ -77,7 +131,11 @@ pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
         return None;
     }
 
-    (1..token.len()).find(|&i| buffer.ends_with(&token[..i]))
+    token
+        .char_indices()
+        .skip(1)
+        .map(|(i, _)| i)
+        .find(|&i| buffer.ends_with(&token[..i]))
 }
 
 /// Reset state for the current tool being parsed (used when skipping invalid tools).
@@ -140,15 +198,7 @@ pub fn is_complete_json(input: &str) -> bool {
     IgnoredAny::deserialize(&mut de).is_ok() && de.end().is_ok()
 }
 
-/// Normalize the arguments/parameters field in a tool call object.
 /// If the object has "parameters" but not "arguments", copy parameters to arguments.
-///
-/// # Background
-/// Different LLM formats use different field names:
-/// - Llama and JSON parsers use "parameters" (correct per JSON Schema spec)
-/// - Mistral and Qwen use "arguments"
-///
-/// This function normalizes to "arguments" for consistent downstream processing.
 pub fn normalize_arguments_field(mut obj: Value) -> Value {
     if obj.get("arguments").is_none() {
         if let Some(params) = obj.get("parameters").cloned() {
@@ -160,15 +210,7 @@ pub fn normalize_arguments_field(mut obj: Value) -> Value {
     obj
 }
 
-/// Normalize the name/tool_name field in a tool call object.
 /// If the object has "tool_name" but not "name", copy tool_name to name.
-///
-/// # Background
-/// Cohere models use "tool_name" instead of "name":
-/// - Standard format uses "name"
-/// - Cohere uses "tool_name"
-///
-/// This function normalizes to "name" for consistent downstream processing.
 pub fn normalize_name_field(mut obj: Value) -> Value {
     if obj.get("name").is_none() {
         if let Some(tool_name) = obj.get("tool_name").cloned() {
@@ -180,41 +222,16 @@ pub fn normalize_name_field(mut obj: Value) -> Value {
     obj
 }
 
-/// Normalize all tool call fields (both name and arguments).
-/// Combines normalize_name_field and normalize_arguments_field.
-///
-/// This handles formats like Cohere that use both "tool_name" and "parameters"
-/// instead of the standard "name" and "arguments".
+/// Normalize both the name and arguments fields (e.g. Cohere's "tool_name"/"parameters").
 pub fn normalize_tool_call_fields(obj: Value) -> Value {
     let obj = normalize_name_field(obj);
     normalize_arguments_field(obj)
 }
 
-/// Handle the entire JSON tool call streaming process for JSON-based parsers.
-///
-/// This unified function handles all aspects of streaming tool calls:
-/// - Parsing partial JSON from the buffer
-/// - Validating tool names against available tools
-/// - Streaming tool names (Case 1)
-/// - Streaming tool arguments (Case 2)
-/// - Managing parser state and buffer updates
-///
-/// Used by JSON, Llama, Mistral, and Qwen parsers.
-///
-/// # Parameters
-/// - `current_text`: The current buffered text being parsed
-/// - `start_idx`: Start index of JSON content in current_text
-/// - `partial_json`: Mutable reference to partial JSON parser
-/// - `tool_indices`: Map of valid tool names to their indices
-/// - `buffer`: Mutable parser buffer
-/// - `current_tool_id`: Mutable current tool index (-1 means no active tool)
-/// - `current_tool_name_sent`: Mutable flag for whether current tool's name was sent
-/// - `streamed_args_for_tool`: Mutable accumulator of streamed arguments per tool
-/// - `prev_tool_call_arr`: Mutable array of previous tool call states
-///
-/// # Returns
-/// - `Ok(StreamingParseResult)` with any tool call items to stream
-/// - `Err(ParserError)` if JSON parsing or serialization fails
+/// Handle JSON tool-call streaming (parse partial JSON, validate names, stream the
+/// name then arguments, advance the buffer) for the JSON, Llama, Mistral, and Qwen
+/// parsers. `start_idx` is where JSON begins in `current_text`; `current_tool_id ==
+/// -1` means no active tool.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn handle_json_tool_streaming(
     current_text: &str,
@@ -391,6 +408,30 @@ mod tests {
         assert!(ends_with_partial_token("hello <|python_tag|>", "<|python_tag|>").is_none());
         assert!(ends_with_partial_token("", "<|python_tag|>").is_none());
         assert!(ends_with_partial_token("hello world", "<|python_tag|>").is_none());
+    }
+
+    #[test]
+    fn test_ends_with_partial_token_multibyte() {
+        // U+FF5C "｜" is 3 bytes, so token[..i] must only be sliced at char boundaries.
+        let token = "<｜tool_calls_begin｜>";
+
+        // Buffer not ending in '<' must not panic and yields no partial match.
+        assert_eq!(
+            ends_with_partial_token("some plain ascii text", token),
+            None
+        );
+
+        // Ending in '<' matches a 1-byte prefix.
+        assert_eq!(ends_with_partial_token("hello <", token), Some(1));
+
+        // Ending in "<｜" matches the prefix up to the next char boundary (1 + 3 bytes).
+        assert_eq!(ends_with_partial_token("hello <｜", token), Some(4));
+
+        // A complete token at the end is not a partial match.
+        assert_eq!(
+            ends_with_partial_token("x <｜tool_calls_begin｜>", token),
+            None
+        );
     }
 
     #[test]
@@ -583,5 +624,44 @@ mod tests {
             normalized.get("arguments").unwrap(),
             &serde_json::json!({"key": "value"})
         );
+    }
+
+    #[test]
+    fn test_coerce_by_schema_type() {
+        use serde_json::json;
+        // string: numeric/bool/array-looking text stays a string; a JSON string
+        // literal is unwrapped.
+        assert_eq!(coerce_by_schema_type("4", Some("string")), Some(json!("4")));
+        assert_eq!(
+            coerce_by_schema_type("true", Some("string")),
+            Some(json!("true"))
+        );
+        assert_eq!(
+            coerce_by_schema_type("[60,30]", Some("string")),
+            Some(json!("[60,30]"))
+        );
+        assert_eq!(
+            coerce_by_schema_type("\"4\"", Some("string")),
+            Some(json!("4"))
+        );
+
+        assert_eq!(coerce_by_schema_type("4", Some("integer")), Some(json!(4)));
+        assert_eq!(
+            coerce_by_schema_type("true", Some("boolean")),
+            Some(json!(true))
+        );
+        assert_eq!(
+            coerce_by_schema_type("[60,30]", Some("array")),
+            Some(json!([60, 30]))
+        );
+        // number keeps integer precision (no f64 rounding).
+        assert_eq!(
+            coerce_by_schema_type("9007199254740993", Some("number")),
+            Some(json!(9007199254740993i64))
+        );
+
+        // unknown type / value that fails to parse -> None (caller infers)
+        assert_eq!(coerce_by_schema_type("4", None), None);
+        assert_eq!(coerce_by_schema_type("abc", Some("integer")), None);
     }
 }

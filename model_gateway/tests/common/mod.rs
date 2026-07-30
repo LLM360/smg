@@ -226,17 +226,11 @@ impl AppTestContext {
             match &mut config.mode {
                 RoutingMode::Regular {
                     worker_urls: ref mut urls,
-                } => {
-                    if urls.is_empty() {
-                        urls.clone_from(&worker_urls);
-                    }
                 }
-                RoutingMode::OpenAI {
+                | RoutingMode::OpenAI {
                     worker_urls: ref mut urls,
-                } => {
-                    if urls.is_empty() {
-                        urls.clone_from(&worker_urls);
-                    }
+                } if urls.is_empty() => {
+                    urls.clone_from(&worker_urls);
                 }
                 _ => {}
             }
@@ -345,7 +339,7 @@ pub fn create_test_context(
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
 
-        // Initialize storage backends (Memory for tests)
+        // Initialize storage backends (Memory for tests).
         let response_storage = Arc::new(MemoryResponseStorage::new());
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
@@ -356,6 +350,7 @@ pub fn create_test_context(
             policy_registry.clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -487,7 +482,7 @@ pub fn create_test_context_with_parsers(
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
 
-        // Initialize storage backends (Memory for tests)
+        // Initialize storage backends (Memory for tests).
         let response_storage = Arc::new(MemoryResponseStorage::new());
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
@@ -498,6 +493,7 @@ pub fn create_test_context_with_parsers(
             policy_registry.clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -636,7 +632,7 @@ pub fn create_test_context_with_mcp_config(
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
 
-        // Initialize storage backends (Memory for tests)
+        // Initialize storage backends (Memory for tests).
         let response_storage = Arc::new(MemoryResponseStorage::new());
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
@@ -647,6 +643,7 @@ pub fn create_test_context_with_mcp_config(
             policy_registry.clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
 
         // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator

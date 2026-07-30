@@ -12,8 +12,8 @@ mod context;
 mod health;
 pub(crate) mod mcp;
 mod provider;
-pub mod realtime;
 pub mod responses;
 mod router;
 
+pub(crate) use provider::strip_default_sglang_fields;
 pub use router::OpenAIRouter;

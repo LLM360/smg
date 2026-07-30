@@ -6,6 +6,7 @@ use reqwest::Client;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
+    health,
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
@@ -62,6 +63,7 @@ pub fn create_test_app(
         policy_registry.clone(),
         client.clone(),
         router_config.load_monitor_interval_secs,
+        router_config.engine_metrics,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines
@@ -99,11 +101,13 @@ pub fn create_test_app(
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
+        probe_state: start_probe_state(&app_context),
         context: app_context,
         concurrency_queue_tx: None,
         concurrency_queue_slots: None,
         router_manager: None,
         mesh_handler: None,
+        mesh_adapters: None,
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -116,17 +120,43 @@ pub fn create_test_app(
         ]
     });
 
-    let auth_config = AuthConfig::new(router_config.api_key.clone());
+    let serving_auth_config = AuthConfig::with_tenant_keys(
+        router_config.api_key.clone(),
+        &router_config.tenant_api_keys,
+    );
+    let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 
     // Use the actual server's build_app function
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper assumes router config is already validated"
+    )]
     build_app(
         app_state,
-        auth_config,
+        serving_auth_config,
+        admin_auth_config,
         None, // No control plane auth for tests
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
     )
+    .expect("valid tenant resolution config")
+}
+
+/// Mirror production wiring: cached probe state plus its readiness
+/// maintainer, so `/readiness` reflects worker registry state in tests.
+/// The initial snapshot is computed synchronously, so workers registered
+/// before app creation are visible immediately; later mutations arrive via
+/// the registry event subscription. Must be called from a tokio runtime.
+fn start_probe_state(app_context: &Arc<AppContext>) -> Arc<health::ProbeState> {
+    let probe_state = health::ProbeState::new(app_context.inflight_tracker.clone());
+    let _maintainer = health::spawn_readiness_maintainer(
+        probe_state.clone(),
+        app_context.worker_registry.clone(),
+        app_context.tokenizer_registry.clone(),
+        app_context.router_config.clone(),
+    );
+    probe_state
 }
 
 /// Create a test Axum application with an existing AppContext
@@ -137,11 +167,13 @@ pub fn create_test_app_with_context(
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
+        probe_state: start_probe_state(&app_context),
         context: app_context.clone(),
         concurrency_queue_tx: None,
         concurrency_queue_slots: None,
         router_manager: None,
         mesh_handler: None,
+        mesh_adapters: None,
     });
 
     // Get config from the context
@@ -157,17 +189,27 @@ pub fn create_test_app_with_context(
         ]
     });
 
-    let auth_config = AuthConfig::new(router_config.api_key.clone());
+    let serving_auth_config = AuthConfig::with_tenant_keys(
+        router_config.api_key.clone(),
+        &router_config.tenant_api_keys,
+    );
+    let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 
     // Use the actual server's build_app function
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper assumes router config is already validated"
+    )]
     build_app(
         app_state,
-        auth_config,
+        serving_auth_config,
+        admin_auth_config,
         None, // No control plane auth for tests
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
     )
+    .expect("valid tenant resolution config")
 }
 
 /// Create a minimal test AppContext for unit tests

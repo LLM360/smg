@@ -13,6 +13,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    middleware::TenantRequestMeta,
     routers::{
         common::retry::{is_retryable_status, RetryExecutor},
         RouterTrait,
@@ -45,6 +46,7 @@ impl GeminiRouter {
             client: ctx.client.clone(),
             worker_registry: ctx.worker_registry.clone(),
             mcp_orchestrator,
+            mcp_format_registry: ctx.mcp_format_registry.clone(),
             request_timeout,
         });
         let retry_config = ctx.router_config.effective_retry_config();
@@ -73,6 +75,7 @@ impl RouterTrait for GeminiRouter {
     async fn route_interactions(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         body: &InteractionsRequest,
         model_id: Option<&str>,
     ) -> Response {
@@ -95,8 +98,10 @@ impl RouterTrait for GeminiRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let tenant_meta = tenant_meta.clone();
                 async move {
-                    let mut ctx = RequestContext::new(request, headers, model_id, components);
+                    let mut ctx =
+                        RequestContext::new(request, headers, model_id, tenant_meta, components);
                     driver::execute(&mut ctx).await
                 }
             },

@@ -167,6 +167,8 @@ mod pd_routing_unit_tests {
                     max_tree_size: 1000000,
                     block_size: 16,
                     engine_load: Default::default(),
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
                 },
             ),
             (
@@ -243,6 +245,7 @@ mod pd_routing_unit_tests {
                     policy_registry.clone(),
                     client.clone(),
                     config.load_monitor_interval_secs,
+                    config.engine_metrics,
                 )));
 
                 // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator

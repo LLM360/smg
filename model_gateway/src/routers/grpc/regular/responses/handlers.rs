@@ -12,9 +12,6 @@
 //! 1. **Synchronous** - Returns complete response immediately (non_streaming.rs)
 //! 2. **Streaming** - Returns SSE stream with real-time events (streaming.rs)
 //!
-//! Note: Background mode is no longer supported. Requests with background=true
-//! will be rejected with a 400 error.
-//!
 //! # Request Flow
 //!
 //! ```text
@@ -51,24 +48,17 @@ pub(crate) async fn route_responses(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
+    tenant_request_meta: crate::middleware::TenantRequestMeta,
     model_id: String,
 ) -> Response {
-    // 1. Reject background mode (no longer supported)
-    let is_background = request.background.unwrap_or(false);
-    if is_background {
-        return error::bad_request(
-            "unsupported_parameter",
-            "Background mode is not supported. Please set 'background' to false or omit it.",
-        );
-    }
-
-    // 2. Route based on execution mode
+    // Route based on execution mode
     let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
         let params = ResponsesCallContext {
             headers,
             model_id,
             response_id: None,
+            tenant_request_meta,
         };
         route_responses_streaming(ctx, request, params).await
     } else {
@@ -76,6 +66,7 @@ pub(crate) async fn route_responses(
             headers,
             model_id,
             response_id: Some(format!("resp_{}", Uuid::now_v7())),
+            tenant_request_meta,
         };
         route_responses_sync(ctx, request, params).await
     }
@@ -114,11 +105,16 @@ async fn route_responses_streaming(
     };
 
     // 2. Check MCP connection and get whether MCP tools are present
-    let (has_mcp_tools, mcp_servers) =
-        match ensure_mcp_connection(&ctx.mcp_orchestrator, request.tools.as_deref()).await {
-            Ok(result) => result,
-            Err(response) => return response,
-        };
+    let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
+        &ctx.mcp_orchestrator,
+        &ctx.mcp_format_registry,
+        request.tools.as_deref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
 
     if has_mcp_tools {
         debug!("MCP tools detected in streaming mode, using streaming tool loop");

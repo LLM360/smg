@@ -361,6 +361,63 @@ async fn run_admitted_request(
     Response::from_parts(parts, Body::new(guarded_body))
 }
 
+/// Enforce the optional cluster-wide requests-per-second ceiling before either
+/// the legacy or priority-aware local admission path runs.
+pub async fn global_rate_limit_middleware(
+    State(app_state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(limit) = app_state
+        .context
+        .router_config
+        .global_rate_limit_requests_per_second
+    else {
+        return next.run(request).await;
+    };
+
+    let Some(mesh_adapters) = &app_state.mesh_adapters else {
+        error!(
+            "Global rate limiting is configured at {} req/s but mesh is unavailable",
+            limit
+        );
+        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+        Metrics::record_http_admission_received();
+        Metrics::record_http_admission_rejected();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Global rate limiting requires mesh"
+            })),
+        )
+            .into_response();
+    };
+
+    let (is_exceeded, current_count) = mesh_adapters
+        .rate_limit()
+        .check_and_increment("global", limit);
+    if is_exceeded {
+        debug!(
+            "Global rate limit exceeded: {}/{} req/s",
+            current_count, limit
+        );
+        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+        Metrics::record_http_admission_received();
+        Metrics::record_http_admission_rejected();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "Rate limit exceeded",
+                "current_count": current_count,
+                "limit": limit
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
@@ -369,31 +426,6 @@ pub async fn concurrency_limit_middleware(
 ) -> Response {
     Metrics::record_http_admission_received();
     let mut pending_guard = AdmissionPendingGuard::new();
-
-    // Check mesh global rate limit first if mesh is enabled
-    // If mesh is not enabled, this check is skipped and local rate limiting is used
-    if let Some(mesh_handler) = &app_state.mesh_handler {
-        let (is_exceeded, current_count, limit) =
-            mesh_handler.sync_manager.check_global_rate_limit();
-        if is_exceeded {
-            debug!(
-                "Global rate limit exceeded: {}/{} req/s",
-                current_count, limit
-            );
-            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            Metrics::record_http_admission_rejected();
-            pending_guard.resolve();
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "Rate limit exceeded",
-                    "current_count": current_count,
-                    "limit": limit
-                })),
-            )
-                .into_response();
-        }
-    }
 
     let token_bucket = match &app_state.context.rate_limiter {
         Some(bucket) => bucket.clone(),

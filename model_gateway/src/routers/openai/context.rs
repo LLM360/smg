@@ -12,14 +12,18 @@ use smg_data_connector::{
 use smg_mcp::{McpOrchestrator, McpToolSession};
 
 use super::provider::Provider;
-use crate::worker::Worker;
+use crate::{
+    config::RouterConfig, middleware::TenantRequestMeta, routers::common::openai_bridge,
+    worker::Worker,
+};
 
 pub struct RequestContext {
     pub input: RequestInput,
     pub components: ComponentRefs,
     pub state: ProcessingState,
-    /// Storage hook request context extracted from HTTP headers by middleware.
     pub storage_request_context: Option<StorageRequestContext>,
+    /// Explicit tenant identity resolved at the HTTP boundary.
+    pub tenant_request_meta: Option<TenantRequestMeta>,
 }
 
 pub struct RequestInput {
@@ -36,11 +40,13 @@ pub enum RequestType {
 #[derive(Clone)]
 pub struct SharedComponents {
     pub client: reqwest::Client,
+    pub router_config: Arc<RouterConfig>,
 }
 
 pub struct ResponsesComponents {
     pub shared: Arc<SharedComponents>,
     pub mcp_orchestrator: Arc<McpOrchestrator>,
+    pub mcp_format_registry: openai_bridge::FormatRegistry,
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -59,10 +65,25 @@ impl ComponentRefs {
         }
     }
 
+    /// Access router configuration shared by both request context variants.
+    pub fn router_config(&self) -> &Arc<RouterConfig> {
+        match self {
+            ComponentRefs::Shared(s) => &s.router_config,
+            ComponentRefs::Responses(r) => &r.shared.router_config,
+        }
+    }
+
     pub fn mcp_orchestrator(&self) -> Option<&Arc<McpOrchestrator>> {
         match self {
             ComponentRefs::Shared(_) => None,
             ComponentRefs::Responses(r) => Some(&r.mcp_orchestrator),
+        }
+    }
+
+    pub fn mcp_format_registry(&self) -> Option<&openai_bridge::FormatRegistry> {
+        match self {
+            ComponentRefs::Shared(_) => None,
+            ComponentRefs::Responses(r) => Some(&r.mcp_format_registry),
         }
     }
 
@@ -112,6 +133,7 @@ pub struct ResponsesPayloadState {
 }
 
 impl RequestContext {
+    /// Build request context for Responses API calls.
     pub fn for_responses(
         request: Arc<ResponsesRequest>,
         headers: Option<HeaderMap>,
@@ -127,9 +149,11 @@ impl RequestContext {
             components,
             state: ProcessingState::default(),
             storage_request_context: None,
+            tenant_request_meta: None,
         }
     }
 
+    /// Build request context for Chat Completions calls.
     pub fn for_chat(
         request: Arc<ChatCompletionRequest>,
         headers: Option<HeaderMap>,
@@ -145,6 +169,7 @@ impl RequestContext {
             components,
             state: ProcessingState::default(),
             storage_request_context: None,
+            tenant_request_meta: None,
         }
     }
 }
@@ -260,6 +285,7 @@ pub struct StreamingEventContext<'a> {
     pub original_request: &'a ResponsesRequest,
     pub previous_response_id: Option<&'a str>,
     pub session: Option<&'a McpToolSession<'a>>,
+    pub mcp_format_registry: Option<&'a openai_bridge::FormatRegistry>,
 }
 
 pub type StreamingRequest = OwnedStreamingContext;

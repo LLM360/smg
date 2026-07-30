@@ -17,8 +17,8 @@ use crate::routers::{
 
 /// Collect and merge responses from execution result
 ///
-/// Handles both Single and Dual (prefill-decode) execution modes.
-/// For Dual mode, merges prefill input_logprobs into decode responses if requested.
+/// Handles both Single and PrefillDecode execution modes.
+/// For PrefillDecode mode, merges prefill input_logprobs into decode responses if requested.
 ///
 /// # Arguments
 /// * `execution_result` - The execution result containing stream(s)
@@ -36,9 +36,10 @@ pub(crate) async fn collect_responses(
             stream.mark_completed();
             responses
         }
-        ExecutionResult::Dual {
+        ExecutionResult::PrefillDecode {
             mut prefill,
             decode,
+            ..
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
             let prefill_responses = collect_stream_responses(&mut prefill, "Prefill").await?;
@@ -64,6 +65,14 @@ pub(crate) async fn collect_responses(
             return Err(error::internal_error(
                 "invalid_execution_mode",
                 "Embedding result encountered in response collection",
+            ));
+        }
+        // Batches are split into per-prompt results by the completion processor
+        // before collection.
+        ExecutionResult::Batch { .. } => {
+            return Err(error::internal_error(
+                "invalid_execution_mode",
+                "Batch result encountered in response collection",
             ));
         }
     };

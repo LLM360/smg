@@ -34,7 +34,7 @@ use smg_data_connector::{
     ConversationItemStorage, ConversationStorage, RequestContext as StorageRequestContext,
     ResponseStorage,
 };
-use smg_mcp::{McpServerBinding, McpToolSession, ResponseFormat, ToolExecutionInput};
+use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, trace, warn};
@@ -50,11 +50,14 @@ use super::{
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::mcp_utils::DEFAULT_MAX_ITERATIONS,
+        common::{
+            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
+            openai_bridge::{self, ResponseFormat},
+        },
         grpc::{
             common::responses::{
                 build_sse_response, persist_response_if_needed,
-                streaming::{attach_mcp_server_label, OutputItemType, ResponseStreamEventEmitter},
+                streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter},
                 ResponsesContext,
             },
             utils,
@@ -90,6 +93,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             params.headers,
             params.model_id,
             ctx.components.clone(),
+            Some(params.tenant_request_meta),
         )
         .await;
 
@@ -306,7 +310,7 @@ impl StreamingResponseAccumulator {
                     // Ensure we have enough tool calls
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
-                            id: String::new(),
+                            id: None,
                             call_id: String::new(),
                             name: String::new(),
                             arguments: String::new(),
@@ -318,13 +322,15 @@ impl StreamingResponseAccumulator {
                     // Update the tool call at this index
                     if let ResponseOutputItem::FunctionToolCall {
                         id,
+                        call_id,
                         name,
                         arguments,
                         ..
                     } = &mut self.tool_calls[index]
                     {
                         if let Some(delta_id) = &delta.id {
-                            id.push_str(delta_id);
+                            id.get_or_insert_with(String::new).push_str(delta_id);
+                            call_id.push_str(delta_id);
                         }
                         if let Some(function) = &delta.function {
                             if let Some(delta_name) = &function.name {
@@ -364,19 +370,20 @@ impl StreamingResponseAccumulator {
                     logprobs: None,
                 }],
                 status: "completed".to_string(),
+                phase: None,
             });
         }
 
         // Add reasoning if present
         if !self.reasoning_buffer.is_empty() {
-            output.push(ResponseOutputItem::Reasoning {
-                id: format!("reasoning_{}", self.response_id),
-                summary: vec![],
-                content: vec![ResponseReasoningContent::ReasoningText {
+            output.push(ResponseOutputItem::new_reasoning(
+                format!("reasoning_{}", self.response_id),
+                vec![],
+                vec![ResponseReasoningContent::ReasoningText {
                     text: self.reasoning_buffer,
                 }],
-                status: Some("completed".to_string()),
-            });
+                Some("completed".to_string()),
+            ));
         }
 
         // Add tool calls
@@ -574,6 +581,7 @@ async fn execute_tool_loop_streaming_internal(
                 params.headers.clone(),
                 params.model_id.clone(),
                 ctx.components.clone(),
+                Some(params.tenant_request_meta.clone()),
             )
             .await;
 
@@ -634,18 +642,21 @@ async fn execute_tool_loop_streaming_internal(
                     tool_call.call_id
                 );
 
-                // Look up response_format for this tool
-                let response_format = session.tool_response_format(&tool_call.name);
+                let response_format = openai_bridge::lookup_tool_format(
+                    &session,
+                    &ctx.mcp_format_registry,
+                    &tool_call.name,
+                );
 
                 // Use emitter helpers to determine correct type and allocate index
                 let item_type =
                     ResponseStreamEventEmitter::type_str_for_format(Some(&response_format));
-                let output_item_type =
-                    ResponseStreamEventEmitter::output_item_type_for_format(Some(&response_format));
                 let resolved_label = session.resolve_tool_server_label(&tool_call.name);
 
-                // Allocate output_index with correct type (generates appropriate item_id prefix)
-                let (output_index, item_id) = emitter.allocate_output_index(output_item_type);
+                // Allocate output_index with the format's id-prefix discriminator
+                // (e.g. `ws_…` for web_search_call); see FormatDescriptor.
+                let (output_index, item_id) =
+                    emitter.allocate_output_index_for_format(Some(response_format));
 
                 // Build initial tool call item
                 let mut item = json!({
@@ -667,7 +678,7 @@ async fn execute_tool_loop_streaming_internal(
 
                 // Emit tool_call.in_progress
                 let event =
-                    emitter.emit_tool_call_in_progress(output_index, &item_id, &response_format);
+                    emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
                 emitter.send_event(&event, &tx)?;
 
                 // Emit arguments events for mcp_call only (skip for builtin tools)
@@ -691,7 +702,7 @@ async fn execute_tool_loop_streaming_internal(
 
                 // Emit searching/interpreting event for builtin tools
                 if let Some(event) =
-                    emitter.emit_tool_call_searching(output_index, &item_id, &response_format)
+                    emitter.emit_tool_call_searching(output_index, &item_id, response_format)
                 {
                     emitter.send_event(&event, &tx)?;
                 }
@@ -702,9 +713,20 @@ async fn execute_tool_loop_streaming_internal(
                     tool_call.name,
                     tool_call.arguments
                 );
-                // Parse arguments to Value
-                let arguments: Value =
-                    serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+                // Parse arguments to Value, coercing scalar/array/null payloads
+                // to an empty object so hosted-tool override merge can actually
+                // apply. `apply_hosted_tool_overrides` is a no-op on non-objects;
+                // silently dropping caller-declared config would be surprising.
+                let mut arguments = match serde_json::from_str::<Value>(&tool_call.arguments) {
+                    Ok(Value::Object(map)) => Value::Object(map),
+                    _ => json!({}),
+                };
+                prepare_hosted_dispatch_args(
+                    &mut arguments,
+                    response_format,
+                    original_request.tools.as_deref().unwrap_or(&[]),
+                    original_request.user.as_deref(),
+                );
 
                 // Execute the single tool via the normalized MCP execution API.
                 // This avoids custom serialization and manual re-transformation in streaming paths.
@@ -719,31 +741,35 @@ async fn execute_tool_loop_streaming_internal(
                 let success = !tool_output.is_error;
                 let output_str = tool_output.output.to_string();
 
-                if success {
-                    // Emit tool_call.completed
-                    let event =
-                        emitter.emit_tool_call_completed(output_index, &item_id, &response_format);
-                    emitter.send_event(&event, &tx)?;
-
-                    // Build complete item with output
-                    let mut item_done = json!({
+                let output_item =
+                    openai_bridge::transform_tool_output(&tool_output, response_format);
+                let mut item_done = serde_json::to_value(&output_item).unwrap_or_else(|e| {
+                    warn!(
+                        tool = %tool_output.tool_name,
+                        error = %e,
+                        "Failed to serialize transformed output item; falling back to a minimal stub",
+                    );
+                    json!({
                         "id": item_id,
                         "type": item_type,
-                        "name": tool_output.tool_name,
-                        "status": "completed",
-                        "arguments": tool_output.arguments_str,
-                        "output": output_str
-                    });
-                    attach_mcp_server_label(
-                        &mut item_done,
-                        Some(tool_output.server_label.as_str()),
-                        Some(&response_format),
-                    );
+                        "status": if success { "completed" } else { "failed" },
+                    })
+                });
+                // Override the typed item's id so output_item.done matches the
+                // streaming-allocated id used by the earlier output_item.added.
+                if let Some(obj) = item_done.as_object_mut() {
+                    obj.insert("id".to_string(), json!(&item_id));
+                }
+                attach_mcp_server_label(
+                    &mut item_done,
+                    Some(tool_output.server_label.as_str()),
+                    Some(&response_format),
+                );
 
-                    // Emit output_item.done
-                    let event = emitter.emit_output_item_done(output_index, &item_done);
+                if success {
+                    let event =
+                        emitter.emit_tool_call_completed(output_index, &item_id, response_format);
                     emitter.send_event(&event, &tx)?;
-                    emitter.complete_output_item(output_index);
                 } else {
                     let err_text = tool_output
                         .error_message
@@ -751,32 +777,28 @@ async fn execute_tool_loop_streaming_internal(
                         .unwrap_or_else(|| output_str.clone());
                     warn!("Tool execution returned error: {}", err_text);
 
-                    // Emit mcp_call.failed (no web_search_call.failed event exists)
-                    let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
-                    emitter.send_event(&event, &tx)?;
-
-                    // Build failed item
-                    let mut item_done = json!({
-                        "id": item_id,
-                        "type": item_type,
-                        "name": tool_output.tool_name,
-                        "status": "failed",
-                        "arguments": tool_output.arguments_str,
-                        "error": err_text
-                    });
-                    attach_mcp_server_label(
-                        &mut item_done,
-                        Some(tool_output.server_label.as_str()),
-                        Some(&response_format),
-                    );
-
-                    // Emit output_item.done
-                    let event = emitter.emit_output_item_done(output_index, &item_done);
-                    emitter.send_event(&event, &tx)?;
-                    emitter.complete_output_item(output_index);
+                    // `response.mcp_call.failed` is the only `*.failed` event
+                    // in the Responses API. Hosted-builtin families close via
+                    // `*.completed` to mirror OpenAI cloud's wire shape;
+                    // the failure context (when present) lives in the item
+                    // content.
+                    if matches!(response_format, ResponseFormat::Passthrough) {
+                        let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
+                        emitter.send_event(&event, &tx)?;
+                    } else {
+                        let event = emitter.emit_tool_call_completed(
+                            output_index,
+                            &item_id,
+                            response_format,
+                        );
+                        emitter.send_event(&event, &tx)?;
+                    }
                 }
 
-                // Record MCP tool metrics
+                let event = emitter.emit_output_item_done(output_index, &item_done);
+                emitter.send_event(&event, &tx)?;
+                emitter.complete_output_item(output_index);
+
                 Metrics::record_mcp_tool_duration(
                     &current_request.model,
                     &tool_output.tool_name,
@@ -792,10 +814,6 @@ async fn execute_tool_loop_streaming_internal(
                     },
                 );
 
-                // Use the centralized tool output transformer from MCP crate output type.
-                let output_item = tool_output.to_response_item();
-
-                // Record the call in state with transformed output item
                 state.record_call(
                     tool_output.call_id,
                     tool_output.tool_name,
@@ -817,7 +835,7 @@ async fn execute_tool_loop_streaming_internal(
                 for tool_call in function_tool_calls {
                     // Allocate output_index for this function_tool_call item
                     let (output_index, item_id) =
-                        emitter.allocate_output_index(OutputItemType::FunctionCall);
+                        emitter.allocate_output_index(OutputItemKind::FunctionCall);
 
                     // Build initial function_call item
                     let item = json!({
@@ -1064,5 +1082,33 @@ impl ChatResponseAccumulator {
             }])
             .maybe_usage(self.usage)
             .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_accumulator_populates_call_id_from_tool_delta_id() {
+        let request = ResponsesRequest::default();
+        let mut accumulator = StreamingResponseAccumulator::new(&request);
+        let chunk = ChatCompletionStreamResponse::builder("chatcmpl_test", "test-model")
+            .add_choice_tool_name(0, "call_streamed", "lookup")
+            .build();
+
+        accumulator.process_chunk(&chunk);
+
+        assert_eq!(accumulator.tool_calls.len(), 1);
+        match &accumulator.tool_calls[0] {
+            ResponseOutputItem::FunctionToolCall {
+                id, call_id, name, ..
+            } => {
+                assert_eq!(id.as_deref(), Some("call_streamed"));
+                assert_eq!(call_id, "call_streamed");
+                assert_eq!(name, "lookup");
+            }
+            other => panic!("expected function tool call, got {other:?}"),
+        }
     }
 }

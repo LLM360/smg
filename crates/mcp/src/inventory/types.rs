@@ -5,9 +5,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::{
-    annotations::ToolAnnotations, core::config::Tool, tenant::TenantId, transform::ResponseFormat,
-};
+use crate::{annotations::ToolAnnotations, core::config::Tool, tenant::TenantId};
 
 /// Category of a tool for filtering and visibility control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -20,6 +18,12 @@ pub enum ToolCategory {
     /// Built-in tools (web_search, code_interpreter, file_search) exposed via aliasing.
     Builtin,
 }
+
+/// Synthetic `server_key` used by alias entries created via
+/// `McpOrchestrator::register_alias`. Exported so gateway-side code that
+/// indexes by `QualifiedToolName` (e.g. the response-format registry) can
+/// reconstruct the same key without hardcoding the literal.
+pub const ALIAS_SERVER_KEY: &str = "alias";
 
 /// Unique tool identifier: `server_key:tool_name`.
 ///
@@ -138,8 +142,6 @@ pub struct ToolEntry {
     pub arg_mapping: Option<ArgMapping>,
     pub cached_at: Instant,
     pub ttl: Option<Duration>,
-    /// Response format for transforming MCP results to API-specific formats.
-    pub response_format: ResponseFormat,
 }
 
 impl ToolEntry {
@@ -154,7 +156,6 @@ impl ToolEntry {
             arg_mapping: None,
             cached_at: Instant::now(),
             ttl: None,
-            response_format: ResponseFormat::default(),
         }
     }
 
@@ -200,12 +201,6 @@ impl ToolEntry {
         self
     }
 
-    #[must_use]
-    pub fn with_response_format(mut self, response_format: ResponseFormat) -> Self {
-        self.response_format = response_format;
-        self
-    }
-
     pub fn is_expired(&self) -> bool {
         self.ttl
             .map(|ttl| self.cached_at.elapsed() > ttl)
@@ -238,15 +233,11 @@ mod tests {
             serde_json::Map::new()
         };
 
-        Tool {
-            name: Cow::Owned(name.to_string()),
-            title: None,
-            description: Some(Cow::Owned(format!("Test tool: {name}"))),
-            input_schema: Arc::new(schema_map),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-        }
+        Tool::new(
+            Cow::Owned(name.to_string()),
+            Cow::Owned(format!("Test tool: {name}")),
+            Arc::new(schema_map),
+        )
     }
 
     #[test]

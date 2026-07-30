@@ -302,15 +302,37 @@ pub enum BuiltinToolType {
     CodeInterpreter,
     /// File search tool (OpenAI: file_search)
     FileSearch,
+    /// Image generation tool (OpenAI: image_generation)
+    ImageGeneration,
 }
 
 impl BuiltinToolType {
+    /// Every builtin tool type. The exhaustive `match` makes a new variant
+    /// fail to compile until it is added here, so callers that enumerate all
+    /// builtins (e.g. session builtin classification) cannot silently miss it.
+    pub fn all() -> [BuiltinToolType; 4] {
+        // The match exists solely for its exhaustiveness check.
+        let _exhaustive = |t: BuiltinToolType| match t {
+            BuiltinToolType::WebSearchPreview => (),
+            BuiltinToolType::CodeInterpreter => (),
+            BuiltinToolType::FileSearch => (),
+            BuiltinToolType::ImageGeneration => (),
+        };
+        [
+            BuiltinToolType::WebSearchPreview,
+            BuiltinToolType::CodeInterpreter,
+            BuiltinToolType::FileSearch,
+            BuiltinToolType::ImageGeneration,
+        ]
+    }
+
     /// Get the corresponding response format for this built-in type.
     pub fn response_format(self) -> ResponseFormatConfig {
         match self {
             BuiltinToolType::WebSearchPreview => ResponseFormatConfig::WebSearchCall,
             BuiltinToolType::CodeInterpreter => ResponseFormatConfig::CodeInterpreterCall,
             BuiltinToolType::FileSearch => ResponseFormatConfig::FileSearchCall,
+            BuiltinToolType::ImageGeneration => ResponseFormatConfig::ImageGenerationCall,
         }
     }
 }
@@ -321,6 +343,7 @@ impl fmt::Display for BuiltinToolType {
             BuiltinToolType::WebSearchPreview => write!(f, "web_search_preview"),
             BuiltinToolType::CodeInterpreter => write!(f, "code_interpreter"),
             BuiltinToolType::FileSearch => write!(f, "file_search"),
+            BuiltinToolType::ImageGeneration => write!(f, "image_generation"),
         }
     }
 }
@@ -332,9 +355,16 @@ pub struct ToolConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
 
-    /// Response format for transformation (default: passthrough)
-    #[serde(default)]
-    pub response_format: ResponseFormatConfig,
+    /// Response format for transformation.
+    ///
+    /// `None` means "use whatever the surrounding context decides" — for a
+    /// builtin-routed tool that becomes the builtin's hosted format, otherwise
+    /// it falls through to `Passthrough`. `Some(Passthrough)` is an *explicit*
+    /// passthrough request and overrides the builtin default. This distinction
+    /// lets users add an `alias` or `arg_mapping` to a builtin tool without
+    /// silently disabling its hosted-format wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormatConfig>,
 
     /// Argument mapping configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,7 +372,7 @@ pub struct ToolConfig {
 }
 
 /// Response format configuration (mirrors ResponseFormat but for config).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseFormatConfig {
     #[default]
@@ -350,6 +380,7 @@ pub enum ResponseFormatConfig {
     WebSearchCall,
     CodeInterpreterCall,
     FileSearchCall,
+    ImageGenerationCall,
 }
 
 /// Argument mapping configuration for tool aliases.
@@ -924,7 +955,7 @@ tools:
         assert_eq!(tool_config.alias, Some("web_search".to_string()));
         assert_eq!(
             tool_config.response_format,
-            ResponseFormatConfig::WebSearchCall
+            Some(ResponseFormatConfig::WebSearchCall)
         );
 
         let arg_mapping = tool_config.arg_mapping.as_ref().unwrap();
@@ -989,7 +1020,7 @@ tools:
         assert!(tool_config.alias.is_none());
         assert_eq!(
             tool_config.response_format,
-            ResponseFormatConfig::FileSearchCall
+            Some(ResponseFormatConfig::FileSearchCall)
         );
         assert!(tool_config.arg_mapping.is_none());
     }
@@ -1008,10 +1039,10 @@ tools:
         let tools = config.tools.as_ref().unwrap();
         let tool_config = tools.get("my_tool").unwrap();
         assert!(tool_config.alias.is_none());
-        assert_eq!(
-            tool_config.response_format,
-            ResponseFormatConfig::Passthrough
-        );
+        // `my_tool: {}` carries no `response_format` field, so the deserialized
+        // value is `None` (meaning "inherit context"), not an explicit
+        // `Passthrough`.
+        assert_eq!(tool_config.response_format, None);
         assert!(tool_config.arg_mapping.is_none());
     }
 
@@ -1025,6 +1056,10 @@ tools:
                 "\"code_interpreter_call\"",
             ),
             (ResponseFormatConfig::FileSearchCall, "\"file_search_call\""),
+            (
+                ResponseFormatConfig::ImageGenerationCall,
+                "\"image_generation_call\"",
+            ),
         ];
 
         for (format, expected) in formats {
@@ -1058,15 +1093,23 @@ tools:
 
         let tool_a = tools.get("tool_a").unwrap();
         assert_eq!(tool_a.alias, Some("a".to_string()));
-        assert_eq!(tool_a.response_format, ResponseFormatConfig::WebSearchCall);
+        assert_eq!(
+            tool_a.response_format,
+            Some(ResponseFormatConfig::WebSearchCall)
+        );
 
         let tool_b = tools.get("tool_b").unwrap();
         assert!(tool_b.alias.is_none());
-        assert_eq!(tool_b.response_format, ResponseFormatConfig::FileSearchCall);
+        assert_eq!(
+            tool_b.response_format,
+            Some(ResponseFormatConfig::FileSearchCall)
+        );
 
         let tool_c = tools.get("tool_c").unwrap();
         assert_eq!(tool_c.alias, Some("c".to_string()));
-        assert_eq!(tool_c.response_format, ResponseFormatConfig::Passthrough);
+        // Alias-only stanza: no `response_format` field → `None` (meaning
+        // "inherit context"), not explicit Passthrough.
+        assert_eq!(tool_c.response_format, None);
     }
 
     #[test]
@@ -1191,6 +1234,7 @@ policy:
             (BuiltinToolType::WebSearchPreview, "\"web_search_preview\""),
             (BuiltinToolType::CodeInterpreter, "\"code_interpreter\""),
             (BuiltinToolType::FileSearch, "\"file_search\""),
+            (BuiltinToolType::ImageGeneration, "\"image_generation\""),
         ];
 
         for (builtin_type, expected) in types {
@@ -1199,6 +1243,19 @@ policy:
 
             let deserialized: BuiltinToolType = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, builtin_type);
+        }
+    }
+
+    #[test]
+    fn test_builtin_tool_type_all_includes_every_variant() {
+        let all = BuiltinToolType::all();
+        for variant in [
+            BuiltinToolType::WebSearchPreview,
+            BuiltinToolType::CodeInterpreter,
+            BuiltinToolType::FileSearch,
+            BuiltinToolType::ImageGeneration,
+        ] {
+            assert!(all.contains(&variant), "all() missing {variant}");
         }
     }
 
@@ -1215,6 +1272,10 @@ policy:
         assert_eq!(
             BuiltinToolType::FileSearch.response_format(),
             ResponseFormatConfig::FileSearchCall
+        );
+        assert_eq!(
+            BuiltinToolType::ImageGeneration.response_format(),
+            ResponseFormatConfig::ImageGenerationCall
         );
     }
 

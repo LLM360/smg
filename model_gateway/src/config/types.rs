@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
+pub use openai_protocol::worker::TransportMode;
 use serde::{Deserialize, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
@@ -8,7 +9,7 @@ pub use smg_data_connector::{
 };
 
 use super::{validation::ConfigValidator, ConfigResult};
-use crate::worker::ConnectionMode;
+use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,18 +18,50 @@ pub struct RouterConfig {
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     pub policy: PolicyConfig,
+    /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
+    #[serde(default)]
+    pub routing_key_override: RoutingKeyOverrideConfig,
     pub host: String,
     pub port: u16,
+    /// Dedicated port for the isolated Kubernetes liveness/readiness/health
+    /// probe listener. `None` means the dedicated listener is off; the probe
+    /// routes always remain available on the main `port` regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_port: Option<u16>,
+    /// Explicit async runtime worker-thread count. `None` uses tokio's default
+    /// (`available_parallelism()`), which already honors the cgroup CPU quota on
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
     pub request_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Re-export engine `GetLoads` signals as `smg_engine_*` gauges, polling
+    /// even when no load-aware routing policy is active. Decouples engine
+    /// observability from routing.
+    #[serde(default)]
+    pub engine_metrics: bool,
+    /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).
+    /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides this; when
+    /// unset, falls back to `SMG_MM_TENSOR_TRANSPORT`, then `inline`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_tensor_transport: Option<TransportMode>,
+    /// Global minimum multimodal tensor size (bytes) before SHM transport is used.
+    /// Per-worker `WorkerSpec.multimodal_shm_min_bytes` overrides this; falls back
+    /// to `SMG_MM_SHM_MIN_BYTES`, then 64 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_shm_min_bytes: Option<usize>,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
     pub api_key: Option<String>,
+    /// Per-tenant API keys for serving-path auth, layered on top of
+    /// `api_key` rather than replacing it.
+    #[serde(default)]
+    pub tenant_api_keys: Vec<TenantApiKeyEntry>,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
@@ -37,12 +70,45 @@ pub struct RouterConfig {
     pub request_id_headers: Option<Vec<String>>,
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub tenant_resolution: TenantResolutionConfig,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Cluster-wide request ceiling per one-second window. Requires mesh.
+    /// `None` disables shared enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_rate_limit_requests_per_second: Option<u64>,
+    /// Enable the priority-aware admission scheduler. When false (default),
+    /// the legacy concurrency-limit middleware stays wired — zero behavior
+    /// change for existing deployments.
+    #[serde(default)]
+    pub priority_scheduler_enabled: bool,
+    /// Max priority class applied to tenants not listed in the scheduler
+    /// YAML (`system` | `interactive` | `default` | `bulk`).
+    #[serde(default = "default_priority_scheduler_max_class")]
+    pub priority_scheduler_default_max_class: String,
+    /// Optional path to the priority-scheduler YAML (per-class + per-tenant
+    /// overrides). Absent → built-in defaults, empty tenant policy map.
+    #[serde(default)]
+    pub priority_scheduler_config: Option<String>,
+    /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
+    /// by inflight; the remainder bucket under `tenant="other"`).
+    #[serde(default = "default_priority_scheduler_tenant_metric_top_n")]
+    pub priority_scheduler_tenant_metric_top_n: u32,
+    /// Enable per-tenant LLM token/request rate limiting. When false
+    /// (default), no rate limiter is constructed — zero behavior change
+    /// for existing deployments.
+    #[serde(default)]
+    pub tenant_rate_limit_enabled: bool,
+    /// Path to the tenant-rate-limit YAML (default + per-tenant policies,
+    /// optionally further restricted per-model). Required when
+    /// `tenant_rate_limit_enabled` is true.
+    #[serde(default)]
+    pub tenant_rate_limit_config: Option<String>,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -104,6 +170,39 @@ pub struct RouterConfig {
     pub storage_hook_wasm_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TenantResolutionConfig {
+    pub trust_tenant_header: bool,
+    pub tenant_header_name: String,
+}
+
+/// A single tenant-scoped API key for serving-path authentication.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantApiKeyEntry {
+    /// Resolves to tenant key `auth:<tenant_id>`, e.g. `team-red`.
+    pub tenant_id: String,
+    pub key: String,
+}
+
+impl std::fmt::Debug for TenantApiKeyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantApiKeyEntry")
+            .field("tenant_id", &self.tenant_id)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Default for TenantResolutionConfig {
+    fn default() -> Self {
+        Self {
+            trust_tenant_header: false,
+            tenant_header_name: DEFAULT_TENANT_HEADER_NAME.to_string(),
+        }
+    }
+}
+
 /// Tokenizer cache configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenizerCacheConfig {
@@ -162,6 +261,14 @@ impl Default for TokenizerCacheConfig {
     }
 }
 
+fn default_priority_scheduler_max_class() -> String {
+    "default".to_string()
+}
+
+fn default_priority_scheduler_tenant_metric_top_n() -> u32 {
+    32
+}
+
 fn default_history_backend() -> HistoryBackend {
     HistoryBackend::Memory
 }
@@ -177,6 +284,21 @@ pub enum RoutingMode {
         /// With optional bootstrap ports
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefill_policy: Option<PolicyConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decode_policy: Option<PolicyConfig>,
+    },
+    #[serde(rename = "encode_prefill_decode")]
+    EncodePrefillDecode {
+        /// Encode worker urls (run the vision tower); optional Mooncake
+        /// bootstrap ports.
+        encode_urls: Vec<(String, Option<u16>)>,
+        /// Prefill worker urls with optional bootstrap ports.
+        prefill_urls: Vec<(String, Option<u16>)>,
+        decode_urls: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encode_policy: Option<PolicyConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,6 +325,12 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                ..
+            } => encode_urls.len() + prefill_urls.len() + decode_urls.len(),
             RoutingMode::OpenAI { worker_urls } => worker_urls.len(),
             RoutingMode::Anthropic { worker_urls } => worker_urls.len(),
             RoutingMode::Gemini { worker_urls } => worker_urls.len(),
@@ -213,7 +341,8 @@ impl RoutingMode {
     /// Falls back to the main policy if no specific prefill policy is set
     pub fn get_prefill_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
-            RoutingMode::PrefillDecode { prefill_policy, .. } => {
+            RoutingMode::PrefillDecode { prefill_policy, .. }
+            | RoutingMode::EncodePrefillDecode { prefill_policy, .. } => {
                 prefill_policy.as_ref().unwrap_or(main_policy)
             }
             _ => main_policy,
@@ -224,10 +353,26 @@ impl RoutingMode {
     /// Falls back to the main policy if no specific decode policy is set
     pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
-            RoutingMode::PrefillDecode { decode_policy, .. } => {
+            RoutingMode::PrefillDecode { decode_policy, .. }
+            | RoutingMode::EncodePrefillDecode { decode_policy, .. } => {
                 decode_policy.as_ref().unwrap_or(main_policy)
             }
             _ => main_policy,
+        }
+    }
+
+    /// Get the effective encode policy for EPD mode. The default is
+    /// consistent_hashing because encode routing is item-cache affinity, not the
+    /// request-level main policy.
+    pub fn get_encode_policy<'a>(
+        &'a self,
+        default_encode_policy: &'a PolicyConfig,
+    ) -> &'a PolicyConfig {
+        match self {
+            RoutingMode::EncodePrefillDecode { encode_policy, .. } => {
+                encode_policy.as_ref().unwrap_or(default_encode_policy)
+            }
+            _ => default_encode_policy,
         }
     }
 }
@@ -245,6 +390,34 @@ pub enum ManualAssignmentMode {
     MinGroup,
 }
 
+/// Per-request sticky-routing override: when `X-SMG-Routing-Key` is present, any
+/// eligible policy routes via manual sticky-map semantics. Reuses the manual
+/// policy knobs for the sticky map; eviction defaults match the manual policy so
+/// config-file users with only `enabled: true` still get TTL eviction (no leak).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingKeyOverrideConfig {
+    /// When false, policies are used unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_manual_eviction_interval_secs")]
+    pub eviction_interval_secs: u64,
+    #[serde(default = "default_manual_max_idle_secs")]
+    pub max_idle_secs: u64,
+    #[serde(default)]
+    pub assignment_mode: ManualAssignmentMode,
+}
+
+impl Default for RoutingKeyOverrideConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            eviction_interval_secs: default_manual_eviction_interval_secs(),
+            max_idle_secs: default_manual_max_idle_secs(),
+            assignment_mode: ManualAssignmentMode::default(),
+        }
+    }
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -254,6 +427,12 @@ pub enum PolicyConfig {
 
     #[serde(rename = "round_robin")]
     RoundRobin,
+
+    /// Forward every request to the single backend with no load balancing,
+    /// load monitoring, or KV-event subscription. Intended for single-worker
+    /// gateways. See `policies/passthrough.rs`.
+    #[serde(rename = "passthrough")]
+    Passthrough,
 
     #[serde(rename = "cache_aware")]
     CacheAware {
@@ -266,6 +445,14 @@ pub enum PolicyConfig {
         block_size: usize,
         #[serde(default)]
         engine_load: bool,
+        /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
+        /// cache affinity is abandoned for shortest-queue. `>= 1.0` disables.
+        #[serde(default = "default_balance_token_usage_threshold")]
+        balance_token_usage_threshold: f32,
+        /// Backend KV-utilization ceiling (0.0–1.0): a single engine above it
+        /// triggers shedding regardless of spread. `>= 1.0` disables (default).
+        #[serde(default = "default_balance_token_usage_threshold")]
+        overload_token_usage_threshold: f32,
     },
 
     #[serde(rename = "power_of_two")]
@@ -275,6 +462,29 @@ pub enum PolicyConfig {
     SizeAwarePowerOfTwo {
         #[serde(default = "default_output_token_estimate")]
         output_token_estimate: u64,
+    },
+
+    /// Least-(token-)work policy: routes to the worker minimizing the expected
+    /// wait `(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`
+    /// — token-work drain time plus a convex KV-cache pressure barrier, computed
+    /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
+    #[serde(rename = "least_load")]
+    LeastLoad {
+        #[serde(default = "default_least_load_interval")]
+        load_check_interval_secs: u64,
+        /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
+        /// commensurate with the expected-queue-wait term.
+        #[serde(default = "default_least_load_kv_pressure_weight")]
+        kv_pressure_weight: f64,
+        /// Mean prefill length (tokens) used to estimate in-flight token-work
+        /// when a request's token count is unknown at routing time.
+        #[serde(default = "default_least_load_mean_prefill")]
+        mean_prefill_tokens: u32,
+        /// Fallback generation throughput (tokens/s) for the expected-wait term
+        /// when a backend reports no live `gen_throughput`. Set to the fleet's
+        /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
+        #[serde(default = "default_least_load_throughput")]
+        default_throughput: f64,
     },
 
     #[serde(rename = "bucket")]
@@ -337,6 +547,10 @@ fn default_output_token_estimate() -> u64 {
     4096
 }
 
+fn default_balance_token_usage_threshold() -> f32 {
+    1.0
+}
+
 fn default_prefix_token_count() -> usize {
     256
 }
@@ -353,14 +567,32 @@ fn default_manual_max_idle_secs() -> u64 {
     4 * 3600
 }
 
+fn default_least_load_interval() -> u64 {
+    10
+}
+
+fn default_least_load_kv_pressure_weight() -> f64 {
+    0.15
+}
+
+fn default_least_load_mean_prefill() -> u32 {
+    1024
+}
+
+fn default_least_load_throughput() -> f64 {
+    2000.0
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
+            PolicyConfig::Passthrough => "passthrough",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::SizeAwarePowerOfTwo { .. } => "size_aware_power_of_two",
+            PolicyConfig::LeastLoad { .. } => "least_load",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
@@ -379,6 +611,9 @@ pub struct DiscoveryConfig {
     pub check_interval_secs: u64,
     /// Regular mode
     pub selector: HashMap<String, String>,
+    /// EPD mode encode
+    #[serde(default)]
+    pub encode_selector: HashMap<String, String>,
     /// PD mode prefill
     pub prefill_selector: HashMap<String, String>,
     /// PD mode decode
@@ -407,6 +642,7 @@ impl Default for DiscoveryConfig {
             port: 8000,
             check_interval_secs: 120,
             selector: HashMap::new(),
+            encode_selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -456,6 +692,16 @@ pub struct HealthCheckConfig {
     pub disable_health_check: bool,
     #[serde(default)]
     pub remove_unhealthy_workers: bool,
+    /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
+    /// is submitted before the registry entry is removed. Lets in-flight
+    /// requests complete naturally. Set to `0` to skip draining and
+    /// remove immediately. Default: 5.
+    #[serde(default = "default_drain_settle_secs")]
+    pub drain_settle_secs: u64,
+}
+
+fn default_drain_settle_secs() -> u64 {
+    5
 }
 
 impl Default for HealthCheckConfig {
@@ -468,6 +714,7 @@ impl Default for HealthCheckConfig {
             endpoint: "/health".to_string(),
             disable_health_check: false,
             remove_unhealthy_workers: false,
+            drain_settle_secs: default_drain_settle_secs(),
         }
     }
 }
@@ -481,6 +728,7 @@ impl HealthCheckConfig {
             success_threshold: self.success_threshold,
             failure_threshold: self.failure_threshold,
             disable_health_check: self.disable_health_check,
+            drain_settle_secs: self.drain_settle_secs,
         }
     }
 }
@@ -543,16 +791,23 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
+            routing_key_override: RoutingKeyOverrideConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
+            health_check_port: None,
+            runtime_worker_threads: None,
             max_payload_size: 536_870_912,     // 512MB
             request_timeout_secs: 1800,        // 30 minutes
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             load_monitor_interval_secs: 10,
+            engine_metrics: false,
+            multimodal_tensor_transport: None,
+            multimodal_shm_min_bytes: None,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
+            tenant_api_keys: Vec::new(),
             discovery: None,
             metrics: None,
             trace_config: None,
@@ -560,10 +815,19 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
+            tenant_resolution: TenantResolutionConfig::default(),
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            global_rate_limit_requests_per_second: None,
+            priority_scheduler_enabled: false,
+            priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
+            priority_scheduler_config: None,
+            priority_scheduler_tenant_metric_top_n: default_priority_scheduler_tenant_metric_top_n(
+            ),
+            tenant_rate_limit_enabled: false,
+            tenant_rate_limit_config: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -614,6 +878,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::EncodePrefillDecode { .. } => "encode_prefill_decode",
             RoutingMode::OpenAI { .. } => "openai",
             RoutingMode::Anthropic { .. } => "anthropic",
             RoutingMode::Gemini { .. } => "gemini",
@@ -686,6 +951,11 @@ mod tests {
         assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert!(!config.tenant_resolution.trust_tenant_header);
+        assert_eq!(
+            config.tenant_resolution.tenant_header_name,
+            DEFAULT_TENANT_HEADER_NAME
+        );
     }
 
     #[test]
@@ -733,6 +1003,34 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
+    }
+
+    #[test]
+    fn test_health_check_port_serde_roundtrip_and_backward_compat() {
+        // Default: dedicated probe listener off, and `skip_serializing_if`
+        // keeps the key out of serialized output entirely.
+        let config = RouterConfig::default();
+        assert_eq!(config.health_check_port, None);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("health_check_port"),
+            "None health_check_port must be omitted from serialized config"
+        );
+
+        // Existing config files predating the field deserialize cleanly via
+        // `#[serde(default)]` (→ None).
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(without.health_check_port, None);
+
+        // When set, the value round-trips.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .health_check_port(Some(8081))
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("health_check_port"));
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.health_check_port, Some(8081));
     }
 
     #[test]
@@ -808,6 +1106,7 @@ mod tests {
     fn test_policy_config_name() {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
+        assert_eq!(PolicyConfig::Passthrough.name(), "passthrough");
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
@@ -817,6 +1116,8 @@ mod tests {
             max_tree_size: 1000,
             block_size: 16,
             engine_load: Default::default(),
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -840,6 +1141,8 @@ mod tests {
             max_tree_size: 1000,
             block_size: 16,
             engine_load: Default::default(),
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -864,6 +1167,8 @@ mod tests {
             max_tree_size: 5000,
             block_size: 16,
             engine_load: Default::default(),
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
 
         match cache_aware {
@@ -932,6 +1237,7 @@ mod tests {
         assert_eq!(config.port, 8000);
         assert_eq!(config.check_interval_secs, 120);
         assert!(config.selector.is_empty());
+        assert!(config.encode_selector.is_empty());
         assert!(config.prefill_selector.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
@@ -949,6 +1255,7 @@ mod tests {
             port: 9000,
             check_interval_secs: 30,
             selector: selector.clone(),
+            encode_selector: selector.clone(),
             prefill_selector: selector.clone(),
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
@@ -1228,6 +1535,7 @@ mod tests {
                 port: 8443,
                 check_interval_secs: 120,
                 selector: selectors.clone(),
+                encode_selector: selectors.clone(),
                 prefill_selector: selectors.clone(),
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
@@ -1271,6 +1579,8 @@ mod tests {
                 max_tree_size: 1000,
                 block_size: 16,
                 engine_load: Default::default(),
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1303,6 +1613,8 @@ mod tests {
                 max_tree_size: 1000,
                 block_size: 16,
                 engine_load: Default::default(),
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             }),
             decode_policy: None,
         };
@@ -1361,6 +1673,8 @@ mod tests {
             max_tree_size: 2000,
             block_size: 16,
             engine_load: Default::default(),
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

@@ -14,7 +14,8 @@ pub mod wasm_module_removal;
 pub use data::{
     McpWorkflowData, ProtocolUpdateRequest, TokenizerWorkflowData, WasmRegistrationWorkflowData,
     WasmRemovalWorkflowData, WorkerKind, WorkerList as WorkflowWorkerList, WorkerRegistrationData,
-    WorkerRemovalWorkflowData, WorkerSpec, WorkerUpdateWorkflowData, WorkerWorkflowData,
+    WorkerRegistrationMode, WorkerRemovalWorkflowData, WorkerSpec, WorkerUpdateWorkflowData,
+    WorkerWorkflowData,
 };
 // Typed workflow engines
 pub use engines::WorkflowEngines;

@@ -5,13 +5,13 @@
 //! - Tool/resource/prompt list change notifications
 //! - Progress and logging notifications
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 use rmcp::{
     model::{
-        CancelledNotificationParam, ClientInfo, CreateElicitationRequestParam,
-        CreateElicitationResult, LoggingLevel, LoggingMessageNotificationParam,
+        CancelledNotificationParam, ClientInfo, CreateElicitationRequestParams,
+        CreateElicitationResult, ElicitationAction, LoggingLevel, LoggingMessageNotificationParam,
         ProgressNotificationParam, ResourceUpdatedNotificationParam,
     },
     service::{NotificationContext, RequestContext},
@@ -38,6 +38,7 @@ pub struct HandlerRequestContext {
     pub request_id: String,
     pub approval_mode: ApprovalMode,
     pub tenant_ctx: TenantContext,
+    pub forwarded_headers: HashMap<String, String>,
 }
 
 impl HandlerRequestContext {
@@ -45,11 +46,13 @@ impl HandlerRequestContext {
         request_id: impl Into<String>,
         approval_mode: ApprovalMode,
         tenant_ctx: TenantContext,
+        forwarded_headers: HashMap<String, String>,
     ) -> Self {
         Self {
             request_id: request_id.into(),
             approval_mode,
             tenant_ctx,
+            forwarded_headers,
         }
     }
 }
@@ -133,7 +136,7 @@ impl SmgClientHandler {
 impl ClientHandler for SmgClientHandler {
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParam,
+        request: CreateElicitationRequestParams,
         context: RequestContext<RoleClient>,
     ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
         use crate::annotations::ToolAnnotations;
@@ -148,8 +151,13 @@ impl ClientHandler for SmgClientHandler {
             rmcp::ErrorData::internal_error("No request context set for elicitation", None)
         })?;
 
-        // Use message as the tool identifier (elicitation doesn't have tool name directly)
-        let message = &request.message;
+        // rmcp 1.7 split elicitation params into form/url variants; both carry a
+        // user-facing message, which we use as the tool identifier (elicitation
+        // doesn't have a tool name directly).
+        let message = match &request {
+            CreateElicitationRequestParams::FormElicitationParams { message, .. }
+            | CreateElicitationRequestParams::UrlElicitationParams { message, .. } => message,
+        };
 
         // Default annotations (conservative - not read-only, potentially destructive)
         let hints = ToolAnnotations::default();
@@ -170,36 +178,20 @@ impl ClientHandler for SmgClientHandler {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
+        let result_for = |allowed: bool| {
+            CreateElicitationResult::new(if allowed {
+                ElicitationAction::Accept
+            } else {
+                ElicitationAction::Decline
+            })
+        };
+
         match outcome {
-            ApprovalOutcome::Decided(decision) => {
-                if decision.is_allowed() {
-                    Ok(CreateElicitationResult {
-                        action: rmcp::model::ElicitationAction::Accept,
-                        content: None,
-                    })
-                } else {
-                    Ok(CreateElicitationResult {
-                        action: rmcp::model::ElicitationAction::Decline,
-                        content: None,
-                    })
-                }
-            }
+            ApprovalOutcome::Decided(decision) => Ok(result_for(decision.is_allowed())),
             ApprovalOutcome::Pending { rx, .. } => {
                 // Wait for user response
                 match rx.await {
-                    Ok(decision) => {
-                        if decision.is_approved() {
-                            Ok(CreateElicitationResult {
-                                action: rmcp::model::ElicitationAction::Accept,
-                                content: None,
-                            })
-                        } else {
-                            Ok(CreateElicitationResult {
-                                action: rmcp::model::ElicitationAction::Decline,
-                                content: None,
-                            })
-                        }
-                    }
+                    Ok(decision) => Ok(result_for(decision.is_approved())),
                     Err(_) => Err(rmcp::ErrorData::internal_error(
                         "Approval channel closed",
                         None,
@@ -350,6 +342,7 @@ mod tests {
             "req-1",
             ApprovalMode::PolicyOnly,
             TenantContext::new("tenant-1"),
+            HashMap::new(),
         );
 
         handler.set_request_context(ctx.clone());

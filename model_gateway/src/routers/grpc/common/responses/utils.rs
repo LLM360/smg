@@ -18,22 +18,24 @@ use tracing::{debug, error, warn};
 use crate::{
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client, persistence_utils::persist_conversation_items,
+            mcp_utils::ensure_request_mcp_client, openai_bridge,
+            persistence_utils::persist_conversation_items,
         },
         error,
     },
     worker::WorkerRegistry,
 };
 
-/// Ensure MCP connection succeeds if MCP tools or builtin tools are declared
+/// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
 ///
-/// Checks if request declares MCP tools or builtin tool types (web_search_preview,
-/// code_interpreter), and if so, validates that the MCP clients can be created
-/// and connected.
+/// Checks if the request declares MCP tools or builtin tool types
+/// (`web_search_preview`, `code_interpreter`, `image_generation`) and,
+/// if so, validates that the MCP clients can be created and connected.
 ///
 /// Returns Ok((has_mcp_tools, mcp_servers)) on success.
 pub(crate) async fn ensure_mcp_connection(
     mcp_orchestrator: &Arc<McpOrchestrator>,
+    format_registry: &openai_bridge::FormatRegistry,
     tools: Option<&[ResponseTool]>,
 ) -> Result<(bool, Vec<McpServerBinding>), Response> {
     // Check for explicit MCP tools (must error if connection fails)
@@ -41,15 +43,20 @@ pub(crate) async fn ensure_mcp_connection(
         .map(|t| t.iter().any(|tool| matches!(tool, ResponseTool::Mcp(_))))
         .unwrap_or(false);
 
-    // Check for builtin tools that MAY have MCP routing configured
+    // Check for builtin tools that MAY have MCP routing configured.
+    //
+    // `ImageGeneration` is included here because gpt-oss via the
+    // harmony pipeline, and Qwen/Llama via the regular pipeline, both
+    // dispatch hosted `image_generation` calls through the same MCP
+    // routing path — the only difference is how the tool is advertised in
+    // the prompt. Without this arm, the short-circuit below would return
+    // `(false, Vec::new())`, the MCP loop would never be entered, and the
+    // registered `image_generation` MCP server would receive zero
+    // dispatches.
     let has_builtin_tools = tools
         .map(|t| {
-            t.iter().any(|tool| {
-                matches!(
-                    tool,
-                    ResponseTool::WebSearchPreview(_) | ResponseTool::CodeInterpreter(_)
-                )
-            })
+            t.iter()
+                .any(|tool| openai_bridge::builtin_type_for_response_tool(tool).is_some())
         })
         .unwrap_or(false);
 
@@ -59,7 +66,9 @@ pub(crate) async fn ensure_mcp_connection(
     }
 
     if let Some(tools) = tools {
-        match ensure_request_mcp_client(mcp_orchestrator, tools).await {
+        // TODO: Thread real request headers through the gRPC responses path if/when
+        // gRPC MCP flows need the same forwarded-header preservation contract.
+        match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
             Some(mcp_servers) => {
                 return Ok((true, mcp_servers));
             }
@@ -89,14 +98,17 @@ pub(crate) async fn ensure_mcp_connection(
     Ok((false, Vec::new()))
 }
 
-/// Validate that workers are available for the requested model
+/// Validate that workers are available for the requested model.
+///
+/// Runs on the client-supplied name, before the pipeline canonicalizes it, so
+/// it has to accept aliases as well as canonical model IDs. `contains_model`
+/// covers both; listing `get_models()` and testing membership would reject
+/// every alias here.
 pub(crate) fn validate_worker_availability(
     worker_registry: &Arc<WorkerRegistry>,
     model: &str,
 ) -> Option<Response> {
-    let available_models = worker_registry.get_models();
-
-    if !available_models.contains(&model.to_string()) {
+    if !worker_registry.contains_model(model) {
         return Some(error::model_not_found(model));
     }
 
@@ -164,5 +176,49 @@ pub(crate) async fn persist_response_if_needed(
         } else {
             debug!("Persisted response: {}", response.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID};
+
+    fn registry_with_aliased_worker() -> Arc<WorkerRegistry> {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = BasicWorkerBuilder::new("http://worker:8080")
+            .model(ModelCard::new("canonical-model").with_alias("model-alias"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry.register_or_replace(Arc::new(worker));
+        registry
+    }
+
+    #[test]
+    fn worker_availability_accepts_alias_and_preserves_unknown_rejection() {
+        let registry = registry_with_aliased_worker();
+
+        assert!(validate_worker_availability(&registry, "canonical-model").is_none());
+        assert!(validate_worker_availability(&registry, "model-alias").is_none());
+
+        let response = validate_worker_availability(&registry, UNKNOWN_MODEL_ID)
+            .expect("unknown model should remain rejected for Responses");
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn worker_availability_rejects_alias_once_its_worker_is_gone() {
+        let registry = registry_with_aliased_worker();
+        let worker_id = registry.get_id_by_url("http://worker:8080").unwrap();
+        assert!(registry.remove(&worker_id).is_some());
+
+        let response = validate_worker_availability(&registry, "model-alias")
+            .expect("alias must stop resolving with no workers behind it");
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
     }
 }

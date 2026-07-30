@@ -117,6 +117,17 @@ class TestRouterArgs:
         with pytest.raises(ValueError, match="Invalid bootstrap port"):
             RouterArgs._parse_prefill_urls([["http://prefill1:8000", "invalid"]])
 
+    def test_parse_encode_urls_valid(self):
+        """Test parsing valid encode URL arguments."""
+        result = RouterArgs._parse_encode_urls([["http://encode1:8000", "9000"]])
+        assert result == [("http://encode1:8000", 9000)]
+
+        result = RouterArgs._parse_encode_urls([["http://encode1:8000", "none"]])
+        assert result == [("http://encode1:8000", None)]
+
+        result = RouterArgs._parse_encode_urls([["http://encode1:8000"]])
+        assert result == [("http://encode1:8000", None)]
+
     def test_parse_decode_urls_valid(self):
         """Test parsing valid decode URL arguments."""
         # Test single decode URL
@@ -175,6 +186,7 @@ class TestRouterArgs:
             router_queue_size=200,
             router_queue_timeout_secs=120,
             router_rate_limit_tokens_per_second=100,
+            router_global_rate_limit_requests_per_second=75,
             router_cors_allowed_origins=["http://localhost:3000"],
             router_retry_max_retries=3,
             router_retry_initial_backoff_ms=100,
@@ -232,6 +244,7 @@ class TestRouterArgs:
         assert router_args.queue_size == 200
         assert router_args.queue_timeout_secs == 120
         assert router_args.rate_limit_tokens_per_second == 100
+        assert router_args.global_rate_limit_requests_per_second == 75
         assert router_args.cors_allowed_origins == ["http://localhost:3000"]
 
         # Test retry configuration
@@ -469,6 +482,8 @@ class TestPolicyFromStr:
             policy_from_str("size_aware_power_of_two")
             == PolicyType.SizeAwarePowerOfTwo
         )
+        assert policy_from_str("consistent_hashing") == PolicyType.ConsistentHashing
+        assert policy_from_str("prefix_hash") == PolicyType.PrefixHash
 
     def test_invalid_policy(self):
         """Test conversion of invalid policy string."""
@@ -543,6 +558,101 @@ class TestParseRouterArgs:
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert router_args.prefill_policy == "power_of_two"
         assert router_args.decode_policy == "round_robin"
+
+    def test_parse_epd_args(self):
+        """Test parsing EPD disaggregated mode arguments."""
+        args = [
+            "--epd-disaggregation",
+            "--encode",
+            "http://encode1:8000",
+            "9000",
+            "--encode",
+            "http://encode2:8000",
+            "none",
+            "--prefill",
+            "http://prefill1:8000",
+            "9001",
+            "--decode",
+            "http://decode1:8001",
+            "--encode-policy",
+            "consistent_hashing",
+            "--prefill-policy",
+            "cache_aware",
+            "--decode-policy",
+            "round_robin",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.epd_disaggregation is True
+        assert router_args.encode_urls == [
+            ("http://encode1:8000", 9000),
+            ("http://encode2:8000", None),
+        ]
+        assert router_args.prefill_urls == [("http://prefill1:8000", 9001)]
+        assert router_args.decode_urls == ["http://decode1:8001"]
+        assert router_args.encode_policy == "consistent_hashing"
+        assert router_args.prefill_policy == "cache_aware"
+        assert router_args.decode_policy == "round_robin"
+
+    def test_parse_pd_args_with_new_policies(self):
+        """Test parsing PD disaggregated mode arguments with new policy options."""
+        # Test consistent_hashing for both prefill and decode
+        args = [
+            "--pd-disaggregation",
+            "--prefill",
+            "http://prefill1:8000",
+            "--decode",
+            "http://decode1:8001",
+            "--prefill-policy",
+            "consistent_hashing",
+            "--decode-policy",
+            "consistent_hashing",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.pd_disaggregation is True
+        assert router_args.prefill_policy == "consistent_hashing"
+        assert router_args.decode_policy == "consistent_hashing"
+
+        # Test prefix_hash for both prefill and decode
+        args = [
+            "--pd-disaggregation",
+            "--prefill",
+            "http://prefill1:8000",
+            "--decode",
+            "http://decode1:8001",
+            "--prefill-policy",
+            "prefix_hash",
+            "--decode-policy",
+            "prefix_hash",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.pd_disaggregation is True
+        assert router_args.prefill_policy == "prefix_hash"
+        assert router_args.decode_policy == "prefix_hash"
+
+        # Test mixed policies
+        args = [
+            "--pd-disaggregation",
+            "--prefill",
+            "http://prefill1:8000",
+            "--decode",
+            "http://decode1:8001",
+            "--prefill-policy",
+            "consistent_hashing",
+            "--decode-policy",
+            "prefix_hash",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.pd_disaggregation is True
+        assert router_args.prefill_policy == "consistent_hashing"
+        assert router_args.decode_policy == "prefix_hash"
 
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""
@@ -628,6 +738,8 @@ class TestParseRouterArgs:
             "120",
             "--rate-limit-tokens-per-second",
             "100",
+            "--global-rate-limit-requests-per-second",
+            "75",
         ]
 
         router_args = parse_router_args(args)
@@ -636,6 +748,7 @@ class TestParseRouterArgs:
         assert router_args.queue_size == 200
         assert router_args.queue_timeout_secs == 120
         assert router_args.rate_limit_tokens_per_second == 100
+        assert router_args.global_rate_limit_requests_per_second == 75
 
     def test_parse_health_check_args(self):
         """Test parsing health check arguments."""
@@ -702,6 +815,30 @@ class TestParseRouterArgs:
         # Note: model-path and tokenizer-path arguments are not available in current implementation
         # This test is skipped until those arguments are added
         pytest.skip("Tokenizer arguments not available in current implementation")
+
+    def test_parse_valid_policies(self):
+        """Test parsing all valid policy arguments."""
+        # Test consistent_hashing policy
+        router_args = parse_router_args(["--policy", "consistent_hashing"])
+        assert router_args.policy == "consistent_hashing"
+
+        # Test prefix_hash policy
+        router_args = parse_router_args(["--policy", "prefix_hash"])
+        assert router_args.policy == "prefix_hash"
+
+        # Test all policies in the choices list
+        valid_policies = [
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash",
+        ]
+        for policy in valid_policies:
+            router_args = parse_router_args(["--policy", policy])
+            assert router_args.policy == policy
 
     def test_parse_invalid_args(self):
         """Test parsing invalid arguments."""

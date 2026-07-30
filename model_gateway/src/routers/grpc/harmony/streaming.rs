@@ -20,29 +20,59 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
-use smg_mcp::{McpToolSession, ResponseFormat, DEFAULT_SERVER_LABEL};
+use smg_mcp::{McpToolSession, DEFAULT_SERVER_LABEL};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use super::{
-    builder::convert_harmony_logprobs, processor::ResponsesIterationResult,
-    types::HarmonyChannelDelta, HarmonyParserAdapter,
+    builder::{convert_harmony_logprobs, try_harmony_encoding},
+    processor::ResponsesIterationResult,
+    types::HarmonyChannelDelta,
+    HarmonyParserAdapter,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
-    routers::grpc::{
+    routers::{
         common::{
-            response_formatting::CompletionTokenTracker,
-            responses::{
-                build_sse_response,
-                streaming::{attach_mcp_server_label, OutputItemType, ResponseStreamEventEmitter},
-            },
+            openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
+            sse::SseEncoder,
         },
-        context,
-        proto_wrapper::{ProtoResponseVariant, ProtoStream},
-        utils,
+        grpc::{
+            common::{
+                response_formatting::CompletionTokenTracker,
+                responses::{
+                    build_sse_response,
+                    streaming::{
+                        attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
+                    },
+                },
+            },
+            context,
+            proto_wrapper::{ProtoResponseVariant, ProtoStream},
+            utils,
+        },
     },
 };
+
+/// Whether a tool call of this `ResponseFormat` streams its arguments via
+/// `mcp_call.arguments.delta` / `function_call.arguments.delta` events.
+///
+/// Hosted built-in tools (`web_search_call`, `code_interpreter_call`,
+/// `file_search_call`, `image_generation_call`) instead surface their
+/// progress through structured events emitted by the shared
+/// [`ResponseStreamEventEmitter`] helpers (`emit_tool_call_in_progress`,
+/// `emit_tool_call_searching`, `emit_tool_call_completed` — plus
+/// `emit_image_generation_partial_image` for the image_generation
+/// partial-image frame). Those builtins therefore skip argument
+/// streaming here.
+///
+/// `None` (plain function tools) and `Some(Passthrough)` (MCP `mcp_call`)
+/// are the only formats that stream arguments through this router.
+fn streams_arguments(response_format: Option<&ResponseFormat>) -> bool {
+    response_format
+        .map(|f| descriptor(*f).streams_arguments)
+        .unwrap_or(true)
+}
 
 /// Processor for streaming Harmony responses
 ///
@@ -91,21 +121,31 @@ impl HarmonyStreamingProcessor {
                         utils::send_error_sse(&tx, &e, "internal_error");
                     }
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    let _ = tx.send(Ok(SseEncoder::done()));
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => {
                 tokio::spawn(async move {
-                    let result =
-                        Self::process_dual_stream(prefill, *decode, dispatch, chat_request, &tx)
-                            .await;
+                    let result = Self::process_prefill_decode_stream(
+                        prefill,
+                        *decode,
+                        dispatch,
+                        chat_request,
+                        &tx,
+                    )
+                    .await;
 
                     if let Err(e) = result {
-                        error!("Harmony dual streaming error: {}", e);
+                        error!("Harmony prefill/decode streaming error: {}", e);
                         utils::send_error_sse(&tx, &e, "internal_error");
                     }
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    let _ = tx.send(Ok(SseEncoder::done()));
                 });
             }
             context::ExecutionResult::Embedding { .. } => {
@@ -115,7 +155,17 @@ impl HarmonyStreamingProcessor {
                     "Embeddings not supported in Harmony streaming",
                     "invalid_request_error",
                 );
-                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                let _ = tx.send(Ok(SseEncoder::done()));
+            }
+            // Batch results exist only on the completions pipeline.
+            context::ExecutionResult::Batch { .. } => {
+                error!("Harmony streaming not supported for batched results");
+                utils::send_error_sse(
+                    &tx,
+                    "Batched results not supported in Harmony streaming",
+                    "invalid_request_error",
+                );
+                let _ = tx.send(Ok(SseEncoder::done()));
             }
         }
 
@@ -143,8 +193,8 @@ impl HarmonyStreamingProcessor {
         .await
     }
 
-    /// Process streaming chunks from dual streams (prefill + decode)
-    async fn process_dual_stream(
+    /// Process streaming chunks from prefill/decode streams (prefill + decode)
+    async fn process_prefill_decode_stream(
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
@@ -183,9 +233,9 @@ impl HarmonyStreamingProcessor {
 
     /// Process the decode phase of a Chat Completion stream.
     ///
-    /// Shared between single-stream and dual-stream modes. The `prompt_tokens`
+    /// Shared between single-stream and prefill/decode stream modes. The `prompt_tokens`
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
-    /// (dual stream) or empty (single stream). Values from `Complete` messages
+    /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
     /// are inserted only if not already present.
     async fn process_chat_decode_stream(
         mut decode_stream: ProtoStream,
@@ -204,6 +254,8 @@ impl HarmonyStreamingProcessor {
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
+        // Reusable SSE encoder shared across every chunk emitted for this stream.
+        let mut encoder = SseEncoder::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -233,9 +285,10 @@ impl HarmonyStreamingProcessor {
 
                     // Convert logprobs if present and requested
                     let chunk_logprobs = if original_request.logprobs {
+                        let encoding = try_harmony_encoding()?;
                         chunk_wrapper
                             .output_logprobs()
-                            .map(|lp| convert_harmony_logprobs(&lp))
+                            .map(|lp| convert_harmony_logprobs(encoding, &lp))
                     } else {
                         None
                     };
@@ -259,6 +312,7 @@ impl HarmonyStreamingProcessor {
                             dispatch,
                             original_request,
                             tx,
+                            &mut encoder,
                             chunk_logprobs,
                         )?;
 
@@ -294,6 +348,7 @@ impl HarmonyStreamingProcessor {
                             dispatch,
                             original_request,
                             tx,
+                            &mut encoder,
                         )?;
                     }
                 }
@@ -318,6 +373,7 @@ impl HarmonyStreamingProcessor {
                 dispatch,
                 original_request,
                 tx,
+                &mut encoder,
             )?;
         }
 
@@ -337,6 +393,7 @@ impl HarmonyStreamingProcessor {
     }
 
     /// Emit a chunk delta from Harmony channels
+    #[expect(clippy::too_many_arguments)]
     fn emit_chunk_delta(
         delta: &HarmonyChannelDelta,
         index: u32,
@@ -344,6 +401,7 @@ impl HarmonyStreamingProcessor {
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        encoder: &mut SseEncoder,
         logprobs: Option<ChatLogProbs>,
     ) -> Result<(), String> {
         // On first chunk, emit role announcement separately
@@ -357,11 +415,11 @@ impl HarmonyStreamingProcessor {
             .maybe_system_fingerprint(dispatch.weight_version.as_deref())
             .build();
 
-            let chunk_json = serde_json::to_string(&role_chunk)
+            let sse_data = encoder
+                .encode_data(&role_chunk)
                 .map_err(|e| format!("JSON serialization error: {e}"))?;
-            let sse_data = format!("data: {chunk_json}\n\n");
 
-            tx.send(Ok(Bytes::from(sse_data)))
+            tx.send(Ok(sse_data))
                 .map_err(|_| "Failed to send role chunk".to_string())?;
         }
 
@@ -399,11 +457,11 @@ impl HarmonyStreamingProcessor {
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
 
-        let chunk_json =
-            serde_json::to_string(&chunk).map_err(|e| format!("JSON serialization error: {e}"))?;
-        let sse_data = format!("data: {chunk_json}\n\n");
+        let sse_data = encoder
+            .encode_data(&chunk)
+            .map_err(|e| format!("JSON serialization error: {e}"))?;
 
-        tx.send(Ok(Bytes::from(sse_data)))
+        tx.send(Ok(sse_data))
             .map_err(|_| "Failed to send chunk".to_string())?;
 
         Ok(())
@@ -417,6 +475,7 @@ impl HarmonyStreamingProcessor {
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let chunk =
             ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
@@ -425,11 +484,11 @@ impl HarmonyStreamingProcessor {
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
 
-        let chunk_json =
-            serde_json::to_string(&chunk).map_err(|e| format!("JSON serialization error: {e}"))?;
-        let sse_data = format!("data: {chunk_json}\n\n");
+        let sse_data = encoder
+            .encode_data(&chunk)
+            .map_err(|e| format!("JSON serialization error: {e}"))?;
 
-        tx.send(Ok(Bytes::from(sse_data)))
+        tx.send(Ok(sse_data))
             .map_err(|_| "Failed to send final chunk".to_string())?;
 
         Ok(())
@@ -443,6 +502,7 @@ impl HarmonyStreamingProcessor {
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let usage_chunk =
             ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
@@ -454,11 +514,11 @@ impl HarmonyStreamingProcessor {
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
 
-        let chunk_json = serde_json::to_string(&usage_chunk)
+        let sse_data = encoder
+            .encode_data(&usage_chunk)
             .map_err(|e| format!("JSON serialization error: {e}"))?;
-        let sse_data = format!("data: {chunk_json}\n\n");
 
-        tx.send(Ok(Bytes::from(sse_data)))
+        tx.send(Ok(sse_data))
             .map_err(|_| "Failed to send usage chunk".to_string())?;
 
         Ok(())
@@ -477,28 +537,47 @@ impl HarmonyStreamingProcessor {
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         session: Option<&McpToolSession<'_>>,
+        format_registry: Option<&FormatRegistry>,
     ) -> Result<ResponsesIterationResult, String> {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 debug!("Processing Responses API single stream mode");
-                Self::process_decode_stream(stream, emitter, tx, session, 0).await
+                Self::process_decode_stream(stream, emitter, tx, session, format_registry, 0).await
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
-                debug!("Processing Responses API dual stream mode");
-                Self::process_responses_dual_stream(prefill, *decode, emitter, tx, session).await
+            context::ExecutionResult::PrefillDecode {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => {
+                debug!("Processing Responses API prefill/decode stream mode");
+                Self::process_responses_prefill_decode_stream(
+                    prefill,
+                    *decode,
+                    emitter,
+                    tx,
+                    session,
+                    format_registry,
+                )
+                .await
             }
             context::ExecutionResult::Embedding { .. } => {
                 Err("Embeddings not supported in Responses API streaming".to_string())
             }
+            // Batch results exist only on the completions pipeline.
+            context::ExecutionResult::Batch { .. } => {
+                Err("Batched results not supported in Responses API streaming".to_string())
+            }
         }
     }
 
-    async fn process_responses_dual_stream(
+    async fn process_responses_prefill_decode_stream(
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         session: Option<&McpToolSession<'_>>,
+        format_registry: Option<&FormatRegistry>,
     ) -> Result<ResponsesIterationResult, String> {
         // Phase 1: Drain prefill stream, collecting cached_tokens from Complete messages
         let mut prefill_cached_tokens_by_index: HashMap<u32, u32> = HashMap::new();
@@ -512,9 +591,15 @@ impl HarmonyStreamingProcessor {
         let prefill_cached_tokens: u32 = prefill_cached_tokens_by_index.values().sum();
 
         // Phase 2: Process decode stream
-        let result =
-            Self::process_decode_stream(decode_stream, emitter, tx, session, prefill_cached_tokens)
-                .await;
+        let result = Self::process_decode_stream(
+            decode_stream,
+            emitter,
+            tx,
+            session,
+            format_registry,
+            prefill_cached_tokens,
+        )
+        .await;
 
         prefill_stream.mark_completed();
         result
@@ -526,6 +611,7 @@ impl HarmonyStreamingProcessor {
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         session: Option<&McpToolSession<'_>>,
+        format_registry: Option<&FormatRegistry>,
         prefill_cached_tokens: u32,
     ) -> Result<ResponsesIterationResult, String> {
         let mut parser =
@@ -544,7 +630,7 @@ impl HarmonyStreamingProcessor {
         let mut tool_call_tracking: HashMap<usize, (usize, String, Option<ResponseFormat>)> =
             HashMap::new();
 
-        // Metadata from Complete message; seed cached_tokens from prefill phase (dual-stream)
+        // Metadata from Complete message; seed cached_tokens from prefill phase (prefill/decode stream)
         let mut finish_reason: String;
         let mut finalized_analysis: Option<String> = None;
         let mut prompt_tokens: u32 = 0;
@@ -593,7 +679,7 @@ impl HarmonyStreamingProcessor {
                                 // Allocate message item if needed
                                 if message_output_index.is_none() {
                                     let (output_index, item_id) =
-                                        emitter.allocate_output_index(OutputItemType::Message);
+                                        emitter.allocate_output_index(OutputItemKind::Message);
                                     message_output_index = Some(output_index);
                                     message_item_id = Some(item_id.clone());
 
@@ -658,27 +744,24 @@ impl HarmonyStreamingProcessor {
                                 // Determine response_format based on MCP context.
                                 let response_format = session.and_then(|s| {
                                     if s.has_exposed_tool(tool_name) {
-                                        Some(s.tool_response_format(tool_name))
+                                        format_registry.map(|reg| {
+                                            openai_bridge::lookup_tool_format(s, reg, tool_name)
+                                        })
                                     } else {
                                         None
                                     }
                                 });
 
-                                // Determine output item type and JSON type string
-                                let output_item_type =
-                                    ResponseStreamEventEmitter::output_item_type_for_format(
-                                        response_format.as_ref(),
-                                    );
                                 let type_str = ResponseStreamEventEmitter::type_str_for_format(
                                     response_format.as_ref(),
                                 );
 
                                 let (output_index, item_id) =
-                                    emitter.allocate_output_index(output_item_type);
+                                    emitter.allocate_output_index_for_format(response_format);
 
                                 tool_call_tracking.insert(
                                     call_index,
-                                    (output_index, item_id.clone(), response_format.clone()),
+                                    (output_index, item_id.clone(), response_format),
                                 );
 
                                 // Build output_item.added event
@@ -704,7 +787,7 @@ impl HarmonyStreamingProcessor {
                                 emitter.send_event_best_effort(&event, tx);
 
                                 // Emit in_progress event for MCP tools
-                                if let Some(ref fmt) = response_format {
+                                if let Some(fmt) = response_format {
                                     let event = emitter.emit_tool_call_in_progress(
                                         output_index,
                                         &item_id,
@@ -722,11 +805,14 @@ impl HarmonyStreamingProcessor {
                                     }
                                 }
 
-                                // Emit initial arguments delta for mcp_call only (skip for builtin tools)
-                                if matches!(
-                                    response_format,
-                                    Some(ResponseFormat::Passthrough) | None
-                                ) {
+                                // Emit initial arguments delta for mcp_call / function_call
+                                // only. Hosted built-in tools (web_search_call,
+                                // code_interpreter_call, file_search_call,
+                                // image_generation_call) surface progress via
+                                // the structured `*.in_progress` /
+                                // `*.searching` / `*.generating` events emitted
+                                // above instead of streaming their arguments.
+                                if streams_arguments(response_format.as_ref()) {
                                     let event = match &response_format {
                                         Some(_) => emitter.emit_mcp_call_arguments_delta(
                                             output_index,
@@ -746,11 +832,14 @@ impl HarmonyStreamingProcessor {
                                 if let Some((output_index, item_id, response_format)) =
                                     tool_call_tracking.get(&call_index)
                                 {
-                                    // Skip arguments streaming for builtin tools (only mcp_call streams arguments)
-                                    if !matches!(
-                                        response_format,
-                                        Some(ResponseFormat::Passthrough) | None
-                                    ) {
+                                    // Only mcp_call / function_call stream
+                                    // arguments; hosted built-in tools
+                                    // (web_search_call, code_interpreter_call,
+                                    // file_search_call, image_generation_call)
+                                    // skip argument deltas — their progress
+                                    // rides on the structured events emitted
+                                    // around MCP dispatch.
+                                    if !streams_arguments(response_format.as_ref()) {
                                         continue;
                                     }
 
@@ -810,11 +899,13 @@ impl HarmonyStreamingProcessor {
                                 let args_str =
                                     tool_call.function.arguments.as_deref().unwrap_or("");
 
-                                // Emit arguments done (skip for builtin tools)
-                                if matches!(
-                                    response_format,
-                                    Some(ResponseFormat::Passthrough) | None
-                                ) {
+                                // Emit arguments.done for mcp_call /
+                                // function_call only. Hosted built-in tools
+                                // (web_search_call, code_interpreter_call,
+                                // file_search_call, image_generation_call)
+                                // close out through the `*.completed`
+                                // structured event emitted below.
+                                if streams_arguments(response_format.as_ref()) {
                                     let event = match response_format {
                                         Some(_) => emitter.emit_mcp_call_arguments_done(
                                             *output_index,
@@ -831,7 +922,7 @@ impl HarmonyStreamingProcessor {
                                 }
 
                                 // Emit completed event for MCP tools
-                                if let Some(ref fmt) = response_format {
+                                if let Some(fmt) = *response_format {
                                     let event = emitter.emit_tool_call_completed(
                                         *output_index,
                                         item_id,
@@ -946,8 +1037,12 @@ impl HarmonyStreamingProcessor {
                         let tool_name = &tool_call.function.name;
                         let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
 
-                        // Emit arguments done (skip for builtin tools)
-                        if matches!(response_format, Some(ResponseFormat::Passthrough) | None) {
+                        // Emit arguments.done for mcp_call / function_call
+                        // only. Hosted built-in tools (web_search_call,
+                        // code_interpreter_call, file_search_call,
+                        // image_generation_call) close out through the
+                        // `*.completed` structured event emitted below.
+                        if streams_arguments(response_format.as_ref()) {
                             let event = match response_format {
                                 Some(_) => emitter.emit_mcp_call_arguments_done(
                                     *output_index,
@@ -964,7 +1059,7 @@ impl HarmonyStreamingProcessor {
                         }
 
                         // Emit completed event for MCP tools
-                        if let Some(ref fmt) = response_format {
+                        if let Some(fmt) = *response_format {
                             let event =
                                 emitter.emit_tool_call_completed(*output_index, item_id, fmt);
                             emitter.send_event_best_effort(&event, tx);
@@ -1060,5 +1155,78 @@ impl HarmonyStreamingProcessor {
 impl Default for HarmonyStreamingProcessor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time exhaustiveness anchor.
+    ///
+    /// This helper exists solely to force every [`ResponseFormat`] variant
+    /// to flow through a non-wildcard `match`. If a new variant is added to
+    /// [`ResponseFormat`] without being classified, this function fails to
+    /// compile — which in turn breaks `streams_arguments_explicit_variants`
+    /// below, since both helpers iterate the same variant set.
+    ///
+    /// Intentionally *does not* call [`streams_arguments`] — this mirrors
+    /// the production classifier so a drift between the two is a separate
+    /// failure (runtime assertion miss) from a missing variant (compile
+    /// error here).
+    fn expected_streams_arguments(format: ResponseFormat) -> bool {
+        match format {
+            ResponseFormat::Passthrough => true,
+            ResponseFormat::WebSearchCall
+            | ResponseFormat::CodeInterpreterCall
+            | ResponseFormat::FileSearchCall
+            | ResponseFormat::ImageGenerationCall => false,
+        }
+    }
+
+    // Locks the `streams_arguments` classification so the Harmony router
+    // keeps treating hosted built-in tools — including `image_generation`
+    // — as structured-event emitters rather than argument streamers.
+    //
+    // Every `ResponseFormat` variant is named explicitly (no `_` arm, no
+    // iteration over a hand-maintained array), so adding a new variant
+    // fails to compile in `expected_streams_arguments` above AND in every
+    // explicit `let ... = ResponseFormat::X;` binding here — which in
+    // turn ensures the production `streams_arguments` classifier must
+    // also be updated to compile.
+    #[test]
+    fn streams_arguments_explicit_variants() {
+        // `None` (plain function tool) streams arguments.
+        assert!(streams_arguments(None), "function_call should stream args");
+
+        // `Some(Passthrough)` (mcp_call) streams arguments.
+        let passthrough = ResponseFormat::Passthrough;
+        assert!(
+            streams_arguments(Some(&passthrough)),
+            "mcp_call (Passthrough) should stream args",
+        );
+        assert!(expected_streams_arguments(passthrough));
+
+        // Hosted built-ins do *not* stream arguments — they surface
+        // progress via structured `*.in_progress` / `*.searching` /
+        // `*.generating` / `*.completed` events from the shared emitter.
+        let web_search = ResponseFormat::WebSearchCall;
+        assert!(!streams_arguments(Some(&web_search)));
+        assert!(!expected_streams_arguments(web_search));
+
+        let code_interpreter = ResponseFormat::CodeInterpreterCall;
+        assert!(!streams_arguments(Some(&code_interpreter)));
+        assert!(!expected_streams_arguments(code_interpreter));
+
+        let file_search = ResponseFormat::FileSearchCall;
+        assert!(!streams_arguments(Some(&file_search)));
+        assert!(!expected_streams_arguments(file_search));
+
+        let image_generation = ResponseFormat::ImageGenerationCall;
+        assert!(
+            !streams_arguments(Some(&image_generation)),
+            "image_generation_call must ride the structured-event path",
+        );
+        assert!(!expected_streams_arguments(image_generation));
     }
 }

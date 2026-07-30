@@ -9,25 +9,25 @@ use crate::routers::{
     error as grpc_error,
     grpc::{
         common::stages::PipelineStage,
-        context::{RequestContext, RequestType},
+        context::{ExecutionPlanKind, RequestContext, RequestType},
     },
 };
 
 /// Request building stage for chat and generate pipelines
 ///
-/// These two request types share a single pipeline instance (`new_regular` /
-/// `new_pd`) and are dispatched here. All other request types have
-/// dedicated pipelines and wire their own request building stages directly.
+/// These two request types share a single pipeline instance and are dispatched
+/// here. All other request types have dedicated pipelines and wire their own
+/// request building stages directly.
 pub(crate) struct ChatGenerateRequestBuildingStage {
     chat_stage: ChatRequestBuildingStage,
     generate_stage: GenerateRequestBuildingStage,
 }
 
 impl ChatGenerateRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool) -> Self {
+    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
         Self {
-            chat_stage: ChatRequestBuildingStage::new(inject_pd_metadata),
-            generate_stage: GenerateRequestBuildingStage::new(inject_pd_metadata),
+            chat_stage: ChatRequestBuildingStage::new(inject_pd_metadata, plan_kind),
+            generate_stage: GenerateRequestBuildingStage::new(inject_pd_metadata, plan_kind),
         }
     }
 }
@@ -54,5 +54,14 @@ impl PipelineStage for ChatGenerateRequestBuildingStage {
 
     fn name(&self) -> &'static str {
         "ChatGenerateRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        format!(
+            "ChatGenerateRequestBuildingStage({}, {})",
+            self.chat_stage.signature(),
+            self.generate_stage.signature()
+        )
     }
 }

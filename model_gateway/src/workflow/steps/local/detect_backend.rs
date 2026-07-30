@@ -1,8 +1,8 @@
 //! Backend runtime detection step.
 //!
-//! Detects the runtime type (sglang, vllm, trtllm, mlx) for both HTTP and gRPC workers.
+//! Detects the runtime type (sglang, vllm, trtllm, tokenspeed, mlx) for both HTTP and gRPC workers.
 //! - HTTP: probes `/v1/models` (owned_by field), falls back to unique endpoints.
-//! - gRPC: tries sglang → vllm → trtllm → mlx health checks sequentially.
+//! - gRPC: tries sglang → vllm → trtllm → tokenspeed → mlx health checks sequentially.
 
 use std::time::Duration;
 
@@ -44,7 +44,7 @@ async fn detect_grpc_backend(
     }
 
     // Try each runtime sequentially (most common first), skipping the hint we already tried
-    for runtime in &["sglang", "vllm", "trtllm", "mlx"] {
+    for runtime in &["sglang", "vllm", "trtllm", "tokenspeed", "mlx"] {
         if Some(*runtime) == runtime_hint {
             continue;
         }
@@ -57,7 +57,7 @@ async fn detect_grpc_backend(
     }
 
     Err(format!(
-        "gRPC backend detection failed for {url} (tried sglang, vllm, trtllm, mlx)"
+        "gRPC backend detection failed for {url} (tried sglang, vllm, trtllm, tokenspeed, mlx)"
     ))
 }
 
@@ -103,7 +103,7 @@ async fn detect_via_models_endpoint(
         .ok_or_else(|| format!("/v1/models returned empty data array from {models_url}"))?;
 
     match first_model.owned_by.as_deref() {
-        Some("sglang") => Ok("sglang".to_string()),
+        Some("sglang" | "nvidia") => Ok("sglang".to_string()),
         Some("vllm") => Ok("vllm".to_string()),
         other => Err(format!("Unrecognized owned_by value: {other:?}")),
     }
@@ -297,5 +297,49 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{routing::get, Json, Router};
+    use reqwest::Client;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::detect_via_models_endpoint;
+
+    #[tokio::test]
+    async fn detect_via_models_endpoint_maps_nvidia_to_sglang() {
+        async fn models() -> Json<serde_json::Value> {
+            Json(json!({
+                "data": [{
+                    "id": "test-model",
+                    "object": "model",
+                    "owned_by": "nvidia"
+                }],
+                "object": "list"
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only mock /v1/models server; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/models", get(models)))
+                .await
+                .unwrap();
+        });
+
+        let runtime =
+            detect_via_models_endpoint(&format!("http://{addr}"), 5, &Client::new(), None)
+                .await
+                .unwrap();
+        server.abort();
+
+        assert_eq!(runtime, "sglang");
     }
 }

@@ -11,7 +11,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::ConnectionMode,
+    worker::{sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, http_base_url},
@@ -50,6 +50,11 @@ pub struct ServerInfo {
     pub is_embedding: Option<bool>,
     pub context_length: Option<usize>,
     pub max_total_tokens: Option<usize>,
+    /// Per-instance concurrency cap. CLI flag `--max-running-requests` on SGLang.
+    /// Already extracted by the SGLang gRPC label pipeline; surfacing it here
+    /// closes the HTTP-only path so capacity-aware consumers (e.g. WorkerCapacity)
+    /// see the same label regardless of transport.
+    pub max_running_requests: Option<usize>,
     pub weight_version: Option<String>,
 }
 
@@ -182,10 +187,21 @@ async fn fetch_sglang_http_metadata(url: &str, api_key: Option<&str>) -> HashMap
         labels.extend(flat_labels(&info));
     }
 
-    // /v1/models gives us max_model_len (fills context_length when /server_info returns null)
+    // /v1/models gives us model identity and max_model_len when a compatible
+    // local frontend does not expose the SGLang-specific metadata endpoints.
     if let Ok(models) = http_get_json::<ModelsResponse>(&format!("{base}/v1/models"), api_key).await
     {
         if let Some(m) = models.data.first() {
+            if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
+                labels
+                    .entry("served_model_name".to_string())
+                    .or_insert_with(|| id.clone());
+            }
+            if let Some(root) = m.root.as_ref().filter(|root| !root.is_empty()) {
+                labels
+                    .entry("model_path".to_string())
+                    .or_insert_with(|| root.clone());
+            }
             if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
                 labels
                     .entry("max_model_len".to_string())
@@ -258,6 +274,7 @@ fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
         ("tensor_parallel_size", "tp_size"),
         ("pipeline_parallel_size", "pp_size"),
         ("context_parallel_size", "cp_size"),
+        ("data_parallel_size", "dp_size"),
     ] {
         if let Some(val) = labels.remove(from) {
             labels.entry(to.to_string()).or_insert(val);
@@ -271,6 +288,29 @@ fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
         "server_type",
     ] {
         labels.remove(key);
+    }
+    normalize_default_sampling_params_label(labels);
+}
+
+fn normalize_default_sampling_params_label(labels: &mut HashMap<String, String>) {
+    let Some(raw) = labels.get(DEFAULT_SAMPLING_PARAMS_LABEL).cloned() else {
+        return;
+    };
+
+    match SamplingDefaults::canonical_json_from_str(&raw) {
+        Ok(Some(canonical)) => {
+            labels.insert(DEFAULT_SAMPLING_PARAMS_LABEL.to_string(), canonical);
+        }
+        Ok(None) => {
+            labels.remove(DEFAULT_SAMPLING_PARAMS_LABEL);
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Ignoring invalid default sampling params label"
+            );
+            labels.remove(DEFAULT_SAMPLING_PARAMS_LABEL);
+        }
     }
 }
 
@@ -407,5 +447,89 @@ mod tests {
             .expect("grpc metadata");
         dump_labels("vLLM gRPC", &labels);
         assert!(!labels.is_empty());
+    }
+
+    #[test]
+    fn test_sglang_server_info_surfaces_max_running_requests_label() {
+        // Subset of an actual SGLang /server_info response. The full payload has
+        // many more fields; `serde(deny_unknown_fields)` is off by default so
+        // they're silently ignored.
+        let body = serde_json::json!({
+            "model_path": "Qwen/Qwen3-8B",
+            "tp_size": 1,
+            "dp_size": 1,
+            "max_running_requests": 256,
+            "context_length": 32768,
+        });
+        let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
+        assert_eq!(info.max_running_requests, Some(256));
+
+        let labels = flat_labels(&info);
+        assert_eq!(
+            labels.get("max_running_requests").map(String::as_str),
+            Some("256")
+        );
+    }
+
+    #[test]
+    fn test_sglang_server_info_max_running_requests_optional() {
+        // Older SGLang versions or special configurations may omit the field.
+        let body = serde_json::json!({
+            "model_path": "Qwen/Qwen3-8B",
+            "tp_size": 1,
+        });
+        let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
+        assert_eq!(info.max_running_requests, None);
+
+        let labels = flat_labels(&info);
+        assert!(!labels.contains_key("max_running_requests"));
+    }
+
+    #[tokio::test]
+    async fn test_sglang_http_metadata_uses_models_identity() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        async fn models() -> Json<serde_json::Value> {
+            Json(json!({
+                "data": [{
+                    "id": "test-model",
+                    "max_model_len": 4096,
+                    "object": "model",
+                    "owned_by": "nvidia",
+                    "root": "test-root"
+                }],
+                "object": "list"
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only mock /v1/models server; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/models", get(models)))
+                .await
+                .unwrap();
+        });
+
+        let labels = fetch_sglang_http_metadata(&format!("http://{addr}"), None).await;
+        server.abort();
+
+        assert_eq!(
+            labels.get("served_model_name").map(String::as_str),
+            Some("test-model")
+        );
+        assert_eq!(
+            labels.get("model_path").map(String::as_str),
+            Some("test-root")
+        );
+        assert_eq!(
+            labels.get("max_model_len").map(String::as_str),
+            Some("4096")
+        );
     }
 }

@@ -21,10 +21,10 @@ use std::ops::Deref;
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase};
+use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::vision::{
-    image_processor::{ImagePreProcessor, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
+    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::TransformError,
 };
 
@@ -84,6 +84,9 @@ impl Qwen2VLProcessor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 min_pixels: DEFAULT_MIN_PIXELS,
                 max_pixels: DEFAULT_MAX_PIXELS,
+                video_min_pixels: DEFAULT_MIN_PIXELS,
+                video_max_pixels: DEFAULT_MAX_PIXELS,
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -106,6 +109,9 @@ impl Qwen2VLProcessor {
                 merge_size,
                 min_pixels,
                 max_pixels,
+                video_min_pixels: min_pixels,
+                video_max_pixels: max_pixels,
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -122,6 +128,9 @@ impl Qwen2VLProcessor {
                 merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
                 min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
                 max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                video_min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
+                video_max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size: config
                     .temporal_patch_size
                     .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
@@ -129,6 +138,16 @@ impl Qwen2VLProcessor {
                 std: CLIP_STD,
                 model_name: "qwen2-vl",
             }),
+        }
+    }
+
+    /// Build the effective processor for a request, applying any structural
+    /// overrides from `config`; otherwise reuse the existing defaults.
+    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
+        if config.has_structural_overrides() {
+            Self::from_preprocessor_config(config)
+        } else {
+            self.clone()
         }
     }
 
@@ -197,7 +216,7 @@ impl Deref for Qwen2VLProcessor {
     }
 }
 
-impl ImagePreProcessor for Qwen2VLProcessor {
+impl VisionPreProcessor for Qwen2VLProcessor {
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -210,12 +229,14 @@ impl ImagePreProcessor for Qwen2VLProcessor {
         &self,
         images: &[DynamicImage],
         config: &PreProcessorConfig,
-    ) -> Result<PreprocessedImages, TransformError> {
-        self.inner.preprocess(images, config)
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        let processor = self.with_preprocessor_config(config);
+        processor.inner.preprocess(images, config)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.inner.calculate_num_tokens(width, height, config)
+        let processor = self.with_preprocessor_config(config);
+        processor.inner.calculate_num_tokens(width, height, config)
     }
 
     fn model_name(&self) -> &'static str {
@@ -232,7 +253,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::vision::{image_processor::ModelSpecificValue, preprocessor_config::PatchSize};
+    use crate::vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue};
 
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
@@ -366,12 +387,12 @@ mod tests {
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
         let result = processor.preprocess(&[image], &config).unwrap();
 
-        // pixel_values is patchified: [total_patches, patch_features]
-        assert_eq!(result.pixel_values.ndim(), 2);
-        assert!(result.pixel_values.shape()[0] > 0); // total_patches > 0
+        // encoder_input is patchified: [total_patches, patch_features]
+        assert_eq!(result.encoder_input.ndim(), 2);
+        assert!(result.encoder_input.shape()[0] > 0); // total_patches > 0
 
         // Check pixel values are normalized
-        let flat = result.pixel_values_flat();
+        let flat = result.encoder_input_flat();
         // After normalization with CLIP mean/std, gray (0.5) should be near 0
         // (0.5 - 0.48) / 0.27 ≈ 0.07
         assert!(flat.iter().all(|&v| v.abs() < 1.0)); // Should be normalized
@@ -381,7 +402,7 @@ mod tests {
         assert!(result.model_specific.contains_key("patches_per_image"));
 
         // Verify token count is reasonable
-        assert!(result.num_img_tokens[0] > 0);
+        assert!(result.feature_token_counts[0] > 0);
     }
 
     #[test]
@@ -397,11 +418,11 @@ mod tests {
         let result = processor.preprocess(&images, &config).unwrap();
 
         // Both images processed
-        assert_eq!(result.image_sizes.len(), 2);
-        assert_eq!(result.num_img_tokens.len(), 2);
+        assert_eq!(result.item_sizes.len(), 2);
+        assert_eq!(result.feature_token_counts.len(), 2);
 
-        // pixel_values is 2D [total_patches, patch_features]
-        assert_eq!(result.pixel_values.ndim(), 2);
+        // encoder_input is 2D [total_patches, patch_features]
+        assert_eq!(result.encoder_input.ndim(), 2);
 
         // Check grid_thw shape
         if let Some(ModelSpecificValue::IntTensor { data, shape }) =
@@ -420,7 +441,7 @@ mod tests {
             assert_eq!(shape, &[2]); // 2 images
             assert_eq!(data.len(), 2);
             let total: i64 = data.iter().sum();
-            assert_eq!(total as usize, result.pixel_values.shape()[0]);
+            assert_eq!(total as usize, result.encoder_input.shape()[0]);
         } else {
             panic!("Expected patches_per_image to be IntTensor");
         }
@@ -447,6 +468,50 @@ mod tests {
         assert_eq!(processor.min_pixels(), 100000);
         assert_eq!(processor.max_pixels(), 500000);
         assert_eq!(processor.temporal_patch_size(), 4);
+    }
+
+    #[test]
+    fn test_calculate_num_tokens_honors_config_max_pixels() {
+        let processor = Qwen2VLProcessor::new();
+
+        // A 1400x1400 image clamps to max_pixels before the grid is computed,
+        // so a lower config max_pixels must yield fewer tokens.
+        let default_tokens =
+            processor.calculate_num_tokens(1400, 1400, &PreProcessorConfig::default());
+        assert_eq!(default_tokens, 1225); // resized to 980x980 -> (70*70)/4
+
+        let config = PreProcessorConfig {
+            max_pixels: Some(512 * 28 * 28), // 401,408, below the 1,003,520 default
+            ..Default::default()
+        };
+        let config_tokens = processor.calculate_num_tokens(1400, 1400, &config);
+        assert_eq!(config_tokens, 484); // resized to 616x616 -> (44*44)/4
+        assert_ne!(
+            config_tokens, default_tokens,
+            "config max_pixels override must change the token count"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_honors_config_max_pixels() {
+        let processor = Qwen2VLProcessor::new();
+        let image = create_test_image(1400, 1400, Rgb([128, 128, 128]));
+
+        let config = PreProcessorConfig {
+            max_pixels: Some(512 * 28 * 28),
+            ..Default::default()
+        };
+        let result = processor.preprocess(&[image], &config).unwrap();
+
+        // 616x616 -> grid (1, 44, 44) -> (44*44)/4 = 484 tokens, vs 1225 at the default.
+        assert_eq!(result.feature_token_counts[0], 484);
+        if let Some(ModelSpecificValue::IntTensor { data, .. }) =
+            result.model_specific.get("image_grid_thw")
+        {
+            assert_eq!(data, &[1, 44, 44]);
+        } else {
+            panic!("Expected image_grid_thw to be IntTensor");
+        }
     }
 
     #[test]

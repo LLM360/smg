@@ -49,77 +49,100 @@ impl ChatPreparationStage {
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
-        // Resolve multimodal context once: placeholder token, model_id, tokenizer_source.
-        // The placeholder is passed to process_chat_messages so that string-format chat
-        // templates insert it per image instead of stripping image parts.  The remaining
-        // fields are reused by process_multimodal to avoid duplicate lookups.
-        let is_multimodal = multimodal::has_multimodal_content(&request.messages);
-        let (image_placeholder, mm_context) = if is_multimodal {
-            if let Some(mm_components) = ctx.components.multimodal.as_ref() {
-                let model_id = ctx.input.model_id.as_str();
-                let tokenizer_source = ctx
-                    .components
-                    .tokenizer_registry
-                    .get_by_name(model_id)
-                    .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id))
-                    .map(|e| e.source)
-                    .unwrap_or_default();
-
-                if tokenizer_source.is_empty() {
-                    error!(
-                        function = "ChatPreparationStage::execute",
-                        model = %model_id,
-                        "Tokenizer source path not found for multimodal processing"
-                    );
-                    return Err(error::bad_request(
-                        "multimodal_config_missing",
-                        format!("Tokenizer source path not found for model: {model_id}"),
-                    ));
-                }
-
-                let placeholder = multimodal::resolve_placeholder_token(
+        // Resolve media-part ordering from the model registry so it stays owned
+        // by the per-model spec. Falls back to vLLM-compatible media-first when
+        // the model has no multimodal components or matches no spec.
+        let model_id = ctx.input.model_id.as_str();
+        let tokenizer_entry = ctx
+            .components
+            .tokenizer_registry
+            .get_by_name(model_id)
+            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+        let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
+            (Some(mm_components), Some(entry)) => {
+                multimodal::resolve_media_part_order(
                     model_id,
                     &*tokenizer,
                     mm_components,
-                    &tokenizer_source,
+                    &entry.id,
+                    &entry.source,
                 )
                 .await
-                .map_err(|e| {
+            }
+            _ => llm_multimodal::MediaPartOrder::MediaFirst,
+        };
+
+        // Normalize media once. The same plan drives placeholder resolution,
+        // rendering, fetching, preprocessing, and final count validation.
+        let media_plan = multimodal::media_plan_chat(&request.messages);
+        let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
+            (None, None)
+        } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
+            let model_id = ctx.input.model_id.as_str();
+            let (tokenizer_id, tokenizer_source) = match tokenizer_entry {
+                Some(e) => (e.id, e.source),
+                None => {
                     error!(
                         function = "ChatPreparationStage::execute",
                         model = %model_id,
-                        error = %e,
-                        "Failed to resolve multimodal placeholder token"
+                        "Tokenizer entry not found for multimodal processing"
                     );
-                    error::internal_error(
-                        "multimodal_placeholder_resolution_failed",
-                        format!("Failed to resolve multimodal placeholder token: {e}"),
-                    )
-                })?;
+                    return Err(error::bad_request(
+                        "multimodal_config_missing",
+                        format!("Tokenizer not found for model: {model_id}"),
+                    ));
+                }
+            };
 
-                (
-                    placeholder,
-                    Some((mm_components, model_id, tokenizer_source)),
-                )
-            } else {
+            let placeholders = multimodal::prepare_placeholder_tokens(
+                &media_plan,
+                model_id,
+                &*tokenizer,
+                mm_components,
+                &tokenizer_id,
+                &tokenizer_source,
+            )
+            .await
+            .map_err(|e| {
                 error!(
                     function = "ChatPreparationStage::execute",
-                    "Multimodal content detected but multimodal components not initialized"
+                    model = %model_id,
+                    error = %e,
+                    "Failed to prepare multimodal prompt plan"
                 );
-                return Err(error::bad_request(
-                    "multimodal_not_supported",
-                    "Multimodal content detected but multimodal processing is not available",
-                ));
-            }
+                error::bad_request(
+                    "invalid_multimodal_request",
+                    format!("Invalid multimodal request: {e}"),
+                )
+            })?;
+
+            (
+                Some(placeholders),
+                Some((
+                    mm_components,
+                    model_id,
+                    tokenizer_id,
+                    tokenizer_source,
+                    media_plan,
+                )),
+            )
         } else {
-            (None, None)
+            error!(
+                function = "ChatPreparationStage::execute",
+                "Multimodal content detected but multimodal components not initialized"
+            );
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                "Multimodal content detected but multimodal processing is not available",
+            ));
         };
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages(
+        let processed_messages = match utils::process_chat_messages_with_placeholders(
             &body_ref,
             &*tokenizer,
-            image_placeholder.as_deref(),
+            placeholder_tokens.as_ref(),
+            media_order,
         ) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -129,7 +152,13 @@ impl ChatPreparationStage {
         };
 
         // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
-        let encoding = match tokenizer.encode(&processed_messages.text, false) {
+        let encoding = match utils::encode_blocking(
+            tokenizer.clone(),
+            processed_messages.text.clone(),
+            false,
+        )
+        .await
+        {
             Ok(encoding) => encoding,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
@@ -142,15 +171,37 @@ impl ChatPreparationStage {
 
         let mut token_ids = encoding.token_ids().to_vec();
 
+        if let (Some(placeholders), Some((_, _, _, _, media_plan))) =
+            (placeholder_tokens.as_ref(), mm_context.as_ref())
+        {
+            multimodal::validate_rendered_media_anchors(
+                media_plan,
+                placeholders,
+                &*tokenizer,
+                &token_ids,
+            )
+            .map_err(|error| {
+                error!(
+                    function = "ChatPreparationStage::execute",
+                    %error,
+                    "Rendered multimodal anchors do not match request media"
+                );
+                error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
+            })?;
+        }
+
         // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
-        if let Some((mm_components, model_id, tokenizer_source)) = mm_context {
-            match multimodal::process_multimodal(
-                &request.messages,
+        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
+            mm_context
+        {
+            match multimodal::process_multimodal_plan(
+                media_plan,
                 model_id,
                 &*tokenizer,
                 token_ids,
                 mm_components,
+                &tokenizer_id,
                 &tokenizer_source,
             )
             .await
@@ -203,20 +254,32 @@ impl ChatPreparationStage {
             None
         };
 
-        // Derive skip_special_tokens from constraint type:
+        let preserve_reasoning_special_tokens = request.separate_reasoning
+            && utils::reasoning_parser_requires_special_tokens(
+                &ctx.components.reasoning_parser_factory,
+                ctx.components.configured_reasoning_parser.as_deref(),
+                &request.model,
+            );
+
+        // Derive skip_special_tokens from parser and constraint type:
+        // - typed reasoning parsers need their control tokens preserved
         // - json_schema: backend forces JSON, no trigger tokens to preserve
         // - structural_tag or no constraint (auto): parser needs trigger tokens
-        let skip_special_tokens = match &tool_call_constraint {
-            Some(c) if c.is_json_schema() => request.skip_special_tokens,
-            _ if request.tools.is_some()
-                && !matches!(
-                    request.tool_choice,
-                    Some(ToolChoice::Value(ToolChoiceValue::None))
-                ) =>
-            {
-                false
+        let skip_special_tokens = if preserve_reasoning_special_tokens {
+            false
+        } else {
+            match &tool_call_constraint {
+                Some(c) if c.is_json_schema() => request.skip_special_tokens,
+                _ if request.tools.is_some()
+                    && !matches!(
+                        request.tool_choice,
+                        Some(ToolChoice::Value(ToolChoiceValue::None))
+                    ) =>
+                {
+                    false
+                }
+                _ => request.skip_special_tokens,
             }
-            _ => request.skip_special_tokens,
         };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
@@ -229,10 +292,8 @@ impl ChatPreparationStage {
             request.ignore_eos,
         );
 
-        let mut processed_messages = processed_messages;
-        processed_messages.multimodal_intermediate = multimodal_intermediate;
-
-        // Store results in context
+        // Store results in context.
+        ctx.state.multimodal_intermediate = multimodal_intermediate;
         ctx.state.preparation = Some(PreparationOutput::Chat {
             token_ids,
             processed_messages,

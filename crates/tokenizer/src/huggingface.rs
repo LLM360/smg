@@ -1,9 +1,19 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{Error, Result};
+use serde::Deserialize;
 use tokenizers::{
+    models::bpe::BPE,
+    normalizers::unicode::NFC,
+    pre_tokenizers::{
+        byte_level::ByteLevel,
+        sequence::Sequence,
+        split::{Split, SplitPattern},
+        PreTokenizerWrapper,
+    },
     processors::template::TemplateProcessing,
-    tokenizer::{step_decode_stream, Tokenizer as HfTokenizer},
+    tokenizer::{step_decode_stream, SplitDelimiterBehavior, Tokenizer as HfTokenizer},
+    AddedToken,
 };
 use tracing::debug;
 
@@ -12,8 +22,16 @@ use crate::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
+    encoders::{deepseek_v32, deepseek_v4},
     traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait},
 };
+
+#[derive(Debug, Clone, Copy)]
+enum Renderer {
+    Jinja,
+    DeepseekV32,
+    DeepseekV4,
+}
 
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
@@ -24,13 +42,31 @@ pub struct HuggingFaceTokenizer {
     chat_template: ChatTemplateState,
     /// EOS token IDs from config.json + generation_config.json
     eos_token_ids: Vec<TokenIdType>,
+    /// Which renderer applies chat templates for this model.
+    renderer: Renderer,
+}
+
+const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+#[derive(Deserialize)]
+struct AddedTokenConfig {
+    content: String,
+    #[serde(default)]
+    single_word: bool,
+    #[serde(default)]
+    lstrip: bool,
+    #[serde(default)]
+    rstrip: bool,
+    normalized: Option<bool>,
+    #[serde(default)]
+    special: bool,
 }
 
 impl HuggingFaceTokenizer {
     /// Create a tokenizer from a HuggingFace tokenizer JSON file
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
-        let path = std::path::Path::new(file_path);
+        let path = Path::new(file_path);
         let chat_template_path = path
             .parent()
             .and_then(crate::factory::discover_chat_template_in_dir);
@@ -42,9 +78,150 @@ impl HuggingFaceTokenizer {
         file_path: &str,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
-        let mut tokenizer = HfTokenizer::from_file(file_path)
+        let tokenizer = HfTokenizer::from_file(file_path)
             .map_err(|e| Error::msg(format!("Failed to load tokenizer: {e}")))?;
+        Self::from_built_tokenizer(tokenizer, Path::new(file_path), chat_template_path)
+    }
 
+    /// Create a Qwen2-compatible byte-level BPE tokenizer from a Hugging Face
+    /// directory containing `vocab.json`, `merges.txt`, and
+    /// `tokenizer_config.json` but no `tokenizer.json`.
+    pub fn from_vocab_and_merges_dir(dir: &Path) -> Result<Self> {
+        let chat_template_path = crate::factory::discover_chat_template_in_dir(dir);
+        Self::from_vocab_and_merges_dir_with_chat_template(dir, chat_template_path.as_deref())
+    }
+
+    /// Create a Qwen2-compatible byte-level BPE tokenizer with an optional
+    /// explicit chat template.
+    pub fn from_vocab_and_merges_dir_with_chat_template(
+        dir: &Path,
+        chat_template_path: Option<&str>,
+    ) -> Result<Self> {
+        let tokenizer = Self::build_qwen2_bpe_tokenizer(dir)?;
+        // Shared initialization only needs this path to locate sibling config
+        // files. The file itself intentionally does not exist in this layout.
+        let logical_tokenizer_path = dir.join("tokenizer.json");
+        Self::from_built_tokenizer(tokenizer, &logical_tokenizer_path, chat_template_path)
+    }
+
+    fn build_qwen2_bpe_tokenizer(dir: &Path) -> Result<HfTokenizer> {
+        let vocab_path = dir.join("vocab.json");
+        let merges_path = dir.join("merges.txt");
+        let config_path = dir.join("tokenizer_config.json");
+
+        let config_content = std::fs::read_to_string(&config_path).map_err(|error| {
+            Error::msg(format!("Failed to read {}: {error}", config_path.display()))
+        })?;
+        let config: serde_json::Value = serde_json::from_str(&config_content).map_err(|error| {
+            Error::msg(format!(
+                "Failed to parse {}: {error}",
+                config_path.display()
+            ))
+        })?;
+        let tokenizer_class = config
+            .get("tokenizer_class")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "{} is missing tokenizer_class; cannot infer vocab.json + merges.txt semantics",
+                    config_path.display()
+                ))
+            })?;
+        if !matches!(tokenizer_class, "Qwen2Tokenizer" | "Qwen2TokenizerFast") {
+            return Err(Error::msg(format!(
+                "Unsupported vocab.json + merges.txt tokenizer_class '{tokenizer_class}' in {}",
+                config_path.display()
+            )));
+        }
+
+        let vocab_path_str = vocab_path.to_str().ok_or_else(|| {
+            Error::msg(format!("Tokenizer path is not valid UTF-8: {vocab_path:?}"))
+        })?;
+        let merges_path_str = merges_path.to_str().ok_or_else(|| {
+            Error::msg(format!(
+                "Tokenizer path is not valid UTF-8: {merges_path:?}"
+            ))
+        })?;
+        let bpe = BPE::builder()
+            .files(vocab_path_str.to_string(), merges_path_str.to_string())
+            .build()
+            .map_err(|error| Error::msg(format!("Failed to build Qwen2 BPE model: {error}")))?;
+        let mut tokenizer = HfTokenizer::new(bpe);
+
+        tokenizer
+            .with_normalizer(Some(NFC))
+            .map_err(|error| Error::msg(format!("Failed to configure NFC normalizer: {error}")))?;
+        let split = Split::new(
+            SplitPattern::Regex(QWEN2_PRETOKENIZE_REGEX.to_string()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|error| Error::msg(format!("Failed to build Qwen2 pre-tokenizer: {error}")))?;
+        let add_prefix_space = config
+            .get("add_prefix_space")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let byte_level = ByteLevel::default()
+            .add_prefix_space(add_prefix_space)
+            .use_regex(false);
+        tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
+            PreTokenizerWrapper::Split(split),
+            PreTokenizerWrapper::ByteLevel(byte_level),
+        ])));
+        tokenizer.with_decoder(Some(ByteLevel::default()));
+        tokenizer.with_post_processor(Some(ByteLevel::default().trim_offsets(false)));
+
+        let mut added_tokens = Vec::new();
+        if let Some(decoder) = config
+            .get("added_tokens_decoder")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (raw_id, raw_token) in decoder {
+                let id = raw_id.parse::<u32>().map_err(|error| {
+                    Error::msg(format!(
+                        "Invalid added token ID '{raw_id}' in {}: {error}",
+                        config_path.display()
+                    ))
+                })?;
+                let entry: AddedTokenConfig =
+                    serde_json::from_value(raw_token.clone()).map_err(|error| {
+                        Error::msg(format!(
+                            "Invalid added token {raw_id} in {}: {error}",
+                            config_path.display()
+                        ))
+                    })?;
+                let normalized = entry.normalized.unwrap_or(!entry.special);
+                let token = AddedToken::from(entry.content, entry.special)
+                    .single_word(entry.single_word)
+                    .lstrip(entry.lstrip)
+                    .rstrip(entry.rstrip)
+                    .normalized(normalized);
+                added_tokens.push((id, token));
+            }
+        }
+        added_tokens.sort_unstable_by_key(|(id, _)| *id);
+
+        tokenizer
+            .add_tokens(added_tokens.iter().map(|(_, token)| token.clone()))
+            .map_err(|error| Error::msg(format!("Failed to add configured tokens: {error}")))?;
+        for (expected_id, token) in &added_tokens {
+            let actual_id = tokenizer.token_to_id(&token.content);
+            if actual_id != Some(*expected_id) {
+                return Err(Error::msg(format!(
+                    "Added token '{}' expected ID {expected_id}, got {actual_id:?}; non-contiguous explicit added-token IDs are unsupported",
+                    token.content
+                )));
+            }
+        }
+
+        Ok(tokenizer)
+    }
+
+    fn from_built_tokenizer(
+        mut tokenizer: HfTokenizer,
+        tokenizer_path: &Path,
+        chat_template_path: Option<&str>,
+    ) -> Result<Self> {
         // Build vocab mappings (include special tokens to get added_tokens like <|im_start|>)
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
@@ -53,7 +230,7 @@ impl HuggingFaceTokenizer {
             .collect();
 
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
-        let config_result = Self::load_chat_template_and_config(file_path);
+        let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         let mut chat_template_str = config_result.chat_template;
         let add_bos_token = config_result.add_bos_token;
         let add_eos_token = config_result.add_eos_token;
@@ -85,10 +262,16 @@ impl HuggingFaceTokenizer {
         }
 
         // Load merged EOS token IDs from config.json + generation_config.json
-        let eos_token_ids = std::path::Path::new(file_path)
+        let eos_token_ids = tokenizer_path
             .parent()
             .map(crate::eos::load_eos_token_ids)
             .unwrap_or_default();
+
+        // Detect a custom Python-encoder model from config.json::architectures.
+        let renderer = tokenizer_path
+            .parent()
+            .map(detect_renderer_from_config)
+            .unwrap_or(Renderer::Jinja);
 
         Ok(HuggingFaceTokenizer {
             tokenizer,
@@ -97,6 +280,7 @@ impl HuggingFaceTokenizer {
             reverse_vocab,
             chat_template: ChatTemplateState::new(chat_template_str)?,
             eos_token_ids,
+            renderer,
         })
     }
 
@@ -164,6 +348,7 @@ impl HuggingFaceTokenizer {
             reverse_vocab,
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
+            renderer: Renderer::Jinja,
         }
     }
 
@@ -225,7 +410,7 @@ impl HuggingFaceTokenizer {
     /// Reads the file once and extracts everything needed by the tokenizer constructor.
     fn load_chat_template_and_config(tokenizer_path: &str) -> TokenizerConfigResult {
         (|| {
-            let path = std::path::Path::new(tokenizer_path);
+            let path = Path::new(tokenizer_path);
             let config_path = path.parent()?.join("tokenizer_config.json");
 
             if !config_path.exists() {
@@ -372,15 +557,21 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        // Inject special tokens if the caller didn't provide them
-        if params.special_tokens.is_some() {
-            return self.chat_template.apply(messages, params);
+        match self.renderer {
+            Renderer::Jinja => {
+                // Inject special tokens if the caller didn't provide them.
+                if params.special_tokens.is_some() {
+                    return self.chat_template.apply(messages, params);
+                }
+                let params = ChatTemplateParams {
+                    special_tokens: Some(&self.special_tokens),
+                    ..params
+                };
+                self.chat_template.apply(messages, params)
+            }
+            Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
+            Renderer::DeepseekV4 => apply_deepseek_v4(messages, &params),
         }
-        let params = ChatTemplateParams {
-            special_tokens: Some(&self.special_tokens),
-            ..params
-        };
-        self.chat_template.apply(messages, params)
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
@@ -388,17 +579,234 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
-        self.chat_template.thinking_toggle()
+        match self.renderer {
+            // DeepSeek V3.2 and V4 encoders gate thinking on the `thinking`
+            // kwarg, default off. The Jinja processor has no knowledge of
+            // the native encoder so we must report it directly.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4 => ThinkingToggle::DefaultOff,
+            Renderer::Jinja => self.chat_template.thinking_toggle(),
+        }
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
-        self.chat_template.thinking_key_name()
+        match self.renderer {
+            Renderer::DeepseekV32 | Renderer::DeepseekV4 => Some(ThinkingKeyName::Thinking),
+            Renderer::Jinja => self.chat_template.thinking_key_name(),
+        }
     }
     fn think_in_prefill(&self) -> bool {
-        self.chat_template.think_in_prefill()
+        match self.renderer {
+            // Both encoders emit `<｜Assistant｜><think>` at the end of the
+            // prompt when thinking mode is on; the completion therefore starts
+            // mid-reasoning and the parser must be told so.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4 => true,
+            Renderer::Jinja => self.chat_template.think_in_prefill(),
+        }
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {
         self.chat_template.set(template)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Renderer detection (config.json::architectures)
+// ---------------------------------------------------------------------------
+/// Inspect the sibling `config.json` to decide which chat-template renderer to
+/// use. A missing or malformed file falls back to [`Renderer::Jinja`] without
+/// erroring (debug-logged), preserving backward compatibility for every model
+/// not in the architecture list.
+fn detect_renderer_from_config(dir: &Path) -> Renderer {
+    let path = dir.join("config.json");
+    if !path.exists() {
+        return Renderer::Jinja;
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(err) => {
+            debug!(?err, ?path, "config.json unreadable; using Jinja renderer");
+            return Renderer::Jinja;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(err) => {
+            debug!(?err, ?path, "config.json malformed; using Jinja renderer");
+            return Renderer::Jinja;
+        }
+    };
+    let architectures = value.get("architectures").and_then(|v| v.as_array());
+    let arch_strs: Vec<&str> = architectures
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if arch_strs.contains(&"DeepseekV32ForCausalLM") {
+        debug!(?path, "selected DeepseekV32 chat-template renderer");
+        return Renderer::DeepseekV32;
+    }
+    if arch_strs.contains(&"DeepseekV4ForCausalLM") {
+        debug!(?path, "selected DeepseekV4 chat-template renderer");
+        return Renderer::DeepseekV4;
+    }
+    Renderer::Jinja
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek V3.2 / V4 dispatch shims
+// ---------------------------------------------------------------------------
+/// Derive the V3.2 / V4 thinking mode. These native encoders bypass
+/// `ChatTemplateState::apply`, so this is where the resolved thinking preference
+/// is consumed. An explicit `template_kwargs["thinking"]` wins; otherwise fall
+/// back to `params.thinking` (resolved from `reasoning_effort` / Anthropic
+/// `ThinkingConfig`) — same precedence as the Jinja path. Default off, matching
+/// the `ThinkingKeyName::Thinking` / `DefaultOff` contract reported here.
+fn derive_thinking_mode(params: &ChatTemplateParams) -> deepseek_v32::ThinkingMode {
+    let enabled = params
+        .template_kwargs
+        .and_then(|k| k.get("thinking"))
+        .and_then(serde_json::Value::as_bool)
+        .or(params.thinking)
+        .unwrap_or(false);
+    if enabled {
+        deepseek_v32::ThinkingMode::Thinking
+    } else {
+        deepseek_v32::ThinkingMode::Chat
+    }
+}
+
+/// Per DeepSeek's encoding README, preserve all reasoning when a system or
+/// developer message declares `tools`; otherwise drop earlier reasoning.
+fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
+    !messages.iter().any(|m| {
+        let role = m.get("role").and_then(|r| r.as_str());
+        matches!(role, Some("system" | "developer"))
+            && m.get("tools")
+                .and_then(|t| t.as_array())
+                .is_some_and(|arr| !arr.is_empty())
+    })
+}
+/// Attach `tools` to a leading system/developer message so the V3.2/V4
+/// encoder can render the tools block. Mirrors the wrapper step in
+/// vllm's `vllm/tokenizers/deepseek_v32.py` and sglang's V4 serving path.
+/// Returns `None` when no rewrite is needed so callers can pass the input
+/// slice directly in the common path.
+fn inject_tools_into_messages(
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+) -> Option<Vec<serde_json::Value>> {
+    let tools = tools?;
+    if tools.is_empty() {
+        return None;
+    }
+    let mut owned: Vec<serde_json::Value> = messages.to_vec();
+    let first_role = owned
+        .first()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str());
+    if !matches!(first_role, Some("system" | "developer")) {
+        owned.insert(0, serde_json::json!({ "role": "system", "content": "" }));
+    }
+    if let Some(obj) = owned[0].as_object_mut() {
+        obj.insert("tools".into(), serde_json::Value::Array(tools.to_vec()));
+    }
+    Some(owned)
+}
+
+fn apply_deepseek_v32(
+    messages: &[serde_json::Value],
+    params: &ChatTemplateParams,
+) -> Result<String> {
+    let owned = inject_tools_into_messages(messages, params.tools);
+    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
+    let thinking_mode = derive_thinking_mode(params);
+    let encode_params = deepseek_v32::EncodeParams {
+        add_default_bos_token: true,
+        drop_thinking: resolve_drop_thinking(msgs),
+    };
+    deepseek_v32::encode_messages(msgs, thinking_mode, &encode_params)
+        .map_err(|e| Error::msg(format!("DeepSeek V3.2 encode failed: {e}")))
+}
+fn apply_deepseek_v4(
+    messages: &[serde_json::Value],
+    params: &ChatTemplateParams,
+) -> Result<String> {
+    let owned = inject_tools_into_messages(messages, params.tools);
+    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
+    let thinking_mode = derive_thinking_mode(params);
+    let reasoning_effort = params
+        .template_kwargs
+        .and_then(|k| k.get("reasoning_effort"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "max" => Some(deepseek_v4::ReasoningEffort::Max),
+            "high" => Some(deepseek_v4::ReasoningEffort::High),
+            _ => None,
+        });
+    let encode_params = deepseek_v4::EncodeParams {
+        add_default_bos_token: true,
+        drop_thinking: resolve_drop_thinking(msgs),
+        reasoning_effort,
+    };
+    deepseek_v4::encode_messages(msgs, thinking_mode, &encode_params)
+        .map_err(|e| Error::msg(format!("DeepSeek V4 encode failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::derive_thinking_mode;
+    use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+
+    fn thinking_kwargs(value: bool) -> HashMap<String, serde_json::Value> {
+        HashMap::from([("thinking".to_string(), serde_json::Value::Bool(value))])
+    }
+
+    // Regression: DeepSeek V3.2/V4 bypass ChatTemplateState::apply, so the
+    // resolved `params.thinking` (from reasoning_effort / Anthropic ThinkingConfig)
+    // must be honored here — with an explicit `template_kwargs["thinking"]` still
+    // winning. Same precedence as the Jinja path.
+    #[test]
+    fn derive_thinking_mode_honors_params_thinking_and_explicit_override() {
+        // No signal at all -> Chat (default off).
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams::default()),
+            ThinkingMode::Chat
+        ));
+
+        // params.thinking is the fallback when there is no explicit kwarg.
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                thinking: Some(true),
+                ..Default::default()
+            }),
+            ThinkingMode::Thinking
+        ));
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                thinking: Some(false),
+                ..Default::default()
+            }),
+            ThinkingMode::Chat
+        ));
+
+        // An explicit template_kwargs["thinking"] wins over params.thinking.
+        let on = thinking_kwargs(true);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                thinking: Some(false),
+                template_kwargs: Some(&on),
+                ..Default::default()
+            }),
+            ThinkingMode::Thinking
+        ));
+        let off = thinking_kwargs(false);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                thinking: Some(true),
+                template_kwargs: Some(&off),
+                ..Default::default()
+            }),
+            ThinkingMode::Chat
+        ));
     }
 }

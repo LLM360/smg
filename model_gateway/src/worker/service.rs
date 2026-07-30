@@ -16,10 +16,20 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::{
-    config::RouterConfig,
-    worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry},
-    workflow::{Job, JobQueue},
+    config::{validate_worker_url, RouterConfig},
+    worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
+    workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
+
+/// Validate the URL of an incoming worker-management request, translating a
+/// config-layer rejection into `400 Bad Request`. Must run before
+/// `WorkerRegistry::reserve_id_for_url` so rejected input can never leave an
+/// orphaned reservation (#1533).
+fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
+    validate_worker_url(url).map_err(|e| WorkerServiceError::BadRequest {
+        message: e.to_string(),
+    })
+}
 
 /// Error types for worker service operations
 #[derive(Debug)]
@@ -161,7 +171,7 @@ impl IntoResponse for UpdateWorkerResult {
     }
 }
 
-/// Result of listing workers
+/// Result of listing workers.
 #[derive(Debug)]
 pub struct ListWorkersResult {
     pub workers: Vec<WorkerInfo>,
@@ -173,16 +183,31 @@ pub struct ListWorkersResult {
 
 impl IntoResponse for ListWorkersResult {
     fn into_response(self) -> Response {
-        let response = json!({
-            "workers": self.workers,
-            "total": self.total,
-            "stats": {
-                "prefill_count": self.prefill_count,
-                "decode_count": self.decode_count,
-                "regular_count": self.regular_count,
-            }
-        });
-        Json(response).into_response()
+        // Serialize the typed response directly with `Json` (a single
+        // `serde_json::to_vec` pass) instead of building an intermediate
+        // `serde_json::Value` via `json!`.
+        #[derive(serde::Serialize)]
+        struct Body {
+            workers: Vec<WorkerInfo>,
+            total: usize,
+            stats: Stats,
+        }
+        #[derive(serde::Serialize)]
+        struct Stats {
+            prefill_count: usize,
+            decode_count: usize,
+            regular_count: usize,
+        }
+        Json(Body {
+            workers: self.workers,
+            total: self.total,
+            stats: Stats {
+                prefill_count: self.prefill_count,
+                decode_count: self.decode_count,
+                regular_count: self.regular_count,
+            },
+        })
+        .into_response()
     }
 }
 
@@ -241,6 +266,8 @@ impl WorkerService {
         &self,
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
+        validate_worker_url_request(&config.url)?;
+
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
                 "Adding worker {} without API key while router has API key configured. \
@@ -264,6 +291,7 @@ impl WorkerService {
 
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
         };
 
         self.get_job_queue()?
@@ -288,12 +316,27 @@ impl WorkerService {
     ) -> Result<UpdateWorkerResult, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
 
-        let url = self
-            .worker_registry
-            .get_url_by_id(&worker_id)
-            .ok_or_else(|| WorkerServiceError::NotFound {
-                worker_id: worker_id_raw.to_string(),
-            })?;
+        let existing =
+            self.worker_registry
+                .get(&worker_id)
+                .ok_or_else(|| WorkerServiceError::NotFound {
+                    worker_id: worker_id_raw.to_string(),
+                })?;
+        let url = existing.url().to_string();
+
+        // A data-parallel router expands one spec into one worker per rank,
+        // each registered under a rank-suffixed URL. Re-running registration
+        // for a single ID cannot express that, so refuse here instead of
+        // answering 202 and failing in the background.
+        if self.router_config.dp_aware {
+            return Err(WorkerServiceError::BadRequest {
+                message: format!(
+                    "Worker '{url}' belongs to a data-parallel group. \
+                    PUT is not supported for data-parallel workers. \
+                    Use DELETE + POST instead."
+                ),
+            });
+        }
 
         // Validate that the URL in the request body matches the existing worker.
         // URL changes are not supported via replace — use DELETE + POST instead.
@@ -307,10 +350,18 @@ impl WorkerService {
             });
         }
 
-        // Re-run the full registration workflow (model discovery, etc.)
-        // The workflow uses register_or_replace() which does overwrite-then-diff.
+        // Re-run the full registration workflow (model discovery, etc.).
+        // The workflow registers with overwrite-then-diff, bound to the ID and
+        // revision validated above: the job runs after this call returns 202,
+        // so a concurrent DELETE, DELETE + POST, or second PUT must make the
+        // write fail rather than resurrect this worker, overwrite its
+        // successor, or restore this specification over a newer one.
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::ReplaceById {
+                worker_id: worker_id.as_str().to_string(),
+                expected_revision: existing.revision(),
+            },
         };
 
         let job_queue = self.get_job_queue()?;
@@ -322,26 +373,43 @@ impl WorkerService {
         Ok(UpdateWorkerResult { worker_id, url })
     }
 
-    /// List all workers with their info
-    pub fn list_workers(&self) -> ListWorkersResult {
-        let workers = self.worker_registry.get_all_with_ids();
-        let worker_infos: Vec<WorkerInfo> = workers
-            .iter()
-            .map(|(worker_id, worker)| {
-                let mut info = worker_to_info(worker);
-                info.id = worker_id.as_str().to_string();
-                info
-            })
-            .collect();
+    /// List all workers with their info, optionally filtered to workers
+    /// serving `model`. Building each `WorkerInfo` is cheap: `WorkerSpec`
+    /// is shared via `Arc`, so there is no per-worker spec deep clone.
+    ///
+    /// The counts reflect the returned (filtered) list, not the whole
+    /// registry.
+    pub fn list_workers(&self, model: Option<&str>) -> ListWorkersResult {
+        let mut worker_infos = Vec::new();
+        let mut prefill_count = 0;
+        let mut decode_count = 0;
+        let mut regular_count = 0;
 
-        let stats = self.worker_registry.stats();
+        for (worker_id, worker) in self.worker_registry.get_all_with_ids() {
+            if let Some(model) = model {
+                if !worker.supports_model(model) {
+                    continue;
+                }
+            }
+            match worker.worker_type() {
+                WorkerType::Prefill => prefill_count += 1,
+                WorkerType::Decode => decode_count += 1,
+                WorkerType::Regular => regular_count += 1,
+                // EPD encode workers are a distinct pool: counted in `total` and
+                // listed, but not in the P/D/Regular sub-counts.
+                WorkerType::Encode => {}
+            }
+            let mut info = worker_to_info(&worker);
+            info.id = worker_id.as_str().to_string();
+            worker_infos.push(info);
+        }
 
         ListWorkersResult {
+            total: worker_infos.len(),
             workers: worker_infos,
-            total: stats.total_workers,
-            prefill_count: stats.prefill_workers,
-            decode_count: stats.decode_workers,
-            regular_count: stats.regular_workers,
+            prefill_count,
+            decode_count,
+            regular_count,
         }
     }
 
@@ -429,5 +497,131 @@ impl WorkerService {
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
         Ok(UpdateWorkerResult { worker_id, url })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::model_card::ModelCard;
+
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+    fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {
+        WorkerService::new(
+            registry,
+            Arc::new(std::sync::OnceLock::new()),
+            RouterConfig::default(),
+        )
+    }
+
+    fn register_worker(registry: &WorkerRegistry, url: &str, model: Option<&str>) {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(WorkerType::Regular);
+        if let Some(model) = model {
+            builder = builder.model(ModelCard::new(model));
+        }
+        registry.register(Arc::new(builder.build())).unwrap();
+    }
+
+    #[test]
+    fn test_list_workers_unfiltered_returns_all() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "http://kimi:30000", Some("moonshotai/Kimi-K2.5"));
+        register_worker(
+            &registry,
+            "http://llama:30000",
+            Some("meta-llama/Llama-3.1-8B"),
+        );
+        let service = make_service(registry);
+
+        let result = service.list_workers(None);
+        assert_eq!(result.workers.len(), 2);
+        assert_eq!(result.total, 2);
+        assert_eq!(result.regular_count, 2);
+    }
+
+    #[test]
+    fn test_list_workers_filters_by_model() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "http://kimi:30000", Some("moonshotai/Kimi-K2.5"));
+        register_worker(
+            &registry,
+            "http://llama:30000",
+            Some("meta-llama/Llama-3.1-8B"),
+        );
+        let service = make_service(registry);
+
+        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"));
+        assert_eq!(result.workers.len(), 1);
+        assert_eq!(
+            result.workers[0].model_id.as_deref(),
+            Some("moonshotai/Kimi-K2.5")
+        );
+        assert_eq!(result.total, 1);
+        assert_eq!(result.regular_count, 1);
+
+        let result = service.list_workers(Some("no-such-model"));
+        assert!(result.workers.is_empty());
+        assert_eq!(result.total, 0);
+        assert_eq!(result.regular_count, 0);
+    }
+
+    #[test]
+    fn test_list_workers_wildcard_worker_matches_any_model() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "http://wildcard:30000", None);
+        let service = make_service(registry);
+
+        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"));
+        assert_eq!(result.workers.len(), 1);
+        assert_eq!(result.total, 1);
+    }
+
+    fn worker_spec(url: &str) -> WorkerSpec {
+        serde_json::from_value(json!({ "url": url })).expect("worker spec")
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_schemeless_url_before_reserving() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        let err = service
+            .create_worker(worker_spec("10.0.0.5:8000"))
+            .await
+            .expect_err("schemeless URL must be rejected at the boundary");
+
+        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+        assert_eq!(err.error_code(), "BAD_REQUEST");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_mixed_case_scheme() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        let err = service
+            .create_worker(worker_spec("HTTP://10.0.0.5:8000"))
+            .await
+            .expect_err("mixed-case scheme must be rejected at the boundary");
+
+        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_worker_accepts_schemed_url() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        // The harness leaves the job queue uninitialized, so a valid URL
+        // passes boundary validation and stops at queue submission —
+        // proving validation did not reject it.
+        let err = service
+            .create_worker(worker_spec("grpc://10.0.0.5:8000"))
+            .await
+            .expect_err("queue is uninitialized in the test harness");
+
+        assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
     }
 }

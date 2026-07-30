@@ -23,9 +23,11 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
     policy_map = {
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
+        "passthrough": PolicyType.Passthrough,
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
         "size_aware_power_of_two": PolicyType.SizeAwarePowerOfTwo,
+        "least_load": PolicyType.LeastLoad,
         "bucket": PolicyType.Bucket,
         "manual": PolicyType.Manual,
         "consistent_hashing": PolicyType.ConsistentHashing,
@@ -144,6 +146,8 @@ class Router:
               balance
             - PolicyType.PowerOfTwo: Select best of two random workers based on load
               (PD mode only)
+            - PolicyType.LeastLoad: Route to the worker with the lowest load score
+              (in-flight requests plus KV-cache pressure)
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,
             ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
@@ -219,6 +223,9 @@ class Router:
             before timing out. Default: 60
         rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If
             not set, defaults to max_concurrent_requests. Default: None
+        global_rate_limit_requests_per_second: Cluster-wide request ceiling per
+            one-second window. Requires mesh and the same value on every gateway.
+            Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
             origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before
@@ -245,20 +252,32 @@ class Router:
     def from_args(args: RouterArgs) -> Router:
         """Create a router from a RouterArgs instance."""
 
-        args_dict = vars(args)
+        args_dict = vars(args).copy()
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
-            if args_dict["service_discovery"] or args_dict["pd_disaggregation"]
+            if (
+                args_dict["service_discovery"]
+                or args_dict["pd_disaggregation"]
+                or args_dict["epd_disaggregation"]
+            )
             else args_dict["worker_urls"]
         )
         args_dict["policy"] = policy_from_str(args_dict["policy"])
+        args_dict["encode_urls"] = (
+            args_dict["encode_urls"] if args_dict["epd_disaggregation"] else None
+        )
         args_dict["prefill_urls"] = (
-            args_dict["prefill_urls"] if args_dict["pd_disaggregation"] else None
+            args_dict["prefill_urls"]
+            if args_dict["pd_disaggregation"] or args_dict["epd_disaggregation"]
+            else None
         )
         args_dict["decode_urls"] = (
-            args_dict["decode_urls"] if args_dict["pd_disaggregation"] else None
+            args_dict["decode_urls"]
+            if args_dict["pd_disaggregation"] or args_dict["epd_disaggregation"]
+            else None
         )
+        args_dict["encode_policy"] = policy_from_str(args_dict["encode_policy"])
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 

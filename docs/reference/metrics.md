@@ -16,9 +16,6 @@ Metrics are exposed on the Prometheus port (default: `29000`):
 curl http://localhost:29000/metrics
 ```
 
-The same listener also serves a WebSocket stream of real-time metric updates
-at `/ws/metrics` (used by the TUI and dashboards that need live state).
-
 Configure via CLI:
 
 ```bash
@@ -69,11 +66,11 @@ rate(smg_http_request_duration_seconds_sum[5m]) / rate(smg_http_request_duration
 
 ### `smg_http_responses_total`
 
-HTTP responses by status and error code.
+HTTP responses by path, status, and error code.
 
 | Type | Labels |
 |------|--------|
-| Counter | `status_code`, `error_code` |
+| Counter | `path`, `status_code`, `error_code` |
 
 ```promql
 # Error rate (5xx responses)
@@ -81,6 +78,11 @@ sum(rate(smg_http_responses_total{status_code=~"5.."}[5m])) / sum(rate(smg_http_
 
 # Success rate
 sum(rate(smg_http_responses_total{status_code="200"}[5m])) / sum(rate(smg_http_responses_total[5m]))
+
+# Success rate for /v1/responses
+sum(rate(smg_http_responses_total{path="/v1/responses",status_code=~"2.."}[5m]))
+/
+sum(rate(smg_http_responses_total{path="/v1/responses"}[5m]))
 ```
 
 ---

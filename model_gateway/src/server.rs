@@ -7,8 +7,8 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
+    extract::{Extension, Path, Query, Request, State},
+    http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -22,6 +22,7 @@ use openai_protocol::{
     generate::GenerateRequest,
     interactions::InteractionsRequest,
     messages::CreateMessageRequest,
+    multipart::AudioTranscriptionMultipart,
     parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
@@ -31,12 +32,14 @@ use openai_protocol::{
     responses::ResponsesRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
-    worker::{WorkerSpec, WorkerUpdateRequest},
+    worker::{
+        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
+    },
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler, WorkerStateSubscriber};
+use serde_json::Value;
+use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
 use tokio::{
     signal, spawn,
     sync::{mpsc, Semaphore},
@@ -46,33 +49,21 @@ use wfaas::LoggingSubscriber;
 
 use crate::{
     app_context::AppContext,
-    config::{RouterConfig, RoutingMode},
+    config::RouterConfig,
+    mesh::MeshAdapters,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
-        metrics_server,
-        metrics_ws::{collectors, registry::WatchRegistry},
-        otel_trace,
+        metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        conversations,
-        mesh::{
-            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
-            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
-            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
-        },
-        openai::realtime::ws::RealtimeQueryParams,
-        parse, responses as response_handlers,
-        router_manager::RouterManager,
-        tokenize, RouterTrait,
+        common::realtime::ws::RealtimeQueryParams, conversations, parse,
+        responses as response_handlers, router_manager::RouterManager, tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    worker::{
-        manager::{WorkerManager, WorkerManagerConfig},
-        worker::WorkerType,
-    },
+    worker::manager::{WorkerManager, WorkerManagerConfig},
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
         Job, TokenizerConfigRequest, WorkflowEngines,
@@ -86,6 +77,11 @@ pub struct AppState {
     pub concurrency_queue_slots: Option<Arc<Semaphore>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
+    pub mesh_adapters: Option<Arc<MeshAdapters>>,
+    /// Cached O(1) readiness state shared with the optional dedicated
+    /// probe listener. Maintained event-driven by
+    /// [`crate::health::spawn_readiness_maintainer`].
+    pub probe_state: Arc<crate::health::ProbeState>,
 }
 
 async fn parse_function_call(
@@ -107,53 +103,16 @@ async fn sink_handler() -> Response {
 }
 
 async fn liveness() -> Response {
-    (StatusCode::OK, "OK").into_response()
+    crate::health::liveness_response()
 }
 
+/// O(1) readiness: reads the event-maintained snapshot (see
+/// [`crate::health::spawn_readiness_maintainer`]) and the drain flag — no registry
+/// scan per probe. The decision logic lives in
+/// [`crate::health::ProbeState::recompute`] and is unchanged from the previous
+/// inline implementation, plus the drain gate (not-ready while draining).
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
-    let workers = state.context.worker_registry.get_all();
-    let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
-
-    let is_ready = if state.context.router_config.enable_igw {
-        !healthy_workers.is_empty()
-    } else {
-        match &state.context.router_config.mode {
-            RoutingMode::PrefillDecode { .. } => {
-                let has_prefill = healthy_workers
-                    .iter()
-                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill));
-                let has_decode = healthy_workers
-                    .iter()
-                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
-                has_prefill && has_decode
-            }
-            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
-            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
-            RoutingMode::Anthropic { .. } => !healthy_workers.is_empty(),
-            RoutingMode::Gemini { .. } => !healthy_workers.is_empty(),
-        }
-    };
-
-    if is_ready {
-        (
-            StatusCode::OK,
-            Json(json!({
-                "status": "ready",
-                "healthy_workers": healthy_workers.len(),
-                "total_workers": workers.len()
-            })),
-        )
-            .into_response()
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "status": "not ready",
-                "reason": "insufficient healthy workers"
-            })),
-        )
-            .into_response()
-    }
+    state.probe_state.readiness_response()
 }
 
 async fn health(_state: State<Arc<AppState>>) -> Response {
@@ -184,113 +143,182 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 async fn generate(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
-    state
-        .router
-        .route_generate(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_generate(Some(&headers), &tenant_meta, &body, &body.model),
+        )
         .await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    state
-        .router
-        .route_chat(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_chat(Some(&headers), &tenant_meta, &body, &body.model),
+        )
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
 ) -> Response {
-    state
-        .router
-        .route_completion(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_completion(Some(&headers), &tenant_meta, &body, &body.model),
+        )
         .await
 }
 
 async fn rerank(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
-    state
-        .router
-        .route_rerank(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_rerank(Some(&headers), &tenant_meta, &body, &body.model),
+        )
         .await
 }
 
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
-    state
-        .router
-        .route_rerank(Some(&headers), &rerank_body, &rerank_body.model)
+    cancel
+        .guard(state.router.route_rerank(
+            Some(&headers),
+            &tenant_meta,
+            &rerank_body,
+            &rerank_body.model,
+        ))
         .await
 }
 
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
-    state
-        .router
-        .route_responses(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_responses(Some(&headers), &tenant_meta, &body, &body.model),
+        )
         .await
 }
 
 async fn v1_interactions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<InteractionsRequest>,
 ) -> Response {
     let model_id = body.model.as_deref().or(body.agent.as_deref());
-    state
-        .router
-        .route_interactions(Some(&headers), &body, model_id)
+    cancel
+        .guard(
+            state
+                .router
+                .route_interactions(Some(&headers), &tenant_meta, &body, model_id),
+        )
         .await
 }
 
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
-    state
-        .router
-        .route_embeddings(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_embeddings(Some(&headers), &tenant_meta, &body, &body.model),
+        )
         .await
 }
 
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
-    state
-        .router
-        .route_messages(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_messages(Some(&headers), &tenant_meta, &body, &body.model),
+        )
         .await
 }
 
 async fn v1_classify(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<ClassifyRequest>,
 ) -> Response {
-    state
-        .router
-        .route_classify(Some(&headers), &body, &body.model)
+    cancel
+        .guard(
+            state
+                .router
+                .route_classify(Some(&headers), &tenant_meta, &body, &body.model),
+        )
+        .await
+}
+
+async fn v1_audio_transcriptions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    AudioTranscriptionMultipart { request, audio }: AudioTranscriptionMultipart,
+) -> Response {
+    cancel
+        .guard(state.router.route_audio_transcriptions(
+            Some(&headers),
+            &tenant_meta,
+            &request,
+            audio,
+            &request.model,
+        ))
         .await
 }
 
@@ -304,7 +332,7 @@ async fn v1_responses_get(
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
     state
         .router
@@ -463,7 +491,7 @@ async fn v1_realtime_ws(
 
 async fn v1_realtime_session(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RealtimeSessionCreateRequest>,
 ) -> Response {
     state
@@ -474,7 +502,7 @@ async fn v1_realtime_session(
 
 async fn v1_realtime_client_secret(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RealtimeClientSecretCreateRequest>,
 ) -> Response {
     state
@@ -485,7 +513,7 @@ async fn v1_realtime_client_secret(
 
 async fn v1_realtime_transcription_session(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RealtimeTranscriptionSessionCreateRequest>,
 ) -> Response {
     state
@@ -495,7 +523,31 @@ async fn v1_realtime_transcription_session(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+    WorkerManager::flush_cache_all(&state.context.worker_registry)
+        .await
+        .into_response()
+}
+
+async fn start_profile(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<StartProfileRequest>>,
+) -> Response {
+    let body = body.map_or_else(StartProfileRequest::default, |Json(body)| body);
+    WorkerManager::start_profile_all(
+        &state.context.worker_registry,
+        &body.options,
+        body.url.as_deref(),
+    )
+    .await
+    .into_response()
+}
+
+async fn stop_profile(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<StopProfileRequest>>,
+) -> Response {
+    let body = body.map_or_else(StopProfileRequest::default, |Json(body)| body);
+    WorkerManager::stop_profile_all(&state.context.worker_registry, body.url.as_deref())
         .await
         .into_response()
 }
@@ -516,8 +568,15 @@ async fn create_worker(
     }
 }
 
-async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
-    state.context.worker_service.list_workers().into_response()
+async fn list_workers_rest(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListWorkersQuery>,
+) -> Response {
+    state
+        .context
+        .worker_service
+        .list_workers(query.model.as_deref())
+        .into_response()
 }
 
 async fn get_worker(
@@ -630,6 +689,13 @@ async fn v1_tokenizers_remove(
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Dedicated port for the isolated liveness/readiness/health probe listener. `None`
+    /// leaves the dedicated listener off; probe routes always stay on the
+    /// main `port` regardless.
+    pub health_check_port: Option<u16>,
+    /// Explicit async runtime worker-thread count. `None` uses tokio's
+    /// container-aware default (`available_parallelism()`).
+    pub runtime_worker_threads: Option<usize>,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
@@ -647,18 +713,68 @@ pub struct ServerConfig {
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
     /// STUN server for ICE candidate gathering (host:port).
-    /// `None` means use the default (stun.l.google.com:19302).
+    /// Defaults to `stun.l.google.com:19302`; `"none"` to disable.
     pub webrtc_stun_server: Option<String>,
 }
 
+/// Apply the request-admission layer to a protected route group.
+///
+/// `AdmissionMode::Priority` installs the priority scheduler middleware
+/// (carrying its own `Arc<SchedulerState>`); `AdmissionMode::Legacy` installs
+/// the original `concurrency_limit_middleware`. Either runs innermost of the
+/// protective layers (closest to the handler), after tenant resolution has
+/// populated `RouteRequestMeta`.
+fn with_admission_layer(
+    router: Router<Arc<AppState>>,
+    admission_mode: &middleware::scheduler::AdmissionMode,
+    app_state: Arc<AppState>,
+) -> Router<Arc<AppState>> {
+    let router = match admission_mode {
+        middleware::scheduler::AdmissionMode::Priority(scheduler_state) => {
+            router.route_layer(axum::middleware::from_fn_with_state(
+                scheduler_state.clone(),
+                middleware::scheduler::priority_admission_middleware,
+            ))
+        }
+        middleware::scheduler::AdmissionMode::Legacy => {
+            router.route_layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                middleware::concurrency_limit_middleware,
+            ))
+        }
+    };
+
+    // Added after the local admission layer so axum runs it first. A shared
+    // rejection therefore consumes neither a legacy queue slot nor a priority
+    // scheduler permit.
+    if app_state
+        .context
+        .router_config
+        .global_rate_limit_requests_per_second
+        .is_some()
+    {
+        router.route_layer(axum::middleware::from_fn_with_state(
+            app_state,
+            middleware::global_rate_limit_middleware,
+        ))
+    } else {
+        router
+    }
+}
+
+/// `serving_auth_config` covers inference-serving routes and may include
+/// per-tenant keys. `admin_auth_config` is the admin/worker-management
+/// fallback (used when `control_plane_auth_state` is `None`) and must
+/// contain only the shared gateway-wide key, never per-tenant keys.
 pub fn build_app(
     app_state: Arc<AppState>,
-    auth_config: AuthConfig,
+    serving_auth_config: AuthConfig,
+    admin_auth_config: AuthConfig,
     control_plane_auth_state: Option<smg_auth::ControlPlaneAuthState>,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
-) -> Router {
+) -> Result<Router, InvalidHeaderName> {
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -667,86 +783,124 @@ pub fn build_app(
         Duration::from_secs(60),
     );
 
-    let protected_routes = Router::new()
-        .route("/v1/responses", post(v1_responses))
-        .route("/v1/responses/{response_id}", get(v1_responses_get))
-        .route(
-            "/v1/responses/{response_id}/cancel",
-            post(v1_responses_cancel),
-        )
-        .route("/v1/responses/{response_id}", delete(v1_responses_delete))
-        .route(
-            "/v1/responses/{response_id}/input_items",
-            get(v1_responses_list_input_items),
-        )
-        .route("/v1/conversations", post(v1_conversations_create))
-        .route(
-            "/v1/conversations/{conversation_id}",
-            get(v1_conversations_get)
-                .post(v1_conversations_update)
-                .delete(v1_conversations_delete),
-        )
-        .route(
-            "/v1/conversations/{conversation_id}/items",
-            get(v1_conversations_list_items).post(v1_conversations_create_items),
-        )
-        .route(
-            "/v1/conversations/{conversation_id}/items/{item_id}",
-            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::storage_context_middleware,
-        ))
-        .route("/generate", post(generate))
-        .route("/v1/chat/completions", post(v1_chat_completions))
-        .route("/v1/completions", post(v1_completions))
-        .route("/rerank", post(rerank))
-        .route("/v1/rerank", post(v1_rerank))
-        .route("/v1/embeddings", post(v1_embeddings))
-        .route("/v1/messages", post(v1_messages))
-        .route("/v1/interactions", post(v1_interactions))
-        .route("/v1/classify", post(v1_classify))
-        // Tokenize / Detokenize endpoints
-        .route("/v1/tokenize", post(v1_tokenize))
-        .route("/v1/detokenize", post(v1_detokenize))
-        // Realtime REST endpoints (same middleware as other protected routes)
-        .route("/v1/realtime/sessions", post(v1_realtime_session))
-        .route(
-            "/v1/realtime/client_secrets",
-            post(v1_realtime_client_secret),
-        )
-        .route(
-            "/v1/realtime/transcription_sessions",
-            post(v1_realtime_transcription_session),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::concurrency_limit_middleware,
-        ))
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ))
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::wasm_middleware,
-        ));
+    let tenant_resolution_state =
+        middleware::TenantResolutionState::new(&app_state.context.router_config)?;
+
+    // Choose the admission path once at startup: priority scheduler when
+    // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
+    let admission_mode = middleware::scheduler::AdmissionMode::from_config(
+        &app_state.context.router_config,
+        app_state.context.worker_registry.clone(),
+        app_state.context.rate_limiter.clone(),
+    );
+
+    let protected_routes = with_admission_layer(
+        Router::new()
+            .route("/v1/responses", post(v1_responses))
+            .route("/v1/responses/{response_id}", get(v1_responses_get))
+            .route(
+                "/v1/responses/{response_id}/cancel",
+                post(v1_responses_cancel),
+            )
+            .route("/v1/responses/{response_id}", delete(v1_responses_delete))
+            .route(
+                "/v1/responses/{response_id}/input_items",
+                get(v1_responses_list_input_items),
+            )
+            .route("/v1/conversations", post(v1_conversations_create))
+            .route(
+                "/v1/conversations/{conversation_id}",
+                get(v1_conversations_get)
+                    .post(v1_conversations_update)
+                    .delete(v1_conversations_delete),
+            )
+            .route(
+                "/v1/conversations/{conversation_id}/items",
+                get(v1_conversations_list_items).post(v1_conversations_create_items),
+            )
+            .route(
+                "/v1/conversations/{conversation_id}/items/{item_id}",
+                get(v1_conversations_get_item).delete(v1_conversations_delete_item),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                middleware::storage_context_middleware,
+            ))
+            .route("/generate", post(generate))
+            .route("/v1/chat/completions", post(v1_chat_completions))
+            .route("/v1/completions", post(v1_completions))
+            .route("/rerank", post(rerank))
+            .route("/v1/rerank", post(v1_rerank))
+            .route("/v1/embeddings", post(v1_embeddings))
+            .route("/v1/messages", post(v1_messages))
+            .route("/v1/interactions", post(v1_interactions))
+            .route("/v1/classify", post(v1_classify))
+            // Tokenize / Detokenize endpoints
+            .route("/v1/tokenize", post(v1_tokenize))
+            .route("/v1/detokenize", post(v1_detokenize))
+            // Realtime REST endpoints (same middleware as other protected routes)
+            .route("/v1/realtime/sessions", post(v1_realtime_session))
+            .route(
+                "/v1/realtime/client_secrets",
+                post(v1_realtime_client_secret),
+            )
+            .route(
+                "/v1/realtime/transcription_sessions",
+                post(v1_realtime_transcription_session),
+            ),
+        &admission_mode,
+        app_state.clone(),
+    )
+    .route_layer(axum::middleware::from_fn_with_state(
+        tenant_resolution_state.clone(),
+        middleware::route_request_meta_middleware,
+    ))
+    .route_layer(axum::middleware::from_fn_with_state(
+        serving_auth_config.clone(),
+        middleware::auth_middleware,
+    ))
+    .route_layer(axum::middleware::from_fn_with_state(
+        app_state.clone(),
+        middleware::wasm_middleware,
+    ));
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
     // WASM OnResponse reconstructs the response from status/headers/body,
     // dropping the response extensions that carry the WebSocket upgrade future.
-    let realtime_routes = Router::new()
-        .route("/v1/realtime", get(v1_realtime_ws))
-        .route("/v1/realtime/calls", post(v1_realtime_webrtc))
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::concurrency_limit_middleware,
-        ))
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+    let realtime_routes = with_admission_layer(
+        Router::new()
+            .route("/v1/realtime", get(v1_realtime_ws))
+            .route("/v1/realtime/calls", post(v1_realtime_webrtc)),
+        &admission_mode,
+        app_state.clone(),
+    )
+    .route_layer(axum::middleware::from_fn_with_state(
+        tenant_resolution_state.clone(),
+        middleware::route_request_meta_middleware,
+    ))
+    .route_layer(axum::middleware::from_fn_with_state(
+        serving_auth_config.clone(),
+        middleware::auth_middleware,
+    ));
+
+    // Multipart upload routes: auth + concurrency but NO WASM middleware.
+    // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
+    // to the WASM manager's `max_body_size` (10MB default). Audio uploads
+    // routinely exceed that, so WASM middleware would reject them with 400
+    // before reaching the handler.
+    let multipart_upload_routes = with_admission_layer(
+        Router::new().route("/v1/audio/transcriptions", post(v1_audio_transcriptions)),
+        &admission_mode,
+        app_state.clone(),
+    )
+    .route_layer(axum::middleware::from_fn_with_state(
+        tenant_resolution_state,
+        middleware::route_request_meta_middleware,
+    ))
+    .route_layer(axum::middleware::from_fn_with_state(
+        serving_auth_config.clone(),
+        middleware::auth_middleware,
+    ));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -761,6 +915,8 @@ pub fn build_app(
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
@@ -792,16 +948,23 @@ pub fn build_app(
                 .delete(delete_worker),
         );
 
-    // Apply authentication middleware to control plane routes
+    // Fallback (no control-plane auth) normally uses `admin_auth_config`.
+    // If only tenant keys are configured (no shared `--api-key`), there's no
+    // credential that should reach these routes — deny outright instead of
+    // falling back to `auth_middleware`, which would treat the empty config
+    // as "open". Neither config having any key at all is a fully open
+    // dev/test deployment, which keeps its legacy pass-through behavior.
     let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
         if let Some(ref cp_state) = control_plane_auth_state {
             routes.route_layer(axum::middleware::from_fn_with_state(
                 cp_state.clone(),
                 smg_auth::control_plane_auth_middleware,
             ))
+        } else if !admin_auth_config.is_enabled() && serving_auth_config.is_enabled() {
+            routes.route_layer(axum::middleware::from_fn(middleware::deny_all_middleware))
         } else {
             routes.route_layer(axum::middleware::from_fn_with_state(
-                auth_config.clone(),
+                admin_auth_config.clone(),
                 middleware::auth_middleware,
             ))
         }
@@ -809,32 +972,19 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
-    // HA management routes
-    let mesh_routes = Router::new()
-        .route("/ha/status", get(get_cluster_status))
-        .route("/ha/health", get(get_mesh_health))
-        .route("/ha/workers", get(get_worker_states))
-        .route("/ha/workers/{worker_id}", get(get_worker_state))
-        .route("/ha/policies", get(get_policy_states))
-        .route("/ha/policies/{model_id}", get(get_policy_state))
-        .route("/ha/config/{key}", get(get_app_config))
-        .route("/ha/config", post(update_app_config))
-        .route("/ha/rate-limit", post(set_global_rate_limit))
-        .route("/ha/rate-limit", get(get_global_rate_limit))
-        .route("/ha/rate-limit/stats", get(get_global_rate_limit_stats))
-        .route("/ha/shutdown", post(trigger_graceful_shutdown))
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+    // `/ha/*` management routes (routers/mesh handlers) are removed
+    // in this PR — they all read/write through the v1
+    // `MeshSyncManager` and don't map cleanly onto the v2 adapters.
+    // A v2-aware admin surface will return in a follow-up PR once
+    // adapters are production-wired.
 
-    Router::new()
+    Ok(Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
+        .merge(multipart_upload_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
-        .merge(mesh_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -846,10 +996,32 @@ pub fn build_app(
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
-        .with_state(app_state)
+        .with_state(app_state))
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Defense in depth: the CLI and Python bindings both validate via
+    // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
+    // is public and `Deserialize`, so a Rust library caller can construct
+    // `ServerConfig` directly (or deserialize it) and call `startup` without
+    // ever going through the builder. Validate here too so `tenant_api_keys`
+    // (and everything else `ConfigValidator` checks) is enforced regardless
+    // of construction path — a bypassed empty/duplicate tenant key would
+    // otherwise silently reach `AuthConfig`.
+    config.router_config.validate()?;
+    if config
+        .router_config
+        .global_rate_limit_requests_per_second
+        .is_some()
+        && config.mesh_server_config.is_none()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "global_rate_limit_requests_per_second requires mesh configuration",
+        )
+        .into());
+    }
+
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     if let Some(trace_config) = &config.router_config.trace_config {
@@ -885,47 +1057,48 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ))
     };
 
-    // Start metrics server and collectors.
-    // Metrics server binds the port now; collectors start after AppContext is built.
-    let (prometheus_handle, watch_registry) =
-        if let Some(prometheus_config) = &config.prometheus_config {
-            let handle = metrics::start_prometheus(prometheus_config.clone());
-            let registry = Arc::new(WatchRegistry::new());
-            let _server_handle = metrics_server::start_metrics_server(
-                handle.clone(),
-                prometheus_config.host.clone(),
-                prometheus_config.port,
-                registry.clone(),
-                metrics_server::DEFAULT_MAX_WS_CONNECTIONS,
-            )
-            .await;
-            (Some(handle), Some(registry))
-        } else {
-            (None, None)
-        };
+    // Seed the process-wide multimodal tensor transport defaults from the
+    // resolved router config; per-worker specs still override at request time.
+    use crate::routers::grpc::multimodal::init_mm_transport_defaults;
+    init_mm_transport_defaults(
+        config.router_config.multimodal_tensor_transport,
+        config.router_config.multimodal_shm_min_bytes,
+    );
 
-    // Initialize mesh server if configured, it will return a handler for mesh management
-    let mesh_handler = if let Some(mesh_server_config) = &config.mesh_server_config {
-        // Create mesh server builder and build with stores
-        let (mesh_server, handler) = MeshServerBuilder::from(mesh_server_config).build();
+    // Start the metrics server. It binds the port eagerly so we fail fast on
+    // port conflicts or bad addresses.
+    if let Some(prometheus_config) = &config.prometheus_config {
+        let handle = metrics::start_prometheus(prometheus_config.clone());
+        let _server_handle = metrics_server::start_metrics_server(
+            handle,
+            prometheus_config.host.clone(),
+            prometheus_config.port,
+        )
+        .await;
+        // Tokio runtime self-observability (event-loop canary + sampler).
+        // `startup` runs on the main runtime, so the observer lands on —
+        // and therefore measures — the runtime that serves requests.
+        runtime_metrics::spawn_observer();
+    }
 
-        // Start rate limit window reset task (managed by handler)
-        handler.start_rate_limit_task(1); // Reset every 1 second
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
-        )]
-        spawn(async move {
-            if let Err(e) = mesh_server.start().await {
-                tracing::error!("Mesh server failed: {}", e);
-            }
-        });
-
-        Some(Arc::new(handler))
-    } else {
-        None
+    // Build the mesh server if configured. Starting gossip is deferred until
+    // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
+    // a remote op arriving for an unregistered prefix would merge through the
+    // default last-writer-wins engine with the wrong semantics.
+    let (mesh_server, mesh_handler) = match &config.mesh_server_config {
+        Some(mesh_server_config) => {
+            let (server, handler) = MeshServerBuilder::from(mesh_server_config).build();
+            (Some(server), Some(Arc::new(handler)))
+        }
+        None => (None, None),
     };
+
+    if let Some(limit) = config.router_config.global_rate_limit_requests_per_second {
+        info!(
+            limit,
+            "Cluster-wide request rate limiting enabled; all gateways must use the same limit"
+        );
+    }
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
@@ -946,20 +1119,30 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await?,
     );
 
+    // Register the CRDT namespaces and start the inbound sync adapters, then
+    // start gossip. Order matters: see the note at the mesh build above.
+    let mesh_adapters = mesh_handler.as_ref().map(|handler| {
+        MeshAdapters::start(
+            handler.mesh_kv(),
+            handler.self_name.clone(),
+            app_context.worker_registry.clone(),
+        )
+    });
+    if let Some(mesh_server) = mesh_server {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.start().await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
+    }
+
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
     }
-
-    // Start WS metrics collectors now that AppContext is available.
-    let _collector_handles = match (&prometheus_handle, &watch_registry) {
-        (Some(handle), Some(registry)) => Some(collectors::start_collectors(
-            app_context.clone(),
-            registry.clone(),
-            collectors::CollectorConfig::default(),
-            handle.clone(),
-        )),
-        _ => None,
-    };
 
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
@@ -1148,39 +1331,35 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Set mesh sync manager to worker registry and policy registry if mesh is enabled
-    // This allows these components to sync state across mesh nodes when mesh is enabled,
-    // but they work independently without mesh when mesh is disabled.
-    // Using thread-safe set_mesh_sync method that works with Arc-wrapped registries
-    if let Some(ref handle) = mesh_handler {
-        app_context
-            .worker_registry
-            .set_mesh_sync(Some(handle.sync_manager.clone()));
-        handle
-            .sync_manager
-            .register_worker_state_subscriber(app_context.worker_registry.clone());
-        // Replay workers already in the CRDT store — they arrived between
-        // mesh server start and subscriber registration above.
-        for state in handle.sync_manager.get_all_worker_states() {
-            app_context.worker_registry.on_remote_worker_state(&state);
-        }
-        info!("Mesh sync manager set on worker registry");
-
-        handle
-            .sync_manager
-            .register_tree_state_subscriber(app_context.policy_registry.clone());
-        app_context
-            .policy_registry
-            .set_mesh_sync(Some(handle.sync_manager.clone()));
-        info!("Mesh sync manager set on policy registry");
-    }
-
     // Get mesh cluster state and port before moving mesh_handler into app_state
     let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
     let mesh_port = config
         .mesh_server_config
         .as_ref()
         .map(|c| c.advertise_addr.port());
+
+    // O(1) readiness state: maintained from WorkerRegistry events (plus a
+    // short checkpoint for broadcast-bypassing mutations), read by
+    // `/readiness` on the main listener and on the optional dedicated
+    // probe listener below. Dropping the JoinHandle detaches the task.
+    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
+    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
+        probe_state.clone(),
+        app_context.worker_registry.clone(),
+        app_context.tokenizer_registry.clone(),
+        config.router_config.clone(),
+    );
+
+    // Optional isolated probe listener (additive): when `--health-check-port`
+    // is set, serves /liveness, /readiness, /health on that port from a
+    // dedicated single-worker runtime on its own OS thread, so probes
+    // cannot be starved by the request runtime. The same routes always remain
+    // on the main listener.
+    if let Some(probe_port) = config.health_check_port {
+        let probe_addr =
+            crate::health::start_probe_listener(&config.host, probe_port, probe_state.clone())?;
+        info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
+    }
 
     let app_state = Arc::new(AppState {
         router,
@@ -1189,6 +1368,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         concurrency_queue_slots: limiter.queue_slots.clone(),
         router_manager: Some(router_manager),
         mesh_handler,
+        mesh_adapters,
+        probe_state,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
@@ -1236,7 +1417,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ]
     });
 
-    let auth_config = AuthConfig::new(config.router_config.api_key.clone());
+    // Serving routes accept both the shared key and per-tenant keys, so the
+    // rate limiter (and anything else keyed on tenant identity) can tell
+    // tenants apart. Admin/worker-management routes must NOT accept tenant
+    // keys when falling back to simple API-key auth (no control-plane auth
+    // configured) — a tenant credential must not be able to reach
+    // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
+    let serving_auth_config = AuthConfig::with_tenant_keys(
+        config.router_config.api_key.clone(),
+        &config.router_config.tenant_api_keys,
+    );
+    let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // Initialize control plane authentication if configured
     let control_plane_auth_state =
@@ -1244,12 +1435,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let app = build_app(
         app_state,
-        auth_config,
+        serving_auth_config,
+        admin_auth_config,
         control_plane_auth_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
-    );
+    )?;
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);
@@ -1263,7 +1455,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
-    let drain_timeout = Duration::from_secs(config.shutdown_grace_period_secs);
+    let grace = Duration::from_secs(config.shutdown_grace_period_secs);
+    // Keep accepting for a short settle window before gating, so requests still
+    // routed here during load-balancer / EndpointSlice propagation lag are
+    // served instead of connection-refused — readiness already reports 503 by
+    // then (#1694), so the orchestrator is removing this endpoint meanwhile.
+    // Carved out of the grace budget (never more than half, capped at 5s — the
+    // per-worker `drain_settle_secs` default) so total shutdown stays within
+    // `shutdown_grace_period_secs` and never overruns terminationGracePeriod.
+    let settle = (grace / 2).min(Duration::from_secs(5));
+    let drain_timeout = grace.saturating_sub(settle);
     #[expect(
         clippy::disallowed_methods,
         reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
@@ -1271,12 +1472,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     spawn(async move {
         shutdown_signal().await;
 
-        // Phase 1: Gate — stop accepting new connections, mark as draining
+        // Phase 1: Flip readiness to 503, hold the listener open through the
+        // settle window so propagation-lagged requests still land, then gate
+        // new connections.
         info!(
             in_flight = inflight_tracker.len(),
-            "Beginning graceful shutdown: gating new connections"
+            "Beginning graceful shutdown: readiness draining"
         );
         inflight_tracker.begin_drain();
+        if !settle.is_zero() {
+            info!(
+                settle_secs = settle.as_secs(),
+                "Keeping listener open during load-balancer propagation window"
+            );
+            tokio::time::sleep(settle).await;
+        }
         handle_clone.graceful_shutdown(Some(drain_timeout));
 
         // Phase 2: Drain — wait for in-flight requests to complete
@@ -1312,12 +1522,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
         axum_server::bind(addr)
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     };
 
@@ -1385,10 +1595,86 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 
         tower_http::cors::CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods([http::Method::GET, http::Method::POST, http::Method::OPTIONS])
+            .allow_methods([
+                http::Method::GET,
+                http::Method::POST,
+                http::Method::PATCH,
+                http::Method::DELETE,
+                http::Method::OPTIONS,
+            ])
             .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
             .expose_headers([http::header::HeaderName::from_static("x-request-id")])
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TenantApiKeyEntry;
+
+    fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            health_check_port: None,
+            runtime_worker_threads: None,
+            router_config,
+            max_payload_size: 1024,
+            log_dir: None,
+            log_level: None,
+            log_json: false,
+            service_discovery_config: None,
+            prometheus_config: None,
+            request_timeout_secs: 60,
+            request_id_headers: None,
+            shutdown_grace_period_secs: 5,
+            control_plane_auth: None,
+            mesh_server_config: None,
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+        }
+    }
+
+    /// `startup` must reject an invalid config even when `RouterConfig` was
+    /// built directly (struct literal or `Deserialize`), not via
+    /// `RouterConfigBuilder::build()` — a Rust library caller can construct
+    /// `ServerConfig` this way and bypass the builder's validation entirely.
+    /// Regression test for a reviewer-flagged gap: an empty tenant_api_keys
+    /// entry reaching `AuthConfig` unvalidated would make `Authorization:
+    /// Bearer ` (empty token) a valid serving credential.
+    #[tokio::test]
+    async fn startup_validates_directly_constructed_router_config() {
+        let router_config = RouterConfig {
+            tenant_api_keys: vec![TenantApiKeyEntry {
+                tenant_id: "team-a".to_string(),
+                key: String::new(),
+            }],
+            ..Default::default()
+        };
+
+        let result = startup(minimal_server_config(router_config)).await;
+        assert!(
+            result.is_err(),
+            "startup must validate router_config even when constructed directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_global_rate_limit_without_mesh() {
+        let router_config = RouterConfig {
+            global_rate_limit_requests_per_second: Some(100),
+            ..Default::default()
+        };
+
+        let result = startup(minimal_server_config(router_config)).await;
+        let error = result.expect_err("shared enforcement must require mesh");
+        assert!(
+            error
+                .to_string()
+                .contains("global_rate_limit_requests_per_second requires mesh"),
+            "unexpected startup error: {error}"
+        );
+    }
 }

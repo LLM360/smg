@@ -12,7 +12,11 @@ use serde_json::Value;
 use smg_mcp::McpOrchestrator;
 
 use super::state::RequestState;
-use crate::worker::{Worker, WorkerRegistry};
+use crate::{
+    middleware::TenantRequestMeta,
+    routers::common::openai_bridge::FormatRegistry,
+    worker::{Worker, WorkerRegistry},
+};
 
 // ============================================================================
 // SharedComponents (per-router)
@@ -34,6 +38,9 @@ pub(crate) struct SharedComponents {
     /// MCP orchestrator for creating tool sessions (used in Phase 2).
     #[expect(dead_code, reason = "MCP tool integration is Phase 2")]
     pub mcp_orchestrator: Arc<McpOrchestrator>,
+
+    #[expect(dead_code, reason = "MCP tool integration is Phase 2")]
+    pub mcp_format_registry: FormatRegistry,
 
     /// Per-request timeout from router config.
     pub request_timeout: Duration,
@@ -77,6 +84,11 @@ pub(crate) struct RequestInput {
     /// Optional model ID override (e.g. from URL path or query parameter).
     /// When set, takes precedence over `original_request.model`.
     pub model_id: Option<String>,
+    #[expect(
+        dead_code,
+        reason = "tenant-aware Gemini consumers land after the shared routing contract"
+    )]
+    pub tenant_request_meta: TenantRequestMeta,
 }
 
 /// Mutable processing state populated incrementally by steps.
@@ -101,6 +113,7 @@ impl RequestContext {
         original_request: Arc<InteractionsRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
+        tenant_request_meta: TenantRequestMeta,
         components: Arc<SharedComponents>,
     ) -> Self {
         Self {
@@ -108,6 +121,7 @@ impl RequestContext {
                 original_request,
                 headers,
                 model_id,
+                tenant_request_meta,
             },
             components,
             state: RequestState::SelectWorker,

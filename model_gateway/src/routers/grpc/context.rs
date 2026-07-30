@@ -23,10 +23,17 @@ use tracing::debug;
 
 use super::{
     client::GrpcClient,
-    multimodal::MultimodalComponents,
-    proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
+    common::stages::encode::EncodeDispatchPlan,
+    multimodal::{MultimodalComponents, MultimodalIntermediate},
+    proto_wrapper::{
+        EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
+        ProtoRequest, ProtoStream,
+    },
 };
-use crate::worker::{RuntimeType, Worker, WorkerLoadGuard};
+use crate::{
+    middleware::TenantRequestMeta,
+    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+};
 
 /// Main request processing context
 ///
@@ -43,7 +50,9 @@ pub(crate) struct RequestContext {
 pub(crate) struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
+    /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
+    pub tenant_request_meta: Option<TenantRequestMeta>,
 }
 
 /// Request type variants
@@ -56,6 +65,45 @@ pub(crate) enum RequestType {
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
     Messages(Arc<CreateMessageRequest>),
+}
+
+impl RequestType {
+    /// Overwrite the request's own `model` field.
+    ///
+    /// Callers hold the request behind an `Arc` that the retry loop also
+    /// holds, so `Arc::make_mut` copies the request here. That cost is paid
+    /// only on the alias path — [`RequestContext::new`] skips this call
+    /// entirely when the client already used the canonical model ID.
+    fn set_model(&mut self, model_id: &str) {
+        fn replace(model: &mut String, model_id: &str) {
+            model.clear();
+            model.push_str(model_id);
+        }
+
+        match self {
+            Self::Chat(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Generate(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Completion(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Responses(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
+        }
+    }
+
+    /// Client-supplied backend request id (`rid`), where the protocol carries
+    /// one. Responses ids are storage-owned (`resp_*`) and never client-set.
+    pub fn rid(&self) -> Option<&str> {
+        match self {
+            Self::Chat(r) => r.rid.as_deref(),
+            Self::Generate(r) => r.rid.as_deref(),
+            Self::Completion(r) => r.rid.as_deref(),
+            Self::Embedding(r) => r.rid.as_deref(),
+            Self::Classify(r) => r.rid.as_deref(),
+            Self::Messages(r) => r.rid.as_deref(),
+            Self::Responses(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for RequestType {
@@ -88,11 +136,13 @@ impl std::fmt::Display for FinalResponse {
 /// Shared components (injected once at creation)
 pub(crate) struct SharedComponents {
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    pub worker_registry: Arc<WorkerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
-    #[expect(dead_code)]
     pub reasoning_parser_factory: ReasoningParserFactory,
     /// Configured tool parser name (from CLI `--tool-call-parser`)
     pub configured_tool_parser: Option<String>,
+    /// Configured reasoning parser name (from CLI `--reasoning-parser`)
+    pub configured_reasoning_parser: Option<String>,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
 }
@@ -102,6 +152,16 @@ pub(crate) struct SharedComponents {
 pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
+
+    /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
+    /// can borrow it for the with-pixels encode serialization before request
+    /// building `take()`s it for the prefill serialization.
+    pub multimodal_intermediate: Option<MultimodalIntermediate>,
+
+    /// `Some` iff the request is multimodal EPD and worker selection produced
+    /// encode assignments. Request building injects the bootstrap info and drops
+    /// prefill pixels; request execution `take()`s the dispatch plan.
+    pub encode_outputs: Option<EncodeOutputs>,
 
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
@@ -114,7 +174,7 @@ pub(crate) struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     // Stage 4: Request building outputs
-    pub proto_request: Option<ProtoRequest>,
+    pub execution_plan: Option<ExecutionPlan>,
 
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
@@ -124,6 +184,94 @@ pub(crate) struct ProcessingState {
 
     // Stage 6: Response processing state
     pub response: ResponseState,
+}
+
+/// Per-item bootstrap rendezvous info for prefill, plus the dispatch plan that
+/// fans out to encode workers.
+///
+/// Not `#[derive(Debug)]`: `EncodeDispatchPlan` transitively holds
+/// non-`Debug` raw proto payloads (`TokenSpeedMultimodalItem`).
+///
+/// Owns the encode jobs' SHM/RDMA Drop guards: dropping this before request
+/// execution dispatches (early return / cancellation) reclaims the staged
+/// `/dev/shm` segments via `PreparedEncodeItem`'s `Drop`.
+pub(crate) struct EncodeOutputs {
+    pub bootstrap_info: Vec<EncodeItemBootstrapInfo>,
+    pub dispatch: EncodeDispatchPlan,
+}
+
+/// Execution shape produced by request building and consumed by request execution.
+pub(crate) enum ExecutionPlan {
+    Single(ProtoRequest),
+    PrefillDecode(ProtoGenerateRequest),
+    EncodePrefillDecode {
+        request: ProtoGenerateRequest,
+    },
+    /// Batched completion fan-out: one backend request per prompt, all
+    /// dispatched with the disaggregation shape given by `kind`. Sub-request
+    /// ids are `{shared_request_id}-p{i}`; the client-visible response id is
+    /// `shared_request_id`.
+    Batch {
+        kind: ExecutionPlanKind,
+        shared_request_id: String,
+        requests: Vec<ProtoGenerateRequest>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionPlanKind {
+    Single,
+    PrefillDecode,
+    EncodePrefillDecode,
+}
+
+impl ExecutionPlan {
+    pub(crate) fn generate(kind: ExecutionPlanKind, request: ProtoGenerateRequest) -> Self {
+        match kind {
+            ExecutionPlanKind::Single => Self::Single(ProtoRequest::Generate(request)),
+            ExecutionPlanKind::PrefillDecode => Self::PrefillDecode(request),
+            ExecutionPlanKind::EncodePrefillDecode => Self::EncodePrefillDecode { request },
+        }
+    }
+
+    pub(crate) fn embed(request: ProtoEmbedRequest) -> Self {
+        Self::Single(ProtoRequest::Embed(request))
+    }
+
+    pub(crate) fn request_id(&self) -> &str {
+        match self {
+            Self::Single(request) => request.request_id(),
+            Self::PrefillDecode(request) | Self::EncodePrefillDecode { request, .. } => {
+                request.request_id()
+            }
+            Self::Batch {
+                shared_request_id, ..
+            } => shared_request_id,
+        }
+    }
+
+    pub(crate) fn request_type(&self) -> &'static str {
+        match self {
+            Self::Single(ProtoRequest::Generate(_))
+            | Self::PrefillDecode(_)
+            | Self::EncodePrefillDecode { .. }
+            | Self::Batch { .. } => "generate",
+            Self::Single(ProtoRequest::Embed(_)) => "embed",
+        }
+    }
+
+    pub(crate) fn mode_label(&self) -> &'static str {
+        match self {
+            Self::Single(_) => "single",
+            Self::PrefillDecode(_) => "prefill_decode",
+            Self::EncodePrefillDecode { .. } => "encode_prefill_decode",
+            Self::Batch { kind, .. } => match kind {
+                ExecutionPlanKind::Single => "single",
+                ExecutionPlanKind::PrefillDecode => "prefill_decode",
+                ExecutionPlanKind::EncodePrefillDecode => "encode_prefill_decode",
+            },
+        }
+    }
 }
 
 /// Output from preparation stage (Step 1)
@@ -142,8 +290,11 @@ pub(crate) enum PreparationOutput {
         tool_constraints: Option<(String, String)>,
     },
     Completion {
-        original_text: String,
-        token_ids: Vec<u32>,
+        /// One entry per prompt; scalar requests carry exactly one.
+        items: Vec<CompletionItem>,
+        /// `Some` iff multiple prompts: their texts joined for routing,
+        /// mirroring the HTTP router's `extract_text_for_routing`.
+        joined_routing_text: Option<String>,
     },
     Generate {
         original_text: Option<String>,
@@ -165,16 +316,25 @@ pub(crate) enum PreparationOutput {
     },
 }
 
+/// One tokenized completion prompt.
+pub(crate) struct CompletionItem {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+}
+
 impl PreparationOutput {
-    /// Token IDs (common to all variants)
+    /// Token IDs (common to all variants). Batched completions expose the
+    /// first prompt's tokens as the routing-affinity proxy.
     pub fn token_ids(&self) -> &[u32] {
         match self {
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
-            | Self::Completion { token_ids, .. }
             | Self::Generate { token_ids, .. }
             | Self::Embedding { token_ids, .. }
             | Self::Harmony { token_ids, .. } => token_ids,
+            Self::Completion { items, .. } => {
+                items.first().map_or(&[], |item| item.token_ids.as_slice())
+            }
         }
     }
 
@@ -188,13 +348,23 @@ impl PreparationOutput {
             | Self::Messages {
                 processed_messages, ..
             } => Some(&processed_messages.text),
-            Self::Completion { original_text, .. } | Self::Embedding { original_text, .. } => {
-                Some(original_text)
-            }
+            Self::Completion {
+                items,
+                joined_routing_text,
+            } => joined_routing_text
+                .as_deref()
+                .or_else(|| items.first().map(|item| item.text.as_str())),
+            Self::Embedding { original_text, .. } => Some(original_text),
             Self::Generate { original_text, .. } => original_text.as_deref(),
             Self::Harmony { selection_text, .. } => Some(selection_text),
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct EncodeWorkerAssignment {
+    pub item_index: usize,
+    pub worker: Arc<dyn Worker>,
 }
 
 /// Worker selection (Step 2)
@@ -202,7 +372,10 @@ pub(crate) enum WorkerSelection {
     Single {
         worker: Arc<dyn Worker>,
     },
-    Dual {
+    /// Disaggregated prefill/decode selection. EPD layers per-item encode
+    /// assignments on top; plain PD leaves `encode_assignments` unset.
+    Disaggregated {
+        encode_assignments: Option<Vec<EncodeWorkerAssignment>>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         runtime_type: RuntimeType,
@@ -210,11 +383,14 @@ pub(crate) enum WorkerSelection {
 }
 
 /// Client selection (Step 3)
+#[derive(Clone)]
 pub(crate) enum ClientSelection {
     Single {
         client: GrpcClient,
     },
-    Dual {
+    /// Disaggregated prefill/decode scheduler clients. EPD encode workers are
+    /// contacted directly from `WorkerSelection::Disaggregated` assignments.
+    Disaggregated {
         prefill: GrpcClient,
         decode: GrpcClient,
     },
@@ -235,9 +411,16 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
     },
-    Dual {
+    /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
+    /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
+    Disaggregated {
         _prefill: WorkerLoadGuard,
         _decode: WorkerLoadGuard,
+    },
+    /// Batched completion fan-out: one guard set per sub-request so load-aware
+    /// policies see the real backend concurrency.
+    Batch {
+        _guards: Vec<LoadGuards>,
     },
 }
 
@@ -247,12 +430,23 @@ impl LoadGuards {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::new(worker.clone(), headers),
             },
-            WorkerSelection::Dual {
+            WorkerSelection::Disaggregated {
                 prefill, decode, ..
-            } => LoadGuards::Dual {
+            } => LoadGuards::Disaggregated {
                 _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
                 _decode: WorkerLoadGuard::new(decode.clone(), headers),
             },
+        }
+    }
+
+    /// One guard set per concurrent sub-request.
+    pub fn scaled(selection: &WorkerSelection, headers: Option<&HeaderMap>, count: usize) -> Self {
+        if count <= 1 {
+            Self::new(selection, headers)
+        } else {
+            Self::Batch {
+                _guards: (0..count).map(|_| Self::new(selection, headers)).collect(),
+            }
         }
     }
 }
@@ -279,6 +473,41 @@ pub(crate) struct ResponseState {
 }
 
 impl RequestContext {
+    /// Build a context, resolving a model alias to its canonical model ID.
+    ///
+    /// This is the single place the gRPC pipeline canonicalizes. Both
+    /// `input.model_id` and the request's own `model` field are rewritten, so
+    /// every stage below — worker selection, tokenizer lookup, parser
+    /// selection, tool call ID format — reads the canonical ID without
+    /// resolving anything itself.
+    ///
+    /// One visible consequence: the response reports the canonical model ID,
+    /// not the alias the client sent. That matches how the OpenAI API answers
+    /// with the model it actually ran.
+    fn new(
+        mut request_type: RequestType,
+        headers: Option<HeaderMap>,
+        mut model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        if let Some(canonical_model_id) = components.worker_registry.resolve_model_alias(&model_id)
+        {
+            model_id.clear();
+            model_id.push_str(&canonical_model_id);
+            request_type.set_model(&model_id);
+        }
+        Self {
+            input: RequestInput {
+                request_type,
+                headers,
+                model_id,
+                tenant_request_meta: None,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
     /// Create context for chat completion request
     pub fn for_chat(
         request: Arc<ChatCompletionRequest>,
@@ -286,15 +515,7 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Chat(request),
-                headers,
-                model_id,
-            },
-            components,
-            state: ProcessingState::default(),
-        }
+        Self::new(RequestType::Chat(request), headers, model_id, components)
     }
 
     /// Create context for generate request
@@ -304,15 +525,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Generate(request),
-                headers,
-                model_id,
-            },
+        Self::new(
+            RequestType::Generate(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for completion request
@@ -322,15 +540,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Completion(request),
-                headers,
-                model_id,
-            },
+        Self::new(
+            RequestType::Completion(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for Responses API request
@@ -340,15 +555,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Responses(request),
-                headers,
-                model_id,
-            },
+        Self::new(
+            RequestType::Responses(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for embedding request
@@ -358,15 +570,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Embedding(request),
-                headers,
-                model_id,
-            },
+        Self::new(
+            RequestType::Embedding(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for classify request
@@ -376,15 +585,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Classify(request),
-                headers,
-                model_id,
-            },
+        Self::new(
+            RequestType::Classify(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for messages request
@@ -394,15 +600,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Messages(request),
-                headers,
-                model_id,
-            },
+        Self::new(
+            RequestType::Messages(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Get chat request (panics if not chat)
@@ -546,14 +749,14 @@ impl RequestContext {
 /// Some methods are kept for API completeness even if currently unused.
 #[expect(dead_code)]
 impl WorkerSelection {
-    pub fn is_dual(&self) -> bool {
-        matches!(self, Self::Dual { .. })
+    pub fn is_disaggregated(&self) -> bool {
+        matches!(self, Self::Disaggregated { .. })
     }
 
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
-            Self::Dual { .. } => None,
+            Self::Disaggregated { .. } => None,
         }
     }
 
@@ -561,18 +764,20 @@ impl WorkerSelection {
     pub fn record_outcome(&self, status_code: u16) {
         match self {
             Self::Single { worker } => worker.record_outcome(status_code),
-            Self::Dual {
+            Self::Disaggregated {
                 prefill, decode, ..
             } => {
+                // EPD encode dispatch is asynchronous and supervised by
+                // RequestExecution; this records only the prefill/decode leg.
                 prefill.record_outcome(status_code);
                 decode.record_outcome(status_code);
             }
         }
     }
 
-    /// Record circuit breaker outcomes for dual dispatch (individual tracking)
-    pub fn record_dual_outcomes(&self, prefill_status: u16, decode_status: u16) {
-        if let Self::Dual {
+    /// Record circuit breaker outcomes for disaggregated dispatch (individual tracking)
+    pub fn record_prefill_decode_outcomes(&self, prefill_status: u16, decode_status: u16) {
+        if let Self::Disaggregated {
             prefill, decode, ..
         } = self
         {
@@ -584,7 +789,9 @@ impl WorkerSelection {
     /// Record circuit breaker outcome for prefill worker only (sequential PD)
     pub fn record_outcome_prefill(&self, status_code: u16) {
         match self {
-            Self::Dual { prefill, .. } => prefill.record_outcome(status_code),
+            Self::Disaggregated { prefill, .. } => {
+                prefill.record_outcome(status_code);
+            }
             Self::Single { .. } => {
                 debug!("record_outcome_prefill called on Single worker selection, ignoring");
             }
@@ -594,7 +801,9 @@ impl WorkerSelection {
     /// Record circuit breaker outcome for decode worker only (sequential PD)
     pub fn record_outcome_decode(&self, status_code: u16) {
         match self {
-            Self::Dual { decode, .. } => decode.record_outcome(status_code),
+            Self::Disaggregated { decode, .. } => {
+                decode.record_outcome(status_code);
+            }
             Self::Single { .. } => {
                 debug!("record_outcome_decode called on Single worker selection, ignoring");
             }
@@ -602,9 +811,9 @@ impl WorkerSelection {
     }
 
     #[expect(clippy::type_complexity)]
-    pub fn dual(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
+    pub fn disaggregated_pair(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {
-            Self::Dual {
+            Self::Disaggregated {
                 prefill, decode, ..
             } => Some((prefill, decode)),
             Self::Single { .. } => None,
@@ -613,22 +822,31 @@ impl WorkerSelection {
 
     pub fn prefill_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Disaggregated { prefill, .. } => Some(prefill),
             Self::Single { .. } => None,
         }
     }
 
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,
         }
     }
 
-    /// Get the runtime type for PD mode (from dual workers)
-    pub fn pd_runtime_type(&self) -> Option<&RuntimeType> {
+    /// Get the runtime type for disaggregated mode.
+    pub fn disaggregated_runtime_type(&self) -> Option<&RuntimeType> {
         match self {
-            Self::Dual { runtime_type, .. } => Some(runtime_type),
+            Self::Disaggregated { runtime_type, .. } => Some(runtime_type),
+            Self::Single { .. } => None,
+        }
+    }
+
+    pub fn encode_assignments(&self) -> Option<&[EncodeWorkerAssignment]> {
+        match self {
+            Self::Disaggregated {
+                encode_assignments, ..
+            } => encode_assignments.as_deref(),
             Self::Single { .. } => None,
         }
     }
@@ -640,48 +858,48 @@ impl ClientSelection {
     pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
-            Self::Dual { .. } => None,
+            Self::Disaggregated { .. } => None,
         }
     }
 
     pub fn single_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
-            Self::Dual { .. } => None,
+            Self::Disaggregated { .. } => None,
         }
     }
 
-    pub fn dual_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
+    pub fn disaggregated_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
         match self {
-            Self::Dual { prefill, decode } => Some((prefill, decode)),
+            Self::Disaggregated { prefill, decode } => Some((prefill, decode)),
             Self::Single { .. } => None,
         }
     }
 
     pub fn prefill_client(&self) -> Option<&GrpcClient> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Disaggregated { prefill, .. } => Some(prefill),
             Self::Single { .. } => None,
         }
     }
 
     pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
-            Self::Dual { prefill, .. } => Some(prefill),
+            Self::Disaggregated { prefill, .. } => Some(prefill),
             Self::Single { .. } => None,
         }
     }
 
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,
         }
     }
 
     pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
-            Self::Dual { decode, .. } => Some(decode),
+            Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,
         }
     }
@@ -693,14 +911,30 @@ pub(crate) enum ExecutionResult {
     Single {
         stream: ProtoStream,
     },
-    Dual {
+    PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        /// PD timing context, for honest PD TTFT (prefill start to first decode token).
+        pd_timing: PdTiming,
     },
     /// Embedding requests return a single response, not a stream
     Embedding {
         response: ProtoEmbedComplete,
     },
+    /// Batched completion fan-out: one result per prompt, in prompt order.
+    Batch {
+        results: Vec<ExecutionResult>,
+    },
+}
+
+/// Timing context threaded from PD execution into the streaming layer so the
+/// first decode token can be measured against prefill start.
+#[derive(Clone)]
+pub(crate) struct PdTiming {
+    /// Monotonic instant the prefill RPC was dispatched.
+    pub prefill_start: std::time::Instant,
+    /// Backend runtime label (e.g. "sglang", "vllm") for the PD metric set.
+    pub runtime: &'static str,
 }
 
 /// Final processed response
@@ -717,4 +951,46 @@ pub(crate) enum FinalResponse {
     Classify(ClassifyResponse),
     /// Messages API response
     Messages(Message),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completion_prep(texts: &[&str], joined: Option<&str>) -> PreparationOutput {
+        PreparationOutput::Completion {
+            items: texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| CompletionItem {
+                    text: (*text).to_string(),
+                    token_ids: vec![i as u32],
+                })
+                .collect(),
+            joined_routing_text: joined.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn completion_preparation_routes_by_first_item_or_joined_text() {
+        let scalar = completion_prep(&["hello"], None);
+        assert_eq!(scalar.routing_text(), Some("hello"));
+        assert_eq!(scalar.token_ids(), &[0]);
+
+        let batch = completion_prep(&["a", "b"], Some("a b"));
+        assert_eq!(batch.routing_text(), Some("a b"));
+        assert_eq!(batch.token_ids(), &[0]);
+    }
+
+    #[test]
+    fn batch_execution_plan_reports_shared_id_and_kind_label() {
+        let plan = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl_shared".to_string(),
+            requests: vec![],
+        };
+        assert_eq!(plan.request_id(), "cmpl_shared");
+        assert_eq!(plan.request_type(), "generate");
+        assert_eq!(plan.mode_label(), "prefill_decode");
+    }
 }

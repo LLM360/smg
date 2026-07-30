@@ -191,6 +191,22 @@ fn test_function_call_function_variant_normalizes() {
     );
 }
 
+#[test]
+fn test_min_tokens_zero_is_valid() {
+    let req = ChatCompletionRequest {
+        model: "test-model".to_string(),
+        messages: vec![ChatMessage::User {
+            content: MessageContent::Text("hello".to_string()),
+            name: None,
+        }],
+        min_tokens: Some(0),
+        max_completion_tokens: Some(1),
+        ..Default::default()
+    };
+
+    assert!(req.validate().is_ok());
+}
+
 // Stream options validation tests
 
 #[test]
@@ -204,6 +220,7 @@ fn test_stream_options_requires_stream_enabled() {
         stream: false,
         stream_options: Some(StreamOptions {
             include_usage: Some(true),
+            ..StreamOptions::default()
         }),
         ..Default::default()
     };
@@ -231,6 +248,7 @@ fn test_stream_options_valid_when_stream_enabled() {
         stream: true,
         stream_options: Some(StreamOptions {
             include_usage: Some(true),
+            ..StreamOptions::default()
         }),
         ..Default::default()
     };
@@ -259,6 +277,49 @@ fn test_no_stream_options_valid_when_stream_disabled() {
     assert!(
         result.is_ok(),
         "Should accept no stream_options when stream is false"
+    );
+}
+
+#[test]
+fn test_stream_options_continuous_usage_stats_valid() {
+    let req = ChatCompletionRequest {
+        model: "test-model".to_string(),
+        messages: vec![ChatMessage::User {
+            content: MessageContent::Text("hello".to_string()),
+            name: None,
+        }],
+        stream: true,
+        stream_options: Some(StreamOptions {
+            include_usage: Some(true),
+            continuous_usage_stats: Some(true),
+            ..StreamOptions::default()
+        }),
+        ..Default::default()
+    };
+
+    let result = req.validate();
+    assert!(
+        result.is_ok(),
+        "Should accept continuous_usage_stats in stream_options"
+    );
+
+    // Verify the field survives a full serialise → deserialise round-trip
+    let opts = req.stream_options.unwrap();
+    let json = serde_json::to_string(&opts).unwrap();
+    assert!(
+        json.contains("continuous_usage_stats"),
+        "continuous_usage_stats must be present in serialised output"
+    );
+    let decoded: StreamOptions = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        decoded.continuous_usage_stats,
+        Some(true),
+        "continuous_usage_stats must deserialise back to Some(true)"
+    );
+    assert_eq!(
+        decoded.include_usage,
+        Some(true),
+        "include_usage must survive the round-trip unchanged"
     );
 }
 
@@ -350,7 +411,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
             tools: vec![ToolReference::Function {
                 name: "get_weather".to_string(),
             }],
-            tool_type: "function".to_string(),
+            tool_type: "allowed_tools".to_string(),
         }),
         ..Default::default()
     };
@@ -386,7 +447,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
             tools: vec![ToolReference::Function {
                 name: "get_weather".to_string(),
             }],
-            tool_type: "function".to_string(),
+            tool_type: "allowed_tools".to_string(),
         }),
         ..Default::default()
     };
@@ -417,7 +478,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
             tools: vec![ToolReference::Function {
                 name: "get_weather".to_string(),
             }],
-            tool_type: "function".to_string(),
+            tool_type: "allowed_tools".to_string(),
         }),
         ..Default::default()
     };
@@ -448,7 +509,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
             tools: vec![ToolReference::Function {
                 name: "nonexistent_tool".to_string(),
             }],
-            tool_type: "function".to_string(),
+            tool_type: "allowed_tools".to_string(),
         }),
         ..Default::default()
     };
@@ -500,7 +561,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                     name: "get_time".to_string(),
                 },
             ],
-            tool_type: "function".to_string(),
+            tool_type: "allowed_tools".to_string(),
         }),
         ..Default::default()
     };
@@ -547,7 +608,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                     name: "nonexistent_tool".to_string(),
                 },
             ],
-            tool_type: "function".to_string(),
+            tool_type: "allowed_tools".to_string(),
         }),
         ..Default::default()
     };

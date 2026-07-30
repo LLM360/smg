@@ -201,11 +201,13 @@ class TestRouterConfigValidation:
             queue_size=100,
             queue_timeout_secs=60,
             rate_limit_tokens_per_second=100,
+            global_rate_limit_requests_per_second=75,
         )
         assert args.max_concurrent_requests == 256
         assert args.queue_size == 100
         assert args.queue_timeout_secs == 60
         assert args.rate_limit_tokens_per_second == 100
+        assert args.global_rate_limit_requests_per_second == 75
 
     def test_service_discovery_config_validation(self):
         """Test service discovery configuration validation."""
@@ -343,6 +345,7 @@ class TestRouterConfigValidation:
             policy_from_str("size_aware_power_of_two")
             == PolicyType.SizeAwarePowerOfTwo
         )
+        assert policy_from_str("least_load") == PolicyType.LeastLoad
 
     def test_invalid_policy_enum_conversion(self):
         """Test invalid policy string to enum conversion."""

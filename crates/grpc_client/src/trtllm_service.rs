@@ -1,12 +1,4 @@
-use std::{
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{future::Future, pin::Pin};
 
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -17,10 +9,10 @@ use openai_protocol::{
     responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request, Streaming};
+use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
-use crate::{BoxedTraceInjector, NoopTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -34,92 +26,9 @@ pub mod proto {
     tonic::include_proto!("trtllm");
 }
 
-/// A smart wrapper around Streaming<GenerateResponse> that automatically
-/// sends abort when dropped (e.g., due to client disconnection or early termination).
-///
-/// This leverages Rust's RAII pattern to ensure cleanup happens automatically,
-/// regardless of how the stream is dropped (panic, early return, client disconnect, etc.).
-pub struct AbortOnDropStream {
-    inner: Streaming<proto::GenerateResponse>,
-    request_id: String,
-    client: TrtllmServiceClient,
-    aborted: Arc<AtomicBool>,
-}
-
-impl AbortOnDropStream {
-    /// Create a new auto-aborting stream wrapper
-    pub fn new(
-        stream: Streaming<proto::GenerateResponse>,
-        request_id: String,
-        client: TrtllmServiceClient,
-    ) -> Self {
-        debug!("Created AbortOnDropStream for request {}", request_id);
-        Self {
-            inner: stream,
-            request_id,
-            client,
-            aborted: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Manually mark the request as completed to prevent abort on drop.
-    /// Call this when the request completes successfully to avoid unnecessary abort RPC.
-    pub fn mark_completed(&self) {
-        // Use Release ordering to ensure that this write is visible to other threads
-        // that use Acquire on the same atomic variable
-        self.aborted.store(true, Ordering::Release);
-        debug!("Request {} marked as completed", self.request_id);
-    }
-}
-
-impl Drop for AbortOnDropStream {
-    fn drop(&mut self) {
-        // Atomically check and set the aborted flag using compare_exchange.
-        // If compare_exchange fails, it means the flag was already true (from mark_completed),
-        // so we don't need to send abort. AcqRel is used for success to synchronize with
-        // mark_completed's Release, and Acquire for failure to see writes from mark_completed.
-        if self
-            .aborted
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
-        let client = self.client.clone();
-        let request_id = self.request_id.clone();
-
-        // Spawn a background task to send abort (since Drop is sync but abort_request is async)
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "fire-and-forget abort on Drop is intentional"
-        )]
-        tokio::spawn(async move {
-            debug!(
-                "Stream dropped without completion for request {}, sending abort",
-                request_id
-            );
-            // Clone request_id for the error message since abort_request takes ownership
-            let request_id_for_log = request_id.clone();
-            if let Err(e) = client.abort_request(request_id).await {
-                warn!(
-                    "Failed to send abort on drop for request {}: {}",
-                    request_id_for_log, e
-                );
-            }
-        });
-    }
-}
-
-// Implement Stream trait to make AbortOnDropStream work like the original Streaming
-impl futures::Stream for AbortOnDropStream {
-    type Item = Result<proto::GenerateResponse, tonic::Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Delegate to the inner stream
-        Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
+/// Streaming `generate()` response that auto-aborts on drop. Concrete
+/// alias for the generic `crate::AbortOnDropStream`.
+pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, TrtllmServiceClient>;
 
 /// gRPC client for TensorRT-LLM service
 #[derive(Clone)]
@@ -128,52 +37,24 @@ pub struct TrtllmServiceClient {
     trace_injector: BoxedTraceInjector,
 }
 
-impl TrtllmServiceClient {
-    /// Create a new client and connect to the TensorRT-LLM server
-    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_with_trace_injector(endpoint, Arc::new(NoopTraceInjector)).await
-    }
-
-    /// Create a new client with a custom trace injector
-    pub async fn connect_with_trace_injector(
-        endpoint: &str,
-        trace_injector: BoxedTraceInjector,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Connecting to TensorRT-LLM gRPC server at {}", endpoint);
-
-        // Convert grpc:// to http:// for tonic
-        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {
-            format!("http://{addr}")
-        } else {
-            endpoint.to_string()
-        };
-
-        let channel = Channel::from_shared(http_endpoint)?
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .tcp_nodelay(true)
-            .http2_adaptive_window(true)
-            .initial_stream_window_size(Some(16 * 1024 * 1024)) // 16MB
-            .initial_connection_window_size(Some(32 * 1024 * 1024)) // 32MB
-            .connect()
-            .await?;
-
-        let client = proto::trtllm_service_client::TrtllmServiceClient::new(channel);
-
-        Ok(Self {
-            client,
-            trace_injector,
+impl AbortOnDropClient for TrtllmServiceClient {
+    fn abort_for_drop(
+        self,
+        request_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
+        Box::pin(async move {
+            // trtllm's abort returns an `AbortResponse`; collapse to `()`
+            // so the wrapper matches the trait signature.
+            self.abort_request(request_id).await.map(|_| ())
         })
     }
+}
 
-    /// Set or replace the trace injector
-    #[must_use]
-    pub fn with_trace_injector(mut self, trace_injector: BoxedTraceInjector) -> Self {
-        self.trace_injector = trace_injector;
-        self
-    }
+impl TrtllmServiceClient {
+    crate::impl_engine_client_basics!(
+        proto::trtllm_service_client::TrtllmServiceClient<Channel>,
+        "TensorRT-LLM"
+    );
 
     /// Submit a generation request (returns auto-aborting streaming response)
     ///
@@ -203,17 +84,6 @@ impl TrtllmServiceClient {
         ))
     }
 
-    /// Perform health check
-    pub async fn health_check(&self) -> Result<proto::HealthCheckResponse, tonic::Status> {
-        debug!("Sending health check request");
-        let request = Request::new(proto::HealthCheckRequest {});
-
-        let mut client = self.client.clone();
-        let response = client.health_check(request).await?;
-        debug!("Health check response received");
-        Ok(response.into_inner())
-    }
-
     /// Abort a request
     pub async fn abort_request(
         &self,
@@ -232,28 +102,6 @@ impl TrtllmServiceClient {
             response.get_ref().success,
             response.get_ref().message
         );
-        Ok(response.into_inner())
-    }
-
-    /// Get model information
-    pub async fn get_model_info(&self) -> Result<proto::GetModelInfoResponse, tonic::Status> {
-        debug!("Requesting model info");
-        let request = Request::new(proto::GetModelInfoRequest {});
-
-        let mut client = self.client.clone();
-        let response = client.get_model_info(request).await?;
-        debug!("Model info response received");
-        Ok(response.into_inner())
-    }
-
-    /// Get server information
-    pub async fn get_server_info(&self) -> Result<proto::GetServerInfoResponse, tonic::Status> {
-        debug!("Requesting server info");
-        let request = Request::new(proto::GetServerInfoRequest {});
-
-        let mut client = self.client.clone();
-        let response = client.get_server_info(request).await?;
-        debug!("Server info response received");
         Ok(response.into_inner())
     }
 
@@ -441,7 +289,7 @@ impl TrtllmServiceClient {
             output_config: Some(output_config),
             max_tokens,
             streaming: body.stream.unwrap_or(false),
-            stop: vec![],
+            stop: vec![], // Does not pass through body.stop yet (follow-up fix)
             stop_token_ids: vec![],
             ignore_eos: false,
             bad: vec![],
@@ -594,7 +442,7 @@ impl TrtllmServiceClient {
         proto::SamplingConfig {
             beam_width: 1,
             num_return_sequences: 1,
-            top_k: None,
+            top_k: (request.top_k >= 0).then_some(request.top_k),
             top_p: Some(request.top_p.unwrap_or(1.0)),
             top_p_min: None,
             top_p_reset_ids: None,
@@ -603,14 +451,14 @@ impl TrtllmServiceClient {
             temperature: Some(request.temperature.unwrap_or(1.0)),
             min_tokens: None,
             beam_search_diversity_rate: None,
-            repetition_penalty: Some(1.0),
-            presence_penalty: None,
-            frequency_penalty: None,
+            repetition_penalty: Some(request.repetition_penalty),
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
             prompt_ignore_length: None,
             length_penalty: None,
             early_stopping: None,
             no_repeat_ngram_size: None,
-            min_p: None,
+            min_p: (request.min_p != 0.0).then_some(request.min_p),
             beam_width_array: vec![],
         }
     }
@@ -1007,6 +855,41 @@ mod tests {
         assert_eq!(config.temperature, None);
         assert_eq!(config.top_p, None);
         assert_eq!(config.top_k, None);
+    }
+
+    #[test]
+    fn test_responses_sampling_config_is_passed_through() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        let request = ResponsesRequest {
+            top_k: 40,
+            min_p: 0.05,
+            repetition_penalty: 1.2,
+            frequency_penalty: Some(0.3),
+            presence_penalty: Some(-0.4),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_output_tokens: Some(128),
+            ..Default::default()
+        };
+
+        let cfg = TrtllmServiceClient::build_sampling_config_from_responses(&request);
+
+        assert_eq!(cfg.top_k, Some(40));
+        assert_eq!(cfg.min_p, Some(0.05));
+        assert_eq!(cfg.repetition_penalty, Some(1.2));
+        assert_eq!(cfg.frequency_penalty, Some(0.3));
+        assert_eq!(cfg.presence_penalty, Some(-0.4));
+
+        // Default top_k (-1) maps to None, letting TRT-LLM use its own default.
+        let disabled = ResponsesRequest {
+            top_k: -1,
+            ..Default::default()
+        };
+        let disabled_cfg = TrtllmServiceClient::build_sampling_config_from_responses(&disabled);
+        assert_eq!(disabled_cfg.top_k, None);
+        // Default min_p (0.0) maps to None for the same reason.
+        assert_eq!(disabled_cfg.min_p, None);
     }
 
     #[tokio::test]

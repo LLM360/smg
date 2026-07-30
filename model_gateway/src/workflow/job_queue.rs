@@ -26,6 +26,7 @@ use crate::{
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, McpServerConfigRequest, TokenizerConfigRequest,
         TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        WorkerRegistrationMode,
     },
 };
 
@@ -34,6 +35,7 @@ use crate::{
 pub enum Job {
     AddWorker {
         config: Box<WorkerSpec>,
+        registration_mode: WorkerRegistrationMode,
     },
     UpdateWorker {
         url: String,
@@ -86,7 +88,7 @@ impl Job {
     /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
     pub fn worker_url(&self) -> &str {
         match self {
-            Job::AddWorker { config } => &config.url,
+            Job::AddWorker { config, .. } => &config.url,
             Job::UpdateWorker { url, .. } => url,
             Job::RemoveWorker { url, .. } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
@@ -310,7 +312,10 @@ impl JobQueue {
     /// Execute a specific job
     async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
         match job {
-            Job::AddWorker { config } => {
+            Job::AddWorker {
+                config,
+                registration_mode,
+            } => {
                 let engines = context
                     .workflow_engines
                     .get()
@@ -319,8 +324,11 @@ impl JobQueue {
                 let timeout_duration =
                     Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
 
-                let workflow_data =
-                    create_worker_workflow_data((**config).clone(), Arc::clone(context));
+                let workflow_data = create_worker_workflow_data(
+                    (**config).clone(),
+                    registration_mode.clone(),
+                    Arc::clone(context),
+                );
                 let instance_id = engines
                     .worker_registration
                     .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
@@ -394,7 +402,20 @@ impl JobQueue {
                     url, instance_id
                 );
 
-                let timeout_duration = Duration::from_secs(30);
+                // Caller wait must cover the worst-case `DrainWorkersStep`
+                // sleep, which is `max(per-worker drain_settle_secs)`. We
+                // can't see per-worker overrides from here without scanning
+                // the registry, so use a generous floor: at least
+                // `MAX_DRAIN_WAIT_SECS` (large enough for realistic
+                // overrides), and at least the global default if it's
+                // higher. 30s on top covers the other removal steps.
+                const MAX_DRAIN_WAIT_SECS: u64 = 600;
+                let drain_wait_secs = context
+                    .router_config
+                    .health_check
+                    .drain_settle_secs
+                    .max(MAX_DRAIN_WAIT_SECS);
+                let timeout_duration = Duration::from_secs(30 + drain_wait_secs);
 
                 let result = engines
                     .worker_removal
@@ -492,6 +513,26 @@ impl JobQueue {
 
                         prefill_workers.chain(decode_workers).collect()
                     }
+                    RoutingMode::EncodePrefillDecode {
+                        encode_urls,
+                        prefill_urls,
+                        decode_urls,
+                        ..
+                    } => {
+                        let encode_workers = encode_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "encode", *port));
+                        let prefill_workers = prefill_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "prefill", *port));
+                        let decode_workers =
+                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
+
+                        encode_workers
+                            .chain(prefill_workers)
+                            .chain(decode_workers)
+                            .collect()
+                    }
                     RoutingMode::OpenAI { worker_urls }
                     | RoutingMode::Anthropic { worker_urls }
                     | RoutingMode::Gemini { worker_urls } => {
@@ -517,6 +558,7 @@ impl JobQueue {
                     let proto_worker_type = match worker_type {
                         "prefill" => WorkerType::Prefill,
                         "decode" => WorkerType::Decode,
+                        "encode" => WorkerType::Encode,
                         _ => WorkerType::Regular,
                     };
                     let mut spec = WorkerSpec::new(url);
@@ -532,6 +574,7 @@ impl JobQueue {
 
                     let job = Job::AddWorker {
                         config: Box::new(config),
+                        registration_mode: WorkerRegistrationMode::Upsert,
                     };
 
                     if let Some(queue) = context.worker_job_queue.get() {
@@ -642,6 +685,7 @@ impl JobQueue {
             Job::RemoveTokenizer { request } => {
                 // Tokenizer removal is synchronous and fast
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
+                    context.multimodal_config_registry.remove(&entry.id);
                     info!(
                         "Successfully removed tokenizer '{}' (id: {})",
                         entry.name, entry.id
@@ -723,6 +767,7 @@ async fn submit_external_worker_jobs(
 
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::Upsert,
         };
 
         if let Some(queue) = context.worker_job_queue.get() {

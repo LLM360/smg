@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{error::Error as _, sync::Arc, time::Instant};
 
 use axum::{
     body::{to_bytes, Body},
@@ -15,17 +15,27 @@ use openai_protocol::{
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
+    messages::CreateMessageRequest,
+    realtime_session::{
+        RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
+        RealtimeTranscriptionSessionCreateRequest,
+    },
     rerank::{RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
+    transcription::{AudioFile, TranscriptionRequest},
 };
-use reqwest::Client;
+use reqwest::{
+    multipart::{Form, Part},
+    Client,
+};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tracing::error;
 
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    middleware::TenantRequestMeta,
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -35,14 +45,23 @@ use crate::{
     routers::{
         common::{
             header_utils,
+            realtime::{
+                rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
+                ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
+            },
             retry::{is_retryable_status, RetryExecutor},
+            worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
+        openai::strip_default_sglang_fields,
         RouterTrait,
     },
     worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
 };
+
+/// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
+const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -50,6 +69,9 @@ pub struct Router {
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     retry_config: RetryConfig,
+    realtime_registry: Arc<RealtimeRegistry>,
+    webrtc_bind_addr: Option<std::net::IpAddr>,
+    webrtc_stun_server: Option<String>,
 }
 
 struct WorkerSelection {
@@ -65,7 +87,7 @@ impl std::fmt::Debug for Router {
             .field("policy_registry", &self.policy_registry)
             .field("client", &self.client)
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,6 +103,9 @@ impl Router {
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            realtime_registry: ctx.realtime_registry.clone(),
+            webrtc_bind_addr: ctx.webrtc_bind_addr,
+            webrtc_stun_server: ctx.webrtc_stun_server.clone(),
         })
     }
 
@@ -181,9 +206,12 @@ impl Router {
             hash_ring,
             max_output_tokens,
             reserve_work: true,
+            leg: crate::policies::WorkerLeg::Single,
         };
         let reservation_cost = policy.reservation_cost(&info);
-        let idx = policy.select_worker(&available, &info)?;
+        let idx = self
+            .policy_registry
+            .select_worker(&policy, &available, &info)?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -200,6 +228,28 @@ impl Router {
         })
     }
 
+    /// Select a local, realtime-capable worker for the given model.
+    ///
+    /// Uses the shared [`WorkerSelector`] (least-loaded) filtered to regular
+    /// HTTP workers advertising the `realtime` label, so realtime traffic
+    /// never lands on a worker that can't serve it.
+    async fn select_realtime_worker(
+        &self,
+        model_id: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Result<Arc<dyn Worker>, Response> {
+        WorkerSelector::new(&self.worker_registry, &self.client)
+            .select_worker(&SelectWorkerRequest {
+                model_id,
+                headers,
+                worker_type: Some(WorkerType::Regular),
+                connection_mode: Some(ConnectionMode::Http),
+                require_realtime_capable: true,
+                ..Default::default()
+            })
+            .await
+    }
+
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -210,6 +260,12 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        // Resolve once, here, so every registry, policy and metrics lookup
+        // below is keyed by the canonical model ID. Only `get_by_model`
+        // understands aliases; retry configs, hash rings and policies do not,
+        // and an alias would silently fall back to router defaults.
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
         let model = model_id;
         let endpoint = route_to_endpoint(route);
 
@@ -234,7 +290,15 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        route,
+                        model_id,
+                        canonical_model.as_deref(),
+                        is_stream,
+                        &text,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -285,12 +349,17 @@ impl Router {
         response
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-attempt state threaded from route_typed_request; a struct would only move the arity"
+    )]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
         model_id: &str,
+        canonical_model: Option<&str>,
         is_stream: bool,
         text: &str,
     ) -> Response {
@@ -351,6 +420,7 @@ impl Router {
                 headers,
                 typed_req,
                 route,
+                canonical_model,
                 worker.as_ref(),
                 is_stream,
                 load_guard,
@@ -486,12 +556,397 @@ impl Router {
             .await
     }
 
-    // Send typed request directly without conversion
+    /// Forward an audio transcription request to an audio-capable worker as
+    /// `multipart/form-data`. Separate from `route_typed_request` because the
+    /// endpoint is not JSON-bodied.
+    async fn route_multipart_transcription(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &TranscriptionRequest,
+        audio: AudioFile,
+        route: &'static str,
+        model_id: &str,
+    ) -> Response {
+        let start = Instant::now();
+        let is_stream = body.is_stream();
+        let text = body.extract_text_for_routing();
+        // Resolve once, here, for the same reason as `route_typed_request`:
+        // only `get_by_model` understands aliases, so the policy and hash ring
+        // lookups below would silently fall back to router defaults on an
+        // alias. This path cannot reuse that resolution because multipart
+        // never goes through `route_typed_request`.
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
+        let endpoint = route_to_endpoint(route);
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id,
+            endpoint,
+            bool_to_static_str(is_stream),
+        );
+
+        // Finalize router metrics for an early error that never reached an
+        // upstream worker (model_not_found, dp_aware_not_supported, no
+        // available workers, build failure). Without this, pre-send failures
+        // silently disappear from router_upstream_responses / router_error.
+        let record_pre_send_error = |response: &Response| {
+            let rstatus = response.status();
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                rstatus.as_u16(),
+                extract_error_code_from_response(response),
+            );
+            if !is_retryable_status(rstatus) {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    error_type_from_status(rstatus),
+                );
+            }
+        };
+
+        // Multipart transcription can't route through `worker.prepare_request`,
+        // which is the hook that injects `data_parallel_rank` for DP-aware
+        // workers. Pre-filter DP-aware workers out of the candidate pool so
+        // the policy can pick a non-DP worker when one exists; only fall back
+        // to model_not_found / 400 when every candidate is DP-aware.
+        let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
+            None
+        } else {
+            Some(model_id)
+        };
+        let all_workers = self.worker_registry.get_workers_filtered(
+            model_filter,
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            None,
+            false,
+        );
+        if all_workers.is_empty() {
+            let resp = error::model_not_found(model_id);
+            record_pre_send_error(&resp);
+            return resp;
+        }
+        let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
+            .iter()
+            .filter(|w| !w.is_dp_aware())
+            .cloned()
+            .collect();
+        if non_dp_workers.is_empty() {
+            let resp = error::bad_request(
+                "dp_aware_not_supported",
+                "/v1/audio/transcriptions does not yet support DP-aware workers",
+            );
+            record_pre_send_error(&resp);
+            return resp;
+        }
+        let available: Vec<Arc<dyn Worker>> = non_dp_workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
+        if available.is_empty() {
+            let resp = error::service_unavailable(
+                "no_available_workers",
+                "All workers are unavailable (circuit breaker open or unhealthy)",
+            );
+            record_pre_send_error(&resp);
+            return resp;
+        }
+
+        let policy = self.policy_registry.get_policy_or_default(model_id);
+        let hash_ring = self.worker_registry.get_hash_ring(model_id);
+        let idx = match self.policy_registry.select_worker(
+            &policy,
+            &available,
+            &SelectWorkerInfo {
+                request_text: Some(&text),
+                tokens: None,
+                headers,
+                hash_ring,
+                max_output_tokens: None,
+                reserve_work: false,
+                leg: crate::policies::WorkerLeg::Single,
+            },
+        ) {
+            Some(i) => i,
+            None => {
+                let resp = error::service_unavailable(
+                    "no_available_workers",
+                    "Policy returned no eligible worker",
+                );
+                record_pre_send_error(&resp);
+                return resp;
+            }
+        };
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id,
+            policy.name(),
+        );
+        let worker = available[idx].clone();
+
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        events::RequestSentEvent { url: worker.url() }.emit();
+
+        let form = match build_transcription_form(body, audio, canonical_model.as_deref()) {
+            Ok(f) => f,
+            Err(e) => {
+                let resp = error::bad_request("multipart_build_failed", e);
+                record_pre_send_error(&resp);
+                return resp;
+            }
+        };
+
+        let endpoint_url = worker.endpoint_url(route);
+        let mut request_builder = self.client.post(&endpoint_url).multipart(form);
+
+        if let Some(key) = worker.api_key().cloned() {
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
+        }
+
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                // Skip Content-Type and Content-Length — reqwest sets the
+                // correct multipart boundary itself.
+                let name_str = name.as_str();
+                if name_str.eq_ignore_ascii_case("content-type")
+                    || name_str.eq_ignore_ascii_case("content-length")
+                {
+                    continue;
+                }
+                if header_utils::should_forward_request_header(name_str) {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        }
+
+        let res = match request_builder.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!(
+                    "Failed to send multipart transcription request worker_url={} route={} error={}",
+                    worker.url(),
+                    route,
+                    e
+                );
+                let err_resp = convert_reqwest_error(e);
+                let err_status = err_resp.status();
+                // Feed the synthetic status into the worker circuit breaker
+                // and worker-error metric; transport failures (timeouts,
+                // connect errors) must be visible to health tracking so the
+                // same bad worker isn't picked repeatedly.
+                worker.record_outcome(err_status.as_u16());
+                if err_status.is_server_error() {
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(err_status),
+                    );
+                }
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    err_status.as_u16(),
+                    extract_error_code_from_response(&err_resp),
+                );
+                // Mirror route_typed_request: a send failure must still bump
+                // the terminal router_error counter, not just upstream_response.
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    error_type_from_status(err_status),
+                );
+                return err_resp;
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
+
+        events::RequestReceivedEvent {}.emit();
+
+        let response = if is_stream {
+            // Preserve the upstream content-type verbatim. A `stream=true`
+            // hint from the client doesn't guarantee the worker actually
+            // streams — whisper backends may ignore it and return a normal
+            // JSON body (success or 4xx error). Don't relabel non-SSE
+            // responses as SSE; leave that judgment to whatever the worker
+            // set.
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let stream = res.bytes_stream();
+            // Bounded channel applies backpressure: if the downstream client
+            // is slow, the upstream relay awaits on `send` rather than piling
+            // chunks in memory.
+            const STREAM_RELAY_BUFFER: usize = 32;
+            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, String>>(STREAM_RELAY_BUFFER);
+            // Attribute worker-level and router-level outcomes to the actual
+            // stream completion from inside the relay task: a mid-stream error
+            // after a 2xx header, or a non-streaming 5xx header returned under
+            // `stream=true`, must be visible to circuit-breaker + worker-error
+            // + router-error metrics. Recording only at header time would mis-
+            // classify those.
+            let worker_for_stream = worker.clone();
+            let stream_header_status = status;
+            let stream_model_id = model_id.to_string();
+            let stream_endpoint = endpoint;
+            let stream_start = start;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
+            )]
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let mut stream_failed = false;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            stream_failed = true;
+                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                            break;
+                        }
+                    }
+                }
+                // Effective status = BAD_GATEWAY if the relay failed, else the
+                // worker's header status. Covers both "5xx header returned
+                // while stream=true" and "200 header then mid-stream break".
+                let effective_status = if stream_failed {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    stream_header_status
+                };
+                worker_for_stream.record_outcome(effective_status.as_u16());
+                if effective_status.is_server_error() {
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(effective_status),
+                    );
+                }
+                if effective_status.is_success() {
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_HTTP,
+                        metrics_labels::BACKEND_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        &stream_model_id,
+                        stream_endpoint,
+                        stream_start.elapsed(),
+                    );
+                } else {
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_HTTP,
+                        metrics_labels::BACKEND_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        &stream_model_id,
+                        stream_endpoint,
+                        error_type_from_status(effective_status),
+                    );
+                }
+            });
+            let stream = ReceiverStream::new(rx);
+            let body = Body::from_stream(stream);
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            if let Some(guard) = load_guard {
+                response = AttachedBody::wrap_response(response, guard);
+            }
+            response
+        } else {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            match res.bytes().await {
+                Ok(body) => {
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => error::internal_error(
+                    "read_response_body_failed",
+                    format!("Failed to read response body: {e}"),
+                ),
+            }
+        };
+
+        // Non-streaming: classify metrics off the final response the client
+        // will actually see. A body-read failure can rewrite a 2xx upstream
+        // into a local 5xx, and we want the circuit breaker + metrics to see
+        // that. Streaming outcomes are owned by the relay task above.
+        if !is_stream {
+            let final_status = response.status();
+            worker.record_outcome(final_status.as_u16());
+            if final_status.is_server_error() {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type_from_status(final_status),
+                );
+            }
+            if final_status.is_success() {
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    start.elapsed(),
+                );
+            } else {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    error_type_from_status(final_status),
+                );
+            }
+        }
+
+        response
+    }
+
+    // Send typed request directly without conversion.
+    //
+    // `canonical_model` is set only when the client addressed the model by an
+    // alias. The worker was registered under the canonical ID and has never
+    // heard of the alias, so the body it receives carries the canonical name.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-request state threaded from route_typed_request_once; a struct would only move the arity"
+    )]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
+        canonical_model: Option<&str>,
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
@@ -499,7 +954,7 @@ impl Router {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
-        let json_val = match serde_json::to_value(typed_req) {
+        let mut json_val = match serde_json::to_value(typed_req) {
             Ok(j) => j,
             Err(e) => {
                 return error::bad_request(
@@ -509,7 +964,11 @@ impl Router {
             }
         };
 
-        let json_val = match worker.prepare_request(json_val) {
+        if let Some(canonical_model) = canonical_model {
+            super::set_request_model(&mut json_val, canonical_model);
+        }
+
+        let mut json_val = match worker.prepare_request(json_val) {
             Ok(prepared) => prepared,
             Err(e) => {
                 return error::bad_request(
@@ -518,6 +977,7 @@ impl Router {
                 );
             }
         };
+        strip_default_sglang_fields(&mut json_val);
 
         let mut request_builder = self.client.post(&endpoint_url).json(&json_val);
 
@@ -620,15 +1080,23 @@ impl Router {
         }
     }
 
+    /// Build the public rerank response.
+    ///
+    /// Rerank is the one HTTP route whose response the gateway constructs
+    /// itself instead of passing the worker's through, so the model it reports
+    /// has to be canonicalized here. `canonical_model` is set only when the
+    /// client addressed the model by an alias; reporting the alias would make
+    /// this route disagree with every other one about which model ran.
     async fn build_rerank_response(
         req: &RerankRequest,
+        canonical_model: Option<&str>,
         response: Response,
     ) -> anyhow::Result<Response> {
         let (_, response_body) = response.into_parts();
         let body_bytes = to_bytes(response_body, usize::MAX).await?;
         let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
-        let mut rerank_response =
-            RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone());
+        let model = canonical_model.map_or_else(|| req.model.clone(), ToOwned::to_owned);
+        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid.clone());
         // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
@@ -638,6 +1106,62 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
+}
+
+/// Build the multipart body forwarded to the worker.
+///
+/// `canonical_model` is set only when the client addressed the model by an
+/// alias. The worker was registered under the canonical ID and has never heard
+/// of the alias, so that is the name the form carries.
+fn build_transcription_form(
+    body: &TranscriptionRequest,
+    audio: AudioFile,
+    canonical_model: Option<&str>,
+) -> Result<Form, String> {
+    let AudioFile {
+        bytes,
+        file_name,
+        content_type,
+    } = audio;
+
+    // Wrap the already-buffered Bytes in a reqwest Body (Arc refcount, no
+    // additional copy) instead of Part::bytes, which would force a Vec copy.
+    let file_len = bytes.len() as u64;
+    let mut file_part =
+        Part::stream_with_length(reqwest::Body::from(bytes), file_len).file_name(file_name);
+    if let Some(ct) = content_type.as_deref() {
+        file_part = file_part
+            .mime_str(ct)
+            .map_err(|e| format!("Invalid audio content-type '{ct}': {e}"))?;
+    }
+
+    let mut form = Form::new().part("file", file_part).text(
+        "model",
+        canonical_model.map_or_else(|| body.model.clone(), ToOwned::to_owned),
+    );
+
+    if let Some(ref language) = body.language {
+        form = form.text("language", language.clone());
+    }
+    if let Some(ref prompt) = body.prompt {
+        form = form.text("prompt", prompt.clone());
+    }
+    if let Some(ref fmt) = body.response_format {
+        form = form.text("response_format", fmt.clone());
+    }
+    if let Some(temp) = body.temperature {
+        form = form.text("temperature", temp.to_string());
+    }
+    if let Some(ref grans) = body.timestamp_granularities {
+        for g in grans {
+            form = form.text("timestamp_granularities[]", g.clone());
+        }
+    }
+    if let Some(stream) = body.stream {
+        form = form.text("stream", stream.to_string());
+    }
+
+    Ok(form)
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
@@ -715,6 +1239,7 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &GenerateRequest,
         model_id: &str,
     ) -> Response {
@@ -725,6 +1250,7 @@ impl RouterTrait for Router {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -732,9 +1258,21 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: &CreateMessageRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages", model_id)
+            .await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &CompletionRequest,
         model_id: &str,
     ) -> Response {
@@ -745,6 +1283,7 @@ impl RouterTrait for Router {
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &ResponsesRequest,
         model_id: &str,
     ) -> Response {
@@ -760,6 +1299,7 @@ impl RouterTrait for Router {
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &EmbeddingRequest,
         model_id: &str,
     ) -> Response {
@@ -770,6 +1310,7 @@ impl RouterTrait for Router {
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &ClassifyRequest,
         model_id: &str,
     ) -> Response {
@@ -777,17 +1318,37 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_audio_transcriptions(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: &TranscriptionRequest,
+        audio: AudioFile,
+        model_id: &str,
+    ) -> Response {
+        self.route_multipart_transcription(
+            headers,
+            body,
+            audio,
+            "/v1/audio/transcriptions",
+            model_id,
+        )
+        .await
+    }
+
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
         body: &RerankRequest,
         model_id: &str,
     ) -> Response {
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let response = self
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
-            match Self::build_rerank_response(body, response).await {
+            match Self::build_rerank_response(body, canonical_model.as_deref(), response).await {
                 Ok(rerank_response) => rerank_response,
                 Err(e) => {
                     error!("Failed to build rerank response: {}", e);
@@ -800,6 +1361,146 @@ impl RouterTrait for Router {
         } else {
             response
         }
+    }
+
+    async fn route_realtime_session(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RealtimeSessionCreateRequest,
+    ) -> Response {
+        let model = body.model.as_deref().unwrap_or_default();
+        let worker = self.select_realtime_worker(model, headers).await;
+        forward_realtime_rest(
+            RealtimeLabels::HTTP,
+            &self.client,
+            worker,
+            headers,
+            body,
+            model,
+            "/v1/realtime/sessions",
+            metrics_labels::ENDPOINT_REALTIME_SESSIONS,
+        )
+        .await
+    }
+
+    async fn route_realtime_client_secret(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RealtimeClientSecretCreateRequest,
+    ) -> Response {
+        let model = body.session.model.as_deref().unwrap_or_default();
+        let worker = self.select_realtime_worker(model, headers).await;
+        forward_realtime_rest(
+            RealtimeLabels::HTTP,
+            &self.client,
+            worker,
+            headers,
+            body,
+            model,
+            "/v1/realtime/client_secrets",
+            metrics_labels::ENDPOINT_REALTIME_CLIENT_SECRETS,
+        )
+        .await
+    }
+
+    async fn route_realtime_transcription_session(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RealtimeTranscriptionSessionCreateRequest,
+    ) -> Response {
+        let model = body.model.as_deref().unwrap_or_default();
+        let worker = self.select_realtime_worker(model, headers).await;
+        forward_realtime_rest(
+            RealtimeLabels::HTTP,
+            &self.client,
+            worker,
+            headers,
+            body,
+            model,
+            "/v1/realtime/transcription_sessions",
+            metrics_labels::ENDPOINT_REALTIME_TRANSCRIPTION,
+        )
+        .await
+    }
+
+    async fn route_realtime_ws(&self, req: Request<Body>, model: &str) -> Response {
+        let (parts, _body) = req.into_parts();
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_WEBSOCKET,
+            model,
+            metrics_labels::ENDPOINT_REALTIME,
+            "false",
+        );
+
+        let auth_header = header_utils::extract_auth_header(Some(&parts.headers), None);
+        let worker = self
+            .select_realtime_worker(model, Some(&parts.headers))
+            .await;
+
+        handle_realtime_ws(
+            RealtimeLabels::HTTP,
+            parts,
+            model.to_owned(),
+            worker,
+            auth_header,
+            Arc::clone(&self.realtime_registry),
+        )
+        .await
+    }
+
+    async fn route_realtime_webrtc(&self, req: Request<Body>, model: &str) -> Response {
+        let (parts, body) = req.into_parts();
+        let body = match to_bytes(body, WEBRTC_REQUEST_BODY_LIMIT).await {
+            Ok(b) => b,
+            Err(e) => {
+                if e.source()
+                    .and_then(|s| s.downcast_ref::<http_body_util::LengthLimitError>())
+                    .is_some()
+                {
+                    return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                }
+                return error::bad_request("invalid_body", format!("Failed to read body: {e}"));
+            }
+        };
+
+        let parsed = match webrtc::parse_webrtc_request(&parts, &body, model).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_WEBRTC,
+            &parsed.model,
+            metrics_labels::ENDPOINT_REALTIME,
+            "false",
+        );
+
+        let auth_header = header_utils::extract_auth_header(Some(&parts.headers), None);
+        let worker = self
+            .select_realtime_worker(&parsed.model, Some(&parts.headers))
+            .await;
+
+        let bind_addr = self
+            .webrtc_bind_addr
+            .unwrap_or_else(|| std::net::Ipv4Addr::UNSPECIFIED.into());
+
+        handle_realtime_webrtc(
+            RealtimeLabels::HTTP,
+            parts.headers,
+            parsed,
+            worker,
+            auth_header,
+            self.client.clone(),
+            bind_addr,
+            self.webrtc_stun_server.clone(),
+            Arc::clone(&self.realtime_registry),
+        )
+        .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -843,6 +1544,9 @@ mod tests {
             policy_registry,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
         }
     }
 

@@ -5,8 +5,7 @@
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
 #![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
-use std::collections::HashMap;
-
+use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     traits::Tokenizer,
@@ -21,7 +20,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 
 use super::chat_utils;
-use crate::routers::grpc::ProcessedMessages;
+use crate::routers::grpc::{multimodal::PlaceholderTokens, ProcessedMessages};
 
 // ============================================================================
 // Top-level processing function
@@ -36,13 +35,18 @@ pub fn process_messages(
     request: &CreateMessageRequest,
     tokenizer: &dyn Tokenizer,
     chat_tools: Option<&[ChatTool]>,
-    image_placeholder: Option<&str>,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
 ) -> Result<ProcessedMessages, String> {
     let content_format = tokenizer.chat_template_content_format();
 
     // Step 1: Convert InputMessages to chat template JSON values
-    let mut transformed_messages =
-        process_message_content_format(&request.messages, content_format, image_placeholder)?;
+    let mut transformed_messages = process_message_content_format(
+        &request.messages,
+        content_format,
+        placeholder_tokens,
+        media_order,
+    )?;
 
     // Step 2: Prepend system message if present
     if let Some(system) = &request.system {
@@ -50,7 +54,10 @@ pub fn process_messages(
             SystemContent::String(s) => s.clone(),
             SystemContent::Blocks(blocks) => blocks
                 .iter()
-                .map(|b| b.text.as_str())
+                .map(|b| {
+                    let messages::SystemContentBlock::Text(tb) = b;
+                    tb.text.as_str()
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
         };
@@ -71,34 +78,21 @@ pub fn process_messages(
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {e}"))?;
 
-    // Step 5: Build template kwargs from ThinkingConfig
-    let mut combined_template_kwargs = HashMap::new();
-
-    // Pass both `enable_thinking` (Qwen3) and `thinking` (Kimi-K2.5) since
-    // different model templates use different kwarg names for the same concept.
-    match &request.thinking {
-        Some(ThinkingConfig::Enabled { .. }) => {
-            combined_template_kwargs.insert("enable_thinking".to_string(), json!(true));
-            combined_template_kwargs.insert("thinking".to_string(), json!(true));
-        }
-        Some(ThinkingConfig::Disabled) => {
-            combined_template_kwargs.insert("enable_thinking".to_string(), json!(false));
-            combined_template_kwargs.insert("thinking".to_string(), json!(false));
-        }
-        None => {} // Let template use its default behavior
-    }
-
-    let final_template_kwargs = if combined_template_kwargs.is_empty() {
-        None
-    } else {
-        Some(&combined_template_kwargs)
+    // Step 5: Project the Anthropic ThinkingConfig onto a thinking on/off
+    // preference. Adaptive is treated as "thinking on"; the model decides
+    // whether to actually emit it. The tokenizer applies this under the model's
+    // own toggle key (`enable_thinking`/`thinking`) in `apply`.
+    let thinking = match &request.thinking {
+        Some(ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }) => Some(true),
+        Some(ThinkingConfig::Disabled) => Some(false),
+        None => None, // Let template use its default behavior
     };
 
     // Step 6: Apply chat template
     let params = ChatTemplateParams {
         add_generation_prompt: true,
         tools: tools_json.as_deref(),
-        template_kwargs: final_template_kwargs,
+        thinking,
         ..Default::default()
     };
 
@@ -114,7 +108,6 @@ pub fn process_messages(
 
     Ok(ProcessedMessages {
         text: formatted_text,
-        multimodal_intermediate: None, // Multimodal postponed
         stop_sequences,
     })
 }
@@ -136,7 +129,8 @@ pub fn process_messages(
 pub(crate) fn process_message_content_format(
     messages: &[InputMessage],
     content_format: ChatTemplateContentFormat,
-    image_placeholder: Option<&str>,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
 ) -> Result<Vec<Value>, String> {
     messages.iter().try_fold(Vec::new(), |mut result, message| {
         match message.role {
@@ -144,16 +138,42 @@ pub(crate) fn process_message_content_format(
                 convert_user_message(
                     &message.content,
                     content_format,
-                    image_placeholder,
+                    placeholder_tokens,
+                    media_order,
                     &mut result,
                 );
             }
             messages::Role::Assistant => {
-                result.push(convert_assistant_message(&message.content, content_format));
+                result.push(convert_assistant_message(&message.content));
+            }
+            // A `system`-role message in `messages[]` (e.g. from Claude Code) is
+            // forwarded in place, preserving its position in the conversation so
+            // inline-`system` chat templates render it where it was sent.
+            // See https://github.com/lightseekorg/smg/issues/1795
+            messages::Role::System => {
+                result.push(convert_system_message(&message.content));
             }
         }
         Ok(result)
     })
+}
+
+/// Convert a `system`-role message's content to a chat-template JSON value,
+/// preserving its position in `messages[]`. System content is text; text blocks
+/// are concatenated.
+fn convert_system_message(content: &InputContent) -> Value {
+    let text = match content {
+        InputContent::String(text) => text.clone(),
+        InputContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                InputContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    json!({"role": "system", "content": text})
 }
 
 /// Convert a user message content to JSON values.
@@ -164,7 +184,8 @@ pub(crate) fn process_message_content_format(
 fn convert_user_message(
     content: &InputContent,
     content_format: ChatTemplateContentFormat,
-    image_placeholder: Option<&str>,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
     result: &mut Vec<Value>,
 ) {
     match content {
@@ -199,7 +220,12 @@ fn convert_user_message(
             );
 
             if !user_parts.is_empty() {
-                let content = format_content_parts(user_parts, content_format, image_placeholder);
+                let content = format_content_parts(
+                    user_parts,
+                    content_format,
+                    placeholder_tokens,
+                    media_order,
+                );
                 result.push(json!({"role": "user", "content": content}));
             }
             result.extend(tool_msgs);
@@ -227,10 +253,7 @@ fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
 /// appropriate JSON fields that the chat template expects.
-fn convert_assistant_message(
-    content: &InputContent,
-    _content_format: ChatTemplateContentFormat,
-) -> Value {
+fn convert_assistant_message(content: &InputContent) -> Value {
     match content {
         InputContent::String(text) => json!({"role": "assistant", "content": text}),
         InputContent::Blocks(blocks) => {
@@ -262,10 +285,15 @@ fn convert_assistant_message(
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String("assistant".into()));
 
-            // Always insert content — empty string when tool-calls-only.
-            // Certain models' chat template requires content to be a string,
-            // not null, even when only tool_calls are present.
-            obj.insert("content".into(), Value::String(text_parts.join("")));
+            // With no text blocks (e.g. tool-calls-only), render content as
+            // `null` — the OpenAI-faithful representation the chat template
+            // expects — rather than an empty text frame.
+            let content = if text_parts.is_empty() {
+                Value::Null
+            } else {
+                Value::String(text_parts.join(""))
+            };
+            obj.insert("content".into(), content);
             if !tool_calls.is_empty() {
                 obj.insert("tool_calls".into(), Value::Array(tool_calls));
             }
@@ -288,12 +316,15 @@ fn convert_assistant_message(
 fn format_content_parts(
     parts: Vec<Value>,
     content_format: ChatTemplateContentFormat,
-    image_placeholder: Option<&str>,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
 ) -> Value {
+    let ordered = order_media_parts(parts, media_order);
+    let image_placeholder = placeholder_tokens.and_then(|tokens| tokens.get(Modality::Image));
     match content_format {
         ChatTemplateContentFormat::String => {
             // Extract text parts; optionally replace image parts with placeholders
-            let text: String = parts
+            let text: String = ordered
                 .iter()
                 .filter_map(|p| {
                     let obj = p.as_object()?;
@@ -308,7 +339,26 @@ fn format_content_parts(
                 .join("\n");
             Value::String(text)
         }
-        ChatTemplateContentFormat::OpenAI => Value::Array(parts),
+        ChatTemplateContentFormat::OpenAI => Value::Array(ordered),
+    }
+}
+
+/// Hoist media parts before text for `MediaFirst`, matching vLLM front
+/// placement; `Authored` keeps request order. `partition` is stable so relative
+/// order within each group is preserved.
+fn order_media_parts(parts: Vec<Value>, media_order: MediaPartOrder) -> Vec<Value> {
+    match media_order {
+        MediaPartOrder::Authored => parts,
+        MediaPartOrder::MediaFirst => {
+            let (mut media, rest): (Vec<Value>, Vec<Value>) = parts.into_iter().partition(|p| {
+                matches!(
+                    p.get("type").and_then(|t| t.as_str()),
+                    Some("image") | Some("video") | Some("audio") | Some("document")
+                )
+            });
+            media.extend(rest);
+            media
+        }
     }
 }
 
@@ -433,9 +483,13 @@ mod tests {
             content: InputContent::String("Hello".to_string()),
         }];
 
-        let result =
-            process_message_content_format(&messages, ChatTemplateContentFormat::String, None)
-                .unwrap();
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "user");
         assert_eq!(result[0]["content"], "Hello");
@@ -452,9 +506,13 @@ mod tests {
             })]),
         }];
 
-        let result =
-            process_message_content_format(&messages, ChatTemplateContentFormat::String, None)
-                .unwrap();
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
         assert_eq!(result[0]["content"], "Hi there");
@@ -479,15 +537,86 @@ mod tests {
             ]),
         }];
 
-        let result =
-            process_message_content_format(&messages, ChatTemplateContentFormat::String, None)
-                .unwrap();
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
         assert_eq!(result[0]["content"], "Let me check.");
         let tool_calls = result[0]["tool_calls"].as_array().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["function"]["name"], "calculator");
+    }
+
+    #[test]
+    fn test_absent_assistant_content_renders_null() {
+        let messages = vec![InputMessage {
+            role: Role::Assistant,
+            content: InputContent::Blocks(vec![InputContentBlock::ToolUse(
+                messages::ToolUseBlock {
+                    id: "tu_1".to_string(),
+                    name: "calc".to_string(),
+                    input: json!({"x": 1}),
+                    cache_control: None,
+                },
+            )]),
+        }];
+
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert!(result[0]["content"].is_null());
+    }
+
+    #[test]
+    fn test_user_media_order_follows_contract() {
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::Text(TextBlock {
+                    text: "question".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+                InputContentBlock::Image(messages::ImageBlock {
+                    source: messages::ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "AAAA".to_string(),
+                    },
+                    cache_control: None,
+                }),
+            ]),
+        }];
+
+        let media_first = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        let arr = media_first[0]["content"].as_array().unwrap();
+        assert_eq!(arr[0], json!({"type": "image"}));
+        assert_eq!(arr[1]["text"], "question");
+
+        let authored = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+        let arr = authored[0]["content"].as_array().unwrap();
+        assert_eq!(arr[0]["text"], "question");
+        assert_eq!(arr[1], json!({"type": "image"}));
     }
 
     #[test]
@@ -504,9 +633,13 @@ mod tests {
             )]),
         }];
 
-        let result =
-            process_message_content_format(&messages, ChatTemplateContentFormat::String, None)
-                .unwrap();
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
         // Tool result becomes a "tool" role message, not a "user" message
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "tool");
@@ -532,9 +665,13 @@ mod tests {
             ]),
         }];
 
-        let result =
-            process_message_content_format(&messages, ChatTemplateContentFormat::String, None)
-                .unwrap();
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
         assert_eq!(result[0]["content"], "The answer is 42.");
@@ -560,9 +697,13 @@ mod tests {
             ]),
         }];
 
-        let result =
-            process_message_content_format(&messages, ChatTemplateContentFormat::String, None)
-                .unwrap();
+        let result = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
         assert_eq!(
             result[0]["reasoning_content"],
             "First thought.\nSecond thought."
@@ -648,6 +789,8 @@ mod tests {
             top_p: None,
             container: None,
             mcp_servers: None,
+            rid: None,
+            other: serde_json::Map::new(),
         };
         assert_eq!(get_history_tool_calls_count_messages(&request), 0);
 
@@ -696,6 +839,8 @@ mod tests {
             top_p: None,
             container: None,
             mcp_servers: None,
+            rid: None,
+            other: serde_json::Map::new(),
         };
         assert_eq!(get_history_tool_calls_count_messages(&request), 2);
     }

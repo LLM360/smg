@@ -30,12 +30,34 @@ service SglangScheduler {
   // Get comprehensive load metrics
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
+  // Flush the KV cache on all scheduler processes
+  rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
+
+  // Start the profiler on all scheduler processes
+  rpc StartProfile(smg.grpc.common.StartProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
+  // Stop the profiler and export traces
+  rpc StopProfile(smg.grpc.common.StopProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
   // Get tokenizer artifacts for remote construction
   rpc GetTokenizer(smg.grpc.common.GetTokenizerRequest) returns (stream smg.grpc.common.GetTokenizerChunk);
 
   // Subscribe to KV cache events (server-streaming)
   rpc SubscribeKvEvents(smg.grpc.common.SubscribeKvEventsRequest)
       returns (stream smg.grpc.common.KvEventBatch);
+
+  // Load a LoRA adapter into the engine (weights from local disk to CPU DRAM)
+  rpc LoadLoRAAdapter(LoadLoRAAdapterRequest) returns (LoadLoRAAdapterResponse);
+
+  // Unload a LoRA adapter from the engine
+  rpc UnloadLoRAAdapter(UnloadLoRAAdapterRequest) returns (UnloadLoRAAdapterResponse);
+
+  // List the LoRA adapters currently loaded in the engine, with the
+  // metadata supplied at load time. Read-only: lets a client reconcile
+  // its view of loaded adapters (e.g. after a restart) without issuing
+  // a mutating load/unload call.
+  rpc ListLoadedLoRAAdapters(ListLoadedLoRAAdaptersRequest)
+      returns (ListLoadedLoRAAdaptersResponse);
 }
 
 // =====================
@@ -137,6 +159,10 @@ message GenerateRequest {
 
   // Whether client wants streaming response
   bool stream = 17;
+
+  // Ask SGLang scheduler to count reasoning tokens.
+  // Keep false unless the request explicitly enables reasoning/thinking.
+  bool require_reasoning = 18;
 }
 
 message TokenizedInput {
@@ -207,6 +233,7 @@ message GenerateStreamChunk {
   uint32 prompt_tokens = 2;
   uint32 completion_tokens = 3;
   uint32 cached_tokens = 4;
+  uint32 reasoning_tokens = 9;
 
   // Output logprobs (if requested) - incremental for streaming
   OutputLogProbs output_logprobs = 5;
@@ -232,6 +259,7 @@ message GenerateComplete {
   uint32 prompt_tokens = 3;
   uint32 completion_tokens = 4;
   uint32 cached_tokens = 5;
+  uint32 reasoning_tokens = 12;
 
   // Output logprobs if requested (cumulative)
   OutputLogProbs output_logprobs = 6;
@@ -349,31 +377,81 @@ message AbortResponse {
 
 
 // =====================
-// Additional Operations (Future)
+// LoRA Adapter
 // =====================
 
-// Load LoRA adapter
-message LoadLoRARequest {
-  string adapter_id = 1;
-  string adapter_path = 2;
-  int32 rank = 3;
+// Load a LoRA adapter into the engine (weights read from a local
+// directory into CPU DRAM; GPU residency is managed by the engine).
+message LoadLoRAAdapterRequest {
+  // Engine-side adapter name (human-readable identifier).
+  string lora_name = 1;
+  // Local directory containing the adapter weights. Must be readable
+  // by the engine process (shared volume).
+  string lora_path = 2;
+  // Pin the adapter in the engine's GPU buffer pool (never evicted).
+  bool pinned = 3;
+  // Unique adapter id minted by the caller. Required: the scheduler-direct
+  // path has no TokenizerManager to auto-generate one, and inference
+  // requests reference the adapter by this id (GenerateRequest.lora_id).
+  string lora_id = 4;
 }
 
-message LoadLoRAResponse {
+message LoadLoRAAdapterResponse {
   bool success = 1;
-  string adapter_id = 2;
-  string message = 3;
-}
-
-// Unload LoRA adapter
-message UnloadLoRARequest {
-  string adapter_id = 1;
-}
-
-message UnloadLoRAResponse {
-  bool success = 1;
+  // Status or error description; empty on success.
   string message = 2;
+  // Full set of caller-minted adapter ids loaded in the engine after
+  // this operation (engine-truth snapshot; see ListLoadedLoRAAdapters).
+  repeated string loaded_lora_ids = 3;
 }
+
+// Unload a LoRA adapter from the engine (frees CPU DRAM; the engine
+// reclaims any GPU slot on its own).
+message UnloadLoRAAdapterRequest {
+  // Human-readable adapter name given at load time. Required — the
+  // primary selector, mirroring the HTTP unload payload.
+  string lora_name = 1;
+  // The caller-minted id the adapter was loaded under (see
+  // LoadLoRAAdapterRequest.lora_id). Complements lora_name rather than
+  // replacing it: both refer to the same adapter and are supplied
+  // together.
+  string lora_id = 2;
+}
+
+message UnloadLoRAAdapterResponse {
+  bool success = 1;
+  // Status or error description; empty on success.
+  string message = 2;
+  // Full set of caller-minted adapter ids still loaded after this
+  // operation (engine-truth snapshot; see ListLoadedLoRAAdapters).
+  repeated string loaded_lora_ids = 3;
+}
+
+// List every LoRA adapter currently loaded in the engine, regardless
+// of how it was loaded — via LoadLoRAAdapter or preloaded at startup
+// (e.g. --lora-paths).
+message ListLoadedLoRAAdaptersRequest {}
+
+// One loaded adapter, echoing the metadata supplied at load time —
+// the same per-adapter fields the HTTP surface exposes via /v1/models.
+message LoadedLoRAAdapter {
+  // Caller-minted for adapters loaded via LoadLoRAAdapter;
+  // engine-assigned for adapters loaded outside this API. Either way,
+  // this is the id inference requests reference
+  // (GenerateRequest.lora_id) and UnloadLoRAAdapter accepts.
+  string lora_id = 1;
+  string lora_name = 2;
+  string lora_path = 3;
+  bool pinned = 4;
+}
+
+message ListLoadedLoRAAdaptersResponse {
+  repeated LoadedLoRAAdapter loaded_adapters = 1;
+}
+
+// =====================
+// Additional Operations (Future)
+// =====================
 
 // Update weights
 message UpdateWeightsRequest {
@@ -438,6 +516,10 @@ message GetModelInfoResponse {
   string id2label_json = 16;
   // Number of classification labels (0 if not a classifier)
   int32 num_labels = 17;
+
+  // Resolved sampling defaults from --sampling-defaults + --preferred-sampling-params.
+  // JSON dict, e.g. '{"temperature": 0.6, "top_p": 0.9}'. Empty = no overrides.
+  string default_sampling_params_json = 20;
 }
 
 // Get server information
@@ -513,6 +595,12 @@ message SchedulerLoad {
   double cache_hit_rate = 9;
   double utilization = 10;
   int32 max_running_requests = 11;
+
+  // Queued token-work: waiting-queue tokens not yet served from cache
+  // (SGLang num_waiting_uncached_tokens). Field 17 is intentionally out of
+  // order — appended after the optional-section field numbers to preserve
+  // wire compatibility with existing readers.
+  int32 num_waiting_uncached_tokens = 17;
 
   // Optional sections
   optional MemoryMetrics memory = 12;

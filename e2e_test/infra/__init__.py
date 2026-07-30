@@ -24,6 +24,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     LOCAL_RUNTIMES,
     LOG_SEPARATOR_WIDTH,
     MAX_RETRY_ATTEMPTS,
+    MOCK_MCP_HOST,
     PARAM_BACKEND_ROUTER,
     PARAM_MODEL,
     PARAM_SETUP_BACKEND,
@@ -32,6 +33,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     Runtime,
     WorkerType,
     get_runtime,
+    is_mlx,
     is_sglang,
     is_trtllm,
     is_vllm,
@@ -66,6 +68,7 @@ from .process_utils import (
 )
 from .run_eval import run_eval
 from .worker import Worker, start_workers, stop_workers
+from .worker_pool import WorkerPool, cleanup_pool, get_pool
 
 __all__ = [
     # Enums
@@ -86,6 +89,7 @@ __all__ = [
     "BRAVE_MCP_HOST",
     "BRAVE_MCP_PORT",
     "BRAVE_MCP_URL",
+    "MOCK_MCP_HOST",
     "DEFAULT_RUNTIME",
     "DEFAULT_STARTUP_TIMEOUT",
     "DEFAULT_ROUTER_TIMEOUT",
@@ -108,6 +112,7 @@ __all__ = [
     "is_vllm",
     "is_sglang",
     "is_trtllm",
+    "is_mlx",
     # Port utilities
     "get_open_port",
     "release_port",
@@ -124,11 +129,19 @@ __all__ = [
     "Worker",
     "start_workers",
     "stop_workers",
+    # Session-scoped worker cache
+    "WorkerPool",
+    "get_pool",
+    "cleanup_pool",
     "MODEL_SPECS",
     # Gateway
     "Gateway",
     "WorkerInfo",
     "launch_cloud_gateway",
+    # Mock MCP server (for builtin-tool e2e tests)
+    "MockMcpServer",
+    "mock_mcp_server",
+    "IMAGE_GENERATION_PNG_BASE64",
     # Default model paths
     "DEFAULT_MODEL_PATH",
     "DEFAULT_SMALL_MODEL_PATH",
@@ -147,3 +160,19 @@ __all__ = [
     # Evaluation
     "run_eval",
 ]
+
+# The mock MCP server is only used by the agentic (responses) lane and drags
+# in the `mcp` SDK at import time. Resolve its symbols lazily so infra
+# consumers that never touch it — model download, chat/router lanes — keep
+# working even when the venv's `mcp` lacks `mcp.server.fastmcp` (e.g.
+# TensorRT-LLM's `pip install --pre` resolving mcp to a 2.x pre-release,
+# which removed the module).
+_LAZY_MOCK_MCP = ("IMAGE_GENERATION_PNG_BASE64", "MockMcpServer", "mock_mcp_server")
+
+
+def __getattr__(name: str) -> object:
+    if name in _LAZY_MOCK_MCP:
+        from . import mock_mcp
+
+        return getattr(mock_mcp, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

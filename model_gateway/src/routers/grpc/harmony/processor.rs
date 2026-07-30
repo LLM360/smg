@@ -14,7 +14,10 @@ use openai_protocol::{
 };
 use tracing::error;
 
-use super::{builder::convert_harmony_logprobs, HarmonyParserAdapter};
+use super::{
+    builder::{convert_harmony_logprobs, try_harmony_encoding},
+    HarmonyParserAdapter,
+};
 use crate::routers::{
     error,
     grpc::{
@@ -91,9 +94,11 @@ impl HarmonyResponseProcessor {
 
             // Convert output logprobs if present
             let logprobs: Option<ChatLogProbs> = if request_logprobs {
+                let encoding = try_harmony_encoding()
+                    .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
                 complete
                     .output_logprobs()
-                    .map(|lp| convert_harmony_logprobs(&lp))
+                    .map(|lp| convert_harmony_logprobs(encoding, &lp))
             } else {
                 None
             };
@@ -268,12 +273,12 @@ impl HarmonyResponseProcessor {
 
         // Map analysis channel → ResponseOutputItem::Reasoning
         if let Some(analysis) = parsed.analysis {
-            let reasoning_item = ResponseOutputItem::Reasoning {
-                id: format!("reasoning_{}", dispatch.request_id),
-                summary: vec![],
-                content: vec![ResponseReasoningContent::ReasoningText { text: analysis }],
-                status: Some("completed".to_string()),
-            };
+            let reasoning_item = ResponseOutputItem::new_reasoning(
+                format!("reasoning_{}", dispatch.request_id),
+                vec![],
+                vec![ResponseReasoningContent::ReasoningText { text: analysis }],
+                Some("completed".to_string()),
+            );
             output.push(reasoning_item);
         }
 
@@ -294,6 +299,7 @@ impl HarmonyResponseProcessor {
                     logprobs,
                 }],
                 status: "completed".to_string(),
+                phase: None,
             };
             output.push(message_item);
         }

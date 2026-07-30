@@ -3,9 +3,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub mod cache;
+pub mod encoders;
 pub mod eos;
 pub mod factory;
 pub mod hub;
+pub(crate) mod json_dumps;
 pub mod mock;
 pub mod registry;
 pub mod sequence;
@@ -15,6 +17,7 @@ pub mod traits;
 
 pub mod chat_template;
 pub mod huggingface;
+mod kimi_k2_tokenizer;
 pub mod tiktoken;
 
 #[cfg(test)]

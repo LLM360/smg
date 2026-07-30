@@ -12,10 +12,14 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    common::{build_next_request_with_tools, load_previous_messages, McpCallTracking},
+    common::{
+        build_next_request_with_tools, load_previous_messages,
+        strip_image_generation_from_request_tools, McpCallTracking,
+    },
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools},
 };
 use crate::{
+    middleware::TenantRequestMeta,
     observability::metrics::Metrics,
     routers::{
         common::mcp_utils::DEFAULT_MAX_ITERATIONS,
@@ -40,6 +44,7 @@ use crate::{
 pub(crate) async fn serve_harmony_responses_stream(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
 ) -> Response {
     // Load previous conversation history if previous_response_id is set
     let current_request = match load_previous_messages(ctx, request.clone()).await {
@@ -50,6 +55,7 @@ pub(crate) async fn serve_harmony_responses_stream(
     // Check MCP connection BEFORE starting stream and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
         &ctx.mcp_orchestrator,
+        &ctx.mcp_format_registry,
         current_request.tools.as_deref(),
     )
     .await
@@ -95,13 +101,22 @@ pub(crate) async fn serve_harmony_responses_stream(
                 ctx,
                 current_request,
                 &request,
+                tenant_request_meta.clone(),
                 mcp_servers,
                 &mut emitter,
                 &tx,
             )
             .await;
         } else {
-            execute_without_mcp_streaming(ctx, &current_request, &request, &mut emitter, &tx).await;
+            execute_without_mcp_streaming(
+                ctx,
+                &current_request,
+                &request,
+                tenant_request_meta,
+                &mut emitter,
+                &tx,
+            )
+            .await;
         }
     });
 
@@ -121,6 +136,7 @@ async fn execute_mcp_tool_loop_streaming(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
     mcp_servers: Vec<McpServerBinding>,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
@@ -149,6 +165,17 @@ async fn execute_mcp_tool_loop_streaming(
             "MCP client available - added static MCP tools to Harmony Responses streaming request"
         );
     }
+
+    // Once the MCP loop has taken ownership of image_generation
+    // dispatch, drop the hosted-tool descriptor so the harmony builder
+    // advertises only the MCP-exposed function-tool name (which
+    // `has_exposed_tool` actually recognizes for dispatch). See the
+    // helper doc comment in `common.rs` for the full rationale.
+    strip_image_generation_from_request_tools(
+        &mut current_request,
+        &session,
+        &ctx.mcp_format_registry,
+    );
 
     let mut mcp_tracking = McpCallTracking::new();
 
@@ -195,7 +222,11 @@ async fn execute_mcp_tool_loop_streaming(
         // Execute pipeline and get stream + load guards
         let (execution_result, _load_guards) = match ctx
             .pipeline
-            .execute_harmony_responses_streaming(&current_request, ctx)
+            .execute_harmony_responses_streaming(
+                &current_request,
+                ctx,
+                Some(tenant_request_meta.clone()),
+            )
             .await
         {
             Ok(result) => result,
@@ -215,6 +246,7 @@ async fn execute_mcp_tool_loop_streaming(
             emitter,
             tx,
             Some(&session),
+            Some(&ctx.mcp_format_registry),
         )
         .await
         {
@@ -283,15 +315,22 @@ async fn execute_mcp_tool_loop_streaming(
                     return;
                 }
 
-                // Execute MCP tools (if any)
+                // Execute MCP tools (if any). `original_request.tools` is the
+                // caller-declared tool list (hosted-tool config lives there);
+                // `execute_mcp_tools` merges the per-kind overrides into
+                // dispatch args and forwards the request-level `user`
+                // identifier for hosted tools.
                 let mcp_results = if mcp_tool_calls.is_empty() {
                     Vec::new()
                 } else {
                     match execute_mcp_tools(
                         &session,
+                        &ctx.mcp_format_registry,
                         &mcp_tool_calls,
                         &mut mcp_tracking,
                         &current_request.model,
+                        original_request.tools.as_deref().unwrap_or(&[]),
+                        original_request.user.as_deref(),
                     )
                     .await
                     {
@@ -394,6 +433,7 @@ async fn execute_without_mcp_streaming(
     ctx: &ResponsesContext,
     current_request: &ResponsesRequest,
     original_request: &ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
@@ -402,7 +442,7 @@ async fn execute_without_mcp_streaming(
     // Execute pipeline and get stream + load guards
     let (execution_result, _load_guards) = match ctx
         .pipeline
-        .execute_harmony_responses_streaming(current_request, ctx)
+        .execute_harmony_responses_streaming(current_request, ctx, Some(tenant_request_meta))
         .await
     {
         Ok(result) => result,
@@ -421,6 +461,7 @@ async fn execute_without_mcp_streaming(
         execution_result,
         emitter,
         tx,
+        None,
         None,
     )
     .await
