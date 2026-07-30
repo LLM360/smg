@@ -7,31 +7,44 @@ use openai_protocol::{
     chat::ChatCompletionStreamResponse,
     common::{Usage, UsageInfo},
     event_types::{
-        CodeInterpreterCallEvent, ContentPartEvent, FileSearchCallEvent, FunctionCallEvent,
-        McpEvent, OutputItemEvent, OutputTextEvent, ResponseEvent, WebSearchCallEvent,
+        ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
+        ResponseEvent,
     },
     responses::{
         ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::json;
-use smg_mcp::{self as mcp, ResponseFormat};
+use smg_mcp::{self as mcp};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::routers::grpc::harmony::responses::ToolResult;
+use crate::routers::{
+    common::openai_bridge::{self, descriptor, ResponseFormat},
+    grpc::harmony::responses::ToolResult,
+};
 
-pub(crate) enum OutputItemType {
+/// Item-id-prefix discriminator for non-format kinds. Format-driven items
+/// derive their prefix from `descriptor(format).id_prefix` instead — keeping
+/// the wire-shape mapping in one place.
+pub(crate) enum OutputItemKind {
     Message,
     McpListTools,
-    McpCall,
     FunctionCall,
     Reasoning,
-    WebSearchCall,
-    CodeInterpreterCall,
-    FileSearchCall,
+}
+
+impl OutputItemKind {
+    fn id_prefix(&self) -> &'static str {
+        match self {
+            Self::Message => "msg",
+            Self::McpListTools => "mcpl",
+            Self::FunctionCall => "fc",
+            Self::Reasoning => "rs",
+        }
+    }
 }
 
 /// Status of an output item
@@ -116,38 +129,37 @@ impl ResponseStreamEventEmitter {
         self.original_request = Some(request);
     }
 
-    /// Update tool call output items with tool execution results
+    /// Update tool call output items with tool execution results.
     ///
-    /// After MCP tools are executed, this updates the stored output items
-    /// to include the output field from the tool results.
-    /// Supports mcp_call, web_search_call, code_interpreter_call, and file_search_call item types.
+    /// Replaces each matched item's stored payload with the authoritative
+    /// `ResponseOutputItem` produced by `ResponseTransformer::transform`
+    /// (carried on `ToolResult::output_item`). That transformer is the
+    /// single source of truth for per-tool shape — e.g. `mcp_call`
+    /// receives `output: string`, `web_search_call` receives
+    /// `{status, action, ...}`, and `image_generation_call` receives
+    /// `result: base64`. The streaming emitter's initial
+    /// `output_item.added` carries a partial stub (tool-call id + arguments);
+    /// this call overwrites that stub once the MCP result is in hand, so
+    /// `response.completed.response.output` sees the same item a
+    /// non-streaming response would emit.
+    ///
+    /// Matching is by the original `call_id` the stub stored, since that
+    /// is the only identifier common to every tool-call item type.
     pub(crate) fn update_mcp_call_outputs(&mut self, tool_results: &[ToolResult]) {
         for tool_result in tool_results {
-            // Find the output item with matching call_id
+            let Ok(item_value) = serde_json::to_value(&tool_result.output_item) else {
+                warn!(
+                    call_id = %tool_result.call_id,
+                    "Failed to serialize transformed tool output item; keeping streaming stub"
+                );
+                continue;
+            };
             for item_state in &mut self.output_items {
                 if let Some(ref mut item_data) = item_state.item_data {
-                    // Check if this is a tool call item with matching call_id
-                    let item_type = item_data.get("type").and_then(|t| t.as_str());
-                    let is_tool_call = matches!(
-                        item_type,
-                        Some("mcp_call")
-                            | Some("web_search_call")
-                            | Some("code_interpreter_call")
-                            | Some("file_search_call")
-                    );
-                    if is_tool_call
-                        && item_data.get("call_id").and_then(|c| c.as_str())
-                            == Some(&tool_result.call_id)
+                    if item_data.get("call_id").and_then(|c| c.as_str())
+                        == Some(&tool_result.call_id)
                     {
-                        // Add output field
-                        let output_str = serde_json::to_string(&tool_result.output)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        item_data["output"] = json!(output_str);
-
-                        // Update status based on success
-                        if tool_result.is_error {
-                            item_data["status"] = json!("failed");
-                        }
+                        *item_data = item_value;
                         break;
                     }
                 }
@@ -353,11 +365,11 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    /// Convert tool entries to JSON values using the shared `build_mcp_tool_infos` bridge.
+    /// Convert tool entries to JSON values using the shared bridge builder.
     fn tool_entries_to_json(
         tools: &[mcp::ToolEntry],
     ) -> Result<Vec<serde_json::Value>, serde_json::Error> {
-        mcp::build_mcp_tool_infos(tools)
+        openai_bridge::build_mcp_tool_infos(tools)
             .into_iter()
             .map(serde_json::to_value)
             .collect()
@@ -464,77 +476,67 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    /// Emit the appropriate in_progress event based on response format
     pub fn emit_tool_call_in_progress(
         &mut self,
         output_index: usize,
         item_id: &str,
-        response_format: &ResponseFormat,
+        response_format: ResponseFormat,
     ) -> serde_json::Value {
-        let event_type = match response_format {
-            ResponseFormat::WebSearchCall => WebSearchCallEvent::IN_PROGRESS,
-            ResponseFormat::CodeInterpreterCall => CodeInterpreterCallEvent::IN_PROGRESS,
-            ResponseFormat::FileSearchCall => FileSearchCallEvent::IN_PROGRESS,
-            ResponseFormat::Passthrough => McpEvent::CALL_IN_PROGRESS,
-        };
+        let event_type = descriptor(response_format).in_progress_event;
         self.emit_tool_event(event_type, output_index, item_id)
     }
 
-    /// Emit the searching/interpreting event for builtin tool calls (no-op for passthrough)
+    /// Emit the searching/interpreting/generating event; `None` for formats
+    /// with no intermediate phase.
     pub fn emit_tool_call_searching(
         &mut self,
         output_index: usize,
         item_id: &str,
-        response_format: &ResponseFormat,
+        response_format: ResponseFormat,
     ) -> Option<serde_json::Value> {
-        let event_type = match response_format {
-            ResponseFormat::WebSearchCall => WebSearchCallEvent::SEARCHING,
-            ResponseFormat::CodeInterpreterCall => CodeInterpreterCallEvent::INTERPRETING,
-            ResponseFormat::FileSearchCall => FileSearchCallEvent::SEARCHING,
-            ResponseFormat::Passthrough => return None,
-        };
+        let event_type = descriptor(response_format).searching_event?;
         Some(self.emit_tool_event(event_type, output_index, item_id))
     }
 
-    /// Emit the appropriate completed event based on response format
+    /// Emit a `response.image_generation_call.partial_image` event. Returns
+    /// `None` for formats with no partial-image frame.
+    #[expect(
+        dead_code,
+        reason = "partial_image emission is wired by per-router integrations"
+    )]
+    pub fn emit_image_generation_partial_image(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        response_format: ResponseFormat,
+        partial_image_index: u32,
+        partial_image_b64: &str,
+    ) -> Option<serde_json::Value> {
+        let event_type = descriptor(response_format).partial_image_event?;
+        Some(json!({
+            "type": event_type,
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "partial_image_index": partial_image_index,
+            "partial_image_b64": partial_image_b64
+        }))
+    }
+
     pub fn emit_tool_call_completed(
         &mut self,
         output_index: usize,
         item_id: &str,
-        response_format: &ResponseFormat,
+        response_format: ResponseFormat,
     ) -> serde_json::Value {
-        let event_type = match response_format {
-            ResponseFormat::WebSearchCall => WebSearchCallEvent::COMPLETED,
-            ResponseFormat::CodeInterpreterCall => CodeInterpreterCallEvent::COMPLETED,
-            ResponseFormat::FileSearchCall => FileSearchCallEvent::COMPLETED,
-            ResponseFormat::Passthrough => McpEvent::CALL_COMPLETED,
-        };
+        let event_type = descriptor(response_format).completed_event;
         self.emit_tool_event(event_type, output_index, item_id)
     }
 
-    // ========================================================================
-    // Helper Methods for ResponseFormat
-    // ========================================================================
-
-    /// Get the type string for JSON based on response format.
     pub fn type_str_for_format(response_format: Option<&ResponseFormat>) -> &'static str {
         match response_format {
-            Some(ResponseFormat::WebSearchCall) => "web_search_call",
-            Some(ResponseFormat::CodeInterpreterCall) => "code_interpreter_call",
-            Some(ResponseFormat::FileSearchCall) => "file_search_call",
-            Some(ResponseFormat::Passthrough) => "mcp_call",
+            Some(format) => descriptor(*format).type_str,
             None => "function_call",
-        }
-    }
-
-    /// Get the OutputItemType based on response format.
-    pub fn output_item_type_for_format(response_format: Option<&ResponseFormat>) -> OutputItemType {
-        match response_format {
-            Some(ResponseFormat::WebSearchCall) => OutputItemType::WebSearchCall,
-            Some(ResponseFormat::CodeInterpreterCall) => OutputItemType::CodeInterpreterCall,
-            Some(ResponseFormat::FileSearchCall) => OutputItemType::FileSearchCall,
-            Some(ResponseFormat::Passthrough) => OutputItemType::McpCall,
-            None => OutputItemType::FunctionCall,
         }
     }
 
@@ -612,21 +614,11 @@ impl ResponseStreamEventEmitter {
         format!("{}_{}", prefix, Uuid::now_v7().simple())
     }
 
-    /// Allocate next output index and track item
-    pub fn allocate_output_index(&mut self, item_type: OutputItemType) -> (usize, String) {
+    /// Allocate next output index and track item, deriving the item-id from
+    /// `id_prefix` (e.g. `"msg"`, `"mcp"`, `"ws"` — without trailing `_`).
+    pub fn allocate_output_index_with_prefix(&mut self, id_prefix: &str) -> (usize, String) {
         let index = self.next_output_index;
         self.next_output_index += 1;
-
-        let id_prefix = match &item_type {
-            OutputItemType::McpListTools => "mcpl",
-            OutputItemType::McpCall => "mcp",
-            OutputItemType::FunctionCall => "fc",
-            OutputItemType::Message => "msg",
-            OutputItemType::Reasoning => "rs",
-            OutputItemType::WebSearchCall => "ws",
-            OutputItemType::CodeInterpreterCall => "ci",
-            OutputItemType::FileSearchCall => "fs",
-        };
 
         let id = Self::generate_item_id(id_prefix);
 
@@ -637,6 +629,25 @@ impl ResponseStreamEventEmitter {
         });
 
         (index, id)
+    }
+
+    /// Convenience: allocate for a non-format kind.
+    pub fn allocate_output_index(&mut self, kind: OutputItemKind) -> (usize, String) {
+        self.allocate_output_index_with_prefix(kind.id_prefix())
+    }
+
+    /// Convenience: allocate for a `ResponseFormat`-driven item, falling back
+    /// to `function_call` (`"fc"`) when no format applies. Mirrors the prior
+    /// `output_item_type_for_format` mapping but reads the prefix straight
+    /// off the format descriptor.
+    pub fn allocate_output_index_for_format(
+        &mut self,
+        response_format: Option<ResponseFormat>,
+    ) -> (usize, String) {
+        let prefix = response_format
+            .map(|f| descriptor(f).id_prefix)
+            .unwrap_or("fc");
+        self.allocate_output_index_with_prefix(prefix)
     }
 
     /// Mark output item as completed and store its data
@@ -713,7 +724,7 @@ impl ResponseStreamEventEmitter {
         reasoning_content: Option<String>,
     ) -> Result<(), String> {
         // Allocate output index and generate ID
-        let (output_index, item_id) = self.allocate_output_index(OutputItemType::Reasoning);
+        let (output_index, item_id) = self.allocate_output_index(OutputItemKind::Reasoning);
 
         // Build reasoning item structure
         let item = json!({
@@ -752,7 +763,7 @@ impl ResponseStreamEventEmitter {
                     // Allocate output_index and item_id for this message item (once per message)
                     if self.current_item_id.is_none() {
                         let (output_index, item_id) =
-                            self.allocate_output_index(OutputItemType::Message);
+                            self.allocate_output_index(OutputItemKind::Message);
 
                         // Build message item structure
                         let item = json!({
@@ -925,7 +936,7 @@ impl ResponseStreamEventEmitter {
         tools: &[mcp::ToolEntry],
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
     ) -> Result<(), String> {
-        let (output_index, item_id) = self.allocate_output_index(OutputItemType::McpListTools);
+        let (output_index, item_id) = self.allocate_output_index(OutputItemKind::McpListTools);
 
         // Build per-tool JSON items
         let tool_items = Self::tool_entries_to_json(tools).unwrap_or_else(|e| {

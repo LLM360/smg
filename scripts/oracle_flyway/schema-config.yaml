@@ -1,4 +1,9 @@
 # SMG SchemaConfig for genai-data-plane Oracle tables (Flyway-managed)
+#
+# This schema is owned by Flyway, so the gateway must not try to apply its own
+# forward migrations during e2e startup. Pin this to the latest core history
+# migration version that the Flyway-managed schema actually provides. Optional
+# skills/background tables are owned by their feature-specific schema lifecycle.
 version: 3
 auto_migrate: false
 
@@ -23,6 +28,3 @@ conversation_items:
 
 conversation_item_links:
   table: CONVERSATION_ITEM_LINKS
-
-conversation_memories:
-  table: CONVERSATION_MEMORIES

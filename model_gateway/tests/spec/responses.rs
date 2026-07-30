@@ -1,8 +1,9 @@
 use openai_protocol::{
-    common::{Function, StringOrArray, ToolChoice, ToolChoiceValue},
+    common::{ConversationRef, Function, StringOrArray},
     responses::{
         FunctionTool, IncludeField, McpTool, ResponseInput, ResponseInputOutputItem, ResponseTool,
-        ResponsesRequest, StringOrContentParts, TextConfig, TextFormat,
+        ResponsesRequest, ResponsesToolChoice, StringOrContentParts, TextConfig, TextFormat,
+        ToolChoiceOptions,
     },
 };
 use serde_json::json;
@@ -22,7 +23,7 @@ fn test_validate_conversation_id_valid() {
 
     for id in valid_ids {
         let request = ResponsesRequest {
-            conversation: Some(id.to_string()),
+            conversation: Some(ConversationRef::Id(id.to_string())),
             input: ResponseInput::Text("test".to_string()),
             ..Default::default()
         };
@@ -32,6 +33,62 @@ fn test_validate_conversation_id_valid() {
             request.validate().err()
         );
     }
+}
+
+/// Object-form `{"conversation": {"id": "conv_abc"}}` must deserialize into
+/// `ConversationRef::Object { .. }` and pass the same validation as the
+/// string-form.
+#[test]
+fn test_validate_conversation_id_object_form_valid() {
+    let v = json!({
+        "input": "test",
+        "model": "gpt-4",
+        "conversation": { "id": "conv_abc" },
+    });
+    let request: ResponsesRequest =
+        serde_json::from_value(v).expect("object-form conversation should deserialize");
+    assert!(
+        matches!(
+            request.conversation,
+            Some(ConversationRef::Object { ref id }) if id == "conv_abc"
+        ),
+        "Expected ConversationRef::Object variant, got {:?}",
+        request.conversation
+    );
+    assert!(
+        request.validate().is_ok(),
+        "Valid object-form conversation should pass validation, got: {:?}",
+        request.validate().err()
+    );
+}
+
+/// Object-form with an empty id must fail validation with the same
+/// `invalid_conversation_id` error code used for the string-form.
+#[test]
+fn test_validate_conversation_id_object_form_empty_invalid() {
+    let v = json!({
+        "input": "test",
+        "model": "gpt-4",
+        "conversation": { "id": "" },
+    });
+    let request: ResponsesRequest =
+        serde_json::from_value(v).expect("object-form conversation should deserialize");
+    let result = request.validate();
+    assert!(
+        result.is_err(),
+        "Object-form conversation with empty id should fail validation"
+    );
+    let errors = result.unwrap_err();
+    let field_errors = errors.field_errors();
+    let conversation_errors = field_errors
+        .get("conversation")
+        .expect("Expected error for 'conversation' field");
+    let code = conversation_errors.first().map(|e| e.code.as_ref());
+    assert_eq!(
+        code,
+        Some("invalid_conversation_id"),
+        "Expected 'invalid_conversation_id' error code, got: {code:?}"
+    );
 }
 
 /// Test that invalid conversation IDs fail validation
@@ -71,7 +128,7 @@ fn test_validate_conversation_id_invalid() {
 
     for id in invalid_ids {
         let request = ResponsesRequest {
-            conversation: Some(id.to_string()),
+            conversation: Some(ConversationRef::Id(id.to_string())),
             input: ResponseInput::Text("test".to_string()),
             ..Default::default()
         };
@@ -132,7 +189,7 @@ fn test_validate_conversation_id_none() {
 fn test_validate_conversation_id_error_message_format() {
     let invalid_id = "conv_.test-conv-streaming";
     let request = ResponsesRequest {
-        conversation: Some(invalid_id.to_string()),
+        conversation: Some(ConversationRef::Id(invalid_id.to_string())),
         input: ResponseInput::Text("test".to_string()),
         ..Default::default()
     };
@@ -170,7 +227,7 @@ fn test_validate_conversation_id_error_message_format() {
 fn test_validate_conversation_id_missing_prefix() {
     let invalid_id = "test-conv-streaming";
     let request = ResponsesRequest {
-        conversation: Some(invalid_id.to_string()),
+        conversation: Some(ConversationRef::Id(invalid_id.to_string())),
         input: ResponseInput::Text("test".to_string()),
         ..Default::default()
     };
@@ -525,6 +582,7 @@ fn test_validate_input_items_empty_content() {
             content: StringOrContentParts::String(String::new()),
             role: "user".to_string(),
             r#type: None,
+            phase: None,
         }]),
         ..Default::default()
     };
@@ -642,6 +700,8 @@ fn test_validate_tools_mcp_valid_ok() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         ..Default::default()
     };
@@ -677,6 +737,8 @@ fn test_validate_tools_mcp_duplicate_server_label() {
                 server_description: None,
                 require_approval: None,
                 allowed_tools: None,
+                connector_id: None,
+                defer_loading: None,
             }),
             ResponseTool::Mcp(McpTool {
                 server_url: None,
@@ -686,6 +748,8 @@ fn test_validate_tools_mcp_duplicate_server_label() {
                 server_description: None,
                 require_approval: None,
                 allowed_tools: None,
+                connector_id: None,
+                defer_loading: None,
             }),
         ]),
         ..Default::default()
@@ -720,6 +784,8 @@ fn test_validate_tools_mcp_server_label_invalid_cases() {
                 server_description: None,
                 require_approval: None,
                 allowed_tools: None,
+                connector_id: None,
+                defer_loading: None,
             })]),
             ..Default::default()
         };
@@ -778,7 +844,7 @@ fn test_validate_tool_choice_requires_tools() {
                 strict: None,
             },
         })]),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         ..Default::default()
     };
     assert!(
@@ -790,7 +856,7 @@ fn test_validate_tool_choice_requires_tools() {
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         tools: None,
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::None)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::None)),
         ..Default::default()
     };
     assert!(
@@ -802,7 +868,7 @@ fn test_validate_tool_choice_requires_tools() {
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         tools: None,
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         ..Default::default()
     };
     let result = request.validate();
@@ -862,31 +928,6 @@ fn test_validate_top_logprobs_requires_include() {
     );
 }
 
-/// Test background/stream conflict
-#[test]
-fn test_validate_background_stream_conflict() {
-    // Invalid: both background and stream enabled
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        background: Some(true),
-        stream: Some(true),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "background=true with stream=true should be invalid"
-    );
-
-    if let Err(errors) = result {
-        let error_msg = errors.to_string();
-        assert!(
-            error_msg.contains("background") || error_msg.contains("stream"),
-            "Error should mention background/stream conflict"
-        );
-    }
-}
-
 /// Test previous_response_id format validation
 /// NOTE: Format validation removed - previous_response_id format is not validated
 /// response_id generated by the grpc router is not necessarily start with 'resp_'
@@ -931,7 +972,7 @@ fn test_validate_conversation_previous_response_mutual_exclusion() {
     // Valid: only conversation
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        conversation: Some("conv_123".to_string()),
+        conversation: Some(ConversationRef::Id("conv_123".to_string())),
         previous_response_id: None,
         ..Default::default()
     };
@@ -955,7 +996,7 @@ fn test_validate_conversation_previous_response_mutual_exclusion() {
     // Invalid: both conversation and previous_response_id
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        conversation: Some("conv_123".to_string()),
+        conversation: Some(ConversationRef::Id("conv_123".to_string())),
         previous_response_id: Some("resp_123".to_string()),
         ..Default::default()
     };
@@ -985,6 +1026,7 @@ fn test_validate_input_items_structure() {
             content: StringOrContentParts::String("Hello".to_string()),
             role: "user".to_string(),
             r#type: None,
+            phase: None,
         }]),
         ..Default::default()
     };
@@ -1042,7 +1084,7 @@ fn test_normalize_tool_choice_auto() {
     assert!(
         matches!(
             request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::Auto))
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
         ),
         "tool_choice should default to auto when tools are present"
     );
@@ -1069,7 +1111,7 @@ fn test_normalize_tool_choice_none() {
     assert!(
         matches!(
             request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::None))
         ),
         "tool_choice should default to none when tools array is empty"
     );
@@ -1090,7 +1132,7 @@ fn test_normalize_tool_choice_no_override() {
                 strict: None,
             },
         })]),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
         ..Default::default()
     };
 
@@ -1099,7 +1141,7 @@ fn test_normalize_tool_choice_no_override() {
     assert!(
         matches!(
             request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::Required))
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required))
         ),
         "tool_choice should not be overridden if already set"
     );

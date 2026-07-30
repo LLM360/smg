@@ -11,13 +11,10 @@ use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{error, field::Empty, info, info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use super::{metrics::normalize_path_for_metrics, request_id::RequestId};
-use crate::{
-    observability::{
-        metrics::{method_to_static_str, Metrics},
-        otel_trace::extract_trace_context_http,
-    },
-    routers::error::extract_error_code_from_response,
+use super::{metrics::matched_path_label, request_id::RequestId};
+use crate::observability::{
+    metrics::{method_to_static_str, Metrics},
+    otel_trace::extract_trace_context_http,
 };
 
 /// Custom span maker that includes request ID
@@ -45,7 +42,8 @@ impl<B> MakeSpan<B> for RequestSpan {
             module = "smg"
         );
 
-        span.set_parent(parent_cx);
+        // 0.33 returns a Result; a missing/empty parent context is not actionable here.
+        let _ = span.set_parent(parent_cx);
         span
     }
 }
@@ -65,8 +63,8 @@ impl<B> OnRequest<B> for RequestLogger {
         }
 
         let method = method_to_static_str(request.method().as_str());
-        let path = normalize_path_for_metrics(request.uri().path());
-        Metrics::record_http_request(method, &path);
+        let path = matched_path_label(request.extensions());
+        Metrics::record_http_request(method, path);
 
         // Log the request start
         info!(
@@ -84,11 +82,6 @@ impl<B> OnResponse<B> for ResponseLogger {
     fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
         let status_code = status.as_u16();
-
-        let error_code = extract_error_code_from_response(response);
-
-        // Layer 1: HTTP metrics
-        Metrics::record_http_response(status_code, error_code);
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status_code);

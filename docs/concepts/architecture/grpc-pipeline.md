@@ -44,14 +44,24 @@ Parse function calls and execute MCP tools with automatic result injection.
 
 </div>
 
+<div class="card" markdown>
+
+### :material-lock-check: Constrained Decoding
+
+XGrammar-enforced tool calls and structured outputs, guaranteed to match declared schemas.
+
+</div>
+
 </div>
 
 ---
 
 ## Pipeline Architecture
 
-<div class="architecture-diagram">
-  <img src="../../../assets/images/grpc-pipeline.svg" alt="gRPC Pipeline Architecture">
+<div class="architecture-diagram" markdown>
+
+![gRPC Pipeline Architecture](../../assets/images/grpc-pipeline.svg)
+
 </div>
 
 <div class="grid" markdown>
@@ -84,6 +94,7 @@ SMG handles routing, load balancing, and failover. Workers run full OpenAI-compa
 |------------|--------------------|--------------------|
 | Chat template | Gateway | Worker |
 | Tokenization | Gateway (cached) | Worker |
+| Constrained decoding (XGrammar) | Gateway builds, worker enforces | Worker |
 | Load balancing | Token-aware | Request count |
 | Reasoning extraction | Gateway | Worker |
 | Tool call parsing | Gateway | Worker |
@@ -247,9 +258,9 @@ Qwen model JSON tool calling format.
 
 <div class="card" markdown>
 
-**Qwen Coder**
+**Qwen XML**
 
-Qwen Coder XML format with parameter tags.
+Qwen3-Coder / Qwen3.5+ XML format with parameter tags.
 
 ```xml
 <tool_call><function=get_weather><parameter=location>NYC</parameter></function></tool_call>
@@ -267,7 +278,7 @@ Qwen Coder XML format with parameter tags.
 | `json` | `gpt-*`, `claude-*`, `gemini-*` | Standard JSON function calls |
 | `mistral` | `mistral-*`, `mixtral-*` | Mistral-specific format |
 | `qwen` | `qwen*`, `Qwen*` | JSON tool calls |
-| `qwen_coder` | `Qwen*-Coder*`, `qwen*-coder*` | XML with parameter tags |
+| `qwen_xml` | `Qwen3-Coder*`, `Qwen3.5*` | XML with parameter tags |
 | `pythonic` | `llama-4*`, `deepseek-*` | Python-style function syntax |
 | `llama` | `llama-3.2*` | Python tag with JSON |
 | `deepseek` | `deepseek-v3*` | XML with function syntax |
@@ -284,6 +295,35 @@ Qwen Coder XML format with parameter tags.
 3. **Execute**: Run MCP tools or return to client
 4. **Inject**: Add tool results back to conversation
 5. **Continue**: Resume generation if needed
+
+---
+
+## Constrained Decoding (XGrammar)
+
+When a request declares `tools` or a structured `response_format`, SMG builds a **constraint** during chat preparation and sends it with the gRPC request. The backend engine compiles it with XGrammar and enforces it token-by-token during decoding, so tool-call framing and JSON arguments are guaranteed to conform to the declared schemas before SMG's own parsers ever see the output.
+
+### Where It Runs in the Pipeline
+
+In the regular gRPC pipeline, the constraint is generated **after chat template rendering and tokenization** (`model_gateway/src/routers/grpc/regular/stages/chat/preparation.rs`):
+
+1. Filter tools by `tool_choice`
+2. Apply chat template
+3. Tokenize
+4. **Build tool constraint** (`generate_tool_constraint`)
+5. Build stop decoder → worker selection → dispatch
+
+The Harmony pipeline (GPT-OSS) differs: it generates the constraint before encoding (`model_gateway/src/routers/grpc/harmony/stages/preparation.rs`). The architecture diagrams follow the regular pipeline order.
+
+### Constraint Types
+
+| Type | When used | What it constrains |
+|------|-----------|--------------------|
+| `structural_tag` | Configured tool parser has a native tag builder (`mistral`, `kimik2`, `kimi_k3`, `inkling`) | Full tool-call format: trigger tokens, tool-call framing, and argument JSON |
+| `json_schema` | Fallback for `required` / specific-function `tool_choice` | Argument JSON only |
+
+### Enforcement
+
+The constraint travels on `GenerateRequest`'s `constraint` oneof (`crates/grpc_client/proto/`), which also carries structured-output controls (`json_schema`, `regex`, `grammar`, `json_object`, `choice`). Engines compile these through XGrammar-guided decoding, and SMG's tool/reasoning parsers then extract the already well-formed calls from the response.
 
 ---
 

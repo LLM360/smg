@@ -19,7 +19,12 @@ use crate::{
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
-    routers::{openai::realtime::RealtimeRegistry, router_manager::RouterManager},
+    rate_limit::RateLimitManager,
+    routers::{
+        common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
+        grpc::multimodal::MultimodalConfigRegistry,
+        router_manager::RouterManager,
+    },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{KvEventMonitor, WorkerMonitor, WorkerRegistry, WorkerService},
     workflow::{JobQueue, WorkflowEngines},
@@ -48,7 +53,9 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -63,6 +70,7 @@ pub struct AppContext {
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
+    pub mcp_format_registry: FormatRegistry,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
@@ -70,7 +78,7 @@ pub struct AppContext {
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
-    /// STUN server for ICE candidate gathering (`None` = `stun.l.google.com:19302`).
+    /// STUN server for ICE candidate gathering. Defaults to `stun.l.google.com:19302`; `"none"` to disable.
     pub webrtc_stun_server: Option<String>,
 }
 
@@ -86,6 +94,7 @@ pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
@@ -99,6 +108,7 @@ pub struct AppContextBuilder {
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_orchestrator: Option<Arc<OnceLock<Arc<McpOrchestrator>>>>,
+    mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -138,6 +148,7 @@ impl AppContextBuilder {
             client: None,
             router_config: None,
             rate_limiter: None,
+            rate_limit_manager: None,
             tokenizer_registry: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
@@ -151,6 +162,7 @@ impl AppContextBuilder {
             worker_job_queue: None,
             workflow_engines: None,
             mcp_orchestrator: None,
+            mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
             webrtc_bind_addr: None,
@@ -171,6 +183,16 @@ impl AppContextBuilder {
     pub fn rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
         self.rate_limiter = rate_limiter;
         self
+    }
+
+    /// Build the tenant rate limiter from config. `Ok(None)` (feature
+    /// disabled) is a valid, non-fatal outcome. `Err` (enabled but the
+    /// policy YAML failed to load/parse/validate) fails startup — an
+    /// operator who explicitly turned rate limiting on must not get a
+    /// gateway that silently runs unlimited.
+    fn maybe_rate_limit_manager(mut self, config: &RouterConfig) -> Result<Self, String> {
+        self.rate_limit_manager = RateLimitManager::from_config(config)?;
+        Ok(self)
     }
 
     pub fn tokenizer_registry(mut self, tokenizer_registry: Arc<TokenizerRegistry>) -> Self {
@@ -250,6 +272,11 @@ impl AppContextBuilder {
         self
     }
 
+    pub fn mcp_format_registry(mut self, registry: FormatRegistry) -> Self {
+        self.mcp_format_registry = Some(registry);
+        self
+    }
+
     pub fn wasm_manager(mut self, wasm_manager: Option<Arc<WasmModuleManager>>) -> Self {
         self.wasm_manager = wasm_manager;
         self
@@ -325,9 +352,11 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError::MissingField("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,
+            rate_limit_manager: self.rate_limit_manager,
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
+            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
@@ -354,6 +383,7 @@ impl AppContextBuilder {
             mcp_orchestrator: self
                 .mcp_orchestrator
                 .ok_or(AppContextBuildError::MissingField("mcp_orchestrator"))?,
+            mcp_format_registry: self.mcp_format_registry.unwrap_or_default(),
             wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
@@ -375,6 +405,7 @@ impl AppContextBuilder {
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
+            .maybe_rate_limit_manager(&router_config)?
             .with_tokenizer_registry()
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
@@ -390,7 +421,9 @@ impl AppContextBuilder {
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
             .webrtc_bind_addr(webrtc_bind_addr)
-            .webrtc_stun_server(webrtc_stun_server)
+            .webrtc_stun_server(
+                webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),
+            )
             .router_config(router_config))
     }
 
@@ -510,7 +543,10 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
+            config.policy.clone(),
+            config.routing_key_override.clone(),
+        )));
         self
     }
 
@@ -542,12 +578,11 @@ impl AppContextBuilder {
             redis: config.redis.as_ref(),
             hook,
         };
-        let (response_storage, conversation_storage, conversation_item_storage) =
-            create_storage(storage_config).await?;
+        let bundle = create_storage(storage_config).await?;
 
-        self.response_storage = Some(response_storage);
-        self.conversation_storage = Some(conversation_storage);
-        self.conversation_item_storage = Some(conversation_item_storage);
+        self.response_storage = Some(bundle.response_storage);
+        self.conversation_storage = Some(bundle.conversation_storage);
+        self.conversation_item_storage = Some(bundle.conversation_item_storage);
 
         Ok(self)
     }
@@ -569,6 +604,7 @@ impl AppContextBuilder {
                 .clone(),
             client.clone(),
             config.load_monitor_interval_secs,
+            config.engine_metrics,
         )));
         Ok(self)
     }
@@ -618,6 +654,7 @@ impl AppContextBuilder {
             .map_err(|_| "Failed to set MCP orchestrator in OnceLock".to_string())?;
 
         self.mcp_orchestrator = Some(mcp_orchestrator_lock);
+        self.mcp_format_registry = Some(FormatRegistry::new());
         Ok(self)
     }
 
@@ -640,6 +677,12 @@ impl AppContextBuilder {
             // and any other existing cache-aware policies.
             if let Some(ref registry) = self.policy_registry {
                 registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
+                // Wire the backend load snapshot so cache-aware policies can use
+                // the KV-usage imbalance trigger. `with_worker_monitor` ran
+                // earlier in the build chain, so this is already set.
+                if let Some(ref worker_monitor) = self.worker_monitor {
+                    registry.set_load_receiver(Some(worker_monitor.subscribe()));
+                }
             }
 
             self.kv_event_monitor = Some(monitor);
@@ -664,5 +707,88 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::PolicyConfig;
+
+    fn config_with_policy(policy: PolicyConfig) -> RouterConfig {
+        RouterConfig {
+            policy,
+            ..Default::default()
+        }
+    }
+
+    /// `with_kv_event_monitor` only creates a monitor for the cache-aware policy.
+    /// This run of the builder needs no storage or network, so it exercises the
+    /// real gating path rather than the predicate in isolation.
+    fn kv_monitor_created_for(policy: PolicyConfig) -> bool {
+        let config = config_with_policy(policy);
+        AppContextBuilder::new()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor(&config)
+            .kv_event_monitor
+            .is_some()
+    }
+
+    /// The #1794-relevant guarantee: passthrough never starts the KV-event
+    /// monitor, so single-backend gateways skip the `SubscribeKvEvents` overhead.
+    #[test]
+    fn test_passthrough_does_not_create_kv_event_monitor() {
+        assert!(!kv_monitor_created_for(PolicyConfig::Passthrough));
+        // Other non-cache-aware policies are likewise skipped.
+        assert!(!kv_monitor_created_for(PolicyConfig::RoundRobin));
+        // Control: cache-aware still creates the monitor.
+        assert!(kv_monitor_created_for(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 1000,
+            block_size: 16,
+            engine_load: false,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+        }));
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_disabled_is_ok_none() {
+        let config = RouterConfig::default();
+        let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
+        assert!(result.is_ok());
+        assert!(result.unwrap().rate_limit_manager.is_none());
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_enabled_with_missing_file_fails_startup() {
+        let config = RouterConfig::builder()
+            .tenant_rate_limit_enabled(true)
+            .tenant_rate_limit_config(Some("/nonexistent/rate_limit.yaml".to_string()))
+            .build_unchecked();
+        assert!(AppContextBuilder::new()
+            .maybe_rate_limit_manager(&config)
+            .is_err());
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate_limit.yaml");
+        std::fs::write(
+            &path,
+            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
+        )
+        .unwrap();
+        let config = RouterConfig::builder()
+            .tenant_rate_limit_enabled(true)
+            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
+            .build_unchecked();
+        let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
+        assert!(result.is_ok());
+        assert!(result.unwrap().rate_limit_manager.is_some());
     }
 }

@@ -1,15 +1,88 @@
+use axum::http::HeaderName;
+use sha2::{Digest, Sha256};
+
 use super::*;
+
+/// Validate a user-supplied mesh server name. The name keys rate-limit
+/// shards as `rl:{counter}:{name}`, so an empty name or one containing the
+/// separator would corrupt shard keys; rejecting at config time avoids a
+/// panic at mesh adapter construction during startup.
+pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
+    if name.is_empty() || name.contains(':') {
+        return Err(ConfigError::InvalidValue {
+            field: "mesh_server_name".to_string(),
+            value: name.to_string(),
+            reason: "must be non-empty and must not contain ':'".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a single worker URL: non-empty, an allowed scheme, and a
+/// parseable host. Shared by [`ConfigValidator::validate_urls`] (startup
+/// config) and the worker-management API so both reject schemeless or
+/// unparsable URLs identically. Rejecting at the API boundary prevents
+/// the orphaned `url_to_id` reservation from #1533: the AddWorker
+/// workflow rewrites schemeless input via `normalize_url`, so a
+/// reservation keyed on the raw URL would never match the registered
+/// worker.
+pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
+    if url.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "worker_url".to_string(),
+            value: url.to_string(),
+            reason: "URL cannot be empty".to_string(),
+        });
+    }
+
+    // Exact (lowercase) scheme allow-list. Case-insensitive matching is
+    // tempting but wrong here: the AddWorker workflow's normalize_url
+    // matches schemes case-sensitively, so a mixed-case scheme would be
+    // rewritten downstream and diverge from the reservation key — the
+    // same orphan failure as a schemeless URL.
+    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs"];
+    let scheme = url.split_once("://").map_or("", |(s, _)| s);
+    if !ALLOWED_SCHEMES.contains(&scheme) {
+        return Err(ConfigError::InvalidValue {
+            field: "worker_url".to_string(),
+            value: url.to_string(),
+            reason:
+                "URL must start with a lowercase http://, https://, grpc://, or grpcs:// scheme"
+                    .to_string(),
+        });
+    }
+
+    match ::url::Url::parse(url) {
+        Ok(parsed) => {
+            if parsed.host_str().is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: "worker_url".to_string(),
+                    value: url.to_string(),
+                    reason: "URL must have a valid host".to_string(),
+                });
+            }
+        }
+        Err(e) => {
+            return Err(ConfigError::InvalidValue {
+                field: "worker_url".to_string(),
+                value: url.to_string(),
+                reason: format!("Invalid URL format: {e}"),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
-
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
-
+        Self::validate_tenant_resolution(config)?;
+        Self::validate_tenant_api_keys(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -70,6 +143,97 @@ impl ConfigValidator {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "storage_context_headers must not map multiple headers to the same context key: '{context_key}'"
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_tenant_resolution(config: &RouterConfig) -> ConfigResult<()> {
+        let header_name = config.tenant_resolution.tenant_header_name.trim();
+        if header_name.is_empty() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "tenant_resolution.tenant_header_name must not be empty".to_string(),
+            });
+        }
+
+        HeaderName::try_from(header_name).map_err(|e| ConfigError::ValidationFailed {
+            reason: format!(
+                "tenant_resolution.tenant_header_name must be a valid HTTP header name: {e}"
+            ),
+        })?;
+
+        Ok(())
+    }
+
+    /// Validates `tenant_api_keys`: non-empty `tenant_id`/`key`, and no two
+    /// credentials (including the shared `api_key`) sharing a secret value —
+    /// duplicates would silently attribute one tenant's traffic to another.
+    /// Runs regardless of construction path, since `TenantApiKeyEntry` is a
+    /// public deserializable struct. Compares hashes only; errors never
+    /// include a raw key value.
+    fn validate_tenant_api_keys(config: &RouterConfig) -> ConfigResult<()> {
+        fn hash(key: &str) -> [u8; 32] {
+            Sha256::digest(key.as_bytes()).into()
+        }
+
+        let mut seen: std::collections::HashMap<[u8; 32], String> =
+            std::collections::HashMap::new();
+
+        if let Some(api_key) = &config.api_key {
+            seen.insert(hash(api_key), "the shared api_key".to_string());
+        }
+
+        for entry in &config.tenant_api_keys {
+            let trimmed_tenant_id = entry.tenant_id.trim();
+            if trimmed_tenant_id.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "tenant_api_keys entries must have a non-empty tenant_id".to_string(),
+                });
+            }
+            // The CLI parser already trims tenant_id, but config-file/binding
+            // entries bypass it — reject padding here instead of silently
+            // normalizing, since `auth:<tenant_id>` embeds it verbatim and a
+            // padded id would resolve to a different, likely-unintended
+            // tenant identity than the canonical one.
+            if trimmed_tenant_id != entry.tenant_id {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "tenant_api_keys tenant_id '{}' must not have surrounding whitespace",
+                        entry.tenant_id
+                    ),
+                });
+            }
+            let trimmed_key = entry.key.trim();
+            if trimmed_key.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "tenant_api_keys entry for tenant_id '{}' must have a non-empty key",
+                        entry.tenant_id
+                    ),
+                });
+            }
+            // Same asymmetry as tenant_id: the CLI trims the key, but
+            // config-file/binding entries don't go through it. A padded key
+            // would hash differently than the operator likely intended,
+            // silently defeating the duplicate-value check above for that
+            // entry.
+            if trimmed_key != entry.key {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "tenant_api_keys entry for tenant_id '{}' key must not have surrounding whitespace",
+                        entry.tenant_id
+                    ),
+                });
+            }
+
+            let label = format!("tenant_id '{}'", entry.tenant_id);
+            if let Some(existing) = seen.insert(hash(&entry.key), label.clone()) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "duplicate API key value: {label} uses the same credential as {existing}. Each credential must be unique, or requests authenticate as whichever entry is checked last."
                     ),
                 });
             }
@@ -177,6 +341,46 @@ impl ConfigValidator {
                     Self::validate_policy(d_policy)?;
                 }
             }
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+            } => {
+                for urls in [encode_urls, prefill_urls] {
+                    if !urls.is_empty() {
+                        let url_strings: Vec<String> =
+                            urls.iter().map(|(url, _)| url.clone()).collect();
+                        Self::validate_urls(&url_strings)?;
+                    }
+                    for (_url, port) in urls {
+                        if let Some(port) = port {
+                            if *port == 0 {
+                                return Err(ConfigError::InvalidValue {
+                                    field: "bootstrap_port".to_string(),
+                                    value: port.to_string(),
+                                    reason: "Port must be between 1 and 65535".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if !decode_urls.is_empty() {
+                    Self::validate_urls(decode_urls)?;
+                }
+                if let Some(policy) = encode_policy {
+                    Self::validate_policy(policy)?;
+                    Self::validate_encode_policy(policy)?;
+                }
+                if let Some(policy) = prefill_policy {
+                    Self::validate_policy(policy)?;
+                }
+                if let Some(policy) = decode_policy {
+                    Self::validate_policy(policy)?;
+                }
+            }
             RoutingMode::OpenAI { worker_urls } => {
                 // Allow empty URLs to support dynamic worker addition
                 // URLs will be validated if provided
@@ -205,6 +409,7 @@ impl ConfigValidator {
         match policy {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
+            | PolicyConfig::Passthrough
             | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {
@@ -215,12 +420,30 @@ impl ConfigValidator {
                 max_tree_size,
                 block_size,
                 engine_load: _,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
             } => {
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
                         field: "block_size".to_string(),
                         value: block_size.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *balance_token_usage_threshold <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_token_usage_threshold".to_string(),
+                        value: balance_token_usage_threshold.to_string(),
+                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                    });
+                }
+
+                if *overload_token_usage_threshold <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "overload_token_usage_threshold".to_string(),
+                        value: overload_token_usage_threshold.to_string(),
+                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
@@ -278,6 +501,44 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::LeastLoad {
+                load_check_interval_secs,
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+            } => {
+                if *load_check_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "load_check_interval_secs".to_string(),
+                        value: load_check_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "kv_pressure_weight".to_string(),
+                        value: kv_pressure_weight.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+
+                if *mean_prefill_tokens == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "mean_prefill_tokens".to_string(),
+                        value: mean_prefill_tokens.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if !default_throughput.is_finite() || *default_throughput <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "default_throughput".to_string(),
+                        value: default_throughput.to_string(),
+                        reason: "Must be finite and > 0.0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::Bucket {
                 balance_abs_threshold: _,
                 balance_rel_threshold,
@@ -330,12 +591,38 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_encode_policy(policy: &PolicyConfig) -> ConfigResult<()> {
+        match policy {
+            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::ConsistentHashing => {
+                Ok(())
+            }
+            _ => Err(ConfigError::IncompatibleConfig {
+                reason: "Encode policy supports random, round_robin, or consistent_hashing"
+                    .to_string(),
+            }),
+        }
+    }
+
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "port".to_string(),
                 value: config.port.to_string(),
                 reason: "Port must be > 0".to_string(),
+            });
+        }
+
+        // Reject a configured dedicated probe port of 0: 0 means "OS-assigned
+        // ephemeral port", which breaks the fail-fast contract that probes
+        // live on a stable operator-configured port. (`start_probe_listener`
+        // itself still accepts 0 so the ephemeral-port unit tests can bind;
+        // only the config-sourced value is rejected here.)
+        if config.health_check_port == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "health_check_port".to_string(),
+                value: "0".to_string(),
+                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
+                    .to_string(),
             });
         }
 
@@ -370,6 +657,16 @@ impl ConfigValidator {
                     field: "rate_limit_tokens_per_second".to_string(),
                     value: tokens_per_second.to_string(),
                     reason: "Must be >= 0 when specified".to_string(),
+                });
+            }
+        }
+
+        if let Some(requests_per_second) = config.global_rate_limit_requests_per_second {
+            if requests_per_second == 0 || requests_per_second > i64::MAX as u64 {
+                return Err(ConfigError::InvalidValue {
+                    field: "global_rate_limit_requests_per_second".to_string(),
+                    value: requests_per_second.to_string(),
+                    reason: format!("Must be between 1 and {}", i64::MAX),
                 });
             }
         }
@@ -435,6 +732,16 @@ impl ConfigValidator {
                 if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
                     return Err(ConfigError::ValidationFailed {
                         reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
+                    });
+                }
+            }
+            RoutingMode::EncodePrefillDecode { .. } => {
+                if discovery.encode_selector.is_empty()
+                    || discovery.prefill_selector.is_empty()
+                    || discovery.decode_selector.is_empty()
+                {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "EPD mode with service discovery requires non-empty encode_selector, prefill_selector, and decode_selector".to_string(),
                     });
                 }
             }
@@ -638,6 +945,15 @@ impl ConfigValidator {
 
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
+        if let RoutingMode::EncodePrefillDecode { decode_policy, .. } = &config.mode {
+            let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
+            if matches!(effective_decode_policy, PolicyConfig::Bucket { .. }) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Decode policy should not be allowed to be bucket".to_string(),
+                });
+            }
+        }
+
         if !has_service_discovery {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
@@ -680,6 +996,37 @@ impl ConfigValidator {
                     });
                 }
             }
+
+            if let RoutingMode::EncodePrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+                ..
+            } = &config.mode
+            {
+                let effective_prefill_policy = prefill_policy.as_ref().unwrap_or(&config.policy);
+                let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
+
+                if matches!(effective_prefill_policy, PolicyConfig::PowerOfTwo { .. })
+                    && prefill_urls.len() < 2
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason:
+                            "Power-of-two policy for prefill requires at least 2 prefill workers"
+                                .to_string(),
+                    });
+                }
+
+                if matches!(effective_decode_policy, PolicyConfig::PowerOfTwo { .. })
+                    && decode_urls.len() < 2
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Power-of-two policy for decode requires at least 2 decode workers"
+                            .to_string(),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -687,43 +1034,7 @@ impl ConfigValidator {
 
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
-            if url.is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_url".to_string(),
-                    value: url.clone(),
-                    reason: "URL cannot be empty".to_string(),
-                });
-            }
-
-            if !url.starts_with("http://")
-                && !url.starts_with("https://")
-                && !url.starts_with("grpc://")
-            {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_url".to_string(),
-                    value: url.clone(),
-                    reason: "URL must start with http://, https://, or grpc://".to_string(),
-                });
-            }
-
-            match ::url::Url::parse(url) {
-                Ok(parsed) => {
-                    if parsed.host_str().is_none() {
-                        return Err(ConfigError::InvalidValue {
-                            field: "worker_url".to_string(),
-                            value: url.clone(),
-                            reason: "URL must have a valid host".to_string(),
-                        });
-                    }
-                }
-                Err(e) => {
-                    return Err(ConfigError::InvalidValue {
-                        field: "worker_url".to_string(),
-                        value: url.clone(),
-                        reason: format!("Invalid URL format: {e}"),
-                    });
-                }
-            }
+            validate_worker_url(url)?;
         }
         Ok(())
     }
@@ -735,6 +1046,77 @@ mod tests {
     use crate::worker::ConnectionMode;
 
     #[test]
+    fn mesh_server_name_with_colon_is_rejected() {
+        assert!(matches!(
+            validate_mesh_server_name("node:a"),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "mesh_server_name"
+        ));
+    }
+
+    #[test]
+    fn empty_mesh_server_name_is_rejected() {
+        assert!(matches!(
+            validate_mesh_server_name(""),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "mesh_server_name"
+        ));
+    }
+
+    #[test]
+    fn valid_mesh_server_name_is_accepted() {
+        assert!(validate_mesh_server_name("node-a").is_ok());
+    }
+
+    #[test]
+    fn worker_url_accepts_allowed_schemes() {
+        for url in [
+            "http://10.0.0.5:8000",
+            "https://worker.example.com",
+            "grpc://10.0.0.5:50051",
+            "grpcs://worker.example.com:443",
+        ] {
+            assert!(validate_worker_url(url).is_ok(), "expected {url} to pass");
+        }
+    }
+
+    #[test]
+    fn worker_url_rejects_non_lowercase_scheme() {
+        // normalize_url in the AddWorker workflow matches schemes
+        // case-sensitively, so `HTTP://…` would be mangled into
+        // `http://HTTP://…` and orphan the reservation just like a
+        // schemeless URL would.
+        assert!(validate_worker_url("HTTP://10.0.0.5:8000").is_err());
+        assert!(validate_worker_url("Grpc://10.0.0.5:50051").is_err());
+    }
+
+    #[test]
+    fn worker_url_rejects_empty() {
+        assert!(matches!(
+            validate_worker_url(""),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "worker_url"
+        ));
+    }
+
+    #[test]
+    fn worker_url_rejects_schemeless_host_port() {
+        // The #1533 case: bare host:port input would be rewritten by the
+        // AddWorker workflow, orphaning the API-layer ID reservation.
+        assert!(matches!(
+            validate_worker_url("10.0.0.5:8000"),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "worker_url"
+        ));
+    }
+
+    #[test]
+    fn worker_url_rejects_disallowed_scheme() {
+        assert!(validate_worker_url("ftp://example.com:21").is_err());
+    }
+
+    #[test]
+    fn worker_url_rejects_unparsable() {
+        assert!(validate_worker_url("http://").is_err());
+    }
+
+    #[test]
     fn test_validate_regular_mode() {
         let config = RouterConfig::new(
             RoutingMode::Regular {
@@ -744,6 +1126,169 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn regular_mode_config() -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        )
+    }
+
+    #[test]
+    fn test_validate_distinct_tenant_api_keys_accepted() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![
+            TenantApiKeyEntry {
+                tenant_id: "team-a".to_string(),
+                key: "secret-a".to_string(),
+            },
+            TenantApiKeyEntry {
+                tenant_id: "team-b".to_string(),
+                key: "secret-b".to_string(),
+            },
+        ];
+
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_duplicate_tenant_api_keys_rejected() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![
+            TenantApiKeyEntry {
+                tenant_id: "team-a".to_string(),
+                key: "shared-secret".to_string(),
+            },
+            TenantApiKeyEntry {
+                tenant_id: "team-b".to_string(),
+                key: "shared-secret".to_string(),
+            },
+        ];
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::ValidationFailed { .. }));
+        let message = err.to_string();
+        assert!(message.contains("team-a"));
+        assert!(message.contains("team-b"));
+        assert!(
+            !message.contains("shared-secret"),
+            "error must not leak the credential value: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_tenant_api_key_matching_shared_api_key_rejected() {
+        let mut config = regular_mode_config();
+        config.api_key = Some("shared-secret".to_string());
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: "team-a".to_string(),
+            key: "shared-secret".to_string(),
+        }];
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::ValidationFailed { .. }));
+        let message = err.to_string();
+        assert!(message.contains("team-a"));
+        assert!(message.contains("shared api_key"));
+        assert!(
+            !message.contains("shared-secret"),
+            "error must not leak the credential value: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_tenant_id_rejected() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: String::new(),
+            key: "some-secret".to_string(),
+        }];
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::ValidationFailed { .. }));
+        assert!(err.to_string().contains("tenant_id"));
+    }
+
+    #[test]
+    fn test_validate_whitespace_only_tenant_id_rejected() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: "   ".to_string(),
+            key: "some-secret".to_string(),
+        }];
+
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    /// A padded-but-otherwise-valid tenant_id (e.g. supplied via a config
+    /// file or binding, bypassing the CLI parser's own trim) must be
+    /// rejected rather than silently resolving to a different `auth:` key
+    /// than the canonical, unpadded tenant_id.
+    #[test]
+    fn test_validate_padded_tenant_id_rejected() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: " team-a ".to_string(),
+            key: "some-secret".to_string(),
+        }];
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::ValidationFailed { .. }));
+        assert!(err.to_string().contains("whitespace"));
+    }
+
+    /// Same asymmetry as the padded-tenant_id case, but for `key`: the CLI
+    /// trims it, config-file/binding entries don't, so an untrimmed key
+    /// would hash differently than intended and silently evade the
+    /// duplicate-value check.
+    #[test]
+    fn test_validate_padded_key_rejected() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: "team-a".to_string(),
+            key: " some-secret ".to_string(),
+        }];
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::ValidationFailed { .. }));
+        let message = err.to_string();
+        assert!(message.contains("team-a"));
+        assert!(message.contains("whitespace"));
+        assert!(
+            !message.contains("some-secret"),
+            "error must not leak the credential value: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_key_rejected() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: "team-a".to_string(),
+            key: String::new(),
+        }];
+
+        // An empty key would make `Authorization: Bearer ` (empty token) a
+        // valid credential for this tenant.
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::ValidationFailed { .. }));
+        let message = err.to_string();
+        assert!(message.contains("team-a"));
+        assert!(message.contains("key"));
+    }
+
+    #[test]
+    fn test_validate_whitespace_only_key_rejected() {
+        let mut config = regular_mode_config();
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: "team-a".to_string(),
+            key: "   ".to_string(),
+        }];
+
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]
@@ -782,6 +1327,19 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_global_rate_limit_bounds() {
+        let mut config = regular_mode_config();
+        config.global_rate_limit_requests_per_second = Some(1);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.global_rate_limit_requests_per_second = Some(0);
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("global_rate_limit_requests_per_second"));
+    }
+
+    #[test]
     fn test_validate_invalid_urls() {
         let config = RouterConfig::new(
             RoutingMode::Regular {
@@ -810,6 +1368,8 @@ mod tests {
                 max_tree_size: 1000,
                 block_size: 16,
                 engine_load: Default::default(),
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             },
         );
 
@@ -831,6 +1391,8 @@ mod tests {
                 max_tree_size: 1000,
                 block_size: 16,
                 engine_load: Default::default(),
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             },
         );
 
@@ -887,6 +1449,8 @@ mod tests {
                 max_tree_size: 1000,
                 block_size: 16,
                 engine_load: Default::default(),
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             },
         );
 
@@ -933,6 +1497,8 @@ mod tests {
                     max_tree_size: 1000,
                     block_size: 16,
                     engine_load: Default::default(),
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -1031,6 +1597,63 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_epd_mode_encode_policy_restrictions() {
+        let valid = RouterConfig::new(
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("http://encode:8000".to_string(), None)],
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                encode_policy: Some(PolicyConfig::ConsistentHashing),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&valid).is_ok());
+
+        let invalid_cache_aware = RouterConfig::new(
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("http://encode:8000".to_string(), None)],
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                encode_policy: Some(PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    engine_load: false,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                }),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&invalid_cache_aware).is_err());
+
+        let invalid_least_load = RouterConfig::new(
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("http://encode:8000".to_string(), None)],
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                encode_policy: Some(PolicyConfig::LeastLoad {
+                    load_check_interval_secs: 5,
+                    kv_pressure_weight: 0.15,
+                    mean_prefill_tokens: 1024,
+                    default_throughput: 2000.0,
+                }),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&invalid_least_load).is_err());
+    }
+
+    #[test]
     fn test_validate_empty_urls_allowed_without_service_discovery() {
         // Test that empty URLs are now allowed in PD mode
         let config = RouterConfig::new(
@@ -1074,6 +1697,22 @@ mod tests {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.connection_mode = ConnectionMode::Grpc;
+        config.model_path = Some("meta-llama/Llama-3-8B".to_string());
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_grpcs_worker_url() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpcs://worker:50051".to_string()],
             },
             PolicyConfig::Random,
         );
@@ -1149,5 +1788,28 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_health_check_port_zero() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        // 0 = OS-ephemeral; breaks the stable-probe-port contract.
+        config.health_check_port = Some(0);
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "health_check_port"
+        ));
+
+        // A real port and the unset (None) default both validate.
+        config.health_check_port = Some(8081);
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.health_check_port = None;
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 }

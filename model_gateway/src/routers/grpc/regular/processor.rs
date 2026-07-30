@@ -5,13 +5,16 @@
 
 use std::{sync::Arc, time::Instant};
 
+use futures::future::try_join_all;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-    common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+    common::{
+        FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage,
+    },
     completion::{CompletionChoice, CompletionRequest, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     messages::{self, CreateMessageRequest, Message},
@@ -97,37 +100,36 @@ impl ResponseProcessor {
         let mut processed_text = final_text;
 
         if original_request.separate_reasoning && reasoning_parser_available {
-            let pooled_parser = utils::get_reasoning_parser(
+            // Fresh parser per request: non-streaming extraction keeps no state
+            // across requests, so avoid serializing on the shared pooled mutex.
+            if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 &original_request.model,
-            );
-
-            let mut parser = pooled_parser.lock().await;
-            // Reset pooled parser to clean state before each request
-            parser.reset();
-
-            // If the template injected `<think>` in the prefill (thinking toggle
-            // is supported and effectively ON), start in reasoning mode.
-            if utils::should_mark_reasoning_started(
-                utils::extract_thinking_from_kwargs(
-                    original_request.chat_template_kwargs.as_ref(),
-                    tokenizer.as_ref(),
-                ),
-                tokenizer.as_ref(),
             ) {
-                parser.mark_reasoning_started();
-            }
-
-            match parser.detect_and_parse_reasoning(&processed_text) {
-                Ok(result) => {
-                    if !result.reasoning_text.is_empty() {
-                        reasoning_text = Some(result.reasoning_text);
-                    }
-                    processed_text = result.normal_text;
+                // If the template injected `<think>` in the prefill (thinking toggle
+                // is supported and effectively ON), start in reasoning mode.
+                if utils::should_mark_reasoning_started(
+                    utils::resolve_user_thinking(
+                        original_request.chat_template_kwargs.as_ref(),
+                        original_request.reasoning_effort.as_deref(),
+                        tokenizer.as_ref(),
+                    ),
+                    tokenizer.as_ref(),
+                ) {
+                    parser.mark_reasoning_started();
                 }
-                Err(e) => {
-                    warn!("Reasoning parsing error, skipping parsing: {e}");
+
+                match parser.detect_and_parse_reasoning(&processed_text) {
+                    Ok(result) => {
+                        if !result.reasoning_text.is_empty() {
+                            reasoning_text = Some(result.reasoning_text);
+                        }
+                        processed_text = result.normal_text;
+                    }
+                    Err(e) => {
+                        warn!("Reasoning parsing error, skipping parsing: {e}");
+                    }
                 }
             }
         }
@@ -168,6 +170,7 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         &original_request.model,
+                        original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
                     )
                     .await;
@@ -194,11 +197,9 @@ impl ResponseProcessor {
         // Step 5: Build ChatCompletionMessage (proper response message type)
         let chat_message = ChatCompletionMessage {
             role: "assistant".to_string(),
-            content: if processed_text.is_empty() {
-                None
-            } else {
-                Some(processed_text)
-            },
+            // Whitespace-only residual (e.g. "\n\n" between </think> and <tool_call>)
+            // must be None, not Some("\n\n") — see normalize_assistant_content.
+            content: normalize_assistant_content(processed_text),
             tool_calls,
             reasoning_content: reasoning_text,
             other: serde_json::Map::new(),
@@ -294,7 +295,7 @@ impl ResponseProcessor {
             }
         }
 
-        // Build usage
+        // Build usage from gRPC response counters.
         let usage = response_formatting::build_usage(&all_responses);
 
         // Build final ChatCompletionResponse
@@ -313,6 +314,7 @@ impl ResponseProcessor {
         &self,
         processed_text: &str,
         model: &str,
+        tools: &[Tool],
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
@@ -322,10 +324,14 @@ impl ResponseProcessor {
             model,
         );
 
-        // Try parsing directly (parser will handle detection internally)
+        // Try parsing directly (parser will handle detection internally). Pass the
+        // tool schemas so schema-aware parsers coerce argument types by their
+        // declared type instead of guessing from the raw text.
         let result = {
             let parser = pooled_parser.lock().await;
-            parser.parse_complete(processed_text).await
+            parser
+                .parse_complete_with_tools(processed_text, tools)
+                .await
             // Lock is dropped here
         };
 
@@ -455,6 +461,7 @@ impl ResponseProcessor {
                 output_token_logprobs,
                 completion_tokens: complete.completion_tokens(),
                 cached_tokens: complete.cached_tokens(),
+                reasoning_tokens: Some(complete.reasoning_tokens()),
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
             };
@@ -512,14 +519,21 @@ impl ResponseProcessor {
         #[expect(clippy::unwrap_used, reason = "safe: checked len == 1 above")]
         let complete = all_responses.into_iter().next().unwrap();
 
-        // Check parser availability
-        // Only run reasoning parser when the user explicitly enabled thinking in the request.
-        // Without this gate, the reasoning parser misclassifies normal text and tool call JSON
-        // as thinking content, breaking tool use and producing incorrect content blocks.
-        let separate_reasoning = matches!(
-            &messages_request.thinking,
-            Some(messages::ThinkingConfig::Enabled { .. })
+        // Check parser availability. Run parser when the user explicitly enabled thinking,
+        // or when the selected parser needs structural special tokens (e.g. Inkling).
+        let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
+            &self.reasoning_parser_factory,
+            self.configured_reasoning_parser.as_deref(),
+            &messages_request.model,
         );
+        let separate_reasoning = reasoning_requires_special_tokens
+            || matches!(
+                &messages_request.thinking,
+                Some(
+                    messages::ThinkingConfig::Enabled { .. }
+                        | messages::ThinkingConfig::Adaptive { .. }
+                )
+            );
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
@@ -587,36 +601,38 @@ impl ResponseProcessor {
         let mut processed_text = final_text;
 
         if reasoning_parser_available {
-            let pooled_parser = utils::get_reasoning_parser(
+            // Fresh parser per request: non-streaming extraction keeps no state
+            // across requests, so avoid serializing on the shared pooled mutex.
+            if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 &messages_request.model,
-            );
-            let mut parser = pooled_parser.lock().await;
-            // Reset pooled parser to clean state before each request
-            parser.reset();
-
-            // If thinking is effectively ON and template has a toggle, start in reasoning mode.
-            {
-                let user_thinking = match &messages_request.thinking {
-                    Some(messages::ThinkingConfig::Enabled { .. }) => Some(true),
-                    Some(messages::ThinkingConfig::Disabled) => Some(false),
-                    None => None,
-                };
-                if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
-                    parser.mark_reasoning_started();
-                }
-            }
-
-            match parser.detect_and_parse_reasoning(&processed_text) {
-                Ok(result) => {
-                    if !result.reasoning_text.is_empty() {
-                        reasoning_text = Some(result.reasoning_text);
+            ) {
+                // If thinking is effectively ON and template has a toggle, start in reasoning mode.
+                {
+                    let user_thinking = match &messages_request.thinking {
+                        Some(
+                            messages::ThinkingConfig::Enabled { .. }
+                            | messages::ThinkingConfig::Adaptive { .. },
+                        ) => Some(true),
+                        Some(messages::ThinkingConfig::Disabled) => Some(false),
+                        None => None,
+                    };
+                    if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
+                        parser.mark_reasoning_started();
                     }
-                    processed_text = result.normal_text;
                 }
-                Err(e) => {
-                    warn!("Reasoning parsing error, skipping parsing: {e}");
+
+                match parser.detect_and_parse_reasoning(&processed_text) {
+                    Ok(result) => {
+                        if !result.reasoning_text.is_empty() {
+                            reasoning_text = Some(result.reasoning_text);
+                        }
+                        processed_text = result.normal_text;
+                    }
+                    Err(e) => {
+                        warn!("Reasoning parsing error, skipping parsing: {e}");
+                    }
                 }
             }
         }
@@ -650,10 +666,16 @@ impl ResponseProcessor {
                     utils::message_utils::get_history_tool_calls_count_messages(&messages_request),
                 );
             } else if tool_parser_available {
+                let chat_tools = messages_request
+                    .tools
+                    .as_deref()
+                    .map(utils::message_utils::extract_chat_tools)
+                    .unwrap_or_default();
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,
                         &messages_request.model,
+                        &chat_tools,
                         utils::message_utils::get_history_tool_calls_count_messages(
                             &messages_request,
                         ),
@@ -673,8 +695,8 @@ impl ResponseProcessor {
             });
         }
 
-        // Text block (if non-empty)
-        if !processed_text.is_empty() {
+        // Text block (only if non-whitespace; a bare "\n\n" residual must not become one).
+        if !processed_text.trim().is_empty() {
             content_blocks.push(messages::ContentBlock::Text {
                 text: processed_text,
                 citations: None,
@@ -754,9 +776,10 @@ impl ResponseProcessor {
 
     /// Process non-streaming completion response
     ///
-    /// Collects all responses (supports n>1), decodes tokens through stop decoder,
-    /// applies `echo` and `suffix`, and builds `CompletionResponse` with legacy
-    /// `LogProbs` format.
+    /// Collects all responses (supports n>1 and batched prompts), decodes tokens
+    /// through the stop decoder, applies `echo` and `suffix`, and builds one
+    /// `CompletionResponse` with prompt-major global choice indices
+    /// (`prompt_index * n + choice_index`).
     pub async fn process_non_streaming_completion_response(
         &self,
         execution_result: ExecutionResult,
@@ -764,90 +787,116 @@ impl ResponseProcessor {
         dispatch: DispatchMetadata,
         _tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
-        prompt_text: &str,
     ) -> Result<CompletionResponse, axum::response::Response> {
         let request_logprobs = completion_req.logprobs.is_some();
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let per_prompt_results = match execution_result {
+            ExecutionResult::Batch { results } => results,
+            other => vec![other],
+        };
+        let choices_per_prompt = completion_req.n.unwrap_or(1).max(1);
+        let prompt_texts: Vec<&str> = match &completion_req.prompt {
+            StringOrArray::String(text) => vec![text.as_str()],
+            StringOrArray::Array(texts) => texts.iter().map(String::as_str).collect(),
+        };
+
+        // Drain all sub-streams concurrently; decoding below stays sequential
+        // (shared stop decoder).
+        let collected = try_join_all(
+            per_prompt_results
+                .into_iter()
+                .map(|result| response_collection::collect_responses(result, request_logprobs)),
+        )
+        .await?;
 
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
         let mut choices = Vec::new();
 
-        for (i, complete) in all_responses.into_iter().enumerate() {
-            stop_decoder.reset();
+        for (prompt_index, all_responses) in collected.into_iter().enumerate() {
+            let prompt_text = prompt_texts.get(prompt_index).copied().unwrap_or_default();
+            let index_offset = prompt_index as u32 * choices_per_prompt;
+            // n>1 choices share one prompt: max within a prompt, summed across prompts.
+            let mut prompt_tokens = 0u32;
 
-            let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
-                Ok(outputs) => outputs,
-                Err(e) => {
-                    return Err(error::internal_error(
-                        "process_tokens_failed",
-                        format!("Failed to process tokens: {e}"),
-                    ))
-                }
-            };
+            // Arrival order, not `complete.index()`: SGLang non-streaming
+            // Complete frames carry index 0 for every choice.
+            for (i, complete) in all_responses.into_iter().enumerate() {
+                stop_decoder.reset();
 
-            let mut decoded_text = String::new();
-            for output in outputs {
-                match output {
-                    SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
-                    SequenceDecoderOutput::StoppedWithText(t) => {
-                        decoded_text.push_str(&t);
-                        break;
+                let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
+                    Ok(outputs) => outputs,
+                    Err(e) => {
+                        return Err(error::internal_error(
+                            "process_tokens_failed",
+                            format!("Failed to process tokens: {e}"),
+                        ))
                     }
-                    SequenceDecoderOutput::Stopped => break,
-                    SequenceDecoderOutput::Held => {}
+                };
+
+                let mut decoded_text = String::new();
+                for output in outputs {
+                    match output {
+                        SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
+                        SequenceDecoderOutput::StoppedWithText(t) => {
+                            decoded_text.push_str(&t);
+                            break;
+                        }
+                        SequenceDecoderOutput::Stopped => break,
+                        SequenceDecoderOutput::Held => {}
+                    }
                 }
-            }
 
-            if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
-                decoded_text.push_str(&t);
-            }
+                if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+                    decoded_text.push_str(&t);
+                }
 
-            total_prompt = total_prompt.max(complete.prompt_tokens());
-            total_completion += complete.completion_tokens();
+                prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
+                total_completion += complete.completion_tokens();
 
-            let finish_reason = {
-                let reason = complete.finish_reason();
-                if reason.is_empty() {
-                    None
-                } else if reason == "stop" || reason == "length" {
-                    Some(reason.to_string())
-                } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(reason) {
-                    json.get("type").and_then(|v| v.as_str()).map(|s| match s {
-                        "length" => "length".to_string(),
-                        "stop" => "stop".to_string(),
-                        other => other.to_string(),
-                    })
+                let finish_reason = {
+                    let reason = complete.finish_reason();
+                    if reason.is_empty() {
+                        None
+                    } else if reason == "stop" || reason == "length" {
+                        Some(reason.to_string())
+                    } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(reason) {
+                        json.get("type").and_then(|v| v.as_str()).map(|s| match s {
+                            "length" => "length".to_string(),
+                            "stop" => "stop".to_string(),
+                            other => other.to_string(),
+                        })
+                    } else {
+                        Some(reason.to_string())
+                    }
+                };
+
+                let matched_stop = complete.matched_stop_json();
+
+                let suffix_len = completion_req.suffix.as_ref().map_or(0, |s| s.len());
+                let echo_len = if completion_req.echo {
+                    prompt_text.len()
                 } else {
-                    Some(reason.to_string())
+                    0
+                };
+                let mut text = String::with_capacity(echo_len + decoded_text.len() + suffix_len);
+                if completion_req.echo {
+                    text.push_str(prompt_text);
                 }
-            };
+                text.push_str(&decoded_text);
+                if let Some(ref sfx) = completion_req.suffix {
+                    text.push_str(sfx);
+                }
 
-            let matched_stop = complete.matched_stop_json();
-
-            let suffix_len = completion_req.suffix.as_ref().map_or(0, |s| s.len());
-            let echo_len = if completion_req.echo {
-                prompt_text.len()
-            } else {
-                0
-            };
-            let mut text = String::with_capacity(echo_len + decoded_text.len() + suffix_len);
-            if completion_req.echo {
-                text.push_str(prompt_text);
-            }
-            text.push_str(&decoded_text);
-            if let Some(ref sfx) = completion_req.suffix {
-                text.push_str(sfx);
+                choices.push(CompletionChoice {
+                    text,
+                    index: index_offset + i as u32,
+                    logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
+                    finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
+                    matched_stop,
+                });
             }
 
-            choices.push(CompletionChoice {
-                text,
-                index: i as u32,
-                logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
-                finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
-                matched_stop,
-            });
+            total_prompt += prompt_tokens;
         }
 
         Ok(CompletionResponse {
@@ -859,5 +908,31 @@ impl ResponseProcessor {
             usage: Some(Usage::from_counts(total_prompt, total_completion)),
             system_fingerprint: dispatch.weight_version.clone(),
         })
+    }
+}
+
+/// Residual assistant text → OpenAI `content`. Whitespace-only (the `"\n\n"` left
+/// after reasoning + tool-call extraction) becomes `None`, not `Some("\n\n")`, which
+/// would otherwise diverge multi-turn conversations. Real content is kept verbatim.
+fn normalize_assistant_content(text: String) -> Option<String> {
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(test)]
+mod content_normalization_tests {
+    use super::normalize_assistant_content;
+
+    #[test]
+    fn whitespace_only_is_none_real_text_kept_verbatim() {
+        assert_eq!(normalize_assistant_content("\n\n".to_string()), None);
+        assert_eq!(normalize_assistant_content("  \t".to_string()), None);
+        assert_eq!(
+            normalize_assistant_content("\n\nDone.".to_string()),
+            Some("\n\nDone.".to_string())
+        );
     }
 }

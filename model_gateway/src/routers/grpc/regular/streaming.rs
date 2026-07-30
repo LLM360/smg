@@ -11,6 +11,7 @@ use std::{
 
 use axum::response::Response;
 use bytes::Bytes;
+use futures::future::try_join_all;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
@@ -35,16 +36,39 @@ use tracing::{debug, error, warn};
 
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
-    routers::grpc::{
-        common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
-        context,
-        proto_wrapper::{ProtoResponseVariant, ProtoStream},
-        utils,
-        utils::message_utils,
+    routers::{
+        common::sse::SseEncoder,
+        grpc::{
+            common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
+            context,
+            proto_wrapper::{ProtoResponseVariant, ProtoStream},
+            utils,
+            utils::message_utils,
+        },
     },
 };
 
-/// Shared streaming processor for both single and dual dispatch modes
+/// One backend stream of a `/v1/completions` request. Batched requests fan
+/// out into several, each remapped by a prompt-major choice-index offset.
+enum CompletionStreamUnit {
+    Single(ProtoStream),
+    PrefillDecode {
+        prefill: ProtoStream,
+        decode: Box<ProtoStream>,
+    },
+}
+
+/// Per-stream token/timing totals returned by the completion chunk loop; the
+/// coordinator aggregates them into the single usage chunk and metrics record.
+struct CompletionStreamOutcome {
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u32,
+    completion_tokens: u32,
+    first_token_time: Option<Instant>,
+}
+
+/// Shared streaming processor for both single and prefill/decode dispatch modes
 #[derive(Clone)]
 pub(crate) struct StreamingProcessor {
     tool_parser_factory: ToolParserFactory,
@@ -140,7 +164,11 @@ impl StreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                prefill,
+                decode,
+                pd_timing,
+            } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
                 #[expect(
@@ -149,7 +177,7 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result = processor
-                        .process_dual_streaming_chunks(
+                        .process_prefill_decode_streaming_chunks(
                             prefill,
                             *decode,
                             dispatch,
@@ -157,6 +185,7 @@ impl StreamingProcessor {
                             stop_params,
                             chat_request,
                             &tx,
+                            pd_timing,
                         )
                         .await;
 
@@ -175,6 +204,15 @@ impl StreamingProcessor {
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }
+            // Batch results exist only on the completions pipeline.
+            context::ExecutionResult::Batch { .. } => {
+                utils::send_error_sse(
+                    &tx,
+                    "Batched results not supported in chat streaming",
+                    "invalid_request_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
         }
 
         // Return SSE response
@@ -184,12 +222,38 @@ impl StreamingProcessor {
     /// Process streaming chunks from a single stream (Regular mode)
     pub async fn process_streaming_chunks(
         &self,
+        grpc_stream: ProtoStream,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        original_request: Arc<ChatCompletionRequest>,
+        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        self.process_streaming_chunks_inner(
+            grpc_stream,
+            dispatch,
+            tokenizer,
+            stop_params,
+            original_request,
+            tx,
+            None,
+        )
+        .await
+    }
+
+    /// Inner implementation shared by single-mode and PD prefill/decode streaming.
+    /// `pd_timing` is `Some` only in PD mode and yields honest PD TTFT
+    /// (prefill start to first decode token).
+    #[expect(clippy::too_many_arguments)]
+    async fn process_streaming_chunks_inner(
+        &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<(), String> {
         // Metrics timing
         let start_time = Instant::now();
@@ -210,6 +274,7 @@ impl StreamingProcessor {
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -224,6 +289,9 @@ impl StreamingProcessor {
 
         // Reusable SSE formatting buffer to avoid allocations per chunk
         let mut sse_buffer = Vec::with_capacity(512);
+        // Reusable SSE encoder for the post-loop flush / tool / finish / usage
+        // chunks, which previously each did `to_string` + `format!`.
+        let mut sse_encoder = SseEncoder::new();
 
         // Use dispatch metadata for consistent response fields
         let request_id = &dispatch.request_id;
@@ -243,8 +311,9 @@ impl StreamingProcessor {
         // the template injected `<think>` in the prefill — parsers should start
         // in reasoning mode.
         let thinking_override = utils::should_mark_reasoning_started(
-            utils::extract_thinking_from_kwargs(
+            utils::resolve_user_thinking(
                 original_request.chat_template_kwargs.as_ref(),
+                original_request.reasoning_effort.as_deref(),
                 tokenizer.as_ref(),
             ),
             tokenizer.as_ref(),
@@ -303,6 +372,14 @@ impl StreamingProcessor {
                     // Track TTFT immediately on first chunk received from backend
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
+                        if let Some(timing) = &pd_timing {
+                            Metrics::record_pd_ttft(
+                                self.backend_type,
+                                model,
+                                timing.runtime,
+                                timing.prefill_start.elapsed(),
+                            );
+                        }
                     }
 
                     let index = chunk.index();
@@ -475,10 +552,10 @@ impl StreamingProcessor {
                                         .build();
 
                                 let sse_chunk =
-                                    serde_json::to_string(&content_chunk).map_err(|e| {
+                                    sse_encoder.encode_data(&content_chunk).map_err(|e| {
                                         format!("Failed to serialize content chunk: {e}")
                                     })?;
-                                tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                                tx.send(Ok(sse_chunk))
                                     .map_err(|_| "Failed to send flushed content".to_string())?;
                             }
                         }
@@ -490,6 +567,7 @@ impl StreamingProcessor {
                     completion_tokens.record_complete(&complete);
 
                     cached_tokens.insert(index, complete.cached_tokens());
+                    reasoning_tokens.insert(index, complete.reasoning_tokens());
                     finish_reasons.insert(index, complete.finish_reason().to_string());
 
                     matched_stops.insert(index, complete.matched_stop_json());
@@ -525,9 +603,10 @@ impl StreamingProcessor {
                         .maybe_system_fingerprint(system_fingerprint)
                         .build();
 
-                    let sse_chunk = serde_json::to_string(&tool_chunk)
+                    let sse_chunk = sse_encoder
+                        .encode_data(&tool_chunk)
                         .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                    tx.send(Ok(sse_chunk))
                         .map_err(|_| "Failed to send unstreamed tool args".to_string())?;
                 }
             }
@@ -550,9 +629,10 @@ impl StreamingProcessor {
                 .maybe_system_fingerprint(system_fingerprint)
                 .build();
 
-            let sse_chunk = serde_json::to_string(&finish_chunk)
+            let sse_chunk = sse_encoder
+                .encode_data(&finish_chunk)
                 .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
-            tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+            tx.send(Ok(sse_chunk))
                 .map_err(|_| "Failed to send finish chunk".to_string())?;
         }
 
@@ -562,19 +642,22 @@ impl StreamingProcessor {
                 let total_prompt: u32 = prompt_tokens.values().sum();
                 let total_completion: u32 = completion_tokens.total();
                 let total_cached: u32 = cached_tokens.values().sum();
+                let total_reasoning: u32 = reasoning_tokens.values().sum();
 
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .usage(
                         Usage::from_counts(total_prompt, total_completion)
-                            .with_cached_tokens(total_cached),
+                            .with_cached_tokens(total_cached)
+                            .with_reasoning_tokens(total_reasoning),
                     )
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();
 
-                let sse_chunk = serde_json::to_string(&usage_chunk)
+                let sse_chunk = sse_encoder
+                    .encode_data(&usage_chunk)
                     .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
-                tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                tx.send(Ok(sse_chunk))
                     .map_err(|_| "Failed to send usage chunk".to_string())?;
             }
         }
@@ -599,9 +682,9 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// Process dual streaming chunks (prefill + decode) - PD mode
+    /// Process prefill/decode streaming chunks (prefill + decode) - PD mode
     #[expect(clippy::too_many_arguments)]
-    pub async fn process_dual_streaming_chunks(
+    pub async fn process_prefill_decode_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -610,6 +693,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: context::PdTiming,
     ) -> Result<(), String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
         if original_request.logprobs {
@@ -627,16 +711,18 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 2-5: Process decode stream (same as single mode)
+        // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
+        // so the first decode token yields honest PD TTFT.
         // Note: decode_stream will be marked completed inside process_streaming_chunks
         let result = self
-            .process_streaming_chunks(
+            .process_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
                 stop_params,
                 original_request,
                 tx,
+                Some(pd_timing),
             )
             .await;
 
@@ -696,7 +782,11 @@ impl StreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                prefill,
+                decode,
+                pd_timing,
+            } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
                 let tokenizer = tokenizer.clone();
                 #[expect(
@@ -704,8 +794,8 @@ impl StreamingProcessor {
                     reason = "streaming task is fire-and-forget; client disconnect terminates it"
                 )]
                 tokio::spawn(async move {
-                    let result = Self::process_generate_streaming_dual(
-                        tokenizer, prefill, *decode, ctx, &tx,
+                    let result = Self::process_generate_prefill_decode_streaming(
+                        tokenizer, prefill, *decode, ctx, &tx, pd_timing,
                     )
                     .await;
 
@@ -720,6 +810,15 @@ impl StreamingProcessor {
                 utils::send_error_sse(
                     &tx,
                     "Embeddings not supported in streaming generate",
+                    "invalid_request_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
+            // Batch results exist only on the completions pipeline.
+            context::ExecutionResult::Batch { .. } => {
+                utils::send_error_sse(
+                    &tx,
+                    "Batched results not supported in streaming generate",
                     "invalid_request_error",
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
@@ -744,6 +843,8 @@ impl StreamingProcessor {
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        // Reusable SSE encoder shared across every chunk emitted for this stream.
+        let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -784,14 +885,16 @@ impl StreamingProcessor {
                             "prompt_tokens": chunk.prompt_tokens(),
                             "weight_version": &ctx.weight_version,
                             "completion_tokens": current_completion_tokens,
-                            "cached_tokens": chunk.cached_tokens()
+                            "cached_tokens": chunk.cached_tokens(),
+                            "reasoning_tokens": chunk.reasoning_tokens()
                         },
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&chunk_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&chunk_response)
                         .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -813,14 +916,16 @@ impl StreamingProcessor {
                             "weight_version": &ctx.weight_version,
                             "completion_tokens": completion_tokens,
                             "cached_tokens": complete.cached_tokens(),
+                            "reasoning_tokens": complete.reasoning_tokens(),
                             "e2e_latency": e2e_latency
                         },
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&finish_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&finish_response)
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
 
                     // Continue to process all completions if n>1
@@ -839,13 +944,14 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// Process dual streaming for generate endpoint (PD mode with logprobs support)
-    async fn process_generate_streaming_dual(
+    /// Process prefill/decode streaming for generate endpoint (PD mode with logprobs support)
+    async fn process_generate_prefill_decode_streaming(
         tokenizer: Arc<dyn Tokenizer>,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: context::PdTiming,
     ) -> Result<(), String> {
         // Collect input_logprobs from prefill stream if requested
         let input_token_logprobs = if ctx.return_logprob {
@@ -870,7 +976,8 @@ impl StreamingProcessor {
             None
         };
 
-        // Process decode stream with input_logprobs prepended
+        // Process decode stream with input_logprobs prepended. Pass pd_timing so
+        // the first decode token yields honest PD TTFT.
         // Note: decode_stream will be marked completed inside the function
         let result = Self::process_generate_streaming_with_input_logprobs(
             tokenizer,
@@ -878,6 +985,7 @@ impl StreamingProcessor {
             ctx,
             input_token_logprobs,
             tx,
+            Some(pd_timing),
         )
         .await;
 
@@ -897,6 +1005,7 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -906,6 +1015,8 @@ impl StreamingProcessor {
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        // Reusable SSE encoder shared across every chunk emitted for this stream.
+        let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -915,6 +1026,14 @@ impl StreamingProcessor {
                     // Track TTFT immediately on first chunk received from backend
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
+                        if let Some(timing) = &pd_timing {
+                            Metrics::record_pd_ttft(
+                                ctx.backend_type,
+                                &ctx.model,
+                                timing.runtime,
+                                timing.prefill_start.elapsed(),
+                            );
+                        }
                     }
 
                     let index = chunk.index();
@@ -972,14 +1091,16 @@ impl StreamingProcessor {
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": current_output_logprobs,
                             "completion_tokens": current_completion_tokens,
-                            "cached_tokens": chunk.cached_tokens()
+                            "cached_tokens": chunk.cached_tokens(),
+                            "reasoning_tokens": chunk.reasoning_tokens()
                         },
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&chunk_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&chunk_response)
                         .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -1015,14 +1136,16 @@ impl StreamingProcessor {
                             "output_token_logprobs": final_output_logprobs,
                             "completion_tokens": completion_tokens,
                             "cached_tokens": complete.cached_tokens(),
+                            "reasoning_tokens": complete.reasoning_tokens(),
                             "e2e_latency": e2e_latency
                         },
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&finish_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&finish_response)
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
 
                     // Continue to process all completions if n>1
@@ -1501,7 +1624,12 @@ impl StreamingProcessor {
                     // No data: [DONE] — Anthropic uses message_stop instead
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::PrefillDecode {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
                 #[expect(
@@ -1510,7 +1638,7 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result = processor
-                        .process_dual_messages_streaming_chunks(
+                        .process_prefill_decode_messages_streaming_chunks(
                             prefill,
                             *decode,
                             dispatch,
@@ -1538,6 +1666,17 @@ impl StreamingProcessor {
                     error: messages::ErrorResponse {
                         error_type: "invalid_request_error".to_string(),
                         message: "Embeddings not supported for Messages API".to_string(),
+                    },
+                };
+                let mut buf = Vec::with_capacity(256);
+                let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+            }
+            // Batch results exist only on the completions pipeline.
+            context::ExecutionResult::Batch { .. } => {
+                let error_event = MessageStreamEvent::Error {
+                    error: messages::ErrorResponse {
+                        error_type: "invalid_request_error".to_string(),
+                        message: "Batched results not supported for Messages API".to_string(),
                     },
                 };
                 let mut buf = Vec::with_capacity(256);
@@ -1602,12 +1741,21 @@ impl StreamingProcessor {
         let mut finish_reason_str = String::new();
         let mut matched_stop: Option<Value> = None;
 
-        // Check parser availability once upfront.
-        // Only run reasoning parser when the user explicitly enabled thinking.
-        let separate_reasoning = matches!(
-            &original_request.thinking,
-            Some(messages::ThinkingConfig::Enabled { .. })
+        // Check parser availability once upfront. Run parser when the user explicitly
+        // enabled thinking, or when the selected parser needs structural special tokens.
+        let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
+            &self.reasoning_parser_factory,
+            self.configured_reasoning_parser.as_deref(),
+            model,
         );
+        let separate_reasoning = reasoning_requires_special_tokens
+            || matches!(
+                &original_request.thinking,
+                Some(
+                    messages::ThinkingConfig::Enabled { .. }
+                        | messages::ThinkingConfig::Adaptive { .. }
+                )
+            );
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
@@ -1617,7 +1765,10 @@ impl StreamingProcessor {
 
         // Determine if thinking is effectively ON (for mark_reasoning_started).
         let user_thinking = match &original_request.thinking {
-            Some(messages::ThinkingConfig::Enabled { .. }) => Some(true),
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                | messages::ThinkingConfig::Adaptive { .. },
+            ) => Some(true),
             Some(messages::ThinkingConfig::Disabled) => Some(false),
             None => None,
         };
@@ -2162,12 +2313,12 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// Process dual streaming chunks for Messages API (PD mode).
+    /// Process prefill/decode streaming chunks for Messages API (PD mode).
     ///
     /// Consumes prefill stream then delegates to
     /// [`Self::process_messages_streaming_chunks`] with the decode stream.
     #[expect(clippy::too_many_arguments)]
-    pub async fn process_dual_messages_streaming_chunks(
+    pub async fn process_prefill_decode_messages_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -2210,6 +2361,11 @@ impl StreamingProcessor {
     // =========================================================================
 
     /// Entry point for `/v1/completions` streaming.
+    ///
+    /// Batched requests fan out into one stream unit per prompt; all units
+    /// write typed SSE events (with prompt-major index offsets) into one
+    /// channel, and the coordinator emits the single aggregated usage chunk,
+    /// metrics record, and `[DONE]`.
     pub fn process_completion_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -2217,86 +2373,196 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Response {
-        let stop_params = (
-            completion_request.stop.clone(),
-            completion_request.stop_token_ids.clone(),
-            completion_request.skip_special_tokens,
-            completion_request.no_stop_trim,
-            completion_request.ignore_eos,
-        );
-
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
-        match execution_result {
-            context::ExecutionResult::Single { stream } => {
-                let processor = self.clone();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
-                    let result = processor
-                        .process_completion_streaming_chunks(
-                            stream,
-                            dispatch,
-                            tokenizer,
-                            stop_params,
-                            completion_request,
-                            &tx,
-                        )
-                        .await;
-
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
-                });
-            }
-            context::ExecutionResult::Dual { prefill, decode } => {
-                let processor = self.clone();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
-                )]
-                tokio::spawn(async move {
-                    let result = processor
-                        .process_dual_completion_streaming_chunks(
-                            prefill,
-                            *decode,
-                            dispatch,
-                            tokenizer,
-                            stop_params,
-                            completion_request,
-                            &tx,
-                        )
-                        .await;
-
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
-                });
-            }
-            context::ExecutionResult::Embedding { .. } => {
-                utils::send_error_sse(
-                    &tx,
-                    "Embeddings not supported in streaming mode",
-                    "invalid_request_error",
-                );
+        let units = match Self::completion_stream_units(execution_result) {
+            Ok(units) => units,
+            Err(message) => {
+                utils::send_error_sse(&tx, message, "invalid_request_error");
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                return build_sse_response(rx);
             }
-        }
+        };
+
+        let processor = self;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "streaming task is fire-and-forget; client disconnect terminates it"
+        )]
+        tokio::spawn(async move {
+            let start_time = Instant::now();
+            let choices_per_prompt = completion_request.n.unwrap_or(1).max(1);
+            let echo = completion_request.echo;
+            let include_usage = completion_request
+                .stream_options
+                .as_ref()
+                .and_then(|opts| opts.include_usage)
+                .unwrap_or(false);
+            let prompt_texts: Vec<&str> = match &completion_request.prompt {
+                StringOrArray::String(text) => vec![text.as_str()],
+                StringOrArray::Array(texts) => texts.iter().map(String::as_str).collect(),
+            };
+
+            // Fail-fast: the first stream error cancels the remaining units
+            // (their streams abort on drop) and fails the whole request.
+            let outcomes =
+                try_join_all(units.into_iter().enumerate().map(|(prompt_index, unit)| {
+                    let stop_params = (
+                        completion_request.stop.clone(),
+                        completion_request.stop_token_ids.clone(),
+                        completion_request.skip_special_tokens,
+                        completion_request.no_stop_trim,
+                        completion_request.ignore_eos,
+                    );
+                    let dispatch = dispatch.clone();
+                    let tokenizer = tokenizer.clone();
+                    let completion_request = completion_request.clone();
+                    let prompt_text = if echo {
+                        prompt_texts.get(prompt_index).copied().unwrap_or_default()
+                    } else {
+                        ""
+                    };
+                    let index_offset = prompt_index as u32 * choices_per_prompt;
+                    let processor = &processor;
+                    let tx = &tx;
+                    async move {
+                        match unit {
+                            CompletionStreamUnit::Single(stream) => {
+                                processor
+                                    .process_completion_streaming_chunks(
+                                        stream,
+                                        dispatch,
+                                        tokenizer,
+                                        stop_params,
+                                        completion_request,
+                                        prompt_text,
+                                        index_offset,
+                                        tx,
+                                    )
+                                    .await
+                            }
+                            CompletionStreamUnit::PrefillDecode { prefill, decode } => {
+                                processor
+                                    .process_prefill_decode_completion_streaming_chunks(
+                                        prefill,
+                                        *decode,
+                                        dispatch,
+                                        tokenizer,
+                                        stop_params,
+                                        completion_request,
+                                        prompt_text,
+                                        index_offset,
+                                        tx,
+                                    )
+                                    .await
+                            }
+                        }
+                    }
+                }))
+                .await;
+
+            match outcomes {
+                Err(e) => {
+                    utils::send_error_sse(&tx, &e, "internal_error");
+                }
+                Ok(outcomes) => {
+                    let mut total_prompt = 0u32;
+                    let mut total_cached = 0u32;
+                    let mut total_reasoning = 0u32;
+                    let mut total_completion = 0u32;
+                    let mut first_token_time: Option<Instant> = None;
+                    for outcome in outcomes {
+                        total_prompt += outcome.prompt_tokens;
+                        total_cached += outcome.cached_tokens;
+                        total_reasoning += outcome.reasoning_tokens;
+                        total_completion += outcome.completion_tokens;
+                        first_token_time = match (first_token_time, outcome.first_token_time) {
+                            (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                            (current, candidate) => current.or(candidate),
+                        };
+                    }
+
+                    if include_usage {
+                        let usage_chunk = CompletionStreamResponse {
+                            id: dispatch.request_id.clone(),
+                            object: "text_completion".to_string(),
+                            created: dispatch.created,
+                            choices: vec![],
+                            model: dispatch.model.clone(),
+                            system_fingerprint: dispatch.weight_version.clone(),
+                            usage: Some(Self::build_completion_streaming_usage(
+                                total_prompt,
+                                total_completion,
+                                total_cached,
+                                total_reasoning,
+                            )),
+                        };
+                        let mut sse_buffer = Vec::with_capacity(256);
+                        Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
+                        let _ = tx.send(Ok(Bytes::from(sse_buffer)));
+                    }
+                    Metrics::record_streaming_metrics(StreamingMetricsParams {
+                        router_type: metrics_labels::ROUTER_GRPC,
+                        backend_type: processor.backend_type,
+                        model_id: &dispatch.model,
+                        endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
+                        ttft: first_token_time.map(|t| t.duration_since(start_time)),
+                        generation_duration: start_time.elapsed(),
+                        input_tokens: Some(total_prompt as u64),
+                        output_tokens: total_completion as u64,
+                    });
+                }
+            }
+
+            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+        });
 
         build_sse_response(rx)
+    }
+
+    /// Split an execution result into per-prompt stream units, in prompt order.
+    fn completion_stream_units(
+        execution_result: context::ExecutionResult,
+    ) -> Result<Vec<CompletionStreamUnit>, &'static str> {
+        match execution_result {
+            context::ExecutionResult::Single { stream } => {
+                Ok(vec![CompletionStreamUnit::Single(stream)])
+            }
+            context::ExecutionResult::PrefillDecode {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => Ok(vec![CompletionStreamUnit::PrefillDecode {
+                prefill,
+                decode,
+            }]),
+            context::ExecutionResult::Batch { results } => results
+                .into_iter()
+                .map(|result| match result {
+                    context::ExecutionResult::Single { stream } => {
+                        Ok(CompletionStreamUnit::Single(stream))
+                    }
+                    context::ExecutionResult::PrefillDecode {
+                        prefill, decode, ..
+                    } => Ok(CompletionStreamUnit::PrefillDecode { prefill, decode }),
+                    _ => Err("Nested batch or embedding result in completion streaming"),
+                })
+                .collect(),
+            context::ExecutionResult::Embedding { .. } => {
+                Err("Embeddings not supported in streaming mode")
+            }
+        }
     }
 
     /// Process completion streaming chunks from a single stream.
     ///
     /// Decodes tokens through stop decoder, handles `echo` (first chunk) and
     /// `suffix` (after final chunk), and emits `CompletionStreamResponse` SSE
-    /// events. Supports n>1 via per-index tracking.
+    /// events with `index_offset`-shifted choice indices. Supports n>1 via
+    /// per-index tracking. Returns per-stream totals for the coordinator's
+    /// usage chunk and metrics record.
+    #[expect(clippy::too_many_arguments)]
     async fn process_completion_streaming_chunks(
         &self,
         mut grpc_stream: ProtoStream,
@@ -2304,9 +2570,10 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         completion_request: Arc<CompletionRequest>,
+        prompt_text: &str,
+        index_offset: u32,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
-        let start_time = Instant::now();
+    ) -> Result<CompletionStreamOutcome, String> {
         let mut first_token_time: Option<Instant> = None;
 
         let request_id = &dispatch.request_id;
@@ -2315,28 +2582,9 @@ impl StreamingProcessor {
         let system_fingerprint = dispatch.weight_version.as_deref();
 
         let echo = completion_request.echo;
-        let prompt_text: &str = if echo {
-            match &completion_request.prompt {
-                StringOrArray::String(s) => s.as_str(),
-                // Array prompts are rejected by CompletionPreparationStage (Stage 1).
-                // If this arm is ever reached, it means a new code path bypassed Stage 1.
-                StringOrArray::Array(_) => {
-                    debug_assert!(false, "Array prompt reached streaming — CompletionPreparationStage should have rejected it");
-                    warn!("Array prompt reached completion streaming — CompletionPreparationStage should have rejected it");
-                    ""
-                }
-            }
-        } else {
-            ""
-        };
         let suffix = completion_request.suffix.as_deref();
         // TODO: wire per-token logprob streaming when backend support is available
         let _request_logprobs = completion_request.logprobs.is_some();
-        let include_usage = completion_request
-            .stream_options
-            .as_ref()
-            .and_then(|opts| opts.include_usage)
-            .unwrap_or(false);
 
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
@@ -2347,6 +2595,7 @@ impl StreamingProcessor {
         // messages rather than summing (same prompt tokenized once, not per-choice).
         let mut total_prompt = 0u32;
         let mut total_cached = 0u32;
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
         let mut total_completion = CompletionTokenTracker::new();
 
         while let Some(response) = grpc_stream.next().await {
@@ -2358,7 +2607,7 @@ impl StreamingProcessor {
                         first_token_time = Some(Instant::now());
                     }
 
-                    let index = chunk.index();
+                    let index = index_offset + chunk.index();
 
                     if stopped_indices.contains(&index) {
                         continue;
@@ -2464,9 +2713,10 @@ impl StreamingProcessor {
                     }
                 }
                 ProtoResponseVariant::Complete(complete) => {
-                    let index = complete.index();
+                    let index = index_offset + complete.index();
                     total_prompt = total_prompt.max(complete.prompt_tokens());
                     total_cached = total_cached.max(complete.cached_tokens());
+                    reasoning_tokens.insert(index, complete.reasoning_tokens());
                     total_completion.record_complete(&complete);
 
                     if stopped_indices.contains(&index) {
@@ -2590,45 +2840,21 @@ impl StreamingProcessor {
             }
         }
 
-        // Mark stream as completed before usage emission — the backend stream
-        // is fully consumed at this point, so an abort would be a no-op.
-        // This ensures mark_completed runs even if the usage send fails.
         grpc_stream.mark_completed();
 
-        if include_usage {
-            let usage_chunk = CompletionStreamResponse {
-                id: request_id.clone(),
-                object: "text_completion".to_string(),
-                created,
-                choices: vec![],
-                model: model.clone(),
-                system_fingerprint: system_fingerprint.map(String::from),
-                usage: Some(
-                    Usage::from_counts(total_prompt, total_completion.total())
-                        .with_cached_tokens(total_cached),
-                ),
-            };
-            Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
-            let _ = tx.send(Ok(Bytes::from(sse_buffer.clone())));
-        }
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
-            router_type: metrics_labels::ROUTER_GRPC,
-            backend_type: self.backend_type,
-            model_id: model,
-            endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
-            ttft: first_token_time.map(|t| t.duration_since(start_time)),
-            generation_duration: start_time.elapsed(),
-            input_tokens: Some(total_prompt as u64),
-            output_tokens: total_completion.total() as u64,
-        });
-
-        Ok(())
+        Ok(CompletionStreamOutcome {
+            prompt_tokens: total_prompt,
+            cached_tokens: total_cached,
+            reasoning_tokens: reasoning_tokens.values().sum(),
+            completion_tokens: total_completion.total(),
+            first_token_time,
+        })
     }
 
-    /// PD dual-dispatch variant: consume prefill stream, then delegate decode
+    /// PD prefill/decode variant: consume prefill stream, then delegate decode
     /// stream to [`Self::process_completion_streaming_chunks`].
     #[expect(clippy::too_many_arguments)]
-    async fn process_dual_completion_streaming_chunks(
+    async fn process_prefill_decode_completion_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -2636,8 +2862,10 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CompletionRequest>,
+        prompt_text: &str,
+        index_offset: u32,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
+    ) -> Result<CompletionStreamOutcome, String> {
         while let Some(response) = prefill_stream.next().await {
             let gen_response =
                 response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
@@ -2655,6 +2883,8 @@ impl StreamingProcessor {
                 tokenizer,
                 stop_params,
                 original_request,
+                prompt_text,
+                index_offset,
                 tx,
             )
             .await;
@@ -2687,5 +2917,44 @@ impl StreamingProcessor {
             buffer.extend_from_slice(error_msg.as_bytes());
         }
         buffer.extend_from_slice(b"\n\n");
+    }
+
+    fn build_completion_streaming_usage(
+        total_prompt: u32,
+        total_completion: u32,
+        total_cached: u32,
+        total_reasoning: u32,
+    ) -> Usage {
+        Usage::from_counts(total_prompt, total_completion)
+            .with_cached_tokens(total_cached)
+            .with_reasoning_tokens(total_reasoning)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_streaming_usage_includes_reasoning_tokens() {
+        let usage = StreamingProcessor::build_completion_streaming_usage(10, 5, 4, 3);
+
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|details| details.cached_tokens),
+            Some(4)
+        );
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+            Some(3)
+        );
     }
 }

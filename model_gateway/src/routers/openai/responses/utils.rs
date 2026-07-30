@@ -12,6 +12,7 @@ use smg_mcp::McpToolSession;
 use tracing::warn;
 
 use super::common::parse_sse_block;
+use crate::routers::common::{mcp_utils::collect_user_function_names, openai_bridge};
 
 /// Check if a JSON value is missing, null, or an empty string
 fn is_missing_or_empty(value: Option<&Value>) -> bool {
@@ -96,9 +97,14 @@ pub(super) fn patch_response_with_request_metadata(
         }
     }
 
-    // Attach conversation id for client response
-    if let Some(conv_id) = &original_body.conversation {
-        obj.insert("conversation".to_string(), json!({ "id": conv_id }));
+    // Attach conversation id for client response. Unwrap via `as_id()` so we
+    // emit a flat `{ "id": "conv_..." }` object regardless of whether the
+    // original request used the string or object variant of `ConversationRef`.
+    if let Some(conv_ref) = &original_body.conversation {
+        obj.insert(
+            "conversation".to_string(),
+            json!({ "id": conv_ref.as_id() }),
+        );
     }
 }
 
@@ -171,9 +177,14 @@ pub(super) fn rewrite_streaming_block(
         }
     }
 
-    // Attach conversation id
-    if let Some(conv_id) = &original_body.conversation {
-        response_obj.insert("conversation".to_string(), json!({ "id": conv_id }));
+    // Attach conversation id. Unwrap via `as_id()` so the SSE payload emits a
+    // flat `{ "id": "conv_..." }` even when the original request used the
+    // object form of `ConversationRef`.
+    if let Some(conv_ref) = &original_body.conversation {
+        response_obj.insert(
+            "conversation".to_string(),
+            json!({ "id": conv_ref.as_id() }),
+        );
         changed = true;
     }
 
@@ -208,8 +219,9 @@ pub(super) fn insert_optional_value<T: Serialize>(
 
 /// Convert a single ResponseTool back to its original JSON representation.
 ///
-/// Handles MCP tools (with server metadata), web_search_preview, and code_interpreter.
-/// Returns None for function tools and other types that don't need restoration.
+/// Handles MCP tools (with server metadata), web_search, web_search_preview,
+/// file_search, and code_interpreter. Returns None for function tools and other
+/// types that don't need restoration.
 pub(super) fn response_tool_to_value(tool: &ResponseTool) -> Option<Value> {
     match tool {
         ResponseTool::Mcp(mcp) => {
@@ -223,36 +235,37 @@ pub(super) fn response_tool_to_value(tool: &ResponseTool) -> Option<Value> {
                 mcp.server_description.as_ref(),
             );
             insert_optional_value(&mut m, "require_approval", mcp.require_approval.as_ref());
-            if let Some(allowed) = &mcp.allowed_tools {
-                m.insert(
-                    "allowed_tools".to_string(),
-                    Value::Array(allowed.iter().map(|s| json!(s)).collect()),
-                );
-            }
+            // T11: `allowed_tools` is now an untagged union (`List(Vec<String>)`
+            // or `Filter { read_only?, tool_names? }`). Delegate to serde so both
+            // wire shapes serialize identically to the input payload.
+            insert_optional_value(&mut m, "allowed_tools", mcp.allowed_tools.as_ref());
+            // T11: surface the new `connector_id` and `defer_loading` fields so
+            // the echoed tools[] payload round-trips losslessly for clients that
+            // rely on connector-based MCP setups (server_url XOR connector_id)
+            // or the deferred-loading hint.
+            insert_optional_value(&mut m, "connector_id", mcp.connector_id.as_ref());
+            insert_optional_value(&mut m, "defer_loading", mcp.defer_loading.as_ref());
             Some(Value::Object(m))
         }
         ResponseTool::WebSearchPreview(_) => serde_json::to_value(tool).ok(),
+        ResponseTool::WebSearch(_) => serde_json::to_value(tool).ok(),
         ResponseTool::CodeInterpreter(_) => serde_json::to_value(tool).ok(),
+        ResponseTool::FileSearch(_) => serde_json::to_value(tool).ok(),
+        ResponseTool::ImageGeneration(_) => serde_json::to_value(tool).ok(),
+        ResponseTool::Computer | ResponseTool::ComputerUsePreview(_) => {
+            serde_json::to_value(tool).ok()
+        }
+        ResponseTool::Custom(_) => serde_json::to_value(tool).ok(),
+        // Namespace groups Function/Custom elements; serialize through serde so
+        // the full {type, name, description, tools} payload round-trips back
+        // to the client unchanged (T9).
+        ResponseTool::Namespace(_) => serde_json::to_value(tool).ok(),
+        ResponseTool::Shell(_) => serde_json::to_value(tool).ok(),
+        ResponseTool::ApplyPatch => serde_json::to_value(tool).ok(),
         ResponseTool::Function(_) => None,
+        // T5 schema-only: forced-cascade arm, no behavior.
+        ResponseTool::LocalShell => serde_json::to_value(tool).ok(),
     }
-}
-
-fn collect_user_function_names(original_body: &ResponsesRequest) -> HashSet<&str> {
-    original_body
-        .tools
-        .as_ref()
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(|tool| match tool {
-                    ResponseTool::Function(function_tool) => {
-                        Some(function_tool.function.name.as_str())
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Restore original tools (MCP and builtin) in response for client.
@@ -275,7 +288,7 @@ fn restore_client_tool_view(
     resp: &mut Value,
     original_body: &ResponsesRequest,
     session: Option<&McpToolSession<'_>>,
-    user_function_names: &HashSet<&str>,
+    user_function_names: &HashSet<String>,
 ) {
     let Some(original_tools) = original_body.tools.as_ref() else {
         return;
@@ -299,7 +312,10 @@ fn restore_client_tool_view(
             }
             _ => {
                 if let Some(value) = response_tool_to_value(original_tool) {
-                    if !is_internal_mcp_tool_value(&value, session, user_function_names) {
+                    let should_hide = session.is_some_and(|s| {
+                        openai_bridge::should_hide_tool_json(s, &value, user_function_names)
+                    });
+                    if !should_hide {
                         restored_tools.push(value);
                     }
                 }
@@ -350,7 +366,7 @@ fn restore_client_tool_view(
 fn strip_internal_mcp_tools(
     resp: &mut Value,
     session: Option<&McpToolSession<'_>>,
-    user_function_names: &HashSet<&str>,
+    user_function_names: &HashSet<String>,
 ) {
     let Some(obj) = resp.as_object_mut() else {
         return;
@@ -360,13 +376,15 @@ fn strip_internal_mcp_tools(
         return;
     };
 
-    tools.retain(|tool| !is_internal_mcp_tool_value(tool, session, user_function_names));
+    tools.retain(|tool| {
+        !session.is_some_and(|s| openai_bridge::should_hide_tool_json(s, tool, user_function_names))
+    });
 }
 
 fn strip_internal_mcp_output_items(
     resp: &mut Value,
     session: Option<&McpToolSession<'_>>,
-    user_function_names: &HashSet<&str>,
+    user_function_names: &HashSet<String>,
 ) {
     let Some(obj) = resp.as_object_mut() else {
         return;
@@ -376,33 +394,14 @@ fn strip_internal_mcp_output_items(
         return;
     };
 
-    output.retain(|item| !is_internal_mcp_output_item(item, session, user_function_names));
+    output.retain(|item| {
+        !session.is_some_and(|s| {
+            openai_bridge::should_hide_output_item_json(s, item, user_function_names)
+        })
+    });
 }
 
-fn is_internal_mcp_tool_value(
-    tool: &Value,
-    session: Option<&McpToolSession<'_>>,
-    user_function_names: &HashSet<&str>,
-) -> bool {
-    let Some(session) = session else {
-        return false;
-    };
-
-    match tool.get("type").and_then(|value| value.as_str()) {
-        Some("function") => function_tool_name(tool).is_some_and(|name| {
-            session.is_internal_tool(name) && !user_function_names.contains(name)
-        }),
-        // MCP tool entries are keyed by server metadata, so function-name collision
-        // handling does not apply to this arm.
-        Some("mcp") => tool
-            .get("server_label")
-            .and_then(|value| value.as_str())
-            .is_some_and(|server_label| session.is_internal_server_label(server_label)),
-        _ => false,
-    }
-}
-
-fn function_tool_name(tool: &Value) -> Option<&str> {
+pub(crate) fn function_tool_name(tool: &Value) -> Option<&str> {
     let tool_type = tool.get("type").and_then(|value| value.as_str());
     if tool_type != Some("function") {
         return None;
@@ -416,57 +415,10 @@ fn function_tool_name(tool: &Value) -> Option<&str> {
         })
 }
 
-fn is_internal_mcp_output_item(
-    item: &Value,
-    session: Option<&McpToolSession<'_>>,
-    user_function_names: &HashSet<&str>,
-) -> bool {
-    let Some(session) = session else {
-        return false;
-    };
-
-    match item.get("type").and_then(|value| value.as_str()) {
-        // mcp_list_tools is gateway-synthesized metadata and should always be hidden
-        // for internal servers, even when builtin call outputs remain visible.
-        Some("mcp_list_tools") => item
-            .get("server_label")
-            .and_then(|value| value.as_str())
-            .is_some_and(|server_label| session.is_internal_server_label(server_label)),
-        Some("mcp_call") | Some("mcp_approval_request") => {
-            let matches_internal_server = item
-                .get("server_label")
-                .and_then(|value| value.as_str())
-                .is_some_and(|server_label| {
-                    session.is_internal_non_builtin_server_label(server_label)
-                });
-
-            match item.get("name").and_then(|value| value.as_str()) {
-                Some(name) if session.has_exposed_tool(name) => {
-                    session.is_internal_non_builtin_tool(name)
-                }
-                _ => matches_internal_server,
-            }
-        }
-        Some("function_call") => item
-            .get("name")
-            .and_then(|value| value.as_str())
-            .is_some_and(|name| {
-                session.is_internal_tool(name) && !user_function_names.contains(name)
-            }),
-        Some("function_tool_call") => item
-            .get("name")
-            .and_then(|value| value.as_str())
-            .is_some_and(|name| {
-                session.is_internal_tool(name) && !user_function_names.contains(name)
-            }),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use openai_protocol::{
-        common::Function,
+        common::{ConversationRef, Function},
         responses::{FunctionTool, McpTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
     use serde_json::json;
@@ -475,7 +427,9 @@ mod tests {
         McpToolSession, McpTransport, Tool, ToolEntry,
     };
 
-    use super::restore_original_tools;
+    use super::{
+        patch_response_with_request_metadata, restore_original_tools, rewrite_streaming_block,
+    };
 
     fn test_tool(name: &str) -> Tool {
         let mut schema = serde_json::Map::new();
@@ -487,15 +441,7 @@ mod tests {
             }),
         );
 
-        Tool {
-            name: name.to_string().into(),
-            title: None,
-            description: Some("internal".into()),
-            input_schema: schema.into(),
-            output_schema: None,
-            icons: None,
-            annotations: None,
-        }
+        Tool::new(name.to_string(), "internal", schema)
     }
 
     #[tokio::test]
@@ -1152,7 +1098,11 @@ mod tests {
                     server_label: "internal-label".to_string(),
                     server_description: None,
                     require_approval: None,
-                    allowed_tools: Some(vec!["internal_search".to_string()]),
+                    allowed_tools: Some(openai_protocol::responses::McpAllowedTools::List(vec![
+                        "internal_search".to_string(),
+                    ])),
+                    connector_id: None,
+                    defer_loading: None,
                 }),
             ]),
             ..Default::default()
@@ -1229,7 +1179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_original_tools_hides_internal_list_tools_but_keeps_builtin_passthrough_call() {
+    async fn restore_original_tools_hides_builtin_list_tools_keeps_passthrough_call() {
         let original_body = ResponsesRequest {
             model: "gpt-5.4".to_string(),
             input: ResponseInput::Text("hello".to_string()),
@@ -1291,6 +1241,9 @@ mod tests {
 
         restore_original_tools(&mut response, &original_body, Some(&session));
 
+        // Builtin mcp_list_tools is hidden — clients don't see the underlying
+        // MCP server for builtin-routed tools like web_search_preview.
+        // Builtin passthrough mcp_call remains visible.
         assert_eq!(
             response["output"],
             serde_json::json!([
@@ -1305,6 +1258,83 @@ mod tests {
                     "content": [{"type": "output_text", "text": "visible"}]
                 }
             ])
+        );
+    }
+
+    /// Regression: when the client sends `conversation` as an object
+    /// (`ConversationRef::Object { id }`), the non-streaming response patcher
+    /// must emit a flat `{ "conversation": { "id": "conv_..." } }`. Before the
+    /// `as_id()` fix, the old code interpolated the whole `ConversationRef`,
+    /// serializing the `Object` variant as `{"id": "conv_..."}` and producing
+    /// a nested `{"conversation": {"id": {"id": "conv_..."}}}`.
+    #[test]
+    fn patch_response_flattens_object_conversation_ref() {
+        let original_body = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: ResponseInput::Text("hello".to_string()),
+            conversation: Some(ConversationRef::Object {
+                id: "conv_abc".to_string(),
+            }),
+            ..Default::default()
+        };
+        let mut response = json!({});
+        patch_response_with_request_metadata(&mut response, &original_body, None);
+
+        assert_eq!(
+            response.get("conversation"),
+            Some(&json!({ "id": "conv_abc" })),
+            "object-form conversation must emit flat {{id}}, not nested {{id:{{id}}}}"
+        );
+        // Negative guard: the inner value must be a string, not an object.
+        let inner = response
+            .get("conversation")
+            .and_then(|v| v.get("id"))
+            .expect("conversation.id present");
+        assert!(
+            inner.is_string(),
+            "conversation.id must be a plain string, got {inner:?}"
+        );
+    }
+
+    /// Regression: same invariant for the streaming SSE rewriter.
+    #[test]
+    fn rewrite_streaming_block_flattens_object_conversation_ref() {
+        let original_body = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: ResponseInput::Text("hello".to_string()),
+            conversation: Some(ConversationRef::Object {
+                id: "conv_xyz".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        // Minimal response.created SSE block with a `response` object to patch.
+        let block = "event: response.created\n\
+                     data: {\"type\":\"response.created\",\"response\":{}}\n";
+
+        let rewritten =
+            rewrite_streaming_block(block, &original_body, None).expect("block rewritten");
+
+        // Extract the `data:` line payload and re-parse it.
+        let data_line = rewritten
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line");
+        let payload: serde_json::Value =
+            serde_json::from_str(data_line.trim_start_matches("data: ")).expect("json");
+        let conv = payload
+            .get("response")
+            .and_then(|r| r.get("conversation"))
+            .expect("conversation attached");
+
+        assert_eq!(
+            conv,
+            &json!({ "id": "conv_xyz" }),
+            "streaming payload must flatten object-form conversation"
+        );
+        assert!(
+            conv.get("id").unwrap().is_string(),
+            "conversation.id must be a plain string, got {conv:?}"
         );
     }
 }

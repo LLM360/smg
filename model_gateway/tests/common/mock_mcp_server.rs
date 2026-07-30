@@ -103,6 +103,11 @@ pub struct MockFailingMCPServer {
     harness: MockServerHarness,
 }
 
+/// Mock MCP server that returns configurable web search response formats.
+pub struct MockSearchResponseMCPServer {
+    harness: MockServerHarness,
+}
+
 /// Simple test server with mock search tools
 #[derive(Clone)]
 pub struct MockSearchServer {
@@ -122,10 +127,32 @@ pub struct MockFailingSearchServer {
     tool_router: ToolRouter<MockFailingSearchServer>,
 }
 
+#[derive(Clone, Copy)]
+pub enum MockSearchResponseMode {
+    Brave,
+    OpenAi,
+}
+
+/// Test server that returns configurable web search payloads.
+#[derive(Clone)]
+pub struct MockSearchResponseServer {
+    mode: MockSearchResponseMode,
+    tool_router: ToolRouter<MockSearchResponseServer>,
+}
+
 impl MockFailingSearchServer {
     pub fn new(error_marker: impl Into<String>) -> Self {
         Self {
             error_marker: error_marker.into(),
+            tool_router: Self::tool_router(),
+        }
+    }
+}
+
+impl MockSearchResponseServer {
+    pub fn new(mode: MockSearchResponseMode) -> Self {
+        Self {
+            mode,
             tool_router: Self::tool_router(),
         }
     }
@@ -169,20 +196,81 @@ impl MockSearchServer {
     }
 }
 
+#[allow(
+    clippy::unused_self,
+    clippy::unnecessary_wraps,
+    reason = "proc macro generated"
+)]
+#[tool_router]
+impl MockSearchResponseServer {
+    #[tool(description = "Mock web search tool with configurable response shape")]
+    fn brave_web_search(
+        &self,
+        Parameters(params): Parameters<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("test");
+
+        match self.mode {
+            MockSearchResponseMode::Brave => Ok(CallToolResult::structured(serde_json::json!({
+                "results": [
+                    {
+                        "type": "url",
+                        "url": "https://example.com/brave-result"
+                    }
+                ]
+            }))),
+            MockSearchResponseMode::OpenAi => {
+                let embedded_payload = serde_json::json!({
+                    "execution_id": "1234",
+                    "brave_search_response": null,
+                    "openai_response": {
+                        "content": {
+                            "type": "output_text",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "title": "Example citation",
+                                    "url": "https://example.com/openai-result",
+                                    "start_index": 0,
+                                    "end_index": 10
+                                }
+                            ],
+                            "logprobs": [],
+                            "text": format!("OpenAI search results for: {query}")
+                        },
+                        "sources": [
+                            {
+                                "type": "url",
+                                "url": "https://example.com/openai-result"
+                            }
+                        ]
+                    }
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    embedded_payload.to_string(),
+                )]))
+            }
+        }
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for MockSearchServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some("Mock server for testing".to_string()),
-        }
+        // `ServerInfo`/`InitializeResult` is `#[non_exhaustive]` in rmcp 1.7;
+        // build via the constructor instead of a struct literal.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions("Mock server for testing")
     }
 
     async fn initialize(
         &self,
-        _request: InitializeRequestParam,
+        _request: InitializeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
@@ -244,17 +332,31 @@ impl MockFailingSearchServer {
 #[tool_handler]
 impl ServerHandler for MockFailingSearchServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some("Mock failing server for testing".to_string()),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions("Mock failing server for testing")
     }
 
     async fn initialize(
         &self,
-        _request: InitializeRequestParam,
+        _request: InitializeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        Ok(self.get_info())
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for MockSearchResponseServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions("Mock search response server for testing")
+    }
+
+    async fn initialize(
+        &self,
+        _request: InitializeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
@@ -277,6 +379,38 @@ impl MockFailingMCPServer {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             harness: MockServerHarness::start(Self::router(error_marker.to_string())).await?,
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.harness.port()
+    }
+
+    pub fn url(&self) -> String {
+        self.harness.url()
+    }
+
+    pub async fn stop(&mut self) {
+        self.harness.stop().await;
+    }
+}
+
+impl MockSearchResponseMCPServer {
+    fn router(mode: MockSearchResponseMode) -> axum::Router {
+        let service = StreamableHttpService::new(
+            move || Ok(MockSearchResponseServer::new(mode)),
+            LocalSessionManager::default().into(),
+            Default::default(),
+        );
+
+        axum::Router::new().nest_service("/mcp", service)
+    }
+
+    pub async fn start(
+        mode: MockSearchResponseMode,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
+            harness: MockServerHarness::start(Self::router(mode)).await?,
         })
     }
 
@@ -336,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_failing_server_startup() {
         use rmcp::{
-            model::CallToolRequestParam, transport::StreamableHttpClientTransport, ServiceExt,
+            model::CallToolRequestParams, transport::StreamableHttpClientTransport, ServiceExt,
         };
 
         let mut server = MockFailingMCPServer::start("marker").await.unwrap();
@@ -347,17 +481,14 @@ mod tests {
         let client = ().serve(transport).await.expect("connect failing mock server");
 
         let err = client
-            .call_tool(CallToolRequestParam {
-                name: "brave_web_search".into(),
-                arguments: Some(
-                    serde_json::json!({
-                        "query": "smoke"
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
+            .call_tool(
+                CallToolRequestParams::new("brave_web_search").with_arguments(
+                    serde_json::json!({ "query": "smoke" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                 ),
-            })
+            )
             .await
             .expect_err("failing mock tool call should error");
         assert!(err.to_string().contains("marker"));

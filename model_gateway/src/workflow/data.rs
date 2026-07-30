@@ -58,6 +58,37 @@ pub trait WorkerRegistrationData: WorkflowData {
 
     /// Get the labels for policy registration.
     fn get_labels(&self) -> Option<&HashMap<String, String>>;
+
+    /// Select the semantics of the final registry write.
+    ///
+    /// Defaults to upsert, which is what every caller did before this method
+    /// existed.
+    fn registration_mode(&self) -> WorkerRegistrationMode {
+        WorkerRegistrationMode::Upsert
+    }
+}
+
+/// Semantics of the final worker registry write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerRegistrationMode {
+    /// `POST /workers`: fail when the URL is already registered.
+    CreateOnly,
+    /// Startup and service discovery: register the URL, replacing whatever
+    /// holds it. Both reconcile declared state against the registry.
+    #[default]
+    Upsert,
+    /// `PUT /workers/{id}`: replace the worker only while `worker_id` still
+    /// holds the URL at `expected_revision`.
+    ///
+    /// `PUT` answers 202 and registers later, so other writes for the same URL
+    /// can land in between. Binding the write to what the request validated
+    /// makes the late write fail instead of resurrecting a worker a `DELETE`
+    /// removed, overwriting one a `POST` created, or restoring the older
+    /// specification over a second `PUT` that finished first.
+    ReplaceById {
+        worker_id: String,
+        expected_revision: u64,
+    },
 }
 
 /// Wrapper for worker list that can be serialized
@@ -93,6 +124,10 @@ impl WorkerList {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerWorkflowData {
     pub config: WorkerSpec,
+    /// Defaults to upsert so persisted workflows from older versions preserve
+    /// their historical registration behavior when deserialized.
+    #[serde(default)]
+    pub registration_mode: WorkerRegistrationMode,
     /// Determined by ClassifyWorkerTypeStep (Local or External).
     pub worker_kind: Option<WorkerKind>,
     // -- Local-only fields --
@@ -142,6 +177,10 @@ impl WorkerRegistrationData for WorkerWorkflowData {
 
     fn get_labels(&self) -> Option<&HashMap<String, String>> {
         Some(&self.final_labels)
+    }
+
+    fn registration_mode(&self) -> WorkerRegistrationMode {
+        self.registration_mode.clone()
     }
 }
 

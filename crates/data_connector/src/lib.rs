@@ -33,10 +33,8 @@ pub(crate) mod versioning;
 // Re-export core types and traits
 pub use core::{
     Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ConversationMemoryId, ConversationMemoryResult, ConversationMemoryStatus,
-    ConversationMemoryStorageError, ConversationMemoryType, ConversationMemoryWriter,
-    ConversationStorage, ListParams, NewConversation, NewConversationItem, NewConversationMemory,
-    ResponseId, ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
+    ConversationStorage, ListParams, NewConversation, NewConversationItem, ResponseId,
+    ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
 };
 
 pub use config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};
@@ -46,7 +44,7 @@ pub use context::{
     RequestContext,
 };
 // Re-export factory
-pub use factory::{create_storage, StorageFactoryConfig};
+pub use factory::{create_storage, StorageBundle, StorageFactoryConfig};
 pub use hooks::{BeforeHookResult, ExtraColumns, HookError, StorageHook, StorageOperation};
 // Re-export memory implementations for testing
 pub use memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage};

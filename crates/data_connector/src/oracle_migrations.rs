@@ -3,28 +3,29 @@
 //! Each migration is a function that generates Oracle DDL from [`SchemaConfig`],
 //! so it respects custom table/column names. PL/SQL exception handling ensures
 //! idempotency (safe to re-run if a previous attempt partially completed).
+#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::{schema::SchemaConfig, versioning::Migration};
 
-/// Oracle migration list. Append new migrations here.
-pub(crate) static ORACLE_MIGRATIONS: [Migration; 3] = [
-    Migration {
-        version: 1,
-        description: "Add safety_identifier column to responses",
-        up: oracle_v1_up,
-    },
-    Migration {
-        version: 2,
-        description: "Remove legacy user_id column from responses",
-        up: oracle_v2_up,
-    },
-    Migration {
-        version: 3,
-        description:
-            "Drop redundant output, metadata, instructions, tool_calls columns from responses",
-        up: oracle_v3_up,
-    },
-];
+const ORACLE_V1: Migration = Migration {
+    version: 1,
+    description: "Add safety_identifier column to responses",
+    up: oracle_v1_up,
+};
+const ORACLE_V2: Migration = Migration {
+    version: 2,
+    description: "Remove legacy user_id column from responses",
+    up: oracle_v2_up,
+};
+const ORACLE_V3: Migration = Migration {
+    version: 3,
+    description: "Drop redundant output, metadata, instructions, tool_calls columns from responses",
+    up: oracle_v3_up,
+};
+
+/// Core history-backend migrations required by the SQL response/conversation
+/// storage path during normal gateway startup.
+pub(crate) static ORACLE_HISTORY_MIGRATIONS: [Migration; 3] = [ORACLE_V1, ORACLE_V2, ORACLE_V3];
 
 fn oracle_v1_up(schema: &SchemaConfig) -> Vec<String> {
     let s = &schema.responses;
@@ -103,9 +104,24 @@ mod tests {
     use crate::schema::TableConfig;
 
     #[test]
-    fn oracle_migrations_are_sequential() {
-        for (i, m) in ORACLE_MIGRATIONS.iter().enumerate() {
-            assert_eq!(m.version, (i + 1) as u32, "migration {i} has wrong version");
+    fn oracle_history_migrations_cover_only_core_history_schema() {
+        let versions: Vec<u32> = ORACLE_HISTORY_MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .collect();
+        assert_eq!(versions, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn oracle_migrations_are_strictly_increasing() {
+        // Versions must be strictly increasing and unique; a numbering gap is allowed.
+        for pair in ORACLE_HISTORY_MIGRATIONS.windows(2) {
+            assert!(
+                pair[1].version > pair[0].version,
+                "migration versions must strictly increase: {} then {}",
+                pair[0].version,
+                pair[1].version
+            );
         }
     }
 
@@ -197,5 +213,86 @@ mod tests {
                 "should skip OUTPUT when mapped: {stmt}"
             );
         }
+    }
+
+    /// Oracle pre-12.2 rejects unquoted identifiers over 30 chars with
+    /// ORA-00972. This test scans every identifier emitted by every migration
+    /// and fails loudly if anything crosses the limit, so future contributors
+    /// can't accidentally reintroduce the bug.
+    ///
+    /// Note: we deliberately do NOT strip the EXECUTE IMMEDIATE literal
+    /// content. Oracle DDL identifiers (table / column / constraint / index
+    /// names) live INSIDE those literals, so stripping would make the test
+    /// check only outer PL/SQL wrapper keywords (BEGIN, EXCEPTION, SQLCODE,
+    /// all ≤11 chars) and silently miss real violations. Doubled-quote
+    /// string values like `''completed''` tokenize to short words
+    /// (`completed` = 9 chars) that never trip the 30-char limit.
+    #[test]
+    fn all_oracle_migration_identifiers_are_within_30_chars() {
+        let schema = SchemaConfig::default();
+        let all: Vec<String> = ORACLE_HISTORY_MIGRATIONS
+            .iter()
+            .flat_map(|m| (m.up)(&schema))
+            .collect();
+
+        fn is_ident_char(c: char) -> bool {
+            c.is_ascii_alphanumeric() || c == '_'
+        }
+        let mut violations: Vec<String> = Vec::new();
+        for stmt in &all {
+            let mut token = String::new();
+            for c in stmt.chars().chain(std::iter::once(' ')) {
+                if is_ident_char(c) {
+                    token.push(c);
+                } else {
+                    if token.len() > 30 && token.starts_with(|ch: char| !ch.is_ascii_digit()) {
+                        violations.push(format!(
+                            "identifier `{}` ({} chars) in: {}",
+                            token,
+                            token.len(),
+                            stmt.chars().take(80).collect::<String>()
+                        ));
+                    }
+                    token.clear();
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "Oracle identifiers must be ≤30 chars (pre-12.2 limit, ORA-00972). \
+             Violations:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    /// Meta-test: plant a 31-char identifier inside an EXECUTE IMMEDIATE
+    /// literal and confirm the guard above catches it. Protects against
+    /// anyone accidentally reintroducing literal-stripping (which would make
+    /// the guard silently useless because real DDL identifiers live INSIDE
+    /// the literal).
+    #[test]
+    fn identifier_length_guard_catches_planted_violation() {
+        fn is_ident_char(c: char) -> bool {
+            c.is_ascii_alphanumeric() || c == '_'
+        }
+        let planted = "BEGIN EXECUTE IMMEDIATE \
+            'CREATE TABLE AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA (x INT)'; \
+            EXCEPTION WHEN OTHERS THEN RAISE; END;";
+        let mut hit_long = false;
+        let mut token = String::new();
+        for c in planted.chars().chain(std::iter::once(' ')) {
+            if is_ident_char(c) {
+                token.push(c);
+            } else {
+                if token.len() > 30 && token.starts_with(|ch: char| !ch.is_ascii_digit()) {
+                    hit_long = true;
+                }
+                token.clear();
+            }
+        }
+        assert!(
+            hit_long,
+            "guard regressed — must detect >30-char identifiers inside EXECUTE IMMEDIATE"
+        );
     }
 }

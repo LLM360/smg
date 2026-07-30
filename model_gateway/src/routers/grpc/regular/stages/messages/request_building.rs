@@ -2,16 +2,19 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::messages;
 use tracing::error;
-use uuid::Uuid;
 
 use crate::routers::{
     error,
     grpc::{
+        client::GenerateRequestBuildOptions,
         common::stages::{helpers, PipelineStage},
-        context::{ClientSelection, PreparationOutput, RequestContext},
-        multimodal::assemble_multimodal_data,
-        proto_wrapper::ProtoRequest,
+        context::{
+            ClientSelection, ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext,
+        },
+        multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
+        utils,
     },
 };
 
@@ -21,11 +24,15 @@ use crate::routers::{
 /// and CreateMessageRequest sampling parameters.
 pub(crate) struct MessageRequestBuildingStage {
     inject_pd_metadata: bool,
+    plan_kind: ExecutionPlanKind,
 }
 
 impl MessageRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool) -> Self {
-        Self { inject_pd_metadata }
+    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
+        Self {
+            inject_pd_metadata,
+            plan_kind,
+        }
     }
 }
 
@@ -54,10 +61,10 @@ impl PipelineStage for MessageRequestBuildingStage {
 
         let messages_request = ctx.messages_request_arc();
 
-        // Get client for building request (use prefill client if PD mode)
+        // Get client for building request (use prefill client in disaggregated mode)
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
-            ClientSelection::Dual { prefill, .. } => prefill,
+            ClientSelection::Disaggregated { prefill, .. } => prefill,
         };
 
         let PreparationOutput::Messages {
@@ -74,20 +81,49 @@ impl PipelineStage for MessageRequestBuildingStage {
         };
 
         // Build message request
-        let request_id = format!("msg_{}", Uuid::now_v7());
+        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
+        let request_id = helpers::resolve_request_id(
+            &ctx.input.request_type,
+            ctx.input.tenant_request_meta.as_ref(),
+            "msg_",
+            disaggregated,
+        );
 
-        // Reject multimodal for backends that don't support it, before assembling
-        if processed_messages.multimodal_intermediate.is_some() && builder_client.is_mlx() {
-            return Err(error::bad_request(
-                "multimodal_not_supported",
-                "MLX backend does not support multimodal inputs".to_string(),
-            ));
-        }
+        // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
+        let is_encode_routed = ctx.state.encode_outputs.is_some();
 
-        // Assemble backend-specific multimodal data now that the backend is known
-        let multimodal_data = processed_messages
-            .multimodal_intermediate
-            .map(|intermediate| assemble_multimodal_data(intermediate, builder_client));
+        // Assemble backend-specific multimodal data now that the backend is known;
+        // take the intermediate here for the prefill serialization. When
+        // encode-routed, drop the prefill pixels.
+        let multimodal_data = if let Some(intermediate) = ctx.state.multimodal_intermediate.take() {
+            let assembled = if is_encode_routed {
+                assemble_multimodal_data_after_encode(
+                    intermediate,
+                    builder_client,
+                    ctx.state.workers.as_ref(),
+                )
+                .await
+            } else {
+                assemble_multimodal_data(intermediate, builder_client, ctx.state.workers.as_ref())
+                    .await
+            };
+            Some(assembled.map_err(|e| {
+                error!(function = "MessageRequestBuildingStage::execute", error = %e, "Failed to assemble multimodal request");
+                error::bad_request("multimodal_not_supported", format!("{e}"))
+            })?)
+        } else {
+            None
+        };
+
+        let user_thinking = match &messages_request.thinking {
+            Some(messages::ThinkingConfig::Enabled { .. })
+            | Some(messages::ThinkingConfig::Adaptive { .. }) => Some(true),
+            Some(messages::ThinkingConfig::Disabled) => Some(false),
+            None => None,
+        };
+        let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
+            utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref())
+        });
 
         let mut proto_request = builder_client
             .build_messages_request(
@@ -95,13 +131,22 @@ impl PipelineStage for MessageRequestBuildingStage {
                 &messages_request,
                 processed_messages.text,
                 token_ids,
-                multimodal_data,
-                tool_constraints,
+                GenerateRequestBuildOptions {
+                    multimodal_inputs: multimodal_data,
+                    tool_constraints,
+                    require_reasoning,
+                },
             )
             .map_err(|e| {
                 error!(function = "MessageRequestBuildingStage::execute", error = %e, "Failed to build generate request");
                 error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {e}"))
             })?;
+
+        helpers::apply_sampling_defaults_to_generate_request(
+            &mut proto_request,
+            &ctx.input.request_type,
+            ctx.state.workers.as_ref(),
+        );
 
         if self.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {
@@ -109,11 +154,32 @@ impl PipelineStage for MessageRequestBuildingStage {
             }
         }
 
-        ctx.state.proto_request = Some(ProtoRequest::Generate(proto_request));
+        // EPD: inject the per-item encode bootstrap info into the prefill
+        // request; the dispatch plan stays on `encode_outputs` for request
+        // execution to take.
+        if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
+            proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+        }
+
+        // EPD: inject the prefill->decode KV rendezvous (mirrors the chat path).
+        // No-op unless the backend carries it in the request.
+        if let Some(workers) = ctx.state.workers.as_ref() {
+            helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
+        }
+
+        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
         Ok(None)
     }
 
     fn name(&self) -> &'static str {
         "MessageRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        format!(
+            "MessageRequestBuildingStage(inject_pd_metadata={}, {:?})",
+            self.inject_pd_metadata, self.plan_kind
+        )
     }
 }

@@ -51,7 +51,9 @@ MODEL_SPECS: dict[str, dict] = {
     # Function calling specialist (larger, for Response API tests)
     "Qwen/Qwen2.5-14B-Instruct": {
         "model": _resolve_model_path("Qwen/Qwen2.5-14B-Instruct"),
-        "tp": 2,
+        # 14B BF16 weights (~28GB) fit on one H100/80GB; tp=1 avoids paying
+        # NCCL setup on every restart. Override via E2E_MODEL_TP_OVERRIDES.
+        "tp": 1,
         "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
         "sglang_args": ["--context-length=16384"],  # Faster startup, prevents memory issues
     },
@@ -61,13 +63,36 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "reasoning"],
     },
-    # Thinking/reasoning model (larger)
+    # Qwen3 instruct (non-thinking variant) — emits the same
+    # `<tool_call>\n{"name": ..., "arguments": ...}\n</tool_call>` format as
+    # Qwen 2.5, so the gateway's ``qwen`` tool-call parser applies. Used by
+    # ``TestToolChoiceQwen`` and ``TestMultiTurnToolCall``: a Qwen3 model is
+    # required because the Qwen2 family is not in TokenSpeed's model registry.
+    "Qwen/Qwen3-4B-Instruct-2507": {
+        "model": _resolve_model_path("Qwen/Qwen3-4B-Instruct-2507"),
+        "tp": 1,
+        "features": ["chat", "streaming", "function_calling", "tool_choice"],
+    },
     "Qwen/Qwen3-30B-A3B": {
         "model": _resolve_model_path("Qwen/Qwen3-30B-A3B"),
         "tp": 1,
         "features": ["chat", "streaming", "thinking", "reasoning"],
         "vllm_args": [] if _is_nightly else ["--enforce-eager"],
         "trtllm_extra_config": {"kv_cache_config": {"free_gpu_memory_fraction": 0.8}},
+    },
+    # Qwen3.6-27B — thinking model with XML tool calls (qwen3_5 arch). Staged for
+    # the nightly BFCL A/B (scripts/bfcl); tp=2 fits the 27B on two GPUs.
+    "Qwen/Qwen3.6-27B": {
+        "model": _resolve_model_path("Qwen/Qwen3.6-27B"),
+        "tp": 2,
+        "features": [
+            "chat",
+            "streaming",
+            "function_calling",
+            "tool_choice",
+            "thinking",
+            "reasoning",
+        ],
     },
     # Mistral for function calling
     "mistralai/Mistral-7B-Instruct-v0.3": {
@@ -80,16 +105,33 @@ MODEL_SPECS: dict[str, dict] = {
             '{"disable_any_whitespace": true, "backend": "xgrammar"}',
         ],
     },
-    # Embedding model
-    "intfloat/e5-mistral-7b-instruct": {
-        "model": _resolve_model_path("intfloat/e5-mistral-7b-instruct"),
+    # Embedding model (last-token pooling; upstream-tested under transformers v5)
+    "Qwen/Qwen3-Embedding-0.6B": {
+        "model": _resolve_model_path("Qwen/Qwen3-Embedding-0.6B"),
         "tp": 1,
         "features": ["embedding"],
+    },
+    # Realtime ASR (speech-to-text). Served with the realtime architecture so
+    # vLLM exposes `ws /v1/realtime`; `TORCH_SDPA` avoids the bundled flash-attn
+    # CUTE kernel that rejects some GPU archs (e.g. GB300 / sm_103).
+    "Qwen/Qwen3-ASR-1.7B": {
+        "model": _resolve_model_path("Qwen/Qwen3-ASR-1.7B"),
+        "tp": 1,
+        "features": ["realtime", "transcription", "audio"],
+        "vllm_args": [
+            "--hf-overrides",
+            '{"architectures":["Qwen3ASRRealtimeGeneration"]}',
+            "--mm-encoder-attn-backend",
+            "TORCH_SDPA",
+            "--enforce-eager",
+        ],
     },
     # GPT-OSS models (Harmony)
     "openai/gpt-oss-20b": {
         "model": _resolve_model_path("openai/gpt-oss-20b"),
-        "tp": 2,
+        # MXFP4-quantized MoE (~13GB weights) fits easily on one H100; tp=1
+        # roughly halves worker startup vs tp=2. Override via E2E_MODEL_TP_OVERRIDES.
+        "tp": 1,
         "features": ["chat", "streaming", "reasoning", "harmony"],
         "vllm_args": [
             "--structured-outputs-config",
@@ -119,6 +161,32 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("Qwen/Qwen3-VL-8B-Instruct"),
         "tp": 1,
         "features": ["chat", "streaming", "multimodal"],
+    },
+    # TokenSpeed EPD multimodal model. Qwen3.5-9B is a vision-language model
+    # (hybrid Gated DeltaNet + sparse MoE); BF16 ~18GB fits one 80GB H100 at
+    # tp=1, so every EPD topology (1e1p1d/1e2p1d/2e1p1d/1e1p2d) runs on the
+    # 4-GPU h100 runner, one worker per card. EPD is TokenSpeed-only: the encode
+    # worker runs the vision tower; prefill/decode run the LM. FA3 is the H100
+    # attention backend (trtllm fails on H100 for this model). Disaggregation
+    # role flags (--disaggregation-mode etc.) are added per-role in worker.py.
+    "Qwen/Qwen3.5-9B": {
+        "model": _resolve_model_path("Qwen/Qwen3.5-9B"),
+        "tp": 1,
+        "features": ["chat", "streaming", "multimodal", "moe"],
+        "startup_timeout": 600,
+        "tokenspeed_args": [
+            "--attention-backend",
+            "fa3",
+            "--max-model-len",
+            "8192",
+            "--max-num-seqs",
+            "4",
+            "--gpu-memory-utilization",
+            "0.8",
+        ],
+        # TokenSpeed-only (GDN + MoE arch won't load under sglang/vllm/trt), so
+        # keep it out of the tier-wide pre-download; the EPD job fetches it by id.
+        "skip_tier_download": True,
     },
     # Llama-4-Maverick (17B with 128 experts, FP8) - Nightly benchmarks
     "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8": {
@@ -184,6 +252,12 @@ MODEL_SPECS: dict[str, dict] = {
             "--enable-chunked-prefill",
         ],
     },
+    # MLX (Apple Silicon). Smallest Qwen3 with tool calling + thinking (~400 MB).
+    "mlx-community/Qwen3-0.6B-4bit": {
+        "model": _resolve_model_path("mlx-community/Qwen3-0.6B-4bit"),
+        "tp": 1,
+        "features": ["chat", "streaming", "function_calling", "reasoning", "thinking"],
+    },
 }
 
 
@@ -242,7 +316,7 @@ DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = MODEL_SPECS["mistralai/Mistral-7B-
     "model"
 ]
 DEFAULT_GPT_OSS_MODEL_PATH = MODEL_SPECS["openai/gpt-oss-20b"]["model"]
-DEFAULT_EMBEDDING_MODEL_PATH = MODEL_SPECS["intfloat/e5-mistral-7b-instruct"]["model"]
+DEFAULT_EMBEDDING_MODEL_PATH = MODEL_SPECS["Qwen/Qwen3-Embedding-0.6B"]["model"]
 
 
 # =============================================================================

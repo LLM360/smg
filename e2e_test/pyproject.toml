@@ -11,6 +11,8 @@ dependencies = [
   "grpcio-health-checking",
   "httpx",
   "jinja2",
+  # infra.mock_mcp_server needs mcp.server.fastmcp: added in 1.2, removed in 2.0
+  "mcp>=1.2,<2",
   "numpy",
   "openai",
   "pandas",
@@ -19,6 +21,7 @@ dependencies = [
   "pytest-rerunfailures",
   "requests",
   "tqdm",
+  "uvicorn>=0.30",
   "websockets",
 ]
 

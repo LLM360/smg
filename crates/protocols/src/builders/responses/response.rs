@@ -17,9 +17,11 @@ pub struct ResponsesResponseBuilder {
     id: String,
     object: String,
     created_at: i64,
+    completed_at: Option<i64>,
+    conversation: Option<String>,
     status: ResponseStatus,
     error: Option<Value>,
-    incomplete_details: Option<Value>,
+    incomplete_details: Option<IncompleteDetails>,
     instructions: Option<String>,
     max_output_tokens: Option<u32>,
     model: String,
@@ -51,6 +53,8 @@ impl ResponsesResponseBuilder {
             id: id.into(),
             object: "response".to_string(),
             created_at: chrono::Utc::now().timestamp(),
+            completed_at: None,
+            conversation: None,
             status: ResponseStatus::InProgress,
             error: None,
             incomplete_details: None,
@@ -90,6 +94,10 @@ impl ResponsesResponseBuilder {
         self.previous_response_id
             .clone_from(&request.previous_response_id);
         self.store = request.store.unwrap_or(true);
+        // ResponsesResponse stores `conversation` as a plain `Option<String>`
+        // (response side per spec is `optional { id }` only); flatten the
+        // request's union-typed reference down to its underlying id string.
+        self.conversation = request.conversation.as_ref().map(|c| c.as_id().to_string());
         self.temperature = request.temperature;
         self.tool_choice = if let Some(ref tc) = request.tool_choice {
             serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string())
@@ -115,6 +123,19 @@ impl ResponsesResponseBuilder {
         self
     }
 
+    /// Set the completion timestamp. Populate when the response reaches a
+    /// terminal status (`completed`, `incomplete`, `failed`, `cancelled`).
+    pub fn completed_at(mut self, timestamp: i64) -> Self {
+        self.completed_at = Some(timestamp);
+        self
+    }
+
+    /// Set the linked conversation ID.
+    pub fn conversation(mut self, conversation: impl Into<String>) -> Self {
+        self.conversation = Some(conversation.into());
+        self
+    }
+
     /// Set the response status
     pub fn status(mut self, status: ResponseStatus) -> Self {
         self.status = status;
@@ -127,8 +148,8 @@ impl ResponsesResponseBuilder {
         self
     }
 
-    /// Set incomplete details (if response was truncated)
-    pub fn incomplete_details(mut self, details: Value) -> Self {
+    /// Set incomplete details (if the response reached `incomplete` status)
+    pub fn incomplete_details(mut self, details: IncompleteDetails) -> Self {
         self.incomplete_details = Some(details);
         self
     }
@@ -271,6 +292,9 @@ impl ResponsesResponseBuilder {
             id: self.id,
             object: self.object,
             created_at: self.created_at,
+            completed_at: self.completed_at,
+            background: None,
+            conversation: self.conversation,
             status: self.status,
             error: self.error,
             incomplete_details: self.incomplete_details,
@@ -386,12 +410,14 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![],
                 status: "completed".to_string(),
+                phase: None,
             })
             .add_output(ResponseOutputItem::Message {
                 id: "msg_2".to_string(),
                 role: "assistant".to_string(),
                 content: vec![],
                 status: "completed".to_string(),
+                phase: None,
             })
             .build();
 

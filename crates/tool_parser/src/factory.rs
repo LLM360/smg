@@ -9,9 +9,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     parsers::{
-        CohereParser, DeepSeek31Parser, DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser,
-        LlamaParser, MinimaxM2Parser, MistralParser, PassthroughParser, PythonicParser,
-        QwenCoderParser, QwenParser, Step3Parser,
+        CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
+        InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
+        MistralParser, PassthroughParser, PythonicParser, QwenParser, QwenXmlParser,
+        SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -239,13 +240,18 @@ impl ParserRegistry {
         if let Some(parser_name) = mapping.get(model) {
             return Some(parser_name.clone());
         }
-        // Try prefix matching (longest pattern wins)
+        // Case-insensitive substring matching (longest pattern wins) so namespaced
+        // and differently-cased ids (e.g. "org/Inkling-Chat") still resolve.
+        let model_lower = model.to_lowercase();
         mapping
             .iter()
-            .filter(|(pattern, _)| {
-                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
+            .filter_map(|(pattern, parser_name)| {
+                let stem = pattern.strip_suffix('*')?;
+                model_lower
+                    .contains(&stem.to_lowercase())
+                    .then_some((stem, parser_name))
             })
-            .max_by_key(|(pattern, _)| pattern.len())
+            .max_by_key(|(stem, _)| stem.len())
             .map(|(_, parser_name)| parser_name.clone())
     }
 
@@ -310,18 +316,32 @@ impl ParserFactory {
             MistralParser::build_structural_tag,
         );
         registry.register_parser("qwen", || Box::new(QwenParser::new()));
-        registry.register_parser("qwen_coder", || Box::new(QwenCoderParser::new()));
+        registry.register_parser("qwen_xml", || Box::new(QwenXmlParser::new()));
+        registry.register_parser("qwen_coder", || Box::new(QwenXmlParser::new()));
         registry.register_parser("pythonic", || Box::new(PythonicParser::new()));
         registry.register_parser("llama", || Box::new(LlamaParser::new()));
         registry.register_parser("deepseek", || Box::new(DeepSeekParser::new()));
         registry.register_parser("deepseek31", || Box::new(DeepSeek31Parser::new()));
+        registry.register_parser("deepseek32", || Box::new(DeepSeekDsmlParser::v32()));
+        registry.register_parser("deepseek_v4", || Box::new(DeepSeekDsmlParser::v4()));
         registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
         registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
+        registry.register_parser("sarashina", || Box::new(SarashinaParser::new()));
         registry.register_parser_with_structural_tag(
             "kimik2",
             || Box::new(KimiK2Parser::new()),
             KimiK2Parser::build_structural_tag,
+        );
+        registry.register_parser_with_structural_tag(
+            "kimi_k3",
+            || Box::new(KimiK3Parser::new()),
+            KimiK3Parser::build_structural_tag,
+        );
+        registry.register_parser_with_structural_tag(
+            "inkling",
+            || Box::new(InklingParser::new()),
+            InklingParser::build_structural_tag,
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
         registry.register_parser("cohere", || Box::new(CohereParser::new()));
@@ -346,14 +366,16 @@ impl ParserFactory {
         registry.map_model("mixtral-*", "mistral");
 
         // Qwen models (more specific patterns first - longer patterns take precedence)
-        // Qwen Coder models use XML format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
-        registry.map_model("Qwen/Qwen3-Coder*", "qwen_coder");
-        registry.map_model("Qwen3-Coder*", "qwen_coder");
-        registry.map_model("qwen3-coder*", "qwen_coder");
-        registry.map_model("Qwen/Qwen2.5-Coder*", "qwen_coder");
-        registry.map_model("Qwen2.5-Coder*", "qwen_coder");
-        registry.map_model("qwen2.5-coder*", "qwen_coder");
-        // Generic Qwen models use JSON format
+        // Qwen3.5+ and Qwen3-Coder use XML format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        registry.map_model("Qwen/Qwen3.5*", "qwen_xml");
+        registry.map_model("Qwen3.5*", "qwen_xml");
+        registry.map_model("qwen3.5*", "qwen_xml");
+        registry.map_model("qwen/qwen3.5*", "qwen_xml");
+        registry.map_model("Qwen/Qwen3-Coder*", "qwen_xml");
+        registry.map_model("Qwen3-Coder*", "qwen_xml");
+        registry.map_model("qwen3-coder*", "qwen_xml");
+        registry.map_model("qwen/qwen3-coder*", "qwen_xml");
+        // Qwen3 and earlier (including Qwen2.5-Coder) use JSON format
         registry.map_model("qwen*", "qwen");
         registry.map_model("Qwen*", "qwen");
 
@@ -370,13 +392,27 @@ impl ParserFactory {
         registry.map_model("deepseek-ai/DeepSeek-V3*", "deepseek");
         registry.map_model("deepseek-v3.1*", "deepseek31");
         registry.map_model("deepseek-ai/DeepSeek-V3.1*", "deepseek31");
+        // V3.2-Exp uses V3.1 format (longer patterns take precedence)
+        registry.map_model("deepseek-v3.2-exp*", "deepseek31");
+        registry.map_model("deepseek-ai/DeepSeek-V3.2-Exp*", "deepseek31");
+        // V3.2 DSML format (outer block: function_calls)
+        registry.map_model("deepseek-v3.2*", "deepseek32");
+        registry.map_model("deepseek-ai/DeepSeek-V3.2*", "deepseek32");
+        // V4 DSML format (outer block: tool_calls — same parser as V3.2, different block name)
+        registry.map_model("deepseek-v4*", "deepseek_v4");
+        registry.map_model("deepseek-ai/DeepSeek-V4*", "deepseek_v4");
         registry.map_model("deepseek-*", "pythonic");
 
         // GLM models
         registry.map_model("glm-4.5*", "glm45_moe");
         registry.map_model("glm-4.6*", "glm45_moe");
         registry.map_model("glm-4.7*", "glm47_moe");
+        registry.map_model("glm-5*", "glm47_moe");
         registry.map_model("glm-*", "json");
+
+        // Sarashina models
+        registry.map_model("sarashina*", "sarashina");
+        registry.map_model("Sarashina*", "sarashina");
 
         // Step3 models
         registry.map_model("step3*", "step3");
@@ -386,6 +422,19 @@ impl ParserFactory {
         registry.map_model("kimi-k2*", "kimik2");
         registry.map_model("Kimi-K2*", "kimik2");
         registry.map_model("moonshot*/Kimi-K2*", "kimik2");
+        registry.map_model("kimi-k3*", "kimi_k3");
+        registry.map_model("Kimi-K3*", "kimi_k3");
+        registry.map_model("moonshot*/Kimi-K3*", "kimi_k3");
+        // Underscore spellings (e.g. `kimi_k3`, `Kimi_K3`) as used by some
+        // checkpoint ids; mirrors the reasoning-parser factory, whose glob
+        // matching is case-insensitive but still enumerates both separators.
+        registry.map_model("kimi_k3*", "kimi_k3");
+        registry.map_model("Kimi_K3*", "kimi_k3");
+        registry.map_model("moonshot*/Kimi_K3*", "kimi_k3");
+
+        // Inkling models use TML JSON tool calls.
+        registry.map_model("inkling*", "inkling");
+        registry.map_model("Inkling*", "inkling");
 
         // MiniMax models
         registry.map_model("minimax*", "minimax_m2");

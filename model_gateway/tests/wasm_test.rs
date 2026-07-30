@@ -19,6 +19,7 @@ use llm_tokenizer::TokenizerRegistry;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
+    health::ProbeState,
     policies::PolicyRegistry,
     routers::RouterFactory,
     server::{build_app, AppState},
@@ -68,6 +69,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         policy_registry.clone(),
         client.clone(),
         config.load_monitor_interval_secs,
+        config.engine_metrics,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -189,23 +191,31 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
 
     let app_state = Arc::new(AppState {
         router,
+        probe_state: ProbeState::new(app_context.inflight_tracker.clone()),
         context: app_context.clone(),
         concurrency_queue_tx: None,
         concurrency_queue_slots: None,
         router_manager: None,
         mesh_handler: None,
+        mesh_adapters: None,
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper assumes router config is already validated"
+    )]
     let app = build_app(
         app_state,
+        smg::middleware::AuthConfig::new(None),
         smg::middleware::AuthConfig::new(None),
         None, // No control plane auth for tests
         256 * 1024 * 1024,
         request_id_headers,
         vec![], // cors_allowed_origins
-    );
+    )
+    .expect("valid tenant resolution config");
 
     (app, app_context, temp_dir)
 }

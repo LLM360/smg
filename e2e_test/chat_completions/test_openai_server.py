@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
@@ -33,7 +33,23 @@ class TestChatCompletion:
     # Harmony (gpt-oss) does not trim because its detokenization is not channel-aware.
     STOP_SEQUENCE_TRIMMED = True
 
-    @pytest.mark.parametrize("logprobs", [None, 5])
+    @pytest.mark.parametrize(
+        "logprobs",
+        [
+            None,
+            pytest.param(
+                5,
+                marks=pytest.mark.skip_for_runtime(
+                    "tokenspeed",
+                    reason=(
+                        "tokenspeed's --enable-top-logprobs is not yet implemented "
+                        "(raises at startup); base output logprobs work via "
+                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                    ),
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num):
         """Test non-streaming chat completion with logprobs and parallel sampling."""
@@ -73,7 +89,23 @@ class TestChatCompletion:
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-    @pytest.mark.parametrize("logprobs", [None, 5])
+    @pytest.mark.parametrize(
+        "logprobs",
+        [
+            None,
+            pytest.param(
+                5,
+                marks=pytest.mark.skip_for_runtime(
+                    "tokenspeed",
+                    reason=(
+                        "tokenspeed's --enable-top-logprobs is not yet implemented "
+                        "(raises at startup); base output logprobs work via "
+                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                    ),
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     def test_chat_completion_stream(self, model, api_client, logprobs, parallel_sample_num):
         """Test streaming chat completion with logprobs and parallel sampling."""
@@ -359,8 +391,8 @@ convenient hands-free control to your smart devices.
         return delta.content or getattr(delta, "reasoning_content", "") or ""
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm")
-@pytest.mark.gpu(2)
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.gpu(1)
 @pytest.mark.model("openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 class TestChatCompletionGptOss(TestChatCompletion):
@@ -375,13 +407,45 @@ class TestChatCompletionGptOss(TestChatCompletion):
 
     STOP_SEQUENCE_TRIMMED = False
 
-    @pytest.mark.parametrize("logprobs", [None, 5])
+    @pytest.mark.parametrize(
+        "logprobs",
+        [
+            None,
+            pytest.param(
+                5,
+                marks=pytest.mark.skip_for_runtime(
+                    "tokenspeed",
+                    reason=(
+                        "tokenspeed's --enable-top-logprobs is not yet implemented "
+                        "(raises at startup); base output logprobs work via "
+                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                    ),
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num):
         """Test non-streaming chat completion with logprobs and parallel sampling."""
         super().test_chat_completion(model, api_client, logprobs, parallel_sample_num)
 
-    @pytest.mark.parametrize("logprobs", [None, 5])
+    @pytest.mark.parametrize(
+        "logprobs",
+        [
+            None,
+            pytest.param(
+                5,
+                marks=pytest.mark.skip_for_runtime(
+                    "tokenspeed",
+                    reason=(
+                        "tokenspeed's --enable-top-logprobs is not yet implemented "
+                        "(raises at startup); base output logprobs work via "
+                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                    ),
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     @pytest.mark.skip_for_runtime(
         "trtllm", reason="trtllm may return more top_logprobs than requested in streaming"
@@ -402,9 +466,44 @@ class TestChatCompletionGptOss(TestChatCompletion):
         pass
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(4)
 @pytest.mark.model("openai/gpt-oss-120b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 class TestChatCompletionGptOss120B(TestChatCompletionGptOss):
     """Tests for chat completions API with Harmony model (GPT-OSS 120B, 4 GPU)."""
+
+
+# =============================================================================
+# Request-id passthrough
+# =============================================================================
+
+
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.gpu(1)
+@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestRequestIdPassthrough:
+    """Backend request ids derive from client correlation signals."""
+
+    def test_rid_becomes_response_id(self, model, api_client):
+        """A protocol `rid` is used as the backend request id verbatim."""
+        resp = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Say hi"}],
+            max_tokens=8,
+            extra_body={"rid": "my-correlation-id-1"},
+        )
+
+        assert resp.id == "my-correlation-id-1"
+
+    def test_x_request_id_header_prefixes_response_id(self, model, api_client):
+        """The middleware request id (client x-request-id) prefixes backend ids."""
+        resp = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Say hi"}],
+            max_tokens=8,
+            extra_headers={"x-request-id": "corr-abc"},
+        )
+
+        assert resp.id.startswith("corr-abc-")

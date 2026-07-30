@@ -1,10 +1,4 @@
 //! Oracle storage implementation using OracleStore helper.
-//!
-//! Structure:
-//! 1. OracleStore helper and common utilities
-//! 2. OracleConversationStorage
-//! 3. OracleConversationItemStorage
-//! 4. OracleResponseStorage
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -31,7 +25,7 @@ use crate::{
     },
     config::OracleConfig,
     context::current_extra_columns,
-    oracle_migrations::ORACLE_MIGRATIONS,
+    oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
 };
 
@@ -86,7 +80,7 @@ impl OracleStore {
         let applied = crate::versioning::run_oracle_migrations(
             &conn,
             &schema,
-            &ORACLE_MIGRATIONS,
+            &ORACLE_HISTORY_MIGRATIONS,
             schema.version,
             schema.auto_migrate,
         )?;

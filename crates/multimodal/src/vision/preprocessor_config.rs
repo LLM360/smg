@@ -192,7 +192,7 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub max_image_tiles: Option<usize>,
 
-    /// Fixed number of image tokens (some models use this)
+    /// Fixed number of image tokens (some model configs use this HF field name).
     #[serde(default)]
     pub num_img_tokens: Option<usize>,
 
@@ -278,9 +278,14 @@ impl PreProcessorConfig {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
         }
-        // Also extract Kimi-specific limits into the extra map
-        // so processors can read them via get_extra()
-        for key in ["in_patch_limit", "patch_limit_on_one_side"] {
+        // Also extract Kimi-specific limits and the K3 transparency settings
+        // into the extra map so processors can read them via get_extra()
+        for key in [
+            "in_patch_limit",
+            "patch_limit_on_one_side",
+            "transparent_bg_config",
+            "transparent_bg_fill_stage",
+        ] {
             if !config.extra.contains_key(key) {
                 if let Some(v) = media_cfg.get(key) {
                     config.extra.insert(key.to_string(), v.clone());
@@ -298,6 +303,26 @@ impl PreProcessorConfig {
             .and_then(|p| p.height)
             .map(|h| h as usize)
             .unwrap_or(default)
+    }
+
+    /// Whether this config changes Qwen-style processor structure or budgets.
+    pub(crate) fn has_structural_overrides(&self) -> bool {
+        self.patch_size.is_some()
+            || self.merge_size.is_some()
+            || self.min_pixels.is_some()
+            || self.max_pixels.is_some()
+            || self.temporal_patch_size.is_some()
+            || self.size.is_some()
+    }
+
+    /// Whether the declared processor type is image-only rather than video-capable.
+    pub(crate) fn is_image_only_processor_type(&self) -> bool {
+        self.image_processor_type
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|processor| {
+                processor.contains("imageprocessor") && !processor.contains("video")
+            })
     }
 
     /// Get image mean as fixed array, with fallback to CLIP defaults.
@@ -347,6 +372,23 @@ impl PreProcessorConfig {
                 .unwrap_or(224);
             (h, w)
         })
+    }
+
+    /// Get a scalar value from the `size` map, such as `shortest_edge` or
+    /// `longest_edge`.
+    pub fn get_size_value(&self, key: &str) -> Option<usize> {
+        self.size
+            .as_ref()
+            .and_then(|s| s.get(key))
+            .map(|v| *v as usize)
+    }
+
+    pub fn get_shortest_edge(&self) -> Option<usize> {
+        self.get_size_value("shortest_edge")
+    }
+
+    pub fn get_longest_edge(&self) -> Option<usize> {
+        self.get_size_value("longest_edge")
     }
 
     /// Get crop size.
@@ -411,6 +453,9 @@ impl PreProcessorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vision::transforms::{
+        TransparentBgConfig, TransparentBgFillStage, TransparentBgPattern,
+    };
 
     #[test]
     fn test_parse_clip_config() {
@@ -493,6 +538,23 @@ mod tests {
     }
 
     #[test]
+    fn test_image_only_processor_type_detection() {
+        for (processor_type, expected) in [
+            (Some("Qwen3VLImageProcessor"), true),
+            (Some("qWeN3vLiMaGePrOcEsSoR"), true),
+            (Some("Qwen3VLVideoProcessor"), false),
+            (Some("Qwen3VLImageProcessorVideo"), false),
+            (None, false),
+        ] {
+            let config = PreProcessorConfig {
+                image_processor_type: processor_type.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(config.is_image_only_processor_type(), expected);
+        }
+    }
+
+    #[test]
     fn test_filter_conversion() {
         let json = r#"{"resampling": 3}"#;
         let config = PreProcessorConfig::from_json(json).unwrap();
@@ -547,5 +609,48 @@ mod tests {
 
         assert_eq!(config.get_patch_size(0), 14);
         assert_eq!(config.merge_size, Some(2));
+    }
+
+    #[test]
+    fn test_parse_kimi_k3_transparency_settings() {
+        // Verbatim excerpt from moonshotai/Kimi-K3's preprocessor_config.json.
+        let json = r#"{
+            "media_proc_cfg": {
+                "in_patch_limit": 65536,
+                "patch_size": 14,
+                "merge_kernel_size": 2,
+                "patch_limit_on_one_side": 512,
+                "transparent_bg_config": {
+                    "pattern": "chessboard",
+                    "chessboard_square_size": 8,
+                    "chessboard_square_on_top_left": true,
+                    "chessboard_white_value": 255,
+                    "chessboard_gray_value": 180
+                },
+                "transparent_bg_fill_stage": "after_resize"
+            }
+        }"#;
+
+        let config = PreProcessorConfig::from_json(json).unwrap();
+
+        assert_eq!(config.get_extra::<usize>("in_patch_limit"), Some(65536));
+        assert_eq!(
+            config.get_extra::<usize>("patch_limit_on_one_side"),
+            Some(512)
+        );
+
+        let bg = config
+            .get_extra::<TransparentBgConfig>("transparent_bg_config")
+            .expect("transparent_bg_config lifted out of media_proc_cfg");
+        assert_eq!(bg.pattern, TransparentBgPattern::Chessboard);
+        assert_eq!(bg.chessboard_square_size, 8);
+        assert!(bg.chessboard_square_on_top_left);
+        assert_eq!(bg.chessboard_white_value, 255);
+        assert_eq!(bg.chessboard_gray_value, 180);
+
+        assert_eq!(
+            config.get_extra::<TransparentBgFillStage>("transparent_bg_fill_stage"),
+            Some(TransparentBgFillStage::AfterResize)
+        );
     }
 }

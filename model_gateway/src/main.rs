@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use rand::{distr::Alphanumeric, Rng};
+use openai_protocol::worker::TransportMode;
+use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, SchemaConfig,
+        validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
+        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
+        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
     observability::{
@@ -20,13 +22,19 @@ use smg::{
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::MeshServerConfig;
-fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+use tracing::info;
+
+/// Parse repeated `<flag> <url> [bootstrap_port|none]` occurrences into
+/// (url, optional bootstrap port) pairs. The trailing port is optional, so
+/// these flags are hand-parsed (clap cannot express the optional positional)
+/// and stripped from argv before `Cli::parse_from`.
+fn parse_url_port_args(flag: &str) -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
-    let mut prefill_entries = Vec::new();
+    let mut entries = Vec::new();
     let mut i = 0;
 
     while i < args.len() {
-        if args[i] == "--prefill" && i + 1 < args.len() {
+        if args[i] == flag && i + 1 < args.len() {
             let url = args[i + 1].clone();
             let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
                 if let Ok(port) = args[i + 2].parse::<u16>() {
@@ -41,14 +49,22 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
             } else {
                 None
             };
-            prefill_entries.push((url, bootstrap_port));
+            entries.push((url, bootstrap_port));
             i += 2;
         } else {
             i += 1;
         }
     }
 
-    prefill_entries
+    entries
+}
+
+fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+    parse_url_port_args("--prefill")
+}
+
+fn parse_encode_args() -> Vec<(String, Option<u16>)> {
+    parse_url_port_args("--encode")
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -132,6 +148,12 @@ enum Commands {
     },
 }
 
+/// Parse the `--multimodal-tensor-transport` value into a `TransportMode`.
+fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
+    TransportMode::parse(value)
+        .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
@@ -143,13 +165,26 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000, help_heading = "Worker Configuration")]
     port: u16,
 
+    /// Dedicated port for liveness/readiness/health probes (Kubernetes,
+    /// load balancers, uptime monitors, etc.).
+    ///
+    /// When set, `/liveness`, `/readiness`, and `/health` are additionally
+    /// served on this port by a middleware-free router running on its own
+    /// single-worker runtime and OS thread, isolated from the request
+    /// runtime so a saturated gateway cannot starve probes (and trigger the
+    /// failed-probe restarts or depooling that follow) under load. The same
+    /// probe routes always remain available on the main `--port` too.
+    /// Unset = dedicated probe listener off.
+    #[arg(long, help_heading = "Worker Configuration")]
+    health_check_port: Option<u16>,
+
     /// List of worker URLs (supports IPv4 and IPv6)
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "size_aware_power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "size_aware_power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Gateway-wide output estimate for size-aware power-of-two routing
@@ -167,6 +202,20 @@ struct CliArgs {
     /// Relative threshold for load balancing trigger
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
+
+    /// Cache-aware KV-usage spread (hottest minus coldest backend, 0.0-1.0)
+    /// above which cache affinity is abandoned for shortest-queue, even if
+    /// request counts look balanced (catches long-context KV imbalance). Backend
+    /// must report token_usage. >= 1.0 disables it.
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    balance_token_usage_threshold: f32,
+
+    /// Cache-aware KV-utilization ceiling (0.0-1.0): when the hottest backend
+    /// exceeds it, shed load off that engine regardless of spread. A safety
+    /// valve for critically-saturated engines, best set high (e.g. 0.9).
+    /// >= 1.0 disables it.
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    overload_token_usage_threshold: f32,
 
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -200,9 +249,28 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
+    /// KV-pressure weight (seconds) for the least_load policy
+    #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
+    least_load_kv_pressure_weight: f64,
+
+    /// Fallback generation throughput (tokens/s) for least_load when a backend
+    /// reports no live throughput
+    #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
+    least_load_default_throughput: f64,
+
+    /// Mean prefill tokens for least_load's in-flight estimate when a request's
+    /// token count is unknown at routing
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    least_load_mean_prefill_tokens: u32,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
+
+    /// Honor X-SMG-Routing-Key for sticky routing on any policy (reuses the
+    /// manual eviction/idle/assignment knobs for the sticky map)
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    routing_key_override: bool,
 
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -217,17 +285,27 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
+    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC + TokenSpeed only).
+    /// Encode workers run the vision tower and ship embeddings to prefill over Mooncake;
+    /// prefill/decode reuse the PD path. Encode urls are given via `--encode <url> [bootstrap_port]`.
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    epd_disaggregation: bool,
+
     /// Decode server URLs (can be specified multiple times)
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
+
+    /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
+    #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
+    encode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -240,6 +318,22 @@ struct CliArgs {
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
+
+    /// Re-export engine GetLoads signals (incl. PD) as smg_engine_* Prometheus
+    /// gauges, polling even without a load-aware routing policy.
+    #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
+    engine_metrics: bool,
+
+    /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
+    /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
+    /// per-worker `WorkerSpec.multimodal_tensor_transport` overrides this.
+    #[arg(long, value_parser = parse_transport_mode, help_heading = "Multimodal")]
+    multimodal_tensor_transport: Option<TransportMode>,
+
+    /// Minimum multimodal tensor size (bytes) before the SHM transport is used.
+    /// Overridable per worker via `WorkerSpec.multimodal_shm_min_bytes`.
+    #[arg(long, help_heading = "Multimodal")]
+    multimodal_shm_min_bytes: Option<usize>,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -265,6 +359,10 @@ struct CliArgs {
     /// Kubernetes namespace to watch for pods
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_namespace: Option<String>,
+
+    /// Label selector for encode server pods in EPD mode
+    #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
+    encode_selector: Vec<String>,
 
     /// Label selector for prefill server pods in PD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -318,6 +416,18 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     storage_context_headers: Vec<String>,
 
+    /// Trust an upstream-provided tenant header for canonical tenant resolution.
+    #[arg(long, default_value_t = false, help_heading = "Request Handling")]
+    trust_tenant_header: bool,
+
+    /// Header name to use when --trust-tenant-header is enabled.
+    #[arg(
+        long,
+        default_value = "x-smg-tenant-id",
+        help_heading = "Request Handling"
+    )]
+    tenant_header_name: String,
+
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
@@ -347,9 +457,44 @@ struct CliArgs {
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 
+    // ==================== Priority Scheduler ====================
+    /// Enable the priority-aware admission scheduler. When unset (default),
+    /// the legacy concurrency-limit middleware stays wired.
+    #[arg(long, help_heading = "Priority Scheduler")]
+    priority_scheduler_enabled: bool,
+
+    /// Max priority class for tenants not listed in the scheduler YAML
+    /// (system | interactive | default | bulk).
+    #[arg(long, default_value = "default", help_heading = "Priority Scheduler")]
+    priority_scheduler_default_max_class: String,
+
+    /// Optional path to the priority-scheduler YAML config.
+    #[arg(long, help_heading = "Priority Scheduler")]
+    priority_scheduler_config: Option<String>,
+
+    /// Cap on per-tenant scheduler metric label cardinality (top-N + "other").
+    #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
+    priority_scheduler_tenant_metric_top_n: u32,
+
+    // ==================== Tenant Rate Limit ====================
+    /// Enable per-tenant LLM token/request rate limiting. When unset
+    /// (default), no rate limiter is constructed.
+    #[arg(long, help_heading = "Tenant Rate Limit")]
+    tenant_rate_limit_enabled: bool,
+
+    /// Path to the tenant-rate-limit YAML. Required when
+    /// `--tenant-rate-limit-enabled` is set.
+    #[arg(long, help_heading = "Tenant Rate Limit")]
+    tenant_rate_limit_config: Option<String>,
+
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
+
+    /// Cluster-wide request ceiling per second. Requires mesh and must be
+    /// configured identically on every gateway.
+    #[arg(long, help_heading = "Rate Limiting")]
+    global_rate_limit_requests_per_second: Option<u64>,
 
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
@@ -425,6 +570,14 @@ struct CliArgs {
     /// Remove workers from the registry when they are marked unhealthy
     #[arg(long, default_value_t = false, help_heading = "Health Checks")]
     remove_unhealthy_workers: bool,
+
+    /// Seconds to keep a Ready worker in `Draining` before removing it from
+    /// the registry. Applies to all RemoveWorker submissions (K8s deletion,
+    /// `--remove-unhealthy-workers`, manual API). Per-worker overrides are
+    /// supported via `WorkerSpec::health.drain_settle_secs`. Set to `0` to
+    /// remove immediately without draining.
+    #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
+    drain_settle_secs: u64,
 
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID or local path)
@@ -588,6 +741,12 @@ struct CliArgs {
     #[arg(long, help_heading = "Control Plane Authentication")]
     api_key: Option<String>,
 
+    /// Per-tenant API keys for serving-path auth (format: tenant_id:key,
+    /// repeatable). Layers on top of `--api-key`, each resolving to its own
+    /// tenant identity.
+    #[arg(long = "tenant-api-key", action = ArgAction::Append, help_heading = "Data Plane Authentication")]
+    tenant_api_keys: Vec<String>,
+
     /// JWT issuer URL for OIDC authentication
     #[arg(
         long,
@@ -668,9 +827,16 @@ struct CliArgs {
     /// STUN server for ICE candidate gathering (host:port).
     /// Set to your own STUN server for enterprise deployments that
     /// restrict outbound traffic to external STUN servers.
-    /// Defaults to `stun.l.google.com:19302` at runtime when omitted.
+    /// Defaults to `stun.l.google.com:19302`. Set to "none" to disable.
     #[arg(long, help_heading = "WebRTC")]
     webrtc_stun_server: Option<String>,
+
+    // ==================== Runtime ====================
+    /// Explicit async runtime worker-thread count. Leave unset to use tokio's
+    /// default (`available_parallelism()`), which already honors the cgroup CPU
+    /// quota on Rust 1.95+ and is therefore container-aware.
+    #[arg(long, help_heading = "Runtime")]
+    runtime_worker_threads: Option<usize>,
 }
 
 enum OracleConnectSource {
@@ -741,6 +907,27 @@ fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
     };
 
     Some(ApiKeyEntry::new(id, name, key, role))
+}
+
+/// Parse a tenant-scoped data-plane API key from CLI format "tenant_id:key".
+/// Only checks for the ':' separator; non-empty/duplicate checks live in
+/// `ConfigValidator::validate_tenant_api_keys` so they also cover
+/// `TenantApiKeyEntry` values from a config file or language binding. Fails
+/// hard (an empty `AuthConfig` disables auth entirely, not just narrows it)
+/// and never echoes `key_str`, which may be the plaintext credential.
+fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {
+    let Some((tenant_id, key)) = key_str.split_once(':') else {
+        return Err(ConfigError::InvalidValue {
+            field: "tenant-api-key".to_string(),
+            value: "<redacted>".to_string(),
+            reason: "expected 'tenant_id:key' (missing ':' separator)".to_string(),
+        });
+    };
+
+    Ok(TenantApiKeyEntry {
+        tenant_id: tenant_id.trim().to_string(),
+        key: key.trim().to_string(),
+    })
 }
 
 impl CliArgs {
@@ -830,6 +1017,7 @@ impl CliArgs {
         }
 
         let self_name = if let Some(name) = &self.mesh_server_name {
+            validate_mesh_server_name(name)?;
             name.to_string()
         } else {
             let mut rng = rand::rng();
@@ -878,14 +1066,11 @@ impl CliArgs {
         }))
     }
 
-    #[expect(
-        clippy::panic,
-        reason = "unreachable: clap value_parser restricts valid assignment modes"
-    )]
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
+            "passthrough" => PolicyConfig::Passthrough,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
@@ -894,6 +1079,8 @@ impl CliArgs {
                 max_tree_size: self.max_tree_size,
                 block_size: self.block_size,
                 engine_load: self.cache_aware_engine_load,
+                balance_token_usage_threshold: self.balance_token_usage_threshold,
+                overload_token_usage_threshold: self.overload_token_usage_threshold,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -901,21 +1088,41 @@ impl CliArgs {
             "size_aware_power_of_two" => PolicyConfig::SizeAwarePowerOfTwo {
                 output_token_estimate: self.output_token_estimate,
             },
+            "least_load" => PolicyConfig::LeastLoad {
+                load_check_interval_secs: 5,
+                kv_pressure_weight: self.least_load_kv_pressure_weight,
+                mean_prefill_tokens: self.least_load_mean_prefill_tokens,
+                default_throughput: self.least_load_default_throughput,
+            },
+            "bucket" => PolicyConfig::Bucket {
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                bucket_adjust_interval_secs: 5,
+            },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
             },
+            "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: match self.assignment_mode.as_str() {
-                    "random" => ManualAssignmentMode::Random,
-                    "min_load" => ManualAssignmentMode::MinLoad,
-                    "min_group" => ManualAssignmentMode::MinGroup,
-                    other => panic!("Unknown assignment mode: {other}"),
-                },
+                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
             },
             _ => PolicyConfig::RoundRobin,
+        }
+    }
+
+    #[expect(
+        clippy::panic,
+        reason = "unreachable: clap value_parser restricts valid assignment modes"
+    )]
+    fn parse_assignment_mode(mode: &str) -> ManualAssignmentMode {
+        match mode {
+            "random" => ManualAssignmentMode::Random,
+            "min_load" => ManualAssignmentMode::MinLoad,
+            "min_group" => ManualAssignmentMode::MinGroup,
+            other => panic!("Unknown assignment mode: {other}"),
         }
     }
 
@@ -1067,6 +1274,7 @@ impl CliArgs {
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
@@ -1081,6 +1289,15 @@ impl CliArgs {
         } else if matches!(self.backend, Some(Backend::Gemini)) {
             RoutingMode::Gemini {
                 worker_urls: self.worker_urls.clone(),
+            }
+        } else if self.epd_disaggregation {
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls: self.decode.clone(),
+                encode_policy: self.encode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
@@ -1104,6 +1321,7 @@ impl CliArgs {
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
                 selector: Self::parse_selector(&self.selector),
+                encode_selector: Self::parse_selector(&self.encode_selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -1140,6 +1358,17 @@ impl CliArgs {
                 }
                 all_urls.extend(decode_urls.clone());
             }
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                ..
+            } => {
+                for (url, _) in encode_urls.iter().chain(prefill_urls.iter()) {
+                    all_urls.push(url.clone());
+                }
+                all_urls.extend(decode_urls.clone());
+            }
             RoutingMode::OpenAI { worker_urls } => {
                 all_urls.extend(worker_urls.clone());
             }
@@ -1162,6 +1391,12 @@ impl CliArgs {
 
         let schema = self.load_schema_config()?;
 
+        let tenant_api_keys = self
+            .tenant_api_keys
+            .iter()
+            .map(|k| parse_tenant_api_key(k))
+            .collect::<ConfigResult<Vec<_>>>()?;
+
         let (oracle, postgres, redis) = match history_backend {
             HistoryBackend::Oracle => (Some(self.build_oracle_config(schema)?), None, None),
             HistoryBackend::Postgres => (None, Some(self.build_postgres_config(schema)?), None),
@@ -1175,14 +1410,25 @@ impl CliArgs {
             .connection_mode(connection_mode)
             .host(&self.host)
             .port(self.port)
+            .health_check_port(self.health_check_port)
+            .runtime_worker_threads(self.runtime_worker_threads)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .engine_metrics(self.engine_metrics)
+            .multimodal_tensor_transport(self.multimodal_tensor_transport)
+            .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .priority_scheduler_enabled(self.priority_scheduler_enabled)
+            .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
+            .priority_scheduler_config(self.priority_scheduler_config.clone())
+            .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
+            .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -1205,6 +1451,7 @@ impl CliArgs {
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: self.remove_unhealthy_workers,
+                drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
@@ -1216,6 +1463,7 @@ impl CliArgs {
             .history_backend(history_backend)
             .log_level(&self.log_level)
             .maybe_api_key(self.api_key.as_ref())
+            .tenant_api_keys(tenant_api_keys)
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
@@ -1227,7 +1475,10 @@ impl CliArgs {
                 (!self.storage_context_headers.is_empty())
                     .then(|| Self::parse_selector(&self.storage_context_headers)),
             )
+            .trust_tenant_header(self.trust_tenant_header)
+            .tenant_header_name(&self.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .maybe_global_rate_limit_requests_per_second(self.global_rate_limit_requests_per_second)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1238,6 +1489,12 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .routing_key_override(RoutingKeyOverrideConfig {
+                enabled: self.routing_key_override,
+                eviction_interval_secs: self.eviction_interval,
+                max_idle_secs: self.max_idle_secs,
+                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+            })
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
@@ -1287,7 +1544,8 @@ impl CliArgs {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                pd_mode: self.pd_disaggregation,
+                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
+                encode_selector: Self::parse_selector(&self.encode_selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -1325,6 +1583,8 @@ impl CliArgs {
         Ok(ServerConfig {
             host: self.host.clone(),
             port: self.port,
+            health_check_port: self.health_check_port,
+            runtime_worker_threads: self.runtime_worker_threads,
             router_config,
             max_payload_size: self.max_payload_size,
             log_dir: self.log_dir.clone(),
@@ -1366,13 +1626,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let prefill_urls = parse_prefill_args();
+    let encode_urls = parse_encode_args();
 
     let mut filtered_args: Vec<String> = Vec::new();
     let raw_args: Vec<String> = std::env::args().collect();
     let mut i = 0;
 
     while i < raw_args.len() {
-        if raw_args[i] == "--prefill" && i + 1 < raw_args.len() {
+        if (raw_args[i] == "--prefill" || raw_args[i] == "--encode") && i + 1 < raw_args.len() {
             i += 2;
             if i < raw_args.len()
                 && !raw_args[i].starts_with("--")
@@ -1406,6 +1667,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "OpenAI Backend".to_string()
     } else if matches!(cli_args.backend, Some(Backend::Anthropic)) {
         "Anthropic Backend".to_string()
+    } else if cli_args.epd_disaggregation {
+        "EPD Disaggregated".to_string()
     } else if cli_args.pd_disaggregation {
         "PD Disaggregated".to_string()
     } else if let Some(backend) = &cli_args.backend {
@@ -1423,16 +1686,197 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Prefill nodes: {prefill_urls:?}");
             println!("Decode nodes: {:?}", cli_args.decode);
         }
+
+        if cli_args.epd_disaggregation {
+            println!("Encode nodes: {encode_urls:?}");
+            println!("Prefill nodes: {prefill_urls:?}");
+            println!("Decode nodes: {:?}", cli_args.decode);
+        }
     }
 
-    let router_config = cli_args.to_router_config(prefill_urls)?;
+    let router_config = cli_args.to_router_config(prefill_urls, encode_urls)?;
     router_config.validate()?;
 
     let server_config = cli_args.to_server_config(router_config)?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move { server::startup(server_config).await })?;
+    // tokio's default worker-thread count is `available_parallelism()`, which on
+    // Rust 1.95+ already honors the cgroup CPU quota, so the default is
+    // container-aware. Only build the runtime explicitly when an operator pins a
+    // worker-thread count.
+    let runtime = match server_config.runtime_worker_threads {
+        Some(n) => {
+            info!(
+                worker_threads = n,
+                "Sizing tokio runtime (explicit override)"
+            );
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(n)
+                .enable_all()
+                .build()?
+        }
+        None => {
+            info!("Sizing tokio runtime (default, container-aware)");
+            tokio::runtime::Runtime::new()?
+        }
+    };
+    runtime.block_on(Box::pin(server::startup(server_config)))?;
     if is_otel_enabled() {
         shutdown_otel();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse top-level CLI args into the flattened `CliArgs` the binary uses.
+    fn cli_args_from(args: &[&str]) -> CliArgs {
+        let argv: Vec<String> = std::iter::once("smg".to_string())
+            .chain(args.iter().map(|s| (*s).to_string()))
+            .collect();
+        Cli::parse_from(argv).router_args
+    }
+
+    /// `--health-check-port` must flow into BOTH conversion paths
+    /// (`to_router_config` and `to_server_config`), mirroring the main
+    /// listener `--port` field exactly. This is the two-path config-plumbing
+    /// guard: wiring only one path would let the flag be silently ignored on
+    /// the other.
+    #[test]
+    fn health_check_port_flows_into_both_configs() {
+        let cli = cli_args_from(&["--health-check-port", "8081"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.health_check_port,
+            Some(8081),
+            "health_check_port must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.health_check_port,
+            Some(8081),
+            "health_check_port must reach ServerConfig via to_server_config"
+        );
+    }
+
+    /// Unset `--health-check-port` means the dedicated probe listener is off:
+    /// `None` propagates through both conversions (backward-compatible default).
+    #[test]
+    fn health_check_port_defaults_to_none_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.health_check_port, None);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.health_check_port, None);
+    }
+
+    /// `--engine-metrics` must flow into `RouterConfig` and survive nesting
+    /// into `ServerConfig.router_config` — the consumer (load monitor) reads it
+    /// off `RouterConfig`. Two-path config-plumbing guard.
+    #[test]
+    fn engine_metrics_flows_into_both_configs() {
+        let cli = cli_args_from(&["--engine-metrics"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.engine_metrics,
+            "engine_metrics must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.engine_metrics,
+            "engine_metrics must survive into ServerConfig via to_server_config"
+        );
+    }
+
+    /// The multimodal transport flags must reach both `RouterConfig` and the
+    /// wrapped `ServerConfig.router_config`. Two-path config-plumbing guard.
+    #[test]
+    fn multimodal_transport_flows_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--multimodal-tensor-transport",
+            "shm",
+            "--multimodal-shm-min-bytes",
+            "1024",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.multimodal_tensor_transport,
+            Some(TransportMode::Shm),
+            "transport mode must reach RouterConfig via to_router_config"
+        );
+        assert_eq!(router_config.multimodal_shm_min_bytes, Some(1024));
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.multimodal_tensor_transport,
+            Some(TransportMode::Shm),
+            "transport mode must survive into ServerConfig via to_server_config"
+        );
+        assert_eq!(
+            server_config.router_config.multimodal_shm_min_bytes,
+            Some(1024)
+        );
+    }
+
+    /// Default is off: the flag stays false through both conversions so
+    /// existing deployments keep the routing-gated polling behavior.
+    #[test]
+    fn engine_metrics_defaults_to_false_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.engine_metrics);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.engine_metrics);
+    }
+
+    /// clap rejects out-of-range probe ports at parse time (the `u16`
+    /// value_parser), matching `--port` validation — no runtime crash.
+    #[test]
+    fn health_check_port_out_of_range_is_rejected_at_parse_time() {
+        let argv = ["smg", "--health-check-port", "70000"];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "a port above u16::MAX must fail clap parsing"
+        );
+    }
+
+    /// The `--runtime-worker-threads` override must flow into BOTH conversion
+    /// paths (`to_router_config` and `to_server_config`); wiring only one path
+    /// would let the flag be silently ignored on the other (the two-path footgun).
+    #[test]
+    fn runtime_worker_threads_flows_into_both_configs() {
+        let cli = cli_args_from(&["--runtime-worker-threads", "3"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.runtime_worker_threads, Some(3));
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.runtime_worker_threads,
+            Some(3),
+            "runtime_worker_threads must reach ServerConfig via to_server_config"
+        );
+    }
+
+    /// Unset, the flag propagates as `None` through both conversions, so the
+    /// runtime uses tokio's container-aware default.
+    #[test]
+    fn runtime_worker_threads_default_to_none_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.runtime_worker_threads, None);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.runtime_worker_threads, None);
+    }
 }

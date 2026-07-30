@@ -184,18 +184,18 @@
   </g>
   <g>
     <rect x="485" y="200" width="70" height="45" rx="6" fill="#334155" stroke="#10b981" stroke-width="1"/>
-    <text x="520" y="220" text-anchor="middle" class="sublabel" font-size="9">XGrammar</text>
-    <text x="520" y="233" text-anchor="middle" class="small">Generate</text>
+    <text x="520" y="220" text-anchor="middle" class="sublabel" font-size="9">Chat</text>
+    <text x="520" y="233" text-anchor="middle" class="small">Template</text>
   </g>
   <g>
     <rect x="570" y="200" width="70" height="45" rx="6" fill="#334155" stroke="#10b981" stroke-width="1"/>
-    <text x="605" y="220" text-anchor="middle" class="sublabel" font-size="9">Chat</text>
-    <text x="605" y="233" text-anchor="middle" class="small">Template</text>
+    <text x="605" y="220" text-anchor="middle" class="sublabel" font-size="9">Tokenize</text>
+    <text x="605" y="233" text-anchor="middle" class="small">+ Cache</text>
   </g>
   <g>
     <rect x="655" y="200" width="70" height="45" rx="6" fill="#334155" stroke="#10b981" stroke-width="1"/>
-    <text x="690" y="220" text-anchor="middle" class="sublabel" font-size="9">Tokenize</text>
-    <text x="690" y="233" text-anchor="middle" class="small">+ Cache</text>
+    <text x="690" y="220" text-anchor="middle" class="sublabel" font-size="9">XGrammar</text>
+    <text x="690" y="233" text-anchor="middle" class="small">Generate</text>
   </g>
   <g>
     <rect x="740" y="200" width="65" height="45" rx="6" fill="#334155" stroke="#f59e0b" stroke-width="1"/>
@@ -205,8 +205,8 @@
   <g>
     <rect x="820" y="195" width="90" height="55" rx="6" fill="#334155" stroke="#8b5cf6" stroke-width="1.5"/>
     <text x="865" y="215" text-anchor="middle" class="sublabel" font-size="9">gRPC Backend</text>
-    <text x="865" y="230" text-anchor="middle" class="tiny">SGLang • vLLM</text>
-    <text x="865" y="242" text-anchor="middle" class="tiny">TensorRT-LLM</text>
+    <text x="865" y="230" text-anchor="middle" class="tiny">vLLM • TRT-LLM</text>
+    <text x="865" y="242" text-anchor="middle" class="tiny">SGLang</text>
   </g>
   <g>
     <rect x="925" y="200" width="70" height="45" rx="6" fill="#334155" stroke="#10b981" stroke-width="1"/>
@@ -269,8 +269,8 @@
   <g>
     <rect x="760" y="340" width="90" height="55" rx="6" fill="#334155" stroke="#8b5cf6" stroke-width="1.5"/>
     <text x="805" y="360" text-anchor="middle" class="sublabel" font-size="9">HTTP Backend</text>
-    <text x="805" y="375" text-anchor="middle" class="tiny">SGLang • vLLM</text>
-    <text x="805" y="387" text-anchor="middle" class="tiny">TensorRT-LLM</text>
+    <text x="805" y="375" text-anchor="middle" class="tiny">vLLM • TRT-LLM</text>
+    <text x="805" y="387" text-anchor="middle" class="tiny">SGLang</text>
   </g>
   <!-- HTTP arrows -->
   <path d="M470 355 L490 350" stroke="#475569" stroke-width="1.5" fill="none"/>

@@ -3,14 +3,12 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
-use uuid::Uuid;
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::{helpers, PipelineStage},
-        context::{ClientSelection, RequestContext},
-        proto_wrapper::ProtoRequest,
+        context::{ClientSelection, ExecutionPlan, ExecutionPlanKind, RequestContext},
     },
 };
 
@@ -19,11 +17,15 @@ use crate::routers::{
 /// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
 pub(crate) struct GenerateRequestBuildingStage {
     inject_pd_metadata: bool,
+    plan_kind: ExecutionPlanKind,
 }
 
 impl GenerateRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool) -> Self {
-        Self { inject_pd_metadata }
+    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
+        Self {
+            inject_pd_metadata,
+            plan_kind,
+        }
     }
 }
 
@@ -51,17 +53,19 @@ impl PipelineStage for GenerateRequestBuildingStage {
 
         let generate_request = ctx.generate_request_arc();
 
-        // Get client for building request (use prefill client if PD mode)
+        // Get client for building request (use prefill client in disaggregated mode)
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
-            ClientSelection::Dual { prefill, .. } => prefill,
+            ClientSelection::Disaggregated { prefill, .. } => prefill,
         };
 
-        // Build generate request
-        let request_id = generate_request
-            .rid
-            .clone()
-            .unwrap_or_else(|| format!("gen-{}", Uuid::now_v7()));
+        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
+        let request_id = helpers::resolve_request_id(
+            &ctx.input.request_type,
+            ctx.input.tenant_request_meta.as_ref(),
+            "gen-",
+            disaggregated,
+        );
 
         // Build proto request using centralized dispatch
         let mut proto_request = builder_client
@@ -76,17 +80,37 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 error::bad_request("build_request_failed", e)
             })?;
 
+        helpers::apply_sampling_defaults_to_generate_request(
+            &mut proto_request,
+            &ctx.input.request_type,
+            ctx.state.workers.as_ref(),
+        );
+
         if self.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {
                 helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
             }
         }
 
-        ctx.state.proto_request = Some(ProtoRequest::Generate(proto_request));
+        // EPD: inject the prefill->decode KV rendezvous for backends that carry it
+        // in the request. No-op unless the selected workers are TokenSpeed EPD.
+        if let Some(workers) = ctx.state.workers.as_ref() {
+            helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
+        }
+
+        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
         Ok(None)
     }
 
     fn name(&self) -> &'static str {
         "GenerateRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        format!(
+            "GenerateRequestBuildingStage(inject_pd_metadata={}, {:?})",
+            self.inject_pd_metadata, self.plan_kind
+        )
     }
 }

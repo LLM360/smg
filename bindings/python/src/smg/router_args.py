@@ -10,15 +10,39 @@ from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_
 logger = logging.getLogger(__name__)
 
 
+COMMON_POLICY_CHOICES = [
+    "random",
+    "round_robin",
+    "passthrough",
+    "cache_aware",
+    "power_of_two",
+    "least_load",
+    "manual",
+    "consistent_hashing",
+    "prefix_hash",
+]
+
+PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
+ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
     worker_urls: list[str] = dataclasses.field(default_factory=list)
     host: str = "0.0.0.0"
     port: int = 30000
+    # Dedicated port for liveness/readiness/health probes (k8s, load balancers, monitors), served from an
+    # isolated runtime so probes are not starved by the request runtime.
+    # None = dedicated probe listener off (routes stay on the main port).
+    health_check_port: int | None = None
 
-    # PD-specific configuration
+    # PD/EPD-specific configuration
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
+    encode_urls: list[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
     prefill_urls: list[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -26,6 +50,7 @@ class RouterArgs:
 
     # Routing policy
     policy: str = "cache_aware"
+    encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
     prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
     decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 1800
@@ -35,15 +60,23 @@ class RouterArgs:
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
+    balance_token_usage_threshold: float = 1.0
+    overload_token_usage_threshold: float = 1.0
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     block_size: int = 16
     cache_aware_engine_load: bool = False
+    least_load_kv_pressure_weight: float = 0.15
+    least_load_default_throughput: float = 2000.0
+    least_load_mean_prefill_tokens: int = 1024
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
+    multimodal_tensor_transport: str | None = None
+    multimodal_shm_min_bytes: int | None = None
+    routing_key_override: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: str | None = None
@@ -55,7 +88,8 @@ class RouterArgs:
     selector: dict[str, str] = dataclasses.field(default_factory=dict)
     service_discovery_port: int = 80
     service_discovery_namespace: str | None = None
-    # PD service discovery configuration
+    # PD/EPD service discovery configuration
+    encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     prefill_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -81,6 +115,8 @@ class RouterArgs:
     queue_timeout_secs: int = 60
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: int | None = None
+    # Cluster-wide requests-per-second ceiling. Requires mesh and the same value on every gateway.
+    global_rate_limit_requests_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -121,6 +157,8 @@ class RouterArgs:
     mcp_config_path: str | None = None
     # Backend selection
     backend: str = "sglang"
+    # WASM support
+    enable_wasm: bool = False
     # Storage hooks (WASM)
     storage_hook_wasm_path: str | None = None
     # History backend configuration
@@ -191,7 +229,7 @@ class RouterArgs:
             "Routing Policy", "Load balancing and routing configuration"
         )
         pd_group = parser.add_argument_group(
-            "PD Disaggregation", "Prefill-Decode disaggregated mode settings"
+            "PD/EPD Disaggregation", "Encode-Prefill-Decode and Prefill-Decode settings"
         )
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
@@ -282,37 +320,46 @@ class RouterArgs:
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
             ),
         )
+        worker_group.add_argument(
+            f"--{prefix}health-check-port",
+            type=int,
+            default=RouterArgs.health_check_port,
+            help=(
+                "Dedicated port for liveness/readiness/health probes (Kubernetes, load"
+                " balancers, uptime monitors)."
+                " When set, those routes are also served on this port by an"
+                " isolated runtime so probes are not starved by the request"
+                " runtime. Unset = dedicated probe listener off (routes remain"
+                " available on the main port)."
+            ),
+        )
 
         # Routing policy configuration
         routing_group.add_argument(
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "power_of_two",
-                "size_aware_power_of_two",
-                "manual",
-            ],
+            choices=[*COMMON_POLICY_CHOICES, "size_aware_power_of_two"],
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}encode-policy",
+            type=str,
+            default=None,
+            choices=ENCODE_POLICY_CHOICES,
+            help=(
+                "Specific policy for encode nodes in EPD mode."
+                " If not specified, uses consistent_hashing"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "power_of_two",
-                "manual",
-                "bucket",
-            ],
+            choices=PREFILL_POLICY_CHOICES,
             help=(
                 "Specific policy for prefill nodes in PD mode."
                 " If not specified, uses the main policy"
@@ -322,7 +369,7 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=COMMON_POLICY_CHOICES,
             help=(
                 "Specific policy for decode nodes in PD mode."
                 " If not specified, uses the main policy"
@@ -344,6 +391,30 @@ class RouterArgs:
             help="Cache threshold (0.0-1.0) for cache-aware routing",
         )
         routing_group.add_argument(
+            f"--{prefix}least-load-kv-pressure-weight",
+            type=float,
+            default=RouterArgs.least_load_kv_pressure_weight,
+            help="KV-pressure weight (seconds) for the least_load policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}least-load-default-throughput",
+            type=float,
+            default=RouterArgs.least_load_default_throughput,
+            help=(
+                "Fallback generation throughput (tokens/s) for least_load when a"
+                " backend reports no live throughput"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}least-load-mean-prefill-tokens",
+            type=int,
+            default=RouterArgs.least_load_mean_prefill_tokens,
+            help=(
+                "Mean prefill tokens for least_load's in-flight estimate when a"
+                " request's token count is unknown at routing"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
             type=int,
             default=RouterArgs.balance_abs_threshold,
@@ -359,6 +430,29 @@ class RouterArgs:
             help=(
                 "Relative threshold for load difference. Balancing is triggered if"
                 " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-token-usage-threshold",
+            type=float,
+            default=RouterArgs.balance_token_usage_threshold,
+            help=(
+                "Cache-aware KV-usage SPREAD threshold (0.0-1.0): the hottest minus"
+                " coldest backend KV utilization above which cache affinity is"
+                " abandoned for shortest-queue. Catches long-context KV imbalance that"
+                " in-flight request counts miss, and is invariant to gateway replica"
+                " count. Backend must report token_usage. Defaults to 1.0 (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}overload-token-usage-threshold",
+            type=float,
+            default=RouterArgs.overload_token_usage_threshold,
+            help=(
+                "Cache-aware KV-utilization CEILING (0.0-1.0): when the hottest backend"
+                " exceeds it, shed load off that engine regardless of spread. A safety"
+                " valve for critically-saturated engines, best set high (e.g. 0.9)."
+                " Backend must report token_usage. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -418,6 +512,11 @@ class RouterArgs:
             help="Enable data parallelism aware schedule",
         )
         routing_group.add_argument(
+            f"--{prefix}routing-key-override",
+            action="store_true",
+            help="Honor X-SMG-Routing-Key for sticky routing on any policy",
+        )
+        routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",
             action="store_true",
             help="Enable minimum tokens scheduler for data parallel group",
@@ -428,11 +527,24 @@ class RouterArgs:
             help="Enable IGW (Inference-Gateway) mode for multi-model support",
         )
 
-        # PD-specific arguments
+        # PD/EPD-specific arguments
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}epd-disaggregation",
+            action="store_true",
+            help="Enable EPD (Encode-Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}encode",
+            nargs="+",
+            action="append",
+            help="Encode server URL and optional bootstrap port. Can be specified multiple times. "
+            "Format: --encode URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",
@@ -471,6 +583,21 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+
+        # Multimodal tensor transport
+        parser.add_argument(
+            f"--{prefix}multimodal-tensor-transport",
+            type=str,
+            choices=["inline", "shm", "auto", "rdma"],
+            default=RouterArgs.multimodal_tensor_transport,
+            help="Multimodal tensor transport: inline (default), shm, auto, or rdma (NIXL lane; needs mm-rdma build)",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-shm-min-bytes",
+            type=int,
+            default=RouterArgs.multimodal_shm_min_bytes,
+            help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
         )
 
         # Logging configuration
@@ -521,6 +648,16 @@ class RouterArgs:
             help=(
                 "Kubernetes namespace to watch for pods. If not provided, watches all namespaces"
                 " (requires cluster-wide permissions)"
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}encode-selector",
+            type=str,
+            nargs="+",
+            default={},
+            help=(
+                "Label selector for encode server pods in EPD mode"
+                " (format: key1=value1 key2=value2)"
             ),
         )
         k8s_group.add_argument(
@@ -656,6 +793,15 @@ class RouterArgs:
             help=(
                 "Token bucket refill rate (tokens per second)."
                 " If not set, defaults to max_concurrent_requests"
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}global-rate-limit-requests-per-second",
+            type=int,
+            default=RouterArgs.global_rate_limit_requests_per_second,
+            help=(
+                "Cluster-wide request ceiling per second."
+                " Requires mesh and the same value on every gateway"
             ),
         )
 
@@ -855,6 +1001,12 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "openai", "anthropic"],
             help="Backend runtime to use (default: sglang)",
+        )
+        backend_group.add_argument(
+            f"--{prefix}enable-wasm",
+            action="store_true",
+            default=None,
+            help="Enable WebAssembly (WASM) module support",
         )
         backend_group.add_argument(
             f"--{prefix}storage-hook-wasm-path",
@@ -1172,7 +1324,10 @@ class RouterArgs:
         if f"{prefix}tls_key_path" in cli_args_dict:
             args_dict["server_key_path"] = cli_args_dict[f"{prefix}tls_key_path"]
 
-        # parse special arguments and remove "--prefill" and "--decode" from cli_args_dict
+        # parse special arguments and remove "--encode", "--prefill", and "--decode" from cli_args_dict
+        args_dict["encode_urls"] = cls._parse_encode_urls(
+            cli_args_dict.get(f"{prefix}encode", None)
+        )
         args_dict["prefill_urls"] = cls._parse_prefill_urls(
             cli_args_dict.get(f"{prefix}prefill", None)
         )
@@ -1180,6 +1335,9 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}decode", None)
         )
         args_dict["selector"] = cls._parse_selector(cli_args_dict.get(f"{prefix}selector", None))
+        args_dict["encode_selector"] = cls._parse_selector(
+            cli_args_dict.get(f"{prefix}encode_selector", None)
+        )
         args_dict["prefill_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}prefill_selector", None)
         )
@@ -1209,7 +1367,21 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.global_rate_limit_requests_per_second is not None:
+            if self.global_rate_limit_requests_per_second <= 0:
+                raise ValueError(
+                    "global_rate_limit_requests_per_second must be greater than zero"
+                )
+            if not self.enable_mesh:
+                raise ValueError(
+                    "global_rate_limit_requests_per_second requires enable_mesh=True"
+                )
+
         # Validate configuration based on mode
+        if self.epd_disaggregation:
+            if self.encode_policy:
+                logger.info(f"Using --encode-policy '{self.encode_policy}' for encode nodes.")
+
         if self.pd_disaggregation:
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:
@@ -1281,6 +1453,18 @@ class RouterArgs:
             prefill_urls.append((url, bootstrap_port))
 
         return prefill_urls
+
+    @staticmethod
+    def _parse_encode_urls(encode_list):
+        """Parse encode URLs from --encode arguments.
+
+        Format: --encode URL [BOOTSTRAP_PORT]
+        Example:
+            --encode http://encode1:8080 9000  # With bootstrap port
+            --encode http://encode2:8080 none  # Explicitly no bootstrap port
+            --encode http://encode3:8080       # Defaults to no bootstrap port
+        """
+        return RouterArgs._parse_prefill_urls(encode_list)
 
     @staticmethod
     def _parse_decode_urls(decode_list):

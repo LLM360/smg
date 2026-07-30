@@ -199,6 +199,10 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
 }
@@ -208,6 +212,19 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+pub struct AudioUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+pub struct InputAudio {
+    /// Base64-encoded audio bytes.
+    pub data: String,
+    /// Encoded audio format. The OpenAI Chat API supports `wav` and `mp3`.
+    pub format: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -242,10 +259,21 @@ pub struct JsonSchemaFormat {
 // Streaming
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct StreamOptions {
+    /// Chat Completions / Completions: include usage block at end of stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+
+    /// Chat Completions / Completions: emit a usage chunk with every streamed
+    /// delta instead of only in the final chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous_usage_stats: Option<bool>,
+
+    /// Responses API: add random chars on `obfuscation` field of delta events
+    /// to normalize payload sizes. Defaults to `true` upstream when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -396,11 +424,18 @@ pub struct Tool {
     pub function: Function,
 }
 
+/// Per the OpenAI spec, omitting `parameters` defines a function with an
+/// empty parameter list, so a missing field deserializes to an empty schema.
+fn empty_parameters_schema() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
+    #[serde(default = "empty_parameters_schema")]
     pub parameters: Value, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
@@ -466,42 +501,25 @@ impl<'de> Deserialize<'de> for FunctionCall {
 }
 
 impl schemars::JsonSchema for FunctionCall {
-    fn schema_name() -> String {
-        "FunctionCall".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FunctionCall".into()
     }
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::*;
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         // FunctionCall is either "none", "auto", or {"name": "..."}
-        let string_schema = SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            enum_values: Some(vec!["none".into(), "auto".into()]),
-            ..Default::default()
-        };
-        let object_schema = SchemaObject {
-            instance_type: Some(InstanceType::Object.into()),
-            object: Some(Box::new(ObjectValidation {
-                properties: {
-                    let mut map = schemars::Map::new();
-                    map.insert("name".to_string(), gen.subschema_for::<String>());
-                    map
+        let name_schema = generator.subschema_for::<String>();
+        schemars::json_schema!({
+            "anyOf": [
+                {
+                    "type": "string",
+                    "enum": ["none", "auto"]
                 },
-                required: {
-                    let mut set = std::collections::BTreeSet::new();
-                    set.insert("name".to_string());
-                    set
-                },
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        SchemaObject {
-            subschemas: Some(Box::new(SubschemaValidation {
-                any_of: Some(vec![string_schema.into(), object_schema.into()]),
-                ..Default::default()
-            })),
-            ..Default::default()
-        }
-        .into()
+                {
+                    "type": "object",
+                    "properties": { "name": name_schema },
+                    "required": ["name"]
+                }
+            ]
+        })
     }
 }
 
@@ -715,7 +733,9 @@ pub enum PromptVariableTyped {
     },
 }
 
-/// Image detail level for [`PromptVariableTyped::InputImage`].
+/// Image detail level for [`PromptVariableTyped::ResponseInputImage`] and
+/// [`crate::responses::ResponseContentPart::InputImage`]. Spec allows
+/// `"low" | "high" | "auto" | "original"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Detail {
@@ -723,6 +743,75 @@ pub enum Detail {
     High,
     #[default]
     Auto,
+    Original,
+}
+
+// ============================================================================
+// Responses API: prompt-cache retention & context management
+// ============================================================================
+
+/// Retention policy for prompt-cache entries on the Responses API.
+///
+/// Spec: `prompt_cache_retention: "in-memory" | "24h"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum PromptCacheRetention {
+    #[serde(rename = "in-memory")]
+    InMemory,
+    #[serde(rename = "24h")]
+    Duration24h,
+}
+
+/// A single entry in the Responses API `context_management` array.
+///
+/// Spec: each entry has `type` (currently only `"compaction"`) and an optional
+/// `compact_threshold` token count.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextManagementEntry {
+    #[serde(rename = "type")]
+    pub r#type: ContextManagementType,
+    pub compact_threshold: Option<u32>,
+}
+
+/// Type tag for [`ContextManagementEntry`]. Currently only `compaction` is
+/// defined by the spec; the enum is kept small so unknown values serde-fail
+/// (consistent with P5's fail-fast direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagementType {
+    Compaction,
+}
+
+// ============================================================================
+// Responses API: conversation reference
+// ============================================================================
+
+/// Reference to a conversation the response belongs to.
+///
+/// Spec: `conversation: string | ResponseConversationParam { id: string }`.
+/// Variant order matters for `#[serde(untagged)]`: a bare JSON string succeeds
+/// as `Id`; an object falls through to `Object`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ConversationRef {
+    Id(String),
+    Object { id: String },
+}
+
+impl ConversationRef {
+    /// Return the underlying conversation id regardless of the wire shape.
+    pub fn as_id(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::Object { id } => id.as_str(),
+        }
+    }
+
+    /// `true` when the underlying conversation id is the empty string.
+    /// Mirrors `String::is_empty` for callers that previously treated
+    /// `Option<String>` empty values as "unset".
+    pub fn is_empty(&self) -> bool {
+        self.as_id().is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -756,5 +845,83 @@ mod tests {
     fn test_deserialize_null_as_false_rejects_non_bool() {
         let result = serde_json::from_value::<NullableBoolTest>(json!({"field": "yes"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn content_part_deserializes_audio_url() {
+        let value = json!({
+            "type": "audio_url",
+            "audio_url": {
+                "url": "https://example.com/audio.wav"
+            }
+        });
+        let part: ContentPart = serde_json::from_value(value).expect("audio_url content part");
+        assert_eq!(
+            part,
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "https://example.com/audio.wav".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn content_part_round_trips_input_audio() {
+        let value = json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": "UklGRg==",
+                "format": "wav"
+            }
+        });
+        let part: ContentPart =
+            serde_json::from_value(value.clone()).expect("input_audio content part");
+        assert_eq!(
+            part,
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "UklGRg==".to_string(),
+                    format: "wav".to_string(),
+                },
+            }
+        );
+        assert_eq!(serde_json::to_value(part).unwrap(), value);
+    }
+
+    #[test]
+    fn conversation_ref_deserializes_bare_string() {
+        let v = json!("conv_abc");
+        let r: ConversationRef = serde_json::from_value(v).expect("string form");
+        assert!(matches!(r, ConversationRef::Id(ref s) if s == "conv_abc"));
+        assert_eq!(r.as_id(), "conv_abc");
+        // Bare string round-trips back to a JSON string.
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!("conv_abc"));
+    }
+
+    #[test]
+    fn conversation_ref_deserializes_object() {
+        let v = json!({"id": "conv_xyz"});
+        let r: ConversationRef = serde_json::from_value(v).expect("object form");
+        assert!(matches!(r, ConversationRef::Object { ref id } if id == "conv_xyz"));
+        assert_eq!(r.as_id(), "conv_xyz");
+        // Object round-trips back to an object.
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!({"id": "conv_xyz"}));
+    }
+
+    #[test]
+    fn conversation_ref_is_empty() {
+        assert!(ConversationRef::Id(String::new()).is_empty());
+        assert!(!ConversationRef::Id("conv_1".to_string()).is_empty());
+        assert!(ConversationRef::Object { id: String::new() }.is_empty());
+    }
+
+    #[test]
+    fn function_deserializes_without_parameters() {
+        // Per the OpenAI spec, omitting `parameters` defines a function with
+        // an empty parameter list.
+        let value = json!({"name": "web_search", "description": ""});
+        let function: Function = serde_json::from_value(value).expect("parameterless function");
+        assert_eq!(function.parameters, json!({}));
     }
 }

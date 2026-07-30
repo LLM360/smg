@@ -11,18 +11,8 @@ use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gau
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::Lazy;
 
-// =============================================================================
-// STRING INTERNING
-// =============================================================================
-//
-// Dynamic strings (model_id, worker URLs, paths) are interned to avoid repeated
-// heap allocations. The interner uses Arc<str> which is cheap to clone and
-// allows the metrics crate to store references without repeated allocations.
-//
-// Performance characteristics:
-// - First occurrence: One allocation + DashMap insert
-// - Subsequent occurrences: DashMap lookup + Arc::clone (very cheap)
-// - Memory: Strings are never freed (acceptable for bounded label cardinality)
+// Interned strings are never freed; only intern low-cardinality, server-controlled
+// labels (model IDs, worker URLs, normalized paths), never user-controlled input.
 
 /// Global string interner for metric labels.
 /// Uses DashMap for lock-free concurrent access.
@@ -114,8 +104,6 @@ pub fn method_to_static_str(method: &str) -> &'static str {
         "PATCH" => http_methods::PATCH,
         "HEAD" => http_methods::HEAD,
         "OPTIONS" => http_methods::OPTIONS,
-        // For unknown methods, we return a static "OTHER" to avoid allocation
-        // This is acceptable since unknown methods are rare in practice
         _ => "OTHER",
     }
 }
@@ -166,7 +154,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_responses_total",
-        "Total HTTP responses by status_code and error_code"
+        "Total HTTP responses by path, status_code and error_code"
     );
     describe_gauge!(
         "smg_http_connections_active",
@@ -269,6 +257,33 @@ pub(crate) fn init_metrics() {
         "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
     );
 
+    // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
+    // only component that observes both the prefill and decode legs of a request).
+    describe_histogram!(
+        "smg_pd_prefill_duration_seconds",
+        "Prefill-leg RPC duration by backend_type, model, runtime"
+    );
+    describe_histogram!(
+        "smg_pd_kv_transfer_duration_seconds",
+        "KV-transfer window (prefill drain to decode send) by backend_type, model, runtime (vLLM sequential PD)"
+    );
+    describe_histogram!(
+        "smg_pd_ttft_seconds",
+        "Honest end-to-end TTFT (prefill start to first decode token) by backend_type, model, runtime"
+    );
+    describe_counter!(
+        "smg_pd_kv_connector_mode_total",
+        "KV connector mode decisions by mode (mooncake/nixl/passthrough)"
+    );
+    describe_counter!(
+        "smg_pd_bootstrap_failures_total",
+        "PD bootstrap injection failures"
+    );
+    describe_counter!(
+        "smg_pd_kv_transfer_failures_total",
+        "PD KV-transfer failures (missing connector params at decode handoff)"
+    );
+
     // Layer 3: Worker metrics
     describe_gauge!(
         "smg_worker_pool_size",
@@ -301,6 +316,11 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
+    );
+    describe_counter!(
+        "smg_kv_event_subscription_failures_total",
+        "KV event subscription task failures by worker and reason \
+         (panic, join_error, intern_failed)"
     );
     describe_gauge!(
         "smg_manual_policy_cache_entries",
@@ -341,6 +361,44 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_worker_retry_backoff_seconds",
         "Retry backoff duration by attempt number"
+    );
+
+    // Layer 3: Engine load re-export (from the GetLoads poll loop)
+    describe_gauge!(
+        "smg_engine_running_requests",
+        "Engine-reported running requests by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_waiting_requests",
+        "Engine-reported waiting requests by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_token_usage",
+        "Engine-reported KV token usage ratio (0.0-1.0) by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_gen_throughput",
+        "Engine-reported generation throughput (tokens/s) by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_cache_hit_rate",
+        "Engine-reported prefix cache hit rate (0.0-1.0) by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_pd_kv_transfer_latency_ms",
+        "Engine-reported PD KV transfer latency (ms) by worker, role, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_pd_kv_transfer_speed_gb_s",
+        "Engine-reported PD KV transfer speed (GB/s) by worker, role, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_pd_prefill_queue_reqs",
+        "Engine-reported PD prefill queue depth by worker, role, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_pd_decode_queue_reqs",
+        "Engine-reported PD decode queue depth by worker, role, dp_rank"
     );
 
     // Layer 4: Discovery metrics
@@ -391,8 +449,30 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 
+    // Multimodal tensor transport (shm vs inline), labeled by runtime.
+    describe_counter!(
+        "smg_mm_tensors_total",
+        "Multimodal tensors sent, by runtime and transport path (shm/inline)"
+    );
+    describe_counter!(
+        "smg_mm_tensor_bytes_total",
+        "Multimodal tensor bytes sent, by runtime and transport path (shm/inline)"
+    );
+    describe_counter!(
+        "smg_mm_shm_write_failures_total",
+        "SHM tensor write attempts that failed and fell back to inline, by runtime"
+    );
+
+    // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
+    super::runtime_metrics::describe();
+
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
+
+    // Priority scheduler metrics (no-op at scrape time unless the scheduler
+    // is enabled and recording).
+    use crate::middleware::scheduler::metrics as scheduler_metrics;
+    scheduler_metrics::describe();
 }
 
 #[expect(
@@ -411,10 +491,33 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         ]
     });
 
+    // The event-loop canary needs its own buckets: its name does not end in
+    // `duration_seconds`, and the request-latency buckets above are far too
+    // coarse for 0-1s wake drift. Without explicit buckets the recorder would
+    // render it as a summary.
+    let canary_matcher = Matcher::Full(super::runtime_metrics::EVENT_LOOP_DELAY_SECONDS.into());
+
+    // TTFT and TPOT (per-request mean inter-token latency) end in `_seconds`
+    // but NOT `duration_seconds`, so without explicit buckets the recorder
+    // renders them as summaries (quantile lines only) — not heatmap-able. Reuse
+    // the request-latency buckets: they span 0.001-7200s, fine for both the
+    // sub-second-to-seconds TTFT and the tens-of-ms TPOT.
+    let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
+    let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
+
     PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(ttft_matcher, &duration_bucket)
+        .expect("failed to set ttft bucket")
+        .set_buckets_for_metric(tpot_matcher, &duration_bucket)
+        .expect("failed to set tpot bucket")
+        .set_buckets_for_metric(
+            canary_matcher,
+            super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
+        )
+        .expect("failed to set event loop delay buckets")
         .install_recorder()
         .expect("failed to install Prometheus recorder")
 }
@@ -449,6 +552,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_REALTIME_SESSIONS: &str = "realtime_sessions";
     pub const ENDPOINT_REALTIME_CLIENT_SECRETS: &str = "realtime_client_secrets";
     pub const ENDPOINT_REALTIME_TRANSCRIPTION: &str = "realtime_transcription";
+    pub const ENDPOINT_AUDIO_TRANSCRIPTIONS: &str = "audio_transcriptions";
 
     // Connection modes
     pub const CONNECTION_WEBSOCKET: &str = "websocket";
@@ -458,12 +562,18 @@ pub mod metrics_labels {
     pub const WORKER_REGULAR: &str = "regular";
     pub const WORKER_PREFILL: &str = "prefill";
     pub const WORKER_DECODE: &str = "decode";
+    pub const WORKER_ENCODE: &str = "encode";
     pub const WORKER_HTTP: &str = "http";
     pub const WORKER_GRPC: &str = "grpc";
 
     // Token types
     pub const TOKEN_INPUT: &str = "input";
     pub const TOKEN_OUTPUT: &str = "output";
+
+    // PD KV connector modes (smg_pd_kv_connector_mode_total)
+    pub const KV_CONNECTOR_MOONCAKE: &str = "mooncake";
+    pub const KV_CONNECTOR_NIXL: &str = "nixl";
+    pub const KV_CONNECTOR_PASSTHROUGH: &str = "passthrough";
 
     // Storage types
     pub const STORAGE_RESPONSE: &str = "response";
@@ -575,11 +685,13 @@ impl Metrics {
     }
 
     /// Record HTTP response.
-    pub fn record_http_response(status_code: u16, error_code: &str) {
+    pub fn record_http_response(path: &str, status_code: u16, error_code: &str) {
+        let path_interned = intern_string(path);
         let status_str: Cow<'static, str> = status_code_to_cow(status_code);
         let error_interned = intern_string(error_code);
         counter!(
             "smg_http_responses_total",
+            "path" => path_interned,
             "status_code" => status_str,
             "error_code" => error_interned
         )
@@ -669,6 +781,18 @@ impl Metrics {
     /// Decrement the number of requests waiting for capacity.
     pub fn decrement_http_admission_queued() {
         gauge!("smg_http_admission_queued").decrement(1.0);
+    }
+
+    /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.
+    pub fn record_mm_tensor(runtime: &'static str, path: &'static str, nbytes: usize) {
+        counter!("smg_mm_tensors_total", "runtime" => runtime, "path" => path).increment(1);
+        counter!("smg_mm_tensor_bytes_total", "runtime" => runtime, "path" => path)
+            .increment(nbytes as u64);
+    }
+
+    /// Record a SHM tensor write that failed and fell back to inline, for `runtime`.
+    pub fn record_mm_shm_write_failure(runtime: &'static str) {
+        counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
     }
 
     // ========================================================================
@@ -945,6 +1069,93 @@ impl Metrics {
     }
 
     // ========================================================================
+    // Layer 2: PD disaggregation metrics
+    //
+    // Per-request, engine-agnostic signals that no backend can self-report: SMG
+    // is the only component that sees both the prefill and decode legs. All
+    // durations come from a monotonic clock and are recorded once per request
+    // (never per retry attempt).
+    // ========================================================================
+
+    /// Record prefill-leg RPC duration.
+    /// Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_prefill_duration(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_string(model_id);
+        histogram!(
+            "smg_pd_prefill_duration_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record the KV-transfer window (prefill drain to decode send) for vLLM
+    /// sequential PD. Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_kv_transfer_duration(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_string(model_id);
+        histogram!(
+            "smg_pd_kv_transfer_duration_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record honest end-to-end TTFT: prefill start to first decode token.
+    ///
+    /// INVARIANT: this is the user-facing complement to
+    /// `smg_router_ttft_seconds{backend_type="pd"}`, which measures only the
+    /// decode leg (first decode token minus decode-send). For sequential PD the
+    /// two differ by the prefill + KV-transfer time; both are kept on purpose.
+    /// Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_ttft(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_string(model_id);
+        histogram!(
+            "smg_pd_ttft_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record a KV connector mode decision (mooncake/nixl/passthrough).
+    pub fn record_pd_kv_connector_mode(mode: &'static str) {
+        counter!(
+            "smg_pd_kv_connector_mode_total",
+            "mode" => mode
+        )
+        .increment(1);
+    }
+
+    /// Record a PD bootstrap injection failure.
+    pub fn record_pd_bootstrap_failure() {
+        counter!("smg_pd_bootstrap_failures_total").increment(1);
+    }
+
+    /// Record a PD KV-transfer failure (missing connector params at handoff).
+    pub fn record_pd_kv_transfer_failure() {
+        counter!("smg_pd_kv_transfer_failures_total").increment(1);
+    }
+
+    // ========================================================================
     // Layer 3: Worker metrics
     // ========================================================================
 
@@ -1091,6 +1302,18 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    /// Record a KV event subscription task failure (panic, join error, or
+    /// worker-id intern failure)
+    pub fn record_kv_event_subscription_failure(worker_url: &str, reason: &'static str) {
+        let worker_interned = intern_string(worker_url);
+        counter!(
+            "smg_kv_event_subscription_failures_total",
+            "worker" => worker_interned,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================
@@ -1329,6 +1552,107 @@ impl Metrics {
     }
 
     // ========================================================================
+    // Layer 3: Engine load re-export
+    // ========================================================================
+
+    /// Re-export a worker's `GetLoads` snapshot as `smg_engine_*` gauges.
+    ///
+    /// Core gauges are per DP rank (`dp_rank` bounded by dp_size). PD gauges
+    /// are emitted only for ranks that carry a `disagg` section, labeled by the
+    /// engine-reported role (`prefill`/`decode`/`null`).
+    pub fn record_engine_load(
+        worker_url: &str,
+        model_id: &str,
+        response: &openai_protocol::worker::WorkerLoadResponse,
+    ) {
+        let worker = intern_string(worker_url);
+        let model = intern_string(model_id);
+
+        for load in &response.loads {
+            let dp_rank = intern_string(&load.dp_rank.to_string());
+
+            gauge!(
+                "smg_engine_running_requests",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.num_running_reqs as f64);
+            gauge!(
+                "smg_engine_waiting_requests",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.num_waiting_reqs as f64);
+            gauge!(
+                "smg_engine_token_usage",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.token_usage);
+            gauge!(
+                "smg_engine_gen_throughput",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.gen_throughput);
+            gauge!(
+                "smg_engine_cache_hit_rate",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.cache_hit_rate);
+
+            // PD gauges only when the engine reported a disagg section. Labeled
+            // by dp_rank too, so DP ranks sharing a role don't overwrite.
+            let Some(role) = load.disagg_mode.as_deref() else {
+                continue;
+            };
+            let role = intern_string(role);
+            if let Some(latency) = load.kv_transfer_latency_ms {
+                gauge!(
+                    "smg_engine_pd_kv_transfer_latency_ms",
+                    "worker" => Arc::clone(&worker),
+                    "role" => Arc::clone(&role),
+                    "dp_rank" => Arc::clone(&dp_rank),
+                )
+                .set(latency);
+            }
+            if let Some(speed) = load.kv_transfer_speed_gb_s {
+                gauge!(
+                    "smg_engine_pd_kv_transfer_speed_gb_s",
+                    "worker" => Arc::clone(&worker),
+                    "role" => Arc::clone(&role),
+                    "dp_rank" => Arc::clone(&dp_rank),
+                )
+                .set(speed);
+            }
+            if let Some(reqs) = load.prefill_queue_reqs {
+                gauge!(
+                    "smg_engine_pd_prefill_queue_reqs",
+                    "worker" => Arc::clone(&worker),
+                    "role" => Arc::clone(&role),
+                    "dp_rank" => Arc::clone(&dp_rank),
+                )
+                .set(reqs as f64);
+            }
+            if let Some(reqs) = load.decode_queue_reqs {
+                gauge!(
+                    "smg_engine_pd_decode_queue_reqs",
+                    "worker" => Arc::clone(&worker),
+                    "role" => role,
+                    "dp_rank" => dp_rank,
+                )
+                .set(reqs as f64);
+            }
+        }
+    }
+
+    // ========================================================================
     // Worker cleanup
     // ========================================================================
 
@@ -1345,13 +1669,171 @@ impl Metrics {
         gauge!("smg_worker_cb_state", "worker" => Arc::clone(&worker)).set(-1.0);
         gauge!("smg_worker_health", "worker" => worker).set(-1.0);
     }
+
+    /// Sentinel-out `smg_engine_*` series for a removed worker.
+    ///
+    /// metrics-rs cannot delete series, so per the `remove_worker_metrics`
+    /// convention we set each to -1 (an impossible value for these gauges, whose
+    /// 0 is meaningful) until <https://github.com/metrics-rs/metrics/issues/653>.
+    /// `dp_size` bounds the rank labels; the role label is unknown at teardown,
+    /// so the full `dp_rank` × role (prefill/decode/null) space is cleared. The
+    /// label set must exactly match `record_engine_load` (including `model` and
+    /// `dp_rank`) or a fresh series is created instead of overwriting the live one.
+    pub fn remove_engine_load_metrics(worker_url: &str, model_id: &str, dp_size: usize) {
+        let worker = intern_string(worker_url);
+        let model = intern_string(model_id);
+
+        for rank in 0..dp_size.max(1) {
+            let dp_rank = intern_string(&rank.to_string());
+            for name in [
+                "smg_engine_running_requests",
+                "smg_engine_waiting_requests",
+                "smg_engine_token_usage",
+                "smg_engine_gen_throughput",
+                "smg_engine_cache_hit_rate",
+            ] {
+                gauge!(
+                    name,
+                    "worker" => Arc::clone(&worker),
+                    "model" => Arc::clone(&model),
+                    "dp_rank" => Arc::clone(&dp_rank),
+                )
+                .set(-1.0);
+            }
+
+            // PD gauges are labeled {worker, role, dp_rank}; the role is unknown
+            // at teardown, so clear every role for this rank.
+            for role in ["prefill", "decode", "null"] {
+                for name in [
+                    "smg_engine_pd_kv_transfer_latency_ms",
+                    "smg_engine_pd_kv_transfer_speed_gb_s",
+                    "smg_engine_pd_prefill_queue_reqs",
+                    "smg_engine_pd_decode_queue_reqs",
+                ] {
+                    gauge!(
+                        name,
+                        "worker" => Arc::clone(&worker),
+                        "role" => role,
+                        "dp_rank" => Arc::clone(&dp_rank),
+                    )
+                    .set(-1.0);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
     use super::*;
+
+    /// Run `f` under a thread-local Prometheus recorder and return the
+    /// rendered `/metrics` text — the same scrape output the :29000 endpoint
+    /// serves in production.
+    fn render_with_recorder(f: impl FnOnce()) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    /// Core engine gauges share these labels for the snapshot fixtures.
+    const CORE_LABELS: [&str; 3] = ["dp_rank=\"2\"", "model=\"m\"", "worker=\"http://w:1\""];
+
+    /// Assert the rendered scrape has a line for `name` carrying every label in
+    /// `labels` and ending in `value`. Label order is exporter-defined, so this
+    /// matches on substrings rather than a fixed label set.
+    fn assert_metric(rendered: &str, name: &str, labels: &[&str], value: &str) {
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with(&format!("{name}{{")))
+            .unwrap_or_else(|| panic!("metric {name} missing; rendered:\n{rendered}"));
+        for label in labels {
+            assert!(line.contains(label), "{name} missing label {label}: {line}");
+        }
+        assert!(
+            line.ends_with(&format!(" {value}")),
+            "{name} expected value {value}: {line}"
+        );
+    }
+
+    #[test]
+    fn record_engine_load_sets_core_gauges_per_dp_rank() {
+        let response = WorkerLoadResponse {
+            timestamp: "t".to_string(),
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 2,
+                num_running_reqs: 7,
+                num_waiting_reqs: 3,
+                token_usage: 0.5,
+                gen_throughput: 42.0,
+                cache_hit_rate: 0.25,
+                ..Default::default()
+            }],
+        };
+
+        let rendered = render_with_recorder(|| {
+            Metrics::record_engine_load("http://w:1", "m", &response);
+        });
+
+        // The exporter renders labels in insertion order, so assert on the
+        // metric line's components rather than a fixed label ordering.
+        assert_metric(&rendered, "smg_engine_running_requests", &CORE_LABELS, "7");
+        assert_metric(&rendered, "smg_engine_waiting_requests", &CORE_LABELS, "3");
+        assert_metric(&rendered, "smg_engine_gen_throughput", &CORE_LABELS, "42");
+        // PD gauges absent when no disagg section was reported.
+        assert!(
+            !rendered.contains("smg_engine_pd_"),
+            "PD gauges must not appear without a disagg section; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn record_engine_load_sets_pd_gauges_when_disagg_present() {
+        let response = WorkerLoadResponse {
+            timestamp: "t".to_string(),
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                disagg_mode: Some("prefill".to_string()),
+                kv_transfer_latency_ms: Some(3.5),
+                kv_transfer_speed_gb_s: Some(12.0),
+                prefill_queue_reqs: Some(9),
+                decode_queue_reqs: Some(4),
+                ..Default::default()
+            }],
+        };
+
+        let rendered = render_with_recorder(|| {
+            Metrics::record_engine_load("http://w:1", "m", &response);
+        });
+
+        let pd_labels = ["role=\"prefill\"", "worker=\"http://w:1\"", "dp_rank=\"0\""];
+        assert_metric(
+            &rendered,
+            "smg_engine_pd_kv_transfer_latency_ms",
+            &pd_labels,
+            "3.5",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_pd_prefill_queue_reqs",
+            &pd_labels,
+            "9",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_pd_decode_queue_reqs",
+            &pd_labels,
+            "4",
+        );
+    }
 
     #[test]
     fn test_prometheus_config_default() {
@@ -1666,5 +2148,104 @@ mod tests {
         assert_eq!(method_to_static_str("GET"), "GET");
         assert_eq!(method_to_static_str("POST"), "POST");
         assert_eq!(method_to_static_str("UNKNOWN"), "OTHER");
+    }
+
+    // ========================================================================
+    // PD disaggregation metric tests
+    // ========================================================================
+
+    /// Run `f` with a Prometheus recorder installed thread-locally and return
+    /// the rendered /metrics text. Mirrors the helper in `runtime_metrics`.
+    fn with_test_recorder<T>(f: impl FnOnce() -> T) -> (String, T) {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let result = metrics::with_local_recorder(&recorder, f);
+        (handle.render(), result)
+    }
+
+    #[test]
+    fn test_record_pd_prefill_duration_emits_histogram() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_prefill_duration(
+                metrics_labels::BACKEND_PD,
+                "test-model",
+                "vllm",
+                Duration::from_millis(42),
+            );
+        });
+        assert!(
+            rendered.contains("smg_pd_prefill_duration_seconds_count{")
+                && rendered.contains(r#"backend_type="pd""#)
+                && rendered.contains(r#"model="test-model""#)
+                && rendered.contains(r#"runtime="vllm""#),
+            "prefill duration histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_kv_transfer_duration_emits_histogram() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_kv_transfer_duration(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                Duration::from_millis(7),
+            );
+        });
+        assert!(
+            rendered.contains("smg_pd_kv_transfer_duration_seconds_count"),
+            "kv transfer histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_ttft_emits_histogram() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_ttft(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "sglang",
+                Duration::from_millis(123),
+            );
+        });
+        assert!(
+            rendered.contains("smg_pd_ttft_seconds_count")
+                && rendered.contains(r#"runtime="sglang""#),
+            "pd ttft histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_kv_connector_mode_counts_by_mode() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_kv_connector_mode(metrics_labels::KV_CONNECTOR_MOONCAKE);
+            Metrics::record_pd_kv_connector_mode(metrics_labels::KV_CONNECTOR_MOONCAKE);
+            Metrics::record_pd_kv_connector_mode(metrics_labels::KV_CONNECTOR_NIXL);
+        });
+        assert!(
+            rendered.contains(r#"smg_pd_kv_connector_mode_total{mode="mooncake"} 2"#),
+            "mooncake connector counter wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"smg_pd_kv_connector_mode_total{mode="nixl"} 1"#),
+            "nixl connector counter wrong; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_failure_counters() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_bootstrap_failure();
+            Metrics::record_pd_kv_transfer_failure();
+            Metrics::record_pd_kv_transfer_failure();
+        });
+        assert!(
+            rendered.contains("smg_pd_bootstrap_failures_total 1"),
+            "bootstrap failure counter wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("smg_pd_kv_transfer_failures_total 2"),
+            "kv transfer failure counter wrong; rendered:\n{rendered}"
+        );
     }
 }

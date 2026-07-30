@@ -23,12 +23,14 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
-    GetLoadsReqInput,
-    GetLoadsReqOutput,
+    FlushCacheReqOutput,
+    GetInternalStateReqOutput,
     HealthCheckOutput,
+    ProfileReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_reader
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     calibrate_time_diff,
@@ -183,9 +185,28 @@ class GrpcRequestManager:
         self.context = zmq.asyncio.Context(2)
 
         # Socket for receiving outputs from scheduler
-        self.recv_from_scheduler = get_zmq_socket(
-            self.context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
+        # If skip_tokenizer_init mode, scheduler sends outputs to tokenizer_ipc_name.
+        self.recv_ipc_name = (
+            port_args.tokenizer_ipc_name
+            if server_args.skip_tokenizer_init
+            else port_args.detokenizer_ipc_name
         )
+        self.recv_from_scheduler = get_zmq_socket(
+            self.context, zmq.PULL, self.recv_ipc_name, bind=True
+        )
+
+        # Communicator responses (ProfileReqOutput, FlushCacheReqOutput, ...)
+        # always arrive on tokenizer_ipc_name via the scheduler's
+        # send_to_tokenizer path. In skip_tokenizer_init mode
+        # recv_from_scheduler already binds that endpoint, so generation
+        # outputs and communicator responses share one socket; otherwise a
+        # second socket is needed for communicator responses.
+        if server_args.skip_tokenizer_init:
+            self.recv_from_tokenizer = None
+        else:
+            self.recv_from_tokenizer = get_zmq_socket(
+                self.context, zmq.PULL, port_args.tokenizer_ipc_name, bind=True
+            )
 
         # Socket for sending requests to scheduler
         self.send_to_scheduler = get_zmq_socket(
@@ -216,15 +237,27 @@ class GrpcRequestManager:
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
 
+        # Schedulers publish per-dp-rank LoadSnapshots (SHM; zmq for
+        # multi-node DP). This manager fills sglang's TokenizerManager role.
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            server_args, port_args, caller="TokenizerManager"
+        )
+
         # Communicators for request/response patterns with scheduler
         # Note: These must be initialized after send_to_scheduler socket is created
-        self.get_loads_communicator = _GrpcCommunicator(
+        self.profile_communicator = _GrpcCommunicator(
+            self.send_to_scheduler, fan_out=server_args.dp_size
+        )
+        self.flush_cache_communicator = _GrpcCommunicator(
+            self.send_to_scheduler, fan_out=server_args.dp_size
+        )
+        self.get_internal_state_communicator = _GrpcCommunicator(
             self.send_to_scheduler, fan_out=server_args.dp_size
         )
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
-            f"recv={port_args.detokenizer_ipc_name}, "
+            f"recv={self.recv_ipc_name}, "
             f"send={port_args.scheduler_input_ipc_name}"
         )
         if self.bootstrap_server:
@@ -501,9 +534,10 @@ class GrpcRequestManager:
                     await self._handle_health_check_output(recv_obj)
                 elif isinstance(recv_obj, AbortReq):
                     await self._handle_abort_req(recv_obj)
-                elif isinstance(recv_obj, GetLoadsReqOutput):
-                    # Route to communicator for request/response pattern
-                    self.get_loads_communicator.handle_recv(recv_obj)
+                elif self._dispatch_communicator_output(recv_obj):
+                    # Communicator responses arrive here in skip_tokenizer_init
+                    # mode, where this socket is bound to tokenizer_ipc_name.
+                    pass
                 else:
                     logger.warning(f"Unknown output type: {type(recv_obj)}")
 
@@ -521,6 +555,50 @@ class GrpcRequestManager:
                 break
             except Exception as e:
                 logger.error(f"Handle loop error: {e}\n{get_exception_traceback()}")
+                if self.gracefully_exit:
+                    break
+
+    def _dispatch_communicator_output(self, recv_obj) -> bool:
+        """Route a communicator response from the scheduler to its communicator.
+
+        Returns True when the object was a recognized communicator response.
+        """
+        if isinstance(recv_obj, ProfileReqOutput):
+            self.profile_communicator.handle_recv(recv_obj)
+        elif isinstance(recv_obj, FlushCacheReqOutput):
+            self.flush_cache_communicator.handle_recv(recv_obj)
+        elif isinstance(recv_obj, GetInternalStateReqOutput):
+            self.get_internal_state_communicator.handle_recv(recv_obj)
+        else:
+            return False
+        return True
+
+    async def _handle_tokenizer_loop(self):
+        """Process communicator responses from the scheduler's send_to_tokenizer path.
+
+        The scheduler sends communicator responses (ProfileReqOutput,
+        FlushCacheReqOutput, ...) directly to tokenizer_ipc_name, not through
+        the detokenizer. This loop only runs when recv_from_tokenizer is a
+        dedicated socket — in skip_tokenizer_init mode those responses arrive
+        on recv_from_scheduler and are dispatched by handle_loop instead.
+        """
+        while not self.gracefully_exit:
+            try:
+                recv_obj = await self.recv_from_tokenizer.recv_pyobj()
+                if not self._dispatch_communicator_output(recv_obj):
+                    logger.warning(f"Unknown type on tokenizer socket: {type(recv_obj)}")
+            except zmq.error.Again:
+                if self.gracefully_exit:
+                    break
+                continue
+            except zmq.error.ZMQError as e:
+                if self.gracefully_exit:
+                    logger.debug(f"ZMQ recv interrupted during shutdown: {e}")
+                    break
+                logger.error(f"ZMQ error in tokenizer loop: {e}\n{get_exception_traceback()}")
+                break
+            except Exception as e:
+                logger.error(f"Tokenizer loop error: {e}\n{get_exception_traceback()}")
                 if self.gracefully_exit:
                     break
 
@@ -583,19 +661,25 @@ class GrpcRequestManager:
                 state.time_stats.set_last_time()
 
             # Extract output for this request
+            prompt_tokens = batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
+            completion_tokens = batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
+            cached_tokens = batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
+            reasoning_tokens_list = getattr(batch_out, "reasoning_tokens", None)
+            reasoning_tokens = reasoning_tokens_list[i] if reasoning_tokens_list else 0
+            token_ids = batch_out.output_ids[i] if batch_out.output_ids else []
+            finished = batch_out.finished_reasons[i] is not None
+            finish_reason = batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
+
             output_data = {
                 "request_id": rid,
-                "token_ids": batch_out.output_ids[i] if batch_out.output_ids else [],
-                "finished": batch_out.finished_reasons[i] is not None,
+                "token_ids": token_ids,
+                "finished": finished,
                 "meta_info": {
-                    "prompt_tokens": (batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0),
-                    "completion_tokens": (
-                        batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
-                    ),
-                    "cached_tokens": (batch_out.cached_tokens[i] if batch_out.cached_tokens else 0),
-                    "finish_reason": (
-                        batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
-                    ),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cached_tokens": cached_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "finish_reason": finish_reason,
                 },
             }
 
@@ -854,8 +938,15 @@ class GrpcRequestManager:
             except Exception as e:
                 logger.warning(f"Error shutting down bootstrap server: {e}")
 
+        try:
+            self.load_snapshot_reader.close()
+        except Exception as e:
+            logger.warning(f"Error closing load snapshot reader: {e}")
+
         # Close ZMQ sockets
         self.recv_from_scheduler.close()
+        if self.recv_from_tokenizer is not None:
+            self.recv_from_tokenizer.close()
         self.send_to_scheduler.close()
 
         # Terminate the ZMQ context - this is critical for asyncio loop to exit cleanly
@@ -871,30 +962,81 @@ class GrpcRequestManager:
             "last_receive_time": self.last_receive_tstamp,
         }
 
-    async def get_loads(
-        self, include: list[str], dp_rank: int | None = None
-    ) -> list[GetLoadsReqOutput]:
+    async def get_loads(self, include: list[str], dp_rank: int | None = None) -> list[LoadSnapshot]:
         """
-        Get comprehensive load metrics from the scheduler.
-
-        This method uses the communicator pattern to send GetLoadsReqInput to the
-        scheduler and wait for GetLoadsReqOutput responses.
+        Get load metrics from the schedulers' published LoadSnapshots.
 
         Args:
             include: List of metric sections to include (core, memory, spec, lora, disagg, queues, all)
             dp_rank: Optional DP rank filter (None for all ranks)
 
         Returns:
-            List of GetLoadsReqOutput objects, one per scheduler/DP rank
+            List of LoadSnapshot objects, one per scheduler/DP rank
         """
-        req = GetLoadsReqInput(include=include, dp_rank=dp_rank)
-        results = await self.get_loads_communicator(req)
+        sections = set(include) if include else {"all"}
+        invalid = sections - LoadSnapshot.VALID_SECTIONS
+        if invalid:
+            raise ValueError(
+                f"Invalid include sections: {sorted(invalid)}. "
+                f"Valid options: {sorted(LoadSnapshot.VALID_SECTIONS)}"
+            )
 
-        # Filter by dp_rank if specified
+        snapshots = self.load_snapshot_reader.read_all()
         if dp_rank is not None:
-            results = [r for r in results if r.dp_rank == dp_rank]
+            snapshots = [s for s in snapshots if s.dp_rank == dp_rank]
+        if "all" not in sections:
+            for snapshot in snapshots:
+                if "memory" not in sections:
+                    snapshot.memory = None
+                if "spec" not in sections:
+                    snapshot.speculative = None
+                if "lora" not in sections:
+                    snapshot.lora = None
+                if "disagg" not in sections:
+                    snapshot.disaggregation = None
+                if "queues" not in sections:
+                    snapshot.queues = None
+        return snapshots
 
-        return results
+    # Communicators that callers may address through send_communicator_req.
+    _PUBLIC_COMMUNICATORS = frozenset(
+        {
+            "profile_communicator",
+            "flush_cache_communicator",
+            "get_internal_state_communicator",
+        }
+    )
+
+    async def send_communicator_req(self, req, communicator_name: str, timeout: float = 30.0):
+        """Send a request to the scheduler via a named communicator and return responses.
+
+        This is the generic transport method for request/response patterns that
+        go through the scheduler's send_to_tokenizer path (profile, flush_cache,
+        get_internal_state, ...). Business logic (request construction, response
+        interpretation) belongs in the caller — sglang's HTTP sidecar relies on
+        this exact signature, so treat it as a public contract.
+
+        Args:
+            req: The request object to send to the scheduler.
+            communicator_name: Attribute name of the communicator
+                (e.g. "profile_communicator").
+            timeout: Timeout in seconds for the scheduler round-trip.
+
+        Returns:
+            List of response objects from the scheduler(s), one per DP rank.
+
+        Raises:
+            ValueError: If communicator_name is not a known communicator.
+            TimeoutError: If the scheduler does not respond within timeout.
+        """
+        if communicator_name not in self._PUBLIC_COMMUNICATORS:
+            raise ValueError(
+                f"Unknown communicator '{communicator_name}'. "
+                f"Allowed: {sorted(self._PUBLIC_COMMUNICATORS)}"
+            )
+        self.auto_create_handle_loop()
+        communicator = getattr(self, communicator_name)
+        return await communicator(req, timeout=timeout)
 
     def auto_create_handle_loop(self):
         """Automatically create and start the handle_loop task, matching TokenizerManager pattern."""
@@ -904,6 +1046,10 @@ class GrpcRequestManager:
         self.no_create_loop = True
         loop = get_or_create_event_loop()
         self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.handle_loop)))
+        if self.recv_from_tokenizer is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self._handle_tokenizer_loop))
+            )
 
         self.event_loop = loop
 

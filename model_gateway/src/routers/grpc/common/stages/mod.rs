@@ -24,10 +24,24 @@ pub trait PipelineStage: Send + Sync {
 
     /// Stage name for logging
     fn name(&self) -> &'static str;
+
+    /// Stable descriptor of the stage plus its mode-bearing args, compared
+    /// against golden literals in the pipeline parity test. Stages whose
+    /// construction args vary by mode override this to include them; the default
+    /// emits the short type name (last `::` segment).
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        std::any::type_name::<Self>()
+            .rsplit("::")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
 }
 
 mod client_acquisition;
 mod dispatch_metadata;
+pub(crate) mod encode;
 pub(crate) mod helpers;
 mod request_execution;
 mod worker_selection;
@@ -35,5 +49,6 @@ mod worker_selection;
 // Export stage implementations
 pub(crate) use client_acquisition::ClientAcquisitionStage;
 pub(crate) use dispatch_metadata::DispatchMetadataStage;
-pub(crate) use request_execution::{ExecutionMode, RequestExecutionStage};
+pub(crate) use encode::EncodeStage;
+pub(crate) use request_execution::RequestExecutionStage;
 pub(crate) use worker_selection::{WorkerSelectionMode, WorkerSelectionStage};

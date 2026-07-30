@@ -243,6 +243,14 @@ class TestParameterValidation:
             args = RouterArgs(rate_limit_tokens_per_second=rate)
             assert args.rate_limit_tokens_per_second == rate
 
+    def test_global_rate_limit_requires_mesh(self):
+        args = RouterArgs(global_rate_limit_requests_per_second=100)
+        with pytest.raises(ValueError, match="requires enable_mesh=True"):
+            args._validate_router_args()
+
+        args.enable_mesh = True
+        args._validate_router_args()
+
     def test_tree_size_validation(self):
         """Test tree size parameter validation."""
         # Valid tree sizes (powers of 2)
@@ -324,6 +332,7 @@ class TestConfigurationValidation:
             "cache_aware",
             "power_of_two",
             "size_aware_power_of_two",
+            "least_load",
         ]
 
         for policy in valid_policies:
@@ -333,7 +342,7 @@ class TestConfigurationValidation:
     def test_pd_policy_validation(self):
         """Test PD policy configuration validation."""
         # Valid PD policies
-        valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
+        valid_policies = ["random", "round_robin", "cache_aware", "power_of_two", "least_load"]
 
         for prefill_policy in valid_policies:
             for decode_policy in valid_policies:

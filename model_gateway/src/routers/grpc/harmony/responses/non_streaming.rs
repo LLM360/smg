@@ -20,18 +20,21 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata, load_previous_messages, McpCallTracking,
+        build_next_request_with_tools, inject_mcp_metadata, load_previous_messages,
+        strip_image_generation_from_request_tools, McpCallTracking,
     },
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
 };
 use crate::{
+    middleware::TenantRequestMeta,
     observability::metrics::Metrics,
     routers::{
         common::mcp_utils::DEFAULT_MAX_ITERATIONS,
         error,
         grpc::{
             common::responses::{
-                ensure_mcp_connection, persist_response_if_needed, ResponsesContext,
+                collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
+                ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -51,6 +54,7 @@ use crate::{
 pub(crate) async fn serve_harmony_responses(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
 ) -> Result<ResponsesResponse, Response> {
     // Clone request for persistence
     let original_request = request.clone();
@@ -59,14 +63,24 @@ pub(crate) async fn serve_harmony_responses(
     let current_request = load_previous_messages(ctx, request).await?;
 
     // Check MCP connection and get whether MCP tools are present
-    let (has_mcp_tools, mcp_servers) =
-        ensure_mcp_connection(&ctx.mcp_orchestrator, current_request.tools.as_deref()).await?;
+    let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
+        &ctx.mcp_orchestrator,
+        &ctx.mcp_format_registry,
+        current_request.tools.as_deref(),
+    )
+    .await?;
 
     let response = if has_mcp_tools {
-        execute_with_mcp_loop(ctx, current_request, mcp_servers).await?
+        execute_with_mcp_loop(
+            ctx,
+            current_request,
+            tenant_request_meta.clone(),
+            mcp_servers,
+        )
+        .await?
     } else {
         // No MCP tools - execute pipeline once (may have function tools or no tools)
-        execute_without_mcp_loop(ctx, current_request).await?
+        execute_without_mcp_loop(ctx, current_request, tenant_request_meta).await?
     };
 
     // Persist response to storage if store=true
@@ -89,6 +103,7 @@ pub(crate) async fn serve_harmony_responses(
 async fn execute_with_mcp_loop(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
     mcp_servers: Vec<McpServerBinding>,
 ) -> Result<ResponsesResponse, Response> {
     let mut iteration_count = 0;
@@ -101,6 +116,7 @@ async fn execute_with_mcp_loop(
     // Preserve original tools for response (before merging MCP tools)
     // The response should show the user's original request tools, not internal MCP tools
     let mut original_tools = current_request.tools.clone();
+    let user_function_names = collect_user_function_names(&current_request);
 
     // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
     let session_request_id = format!("resp_{}", uuid::Uuid::now_v7());
@@ -122,6 +138,17 @@ async fn execute_with_mcp_loop(
             "MCP client available - added static MCP tools to Harmony Responses request"
         );
     }
+
+    // Once the MCP loop has taken ownership of image_generation
+    // dispatch, drop the hosted-tool descriptor so the harmony builder
+    // advertises only the MCP-exposed function-tool name (which
+    // `has_exposed_tool` actually recognizes for dispatch). See the
+    // helper doc comment in `common.rs` for the full rationale.
+    strip_image_generation_from_request_tools(
+        &mut current_request,
+        &session,
+        &ctx.mcp_format_registry,
+    );
 
     loop {
         iteration_count += 1;
@@ -151,7 +178,7 @@ async fn execute_with_mcp_loop(
         // Execute through full pipeline
         let iteration_result = ctx
             .pipeline
-            .execute_harmony_responses(&current_request, ctx)
+            .execute_harmony_responses(&current_request, ctx, Some(tenant_request_meta.clone()))
             .await?;
 
         match iteration_result {
@@ -174,7 +201,7 @@ async fn execute_with_mcp_loop(
                 // discriminator is whether the name belongs to the MCP session.
                 let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                     .into_iter()
-                    .partition(|tc| session.has_exposed_tool(&tc.function.name));
+                    .partition(|tc| session.has_exposed_tool(tc.function.name.as_str()));
 
                 debug!(
                     mcp_calls = mcp_tool_calls.len(),
@@ -221,27 +248,49 @@ async fn execute_with_mcp_loop(
                         Arc::new(response_request),
                     );
 
-                    // Mark as completed with incomplete_details
-                    response.status = ResponseStatus::Completed;
-                    response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
+                    // Tool-call limit reached before executing the remaining
+                    // calls: this is an aborted run, not a successful answer.
+                    // Per the design, exhausting `max_tool_calls` is a `failed`
+                    // status with an `error` payload (truncation
+                    // `incomplete_details` is reserved for `max_output_tokens` /
+                    // `content_filter`).
+                    response.status = ResponseStatus::Failed;
+                    response.error = Some(json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!(
+                            "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
+                        ),
+                    }));
 
                     // Inject MCP metadata if any calls were executed
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &session);
+                        inject_mcp_metadata(
+                            &mut response,
+                            &mcp_tracking,
+                            &session,
+                            &user_function_names,
+                        );
                     }
 
                     return Ok(response);
                 }
 
-                // Execute MCP tools (if any)
+                // Execute MCP tools (if any). Caller-declared hosted-tool overrides
+                // live on `original_tools` (pre-MCP-injection), so we thread those
+                // into dispatch — `execute_mcp_tools` merges per-kind. The
+                // request-level `user` identifier is also forwarded into
+                // hosted-tool dispatch args.
                 let mcp_results = if mcp_tool_calls.is_empty() {
                     Vec::new()
                 } else {
                     execute_mcp_tools(
                         &session,
+                        &ctx.mcp_format_registry,
                         &mcp_tool_calls,
                         &mut mcp_tracking,
                         &current_request.model,
+                        original_tools.as_deref().unwrap_or(&[]),
+                        current_request.user.as_deref(),
                     )
                     .await?
                 };
@@ -272,7 +321,12 @@ async fn execute_with_mcp_loop(
 
                     // Inject MCP metadata for all executed calls
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &session);
+                        inject_mcp_metadata(
+                            &mut response,
+                            &mcp_tracking,
+                            &session,
+                            &user_function_names,
+                        );
                     }
 
                     return Ok(response);
@@ -304,7 +358,7 @@ async fn execute_with_mcp_loop(
                 );
 
                 // Inject MCP metadata into final response
-                inject_mcp_metadata(&mut response, &mcp_tracking, &session);
+                inject_mcp_metadata(&mut response, &mcp_tracking, &session, &user_function_names);
 
                 // Restore original tools (hide internal MCP tools from response)
                 response.tools = original_tools.take().unwrap_or_default();
@@ -328,13 +382,14 @@ async fn execute_with_mcp_loop(
 async fn execute_without_mcp_loop(
     ctx: &ResponsesContext,
     current_request: ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
 ) -> Result<ResponsesResponse, Response> {
     debug!("Executing Harmony Responses without MCP loop");
 
     // Execute pipeline once
     let iteration_result = ctx
         .pipeline
-        .execute_harmony_responses(&current_request, ctx)
+        .execute_harmony_responses(&current_request, ctx, Some(tenant_request_meta))
         .await?;
 
     match iteration_result {
@@ -386,14 +441,14 @@ fn build_tool_response(
 
     // Add reasoning output item if analysis exists
     if let Some(analysis_text) = analysis {
-        output.push(ResponseOutputItem::Reasoning {
-            id: format!("reasoning_{request_id}"),
-            summary: vec![],
-            content: vec![ResponseReasoningContent::ReasoningText {
+        output.push(ResponseOutputItem::new_reasoning(
+            format!("reasoning_{request_id}"),
+            vec![],
+            vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
             }],
-            status: Some("completed".to_string()),
-        });
+            Some("completed".to_string()),
+        ));
     }
 
     // Add message output item if partial text exists
@@ -407,6 +462,7 @@ fn build_tool_response(
                 logprobs: None,
             }],
             status: "completed".to_string(),
+            phase: None,
         });
     }
 
@@ -416,7 +472,7 @@ fn build_tool_response(
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize tool output: {e}\"}}"));
 
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: tool_call.id.clone(),
+            id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
             name: tool_call.function.name.clone(),
             arguments: tool_call.function.arguments.clone().unwrap_or_default(),
@@ -435,7 +491,7 @@ fn build_tool_response(
         let call_id = tool_call.id.clone();
         let arguments = tool_call.function.arguments.unwrap_or_default();
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: tool_call.id,
+            id: Some(tool_call.id),
             call_id,
             name: tool_call.function.name,
             arguments,

@@ -18,15 +18,13 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use openai_protocol::{
     event_types::{
-        is_function_call_type, is_response_event, CodeInterpreterCallEvent, FileSearchCallEvent,
-        FunctionCallEvent, ItemType, McpEvent, OutputItemEvent, ResponseEvent, WebSearchCallEvent,
+        is_function_call_type, is_response_event, FunctionCallEvent, ItemType, McpEvent,
+        OutputItemEvent, ResponseEvent,
     },
     responses::{ResponseTool, ResponsesRequest},
 };
 use serde_json::{json, Value};
-use smg_mcp::{
-    mcp_response_item_id, McpOrchestrator, McpServerBinding, McpToolSession, ResponseFormat,
-};
+use smg_mcp::{McpOrchestrator, McpServerBinding, McpToolSession};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
@@ -39,15 +37,19 @@ use super::{
         rewrite_streaming_block,
     },
 };
+use crate::routers::common::openai_bridge::{self, mcp_response_item_id, ResponseFormat};
 const SSE_DONE: &str = "data: [DONE]\n\n";
 
 use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            header_utils::{preserve_response_headers, ApiProvider},
+            header_utils::{
+                extract_forwardable_request_headers, preserve_response_headers, ApiProvider,
+            },
             mcp_utils::DEFAULT_MAX_ITERATIONS,
             persistence_utils::persist_conversation_items,
+            sse::SseEncoder,
         },
         error,
         openai::{
@@ -144,13 +146,15 @@ pub(super) fn apply_event_transformations_inplace(
                         if let Some(session) =
                             ctx.session.filter(|s| s.has_exposed_tool(&tool_name))
                         {
-                            let response_format = session.tool_response_format(&tool_name);
+                            let response_format = ctx
+                                .mcp_format_registry
+                                .map(|reg| {
+                                    openai_bridge::lookup_tool_format(session, reg, &tool_name)
+                                })
+                                .unwrap_or(ResponseFormat::Passthrough);
 
-                            // Determine item type and ID prefix based on response_format
-                            let (new_type, id_prefix) = match response_format {
-                                ResponseFormat::WebSearchCall => (ItemType::WEB_SEARCH_CALL, "ws_"),
-                                _ => (ItemType::MCP_CALL, "mcp_"),
-                            };
+                            let d = openai_bridge::descriptor(response_format);
+                            let (new_type, id_prefix) = (d.type_str, d.id_prefix);
 
                             item["type"] = json!(new_type);
                             if new_type == ItemType::MCP_CALL {
@@ -163,7 +167,7 @@ pub(super) fn apply_event_transformations_inplace(
                                 if new_type == ItemType::MCP_CALL {
                                     item["id"] = json!(mcp_response_item_id(id));
                                 } else if let Some(stripped) = id.strip_prefix("fc_") {
-                                    let new_id = format!("{id_prefix}{stripped}");
+                                    let new_id = format!("{id_prefix}_{stripped}");
                                     item["id"] = json!(new_id);
                                 }
                             }
@@ -207,15 +211,25 @@ fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
 }
 
 /// Send an SSE event to the client channel
-/// Returns false if client disconnected
+/// Returns false if the client disconnected
 #[inline]
 fn send_sse_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     event_name: &str,
     data: &Value,
 ) -> bool {
-    let block = format!("event: {event_name}\ndata: {data}\n\n");
-    tx.send(Ok(Bytes::from(block))).is_ok()
+    match enc.encode_event(event_name, data) {
+        Ok(bytes) => tx.send(Ok(bytes)).is_ok(),
+        Err(e) => {
+            // Unreachable in practice (static event name + Value); fall back to
+            // manual framing like send_final_response_event rather than treating
+            // an encode error as a client disconnect.
+            warn!("failed to encode SSE event '{event_name}', falling back: {e}");
+            let block = format!("event: {event_name}\ndata: {data}\n\n");
+            tx.send(Ok(Bytes::from(block))).is_ok()
+        }
+    }
 }
 
 /// Map function_call event names to mcp_call event names
@@ -234,6 +248,7 @@ fn send_buffered_arguments(
     parsed_data: &mut Value,
     handler: &StreamingToolHandler,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     sequence_number: &mut u64,
     mapped_output_index: &mut Option<usize>,
 ) -> bool {
@@ -292,7 +307,7 @@ fn send_buffered_arguments(
         }
     }
 
-    if !send_sse_event(tx, McpEvent::CALL_ARGUMENTS_DELTA, &delta_event) {
+    if !send_sse_event(tx, enc, McpEvent::CALL_ARGUMENTS_DELTA, &delta_event) {
         return false;
     }
 
@@ -315,6 +330,7 @@ pub(super) fn forward_streaming_event(
     event: SseEventData<'_>,
     handler: &mut StreamingToolHandler,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     ctx: &StreamingEventContext<'_>,
     sequence_number: &mut u64,
 ) -> bool {
@@ -353,6 +369,7 @@ pub(super) fn forward_streaming_event(
             &mut parsed_data,
             handler,
             tx,
+            enc,
             sequence_number,
             &mut mapped_output_index,
         )
@@ -385,25 +402,24 @@ pub(super) fn forward_streaming_event(
         *sequence_number += 1;
     }
 
-    let final_data = match serde_json::to_string(&parsed_data) {
-        Ok(s) => s,
-        Err(_) => {
-            let chunk = format!("{raw_block}\n\n");
-            return tx.send(Ok(Bytes::from(chunk))).is_ok();
-        }
+    // Serialize directly into the reusable encoder buffer (no intermediate
+    // `String`). On the (practically impossible) serialization error, fall
+    // back to forwarding the original raw block unchanged.
+    let final_bytes = match event_name {
+        Some(evt) => enc.encode_event(map_event_name(evt), &parsed_data),
+        None => enc.encode_data(&parsed_data),
+    };
+    let final_bytes = match final_bytes {
+        Ok(bytes) => bytes,
+        Err(_) => Bytes::from(format!("{raw_block}\n\n")),
     };
 
-    let final_block = match event_name {
-        Some(evt) => format!("event: {}\ndata: {}\n\n", map_event_name(evt), final_data),
-        None => format!("data: {final_data}\n\n"),
-    };
-
-    if tx.send(Ok(Bytes::from(final_block))).is_err() {
+    if tx.send(Ok(final_bytes)).is_err() {
         return false;
     }
 
     if event_name == Some(OutputItemEvent::ADDED)
-        && !maybe_inject_tool_in_progress(&parsed_data, tx, sequence_number)
+        && !maybe_inject_tool_in_progress(&parsed_data, tx, enc, sequence_number)
     {
         return false;
     }
@@ -412,11 +428,13 @@ pub(super) fn forward_streaming_event(
 }
 
 /// Inject in_progress event after a tool call item is added.
-/// Handles mcp_call, web_search_call, code_interpreter_call, and file_search_call items.
+/// Handles mcp_call, web_search_call, code_interpreter_call, file_search_call,
+/// and image_generation_call items.
 /// Returns false if client disconnected.
 fn maybe_inject_tool_in_progress(
     parsed_data: &Value,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     sequence_number: &mut u64,
 ) -> bool {
     let Some(item) = parsed_data.get("item") else {
@@ -425,14 +443,10 @@ fn maybe_inject_tool_in_progress(
 
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Determine the in_progress event type based on item type
-    let event_type = match item_type {
-        ItemType::MCP_CALL => McpEvent::CALL_IN_PROGRESS,
-        ItemType::WEB_SEARCH_CALL => WebSearchCallEvent::IN_PROGRESS,
-        ItemType::CODE_INTERPRETER_CALL => CodeInterpreterCallEvent::IN_PROGRESS,
-        ItemType::FILE_SEARCH_CALL => FileSearchCallEvent::IN_PROGRESS,
-        _ => return true, // Not a tool call item, nothing to inject
+    let Some(format) = openai_bridge::format_from_type_str(item_type) else {
+        return true; // Not a tool call item, nothing to inject
     };
+    let event_type = openai_bridge::descriptor(format).in_progress_event;
 
     let Some(item_id) = item.get("id").and_then(|v| v.as_str()) else {
         return true;
@@ -449,7 +463,7 @@ fn maybe_inject_tool_in_progress(
     });
     *sequence_number += 1;
 
-    send_sse_event(tx, event_type, &event)
+    send_sse_event(tx, enc, event_type, &event)
 }
 
 /// Send final response.completed event to client
@@ -457,6 +471,7 @@ fn maybe_inject_tool_in_progress(
 pub(super) fn send_final_response_event(
     handler: &StreamingToolHandler,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     sequence_number: &mut u64,
     state: &ToolLoopState,
     ctx: &StreamingEventContext<'_>,
@@ -497,12 +512,18 @@ pub(super) fn send_final_response_event(
     });
     *sequence_number += 1;
 
-    let completed_event = format!(
-        "event: {}\ndata: {}\n\n",
-        ResponseEvent::COMPLETED,
-        completed_payload
-    );
-    tx.send(Ok(Bytes::from(completed_event))).is_ok()
+    match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
+        Ok(bytes) => tx.send(Ok(bytes)).is_ok(),
+        Err(e) => {
+            warn!("failed to encode response.completed via SseEncoder, falling back: {e}");
+            let completed_event = format!(
+                "event: {}\ndata: {}\n\n",
+                ResponseEvent::COMPLETED,
+                completed_payload
+            );
+            tx.send(Ok(Bytes::from(completed_event))).is_ok()
+        }
+    }
 }
 
 /// Simple pass-through streaming without MCP interception
@@ -666,6 +687,7 @@ pub(super) fn handle_streaming_with_tool_interception(
     headers: Option<&HeaderMap>,
     req: StreamingRequest,
     orchestrator: &Arc<McpOrchestrator>,
+    format_registry: openai_bridge::FormatRegistry,
     mcp_servers: Vec<McpServerBinding>,
 ) -> Response {
     let payload = req.payload;
@@ -683,6 +705,7 @@ pub(super) fn handle_streaming_with_tool_interception(
     let headers_opt = headers.cloned();
     let payload_clone = payload.clone();
     let orchestrator_clone = Arc::clone(orchestrator);
+    let forwarded_headers = extract_forwardable_request_headers(headers);
 
     #[expect(
         clippy::disallowed_methods,
@@ -697,10 +720,11 @@ pub(super) fn handle_streaming_with_tool_interception(
 
         // Create session inside spawned task (borrows from orchestrator_clone which lives in closure)
         let session_request_id = format!("resp_{}", uuid::Uuid::now_v7());
-        let session = McpToolSession::new(
+        let session = McpToolSession::new_with_headers(
             &orchestrator_clone,
             mcp_servers.clone(),
             &session_request_id,
+            forwarded_headers.clone(),
         );
         let mut current_payload = payload_clone;
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
@@ -709,6 +733,7 @@ pub(super) fn handle_streaming_with_tool_interception(
         let mut mcp_list_tools_sent = false;
         let mut is_first_iteration = true;
         let mut sequence_number: u64 = 0;
+        let mut sse_encoder = SseEncoder::new();
         let mut next_output_index: usize = 0;
         let mut preserved_response_id: Option<String> = None;
         let list_tools_bindings = mcp_list_tools_bindings_to_emit(
@@ -720,6 +745,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             original_request: &original_request,
             previous_response_id: previous_response_id.as_deref(),
             session: Some(&session),
+            mcp_format_registry: Some(&format_registry),
         };
         let provider = ApiProvider::from_url(&url_clone);
         let auth_header =
@@ -734,8 +760,12 @@ pub(super) fn handle_streaming_with_tool_interception(
             let response = match request_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ =
-                        send_sse_event(&tx, "error", &json!({"error": {"message": e.to_string()}}));
+                    let _ = send_sse_event(
+                        &tx,
+                        &mut sse_encoder,
+                        "error",
+                        &json!({"error": {"message": e.to_string()}}),
+                    );
                     return;
                 }
             };
@@ -746,6 +776,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 let body = error::sanitize_error_body(&body);
                 let _ = send_sse_event(
                     &tx,
+                    &mut sse_encoder,
                     "error",
                     &json!({"error": {"message": format!("Upstream error {}: {}", status, body)}}),
                 );
@@ -813,6 +844,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                                             },
                                             &mut handler,
                                             &tx,
+                                            &mut sse_encoder,
                                             &streaming_ctx,
                                             &mut sequence_number,
                                         ) {
@@ -845,19 +877,49 @@ pub(super) fn handle_streaming_with_tool_interception(
                                 StreamAction::Buffer => {
                                     // Don't forward, just buffer
                                 }
-                                StreamAction::ExecuteTools => {
-                                    if !forward_streaming_event(
-                                        SseEventData {
-                                            raw_block: &raw_block,
-                                            event_name,
-                                            data: data.as_ref(),
-                                            pre_parsed: None,
-                                        },
-                                        &mut handler,
-                                        &tx,
-                                        &streaming_ctx,
-                                        &mut sequence_number,
-                                    ) {
+                                StreamAction::Drop => {
+                                    // R6.7c native passthrough: upstream
+                                    // emitted an `output_item.done` for a
+                                    // hosted tool-call item that we did
+                                    // NOT wrap as a function_call (and so
+                                    // did not track in `pending_calls`).
+                                    // The upstream envelope arrives
+                                    // mis-ordered BEFORE
+                                    // `response.<type>.completed`, so we
+                                    // drop it here to preserve the wire
+                                    // invariant that `output_item.done`
+                                    // is the LAST event for a given item.
+                                    // Unlike `ExecuteTools`, this does NOT
+                                    // kick the tool loop — there is no
+                                    // dispatched call to finish.
+                                }
+                                StreamAction::ExecuteTools {
+                                    forward_triggering_event,
+                                } => {
+                                    // When the upstream signals tool completion via
+                                    // `output_item.done` (instead of a preceding
+                                    // `function_call_arguments.done`), forwarding the
+                                    // event here would emit an umbrella
+                                    // `response.output_item.done` BEFORE
+                                    // `response.<tool>.completed`, violating spec
+                                    // sub-event ordering. The tool loop emits its own
+                                    // `output_item.done` at the correct position after
+                                    // the `.completed` sub-event; suppress here.
+                                    if forward_triggering_event
+                                        && !forward_streaming_event(
+                                            SseEventData {
+                                                raw_block: &raw_block,
+                                                event_name,
+                                                data: data.as_ref(),
+                                                pre_parsed: None,
+                                            },
+                                            &mut handler,
+                                            &tx,
+                                            &mut sse_encoder,
+                                            &streaming_ctx,
+                                            &mut sequence_number,
+                                        )
+                                    {
                                         return;
                                     }
                                     tool_calls_detected = true;
@@ -873,6 +935,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                     Err(e) => {
                         let _ = send_sse_event(
                             &tx,
+                            &mut sse_encoder,
                             "error",
                             &json!({"error": {"message": format!("Stream error: {}", e)}}),
                         );
@@ -891,6 +954,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 if !send_final_response_event(
                     &handler,
                     &tx,
+                    &mut sse_encoder,
                     &mut sequence_number,
                     &state,
                     &streaming_ctx,
@@ -963,6 +1027,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 );
                 send_sse_event(
                     &tx,
+                    &mut sse_encoder,
                     "error",
                     &json!({"error": {"message": "Exceeded max_tool_calls limit"}}),
                 );
@@ -970,14 +1035,20 @@ pub(super) fn handle_streaming_with_tool_interception(
                 return;
             }
 
-            // Execute all pending tool calls
+            // Execute all pending tool calls. Pass the caller-declared tools so
+            // hosted-tool overrides (e.g. image_generation size/quality) are
+            // merged into dispatch args before MCP execution. The request-level
+            // `user` is also forwarded into hosted-tool dispatch args.
             if !execute_streaming_tool_calls(
                 pending_calls,
                 &session,
+                &format_registry,
                 &tx,
                 &mut state,
                 &mut sequence_number,
                 &original_request.model,
+                original_request.tools.as_deref().unwrap_or(&[]),
+                original_request.user.as_deref(),
             )
             .await
             {
@@ -999,6 +1070,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 Err(e) => {
                     send_sse_event(
                         &tx,
+                        &mut sse_encoder,
                         "error",
                         &json!({"error": {"message": format!("Failed to build resume payload: {}", e)}}),
                     );
@@ -1020,7 +1092,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
 /// Main entry point for streaming responses
 pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
-    use crate::routers::common::mcp_utils::ensure_request_mcp_client;
+    use crate::routers::common::mcp_utils::{ensure_request_mcp_client, request_uses_mcp_routing};
 
     let worker = match ctx.worker() {
         Some(w) => w.clone(),
@@ -1035,18 +1107,29 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
             return error::internal_error("internal_error", "Expected responses request");
         }
     };
-    let mcp_orchestrator = match ctx.components.mcp_orchestrator() {
-        Some(m) => m.clone(),
-        None => {
-            return error::internal_error("internal_error", "MCP orchestrator required");
+    // Only MCP-laden requests need the orchestrator and format registry;
+    // plain streaming requests must still pass through deployments without
+    // MCP wiring.
+    let mcp_routing = match original_body.tools.as_deref() {
+        Some(tools) if request_uses_mcp_routing(tools) => {
+            let Some(mcp_orchestrator) = ctx.components.mcp_orchestrator().cloned() else {
+                return error::internal_error(
+                    "internal_error",
+                    "MCP orchestrator required for requests carrying MCP/builtin tools",
+                );
+            };
+            let Some(registry) = ctx.components.mcp_format_registry() else {
+                return error::internal_error(
+                    "internal_error",
+                    "MCP format registry required for requests carrying MCP/builtin tools",
+                );
+            };
+            let registry = registry.clone();
+            ensure_request_mcp_client(&mcp_orchestrator, &registry, tools)
+                .await
+                .map(|servers| (servers, mcp_orchestrator, registry))
         }
-    };
-
-    // Check for MCP tools and create request context if needed
-    let mcp_servers = if let Some(tools) = original_body.tools.as_deref() {
-        ensure_request_mcp_client(&mcp_orchestrator, tools).await
-    } else {
-        None
+        _ => None,
     };
 
     let client = ctx.components.client().clone();
@@ -1057,7 +1140,7 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
         }
     };
 
-    let Some(mcp_servers) = mcp_servers else {
+    let Some((mcp_servers, mcp_orchestrator, mcp_format_registry)) = mcp_routing else {
         return handle_simple_streaming_passthrough(&client, &worker, headers.as_ref(), req).await;
     };
 
@@ -1067,6 +1150,7 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
         headers.as_ref(),
         req,
         &mcp_orchestrator,
+        mcp_format_registry,
         mcp_servers,
     )
 }

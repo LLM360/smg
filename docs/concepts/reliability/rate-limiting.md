@@ -65,8 +65,10 @@ Rate limiting ensures **fair access** and **predictable performance**.
 
 SMG uses a **token bucket** algorithm:
 
-<div class="architecture-diagram">
-  <img src="../../../assets/images/rate-limiting.svg" alt="Token Bucket Rate Limiting">
+<div class="architecture-diagram" markdown>
+
+![Token Bucket Rate Limiting](../../assets/images/rate-limiting.svg)
+
 </div>
 
 ### Token Bucket
@@ -101,6 +103,7 @@ smg \
 |-----------|---------|-------------|
 | `--max-concurrent-requests` | `-1` (disabled) | Token bucket capacity. When `<= 0` the limiter is disabled entirely and requests pass through. |
 | `--rate-limit-tokens-per-second` | unset (refills at `max_concurrent_requests`) | Token bucket refill rate in tokens per second. |
+| `--global-rate-limit-requests-per-second` | unset (disabled) | Shared one-second request ceiling across mesh gateways. |
 | `--queue-size` | `100` | Maximum queued requests |
 | `--queue-timeout-secs` | `60` | Maximum queue wait time |
 
@@ -114,6 +117,24 @@ smg \
 
 !!! note "Concurrency vs. Rate Limiting"
     Setting `--max-concurrent-requests` alone creates a token bucket whose capacity *and* refill rate both equal `max_concurrent_requests`, so it enforces both burst capacity and a sustained rate. Set `--rate-limit-tokens-per-second` when you want the sustained rate to differ from the burst capacity (for example, capacity `100` with refill `50` allows short bursts of 100 while sustaining 50 req/s).
+
+### Cluster-wide request rate
+
+Use the mesh-backed limiter when several gateways must share one request
+ceiling:
+
+```bash
+smg \
+  --enable-mesh \
+  --mesh-server-name gateway-a \
+  --mesh-advertise-host 10.0.0.10 \
+  --global-rate-limit-requests-per-second 100
+```
+
+The option requires mesh, and every gateway in the mesh must be started with
+the same value. It applies before both legacy admission and the priority
+scheduler. Configuration is startup-only; the removed `/ha/rate-limit`
+management endpoints are not restored.
 
 ---
 

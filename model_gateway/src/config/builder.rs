@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
+use openai_protocol::worker::TransportMode;
 use smg_mcp::McpConfig;
 
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
+    TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::ConnectionMode;
 
@@ -131,6 +133,8 @@ impl RouterConfigBuilder {
             max_tree_size,
             block_size: 16,
             engine_load: Default::default(),
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
         self
     }
@@ -169,6 +173,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn health_check_port(mut self, health_check_port: Option<u16>) -> Self {
+        self.config.health_check_port = health_check_port;
+        self
+    }
+
+    pub fn runtime_worker_threads(mut self, threads: Option<usize>) -> Self {
+        self.config.runtime_worker_threads = threads;
+        self
+    }
+
     // ==================== Request ====================
 
     pub fn max_payload_size(mut self, size: usize) -> Self {
@@ -193,6 +207,23 @@ impl RouterConfigBuilder {
 
     pub fn load_monitor_interval_secs(mut self, interval: u64) -> Self {
         self.config.load_monitor_interval_secs = interval;
+        self
+    }
+
+    pub fn engine_metrics(mut self, enabled: bool) -> Self {
+        self.config.engine_metrics = enabled;
+        self
+    }
+
+    /// Global multimodal tensor transport mode (per-worker specs can override).
+    pub fn multimodal_tensor_transport(mut self, mode: Option<TransportMode>) -> Self {
+        self.config.multimodal_tensor_transport = mode;
+        self
+    }
+
+    /// Global minimum multimodal tensor size (bytes) before SHM transport is used.
+    pub fn multimodal_shm_min_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.config.multimodal_shm_min_bytes = bytes;
         self
     }
 
@@ -223,10 +254,54 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn global_rate_limit_requests_per_second(mut self, requests: u64) -> Self {
+        self.config.global_rate_limit_requests_per_second = Some(requests);
+        self
+    }
+
+    // ==================== Priority Scheduler ====================
+
+    pub fn priority_scheduler_enabled(mut self, enabled: bool) -> Self {
+        self.config.priority_scheduler_enabled = enabled;
+        self
+    }
+
+    pub fn priority_scheduler_default_max_class(mut self, class: impl Into<String>) -> Self {
+        self.config.priority_scheduler_default_max_class = class.into();
+        self
+    }
+
+    pub fn priority_scheduler_config(mut self, path: Option<String>) -> Self {
+        self.config.priority_scheduler_config = path;
+        self
+    }
+
+    pub fn priority_scheduler_tenant_metric_top_n(mut self, n: u32) -> Self {
+        self.config.priority_scheduler_tenant_metric_top_n = n;
+        self
+    }
+
+    // ==================== Tenant Rate Limit ====================
+
+    pub fn tenant_rate_limit_enabled(mut self, enabled: bool) -> Self {
+        self.config.tenant_rate_limit_enabled = enabled;
+        self
+    }
+
+    pub fn tenant_rate_limit_config(mut self, path: Option<String>) -> Self {
+        self.config.tenant_rate_limit_config = path;
+        self
+    }
+
     // ==================== Security & CORS ====================
 
     pub fn api_key<S: Into<String>>(mut self, key: S) -> Self {
         self.config.api_key = Some(key.into());
+        self
+    }
+
+    pub fn tenant_api_keys(mut self, keys: Vec<TenantApiKeyEntry>) -> Self {
+        self.config.tenant_api_keys = keys;
         self
     }
 
@@ -349,6 +424,16 @@ impl RouterConfigBuilder {
 
     pub fn storage_context_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.config.storage_context_headers = headers;
+        self
+    }
+
+    pub fn trust_tenant_header(mut self, trust: bool) -> Self {
+        self.config.tenant_resolution.trust_tenant_header = trust;
+        self
+    }
+
+    pub fn tenant_header_name<S: Into<String>>(mut self, header_name: S) -> Self {
+        self.config.tenant_resolution.tenant_header_name = header_name.into();
         self
     }
 
@@ -478,6 +563,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn routing_key_override(mut self, config: RoutingKeyOverrideConfig) -> Self {
+        self.config.routing_key_override = config;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;
@@ -548,8 +638,20 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn maybe_tenant_header_name(mut self, header_name: Option<impl Into<String>>) -> Self {
+        if let Some(header_name) = header_name {
+            self.config.tenant_resolution.tenant_header_name = header_name.into();
+        }
+        self
+    }
+
     pub fn maybe_rate_limit_tokens_per_second(mut self, tokens: Option<i32>) -> Self {
         self.config.rate_limit_tokens_per_second = tokens;
+        self
+    }
+
+    pub fn maybe_global_rate_limit_requests_per_second(mut self, requests: Option<u64>) -> Self {
+        self.config.global_rate_limit_requests_per_second = requests;
         self
     }
 

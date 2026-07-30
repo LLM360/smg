@@ -21,7 +21,9 @@ fn extract_text_for_routing_old(req: &ResponsesRequest) -> String {
                         .filter_map(|part| match part {
                             ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                             ResponseContentPart::InputText { text } => Some(text.clone()),
-                            ResponseContentPart::Unknown => None,
+                            ResponseContentPart::InputImage { .. }
+                            | ResponseContentPart::InputFile { .. }
+                            | ResponseContentPart::Refusal { .. } => None,
                         })
                         .collect();
                     if texts.is_empty() {
@@ -66,6 +68,23 @@ fn extract_text_for_routing_old(req: &ResponsesRequest) -> String {
                 ResponseInputOutputItem::FunctionCallOutput { output, .. } => Some(output.clone()),
                 ResponseInputOutputItem::McpApprovalRequest { .. } => None,
                 ResponseInputOutputItem::McpApprovalResponse { .. } => None,
+                ResponseInputOutputItem::ImageGenerationCall { .. } => None,
+                ResponseInputOutputItem::Compaction { .. } => None,
+                ResponseInputOutputItem::ComputerCall { .. } => None,
+                ResponseInputOutputItem::ComputerCallOutput { .. } => None,
+                ResponseInputOutputItem::CustomToolCall { .. }
+                | ResponseInputOutputItem::CustomToolCallOutput { .. } => None,
+                ResponseInputOutputItem::ShellCall { .. }
+                | ResponseInputOutputItem::ShellCallOutput { .. } => None,
+                ResponseInputOutputItem::ItemReference { .. } => None,
+                ResponseInputOutputItem::ApplyPatchCall { .. }
+                | ResponseInputOutputItem::ApplyPatchCallOutput { .. } => None,
+                // T5 schema-only: forced-cascade arm, no behavior.
+                ResponseInputOutputItem::LocalShellCall { .. }
+                | ResponseInputOutputItem::LocalShellCallOutput { .. } => None,
+                // T11 schema-only: forced-cascade arm, no behavior.
+                ResponseInputOutputItem::McpCall { .. }
+                | ResponseInputOutputItem::McpListTools { .. } => None,
             })
             .collect::<Vec<String>>()
             .join(" "),
@@ -92,6 +111,7 @@ fn create_bench_request() -> ResponsesRequest {
             role: "user".to_string(),
             content,
             status: None,
+            phase: None,
         });
     }
 

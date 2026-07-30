@@ -1,17 +1,18 @@
 // Integration test for Responses API
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use openai_protocol::{
-    common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
+    common::{GenerationRequest, UsageInfo},
     responses::{
-        CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, ResponseInput,
-        ResponseReasoningParam, ResponseTool, ResponsesRequest, ServiceTier, Truncation,
-        WebSearchPreviewTool,
+        CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
+        ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest, ResponsesToolChoice,
+        ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
     config::RouterConfig,
     routers::{conversations, RouterFactory},
+    tenant::{RouteRequestMeta, TenantKey},
 };
 
 use crate::common::{
@@ -21,6 +22,10 @@ use crate::common::{
 
 const TEST_INTERNAL_MCP_SERVER_LABEL: &str = "internal-mock";
 const TEST_INTERNAL_MCP_ERROR_MARKER: &str = "internal-mcp-failure-marker";
+
+fn test_tenant_meta() -> smg::middleware::TenantRequestMeta {
+    RouteRequestMeta::new(TenantKey::from("test-tenant"))
+}
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -69,7 +74,6 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -84,7 +88,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: Some(ToolChoice::default()),
+        tool_choice: Some(ResponsesToolChoice::default()),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: Some(mcp.url()),
             authorization: None,
@@ -93,6 +97,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -104,13 +110,22 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
-    let resp = router.route_responses(None, &req, req.model.as_str()).await;
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -221,6 +236,283 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 }
 
 #[tokio::test]
+async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx =
+        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
+            .await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        include: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_forwardable_headers".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer test-forwarded-token"),
+    );
+    headers.insert(
+        "x-request-id",
+        HeaderValue::from_static("req-forwarded-123"),
+    );
+    headers.insert(
+        "x-correlation-id",
+        HeaderValue::from_static("corr-forwarded-456"),
+    );
+    headers.insert(
+        "traceparent",
+        HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"),
+    );
+    headers.insert("x-custom-header", HeaderValue::from_static("blocked-value"));
+
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(Some(&headers), &tenant_meta, &req, req.model.as_str())
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    let output = body_json
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("response output missing");
+
+    assert!(
+        output.iter().any(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_list_tools".into()))
+        }),
+        "expected mcp_list_tools output item",
+    );
+    assert!(
+        output.iter().any(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_call".into()))
+        }),
+        "expected mcp_call output item",
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_mcp_returns_approval_request_when_required() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx =
+        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
+            .await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        include: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Always)),
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_approval_interrupt".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    assert_eq!(body_json["status"], "completed");
+
+    let output = body_json["output"]
+        .as_array()
+        .expect("response output missing");
+
+    let approval_item = output
+        .iter()
+        .find(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_approval_request".into()))
+        })
+        .expect("missing mcp_approval_request output item");
+
+    assert_eq!(
+        approval_item.get("server_label").and_then(|v| v.as_str()),
+        Some("mock")
+    );
+    assert_eq!(
+        approval_item.get("name").and_then(|v| v.as_str()),
+        Some("brave_web_search")
+    );
+    assert!(approval_item.get("arguments").is_some());
+    assert!(
+        output
+            .iter()
+            .all(|entry| entry.get("type") != Some(&serde_json::Value::String("mcp_call".into()))),
+        "response should interrupt before emitting mcp_call"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
 async fn test_final_response_hides_internal_mcp_trace_items() {
     let mut mcp = MockMCPServer::start().await.expect("start mcp");
 
@@ -261,7 +553,6 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("search something private".to_string()),
         instructions: Some("Use tools when relevant.".to_string()),
@@ -276,7 +567,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: Some(ToolChoice::default()),
+        tool_choice: Some(ResponsesToolChoice::default()),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: None,
             authorization: None,
@@ -285,6 +576,8 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -296,13 +589,22 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
-    let resp = router.route_responses(None, &req, req.model.as_str()).await;
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -389,12 +691,13 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         headers: None,
         server_label: "mock".to_string(),
         server_description: None,
-        require_approval: Some(RequireApproval::Never),
+        require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
         allowed_tools: None,
+        connector_id: None,
+        defer_loading: None,
     });
 
     let req1 = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -409,7 +712,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: Some(ToolChoice::default()),
+        tool_choice: Some(ResponsesToolChoice::default()),
         tools: Some(vec![mcp_tool.clone()]),
         top_logprobs: Some(0),
         top_p: None,
@@ -421,14 +724,21 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
+    let tenant_meta = test_tenant_meta();
     let resp1 = router
-        .route_responses(None, &req1, req1.model.as_str())
+        .route_responses(None, &tenant_meta, &req1, req1.model.as_str())
         .await;
     assert_eq!(resp1.status(), StatusCode::OK);
 
@@ -443,7 +753,6 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         .to_string();
 
     let req2 = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("Summarize that in five words".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -458,7 +767,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: Some(ToolChoice::default()),
+        tool_choice: Some(ResponsesToolChoice::default()),
         tools: Some(vec![mcp_tool]),
         top_logprobs: Some(0),
         top_p: None,
@@ -470,14 +779,21 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
+    let tenant_meta = test_tenant_meta();
     let resp2 = router
-        .route_responses(None, &req2, req2.model.as_str())
+        .route_responses(None, &tenant_meta, &req2, req2.model.as_str())
         .await;
     assert_eq!(resp2.status(), StatusCode::OK);
 
@@ -551,7 +867,6 @@ async fn test_final_response_hides_internal_mcp_error_details() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("search something private".to_string()),
         instructions: Some("Use tools when relevant.".to_string()),
@@ -566,7 +881,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: Some(ToolChoice::default()),
+        tool_choice: Some(ResponsesToolChoice::default()),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: None,
             authorization: None,
@@ -575,6 +890,8 @@ async fn test_final_response_hides_internal_mcp_error_details() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -586,13 +903,22 @@ async fn test_final_response_hides_internal_mcp_error_details() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
-    let resp = router.route_responses(None, &req, req.model.as_str()).await;
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -689,7 +1015,6 @@ async fn test_conversations_crud_basic() {
 #[test]
 fn test_responses_request_creation() {
     let request = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("Hello, world!".to_string()),
         instructions: Some("Be helpful".to_string()),
@@ -707,7 +1032,7 @@ fn test_responses_request_creation() {
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         tools: Some(vec![ResponseTool::WebSearchPreview(
             WebSearchPreviewTool::default(),
         )]),
@@ -721,6 +1046,12 @@ fn test_responses_request_creation() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -737,7 +1068,6 @@ fn test_responses_request_creation() {
 fn test_responses_request_sglang_extensions() {
     // Test that SGLang-specific sampling parameters are present and serializable
     let request = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("Test".to_string()),
         instructions: None,
@@ -752,7 +1082,7 @@ fn test_responses_request_sglang_extensions() {
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.8),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         tools: Some(vec![]),
         top_logprobs: Some(0),
         top_p: Some(0.95),
@@ -764,6 +1094,12 @@ fn test_responses_request_sglang_extensions() {
         frequency_penalty: Some(0.1),
         presence_penalty: Some(0.2),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         // SGLang-specific extensions:
         top_k: 10,
         min_p: 0.05,
@@ -873,7 +1209,6 @@ fn test_reasoning_param_default() {
 #[test]
 fn test_json_serialization() {
     let request = ResponsesRequest {
-        background: Some(true),
         include: None,
         input: ResponseInput::Text("Test input".to_string()),
         instructions: Some("Test instructions".to_string()),
@@ -891,7 +1226,7 @@ fn test_json_serialization() {
         store: Some(false),
         stream: Some(true),
         temperature: Some(0.9),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
         tools: Some(vec![ResponseTool::CodeInterpreter(
             CodeInterpreterTool::default(),
         )]),
@@ -905,6 +1240,12 @@ fn test_json_serialization() {
         frequency_penalty: Some(0.3),
         presence_penalty: Some(0.4),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: 50,
         min_p: 0.1,
         repetition_penalty: 1.2,
@@ -920,7 +1261,6 @@ fn test_json_serialization() {
         Some("resp_comprehensive_test".to_string())
     );
     assert_eq!(parsed.model, "gpt-4");
-    assert_eq!(parsed.background, Some(true));
     assert_eq!(parsed.stream, Some(true));
     assert_eq!(parsed.tools.as_ref().map(|t| t.len()), Some(1));
 }
@@ -978,7 +1318,6 @@ async fn test_multi_turn_loop_with_mcp() {
 
     // Build request with MCP tools
     let req = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("search for SGLang".to_string()),
         instructions: Some("Be helpful".to_string()),
@@ -993,15 +1332,17 @@ async fn test_multi_turn_loop_with_mcp() {
         store: Some(true),
         stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: Some(mcp.url()),
             authorization: None,
             headers: None,
             server_label: "mock".to_string(),
             server_description: Some("Mock MCP server for testing".to_string()),
-            require_approval: Some(RequireApproval::Never),
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1013,6 +1354,12 @@ async fn test_multi_turn_loop_with_mcp() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -1020,7 +1367,10 @@ async fn test_multi_turn_loop_with_mcp() {
     };
 
     // Execute the request (this should trigger the multi-turn loop)
-    let response = router.route_responses(None, &req, req.model.as_str()).await;
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
 
     // Check status
     assert_eq!(response.status(), StatusCode::OK, "Request should succeed");
@@ -1131,7 +1481,6 @@ async fn test_max_tool_calls_limit() {
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("test max calls".to_string()),
         instructions: None,
@@ -1146,7 +1495,7 @@ async fn test_max_tool_calls_limit() {
         store: Some(false),
         stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: Some(mcp.url()),
             authorization: None,
@@ -1155,6 +1504,8 @@ async fn test_max_tool_calls_limit() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1166,13 +1517,22 @@ async fn test_max_tool_calls_limit() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
-    let response = router.route_responses(None, &req, req.model.as_str()).await;
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     use axum::body::to_bytes;
@@ -1311,7 +1671,6 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     // Build streaming request with MCP tools
     let req = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("search for something interesting".to_string()),
         instructions: Some("Use tools when needed".to_string()),
@@ -1326,15 +1685,17 @@ async fn test_streaming_with_mcp_tool_calls() {
         store: Some(true),
         stream: Some(true), // KEY: Enable streaming
         temperature: Some(0.7),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: Some(mcp.url()),
             authorization: None,
             headers: None,
             server_label: "mock".to_string(),
             server_description: Some("Mock MCP for streaming test".to_string()),
-            require_approval: Some(RequireApproval::Never),
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1346,13 +1707,22 @@ async fn test_streaming_with_mcp_tool_calls() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
-    let response = router.route_responses(None, &req, req.model.as_str()).await;
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
 
     // Verify streaming response
     assert_eq!(
@@ -1589,7 +1959,6 @@ async fn test_streaming_multi_turn_with_mcp() {
     let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
 
     let req = ResponsesRequest {
-        background: Some(false),
         include: None,
         input: ResponseInput::Text("complex query requiring multiple tool calls".to_string()),
         instructions: Some("Be thorough".to_string()),
@@ -1604,7 +1973,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         store: Some(true),
         stream: Some(true),
         temperature: Some(0.8),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         tools: Some(vec![ResponseTool::Mcp(McpTool {
             server_url: Some(mcp.url()),
             authorization: None,
@@ -1613,6 +1982,8 @@ async fn test_streaming_multi_turn_with_mcp() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1624,13 +1995,22 @@ async fn test_streaming_multi_turn_with_mcp() {
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
     };
 
-    let response = router.route_responses(None, &req, req.model.as_str()).await;
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     use axum::body::to_bytes;

@@ -3,7 +3,7 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, fs, io};
 
 use anyhow::{anyhow, Result};
 use minijinja::{
@@ -17,7 +17,7 @@ use minijinja::{
     Environment, Error as MinijinjaError, ErrorKind, Value,
 };
 use serde::Serialize;
-use serde_json::{self, ser::PrettyFormatter, Value as JsonValue};
+use serde_json::{self, ser::Formatter, Value as JsonValue};
 
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,6 +46,16 @@ pub enum ThinkingKeyName {
     EnableThinking,
     /// Template uses `thinking` (DeepSeek V3.1, Kimi-K2.5)
     Thinking,
+}
+
+impl ThinkingKeyName {
+    /// The template kwarg name this toggle uses.
+    pub fn as_kwarg(self) -> &'static str {
+        match self {
+            ThinkingKeyName::EnableThinking => "enable_thinking",
+            ThinkingKeyName::Thinking => "thinking",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,7 +121,7 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 /// - ChatTemplateContentFormat::String if template expects simple string content
 pub fn detect_chat_template_content_format(template: &str) -> ChatTemplateContentFormat {
     // Use AST-based detection (enabled by default)
-    detect_format_with_ast(template)
+    detect_all_with_ast(template).0
 }
 
 /// Flags tracking which OpenAI-style patterns we've seen
@@ -247,12 +257,11 @@ impl<'a> Detector<'a> {
                         }
                     }
                 }
-                Stmt::IfCond(ic) => {
+                Stmt::IfCond(ic)
                     if Self::body_has_think_tag(&ic.true_body)
-                        || Self::body_has_think_tag(&ic.false_body)
-                    {
-                        return true;
-                    }
+                        || Self::body_has_think_tag(&ic.false_body) =>
+                {
+                    return true;
                 }
                 _ => {}
             }
@@ -320,12 +329,11 @@ impl<'a> Detector<'a> {
                 self.inspect_expr_for_structure(&e.expr);
             }
             // {% set content = message.content %}
-            Stmt::Set(s) => {
+            Stmt::Set(s)
                 if Self::is_var_access(&s.target, "content")
-                    && self.is_any_scope_var_content(&s.expr)
-                {
-                    self.flags.saw_assignment = true;
-                }
+                    && self.is_any_scope_var_content(&s.expr) =>
+            {
+                self.flags.saw_assignment = true;
             }
             Stmt::Macro(m) => {
                 // Heuristic: macro that checks type (via `is` test) and also has any loop
@@ -347,13 +355,12 @@ impl<'a> Detector<'a> {
 
         match expr {
             // content[0] or message.content[0]
-            Expr::GetItem(gi) => {
+            Expr::GetItem(gi)
                 if (matches!(&gi.expr, Expr::Var(v) if v.id == "content")
                     || self.is_any_scope_var_content(&gi.expr))
-                    && Self::is_numeric_const(&gi.subscript_expr)
-                {
-                    self.flags.saw_structure = true;
-                }
+                    && Self::is_numeric_const(&gi.subscript_expr) =>
+            {
+                self.flags.saw_structure = true;
             }
             // content|length or message.content|length
             Expr::Filter(f) => {
@@ -419,12 +426,6 @@ impl<'a> Detector<'a> {
     }
 }
 
-/// AST-based detection using minijinja's unstable machinery
-/// Single-pass detector with scope tracking
-fn detect_format_with_ast(template: &str) -> ChatTemplateContentFormat {
-    detect_all_with_ast(template).0
-}
-
 /// Single-pass detection of content format, think-in-prefill, and thinking toggle.
 fn detect_all(
     template: &str,
@@ -475,23 +476,311 @@ pub struct ChatTemplateParams<'a> {
     /// Special tokens to inject into the template context.
     /// Many templates reference `{{ bos_token }}`, `{{ eos_token }}`, etc.
     pub special_tokens: Option<&'a crate::traits::SpecialTokens>,
+    /// Resolved thinking preference. When `Some`, `apply` sets the template's
+    /// own thinking-toggle key (`enable_thinking`/`thinking`, per detection) to
+    /// this value as a default. An explicit `template_kwargs` entry for that
+    /// key still wins.
+    pub thinking: Option<bool>,
+}
+
+/// JSON separator pair passed through HuggingFace's `tojson` filter.
+#[derive(Debug, Clone)]
+struct JsonSeparators {
+    item: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl JsonSeparators {
+    fn python_default(indent: Option<i64>) -> Self {
+        // Python's json.dumps defaults to `(', ', ': ')` for compact output
+        // and `(',', ': ')` when pretty indentation is enabled.
+        let item = if indent.is_some() { "," } else { ", " };
+        Self {
+            item: item.as_bytes().to_vec(),
+            key: b": ".to_vec(),
+        }
+    }
+}
+
+/// Formatter matching Python's `json.dumps` separator and ASCII escaping rules.
+#[derive(Debug, Clone)]
+struct PythonJsonFormatter {
+    current_indent: usize,
+    has_value: bool,
+    indent: Option<Vec<u8>>,
+    separators: JsonSeparators,
+    ensure_ascii: bool,
+}
+
+impl PythonJsonFormatter {
+    fn new(indent: Option<usize>, separators: JsonSeparators, ensure_ascii: bool) -> Self {
+        Self {
+            current_indent: 0,
+            has_value: false,
+            indent: indent.map(|spaces| vec![b' '; spaces]),
+            separators,
+            ensure_ascii,
+        }
+    }
+}
+
+fn write_indent<W>(writer: &mut W, count: usize, indent: &[u8]) -> io::Result<()>
+where
+    W: ?Sized + io::Write,
+{
+    for _ in 0..count {
+        writer.write_all(indent)?;
+    }
+    Ok(())
+}
+
+fn write_u_escape<W>(writer: &mut W, code: u16) -> io::Result<()>
+where
+    W: ?Sized + io::Write,
+{
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    writer.write_all(&[
+        b'\\',
+        b'u',
+        HEX[((code >> 12) & 0xF) as usize],
+        HEX[((code >> 8) & 0xF) as usize],
+        HEX[((code >> 4) & 0xF) as usize],
+        HEX[(code & 0xF) as usize],
+    ])
+}
+
+impl Formatter for PythonJsonFormatter {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !self.ensure_ascii {
+            return writer.write_all(fragment.as_bytes());
+        }
+
+        for ch in fragment.chars() {
+            if ch.is_ascii() {
+                let mut buf = [0; 4];
+                writer.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+                continue;
+            }
+
+            let code = ch as u32;
+            if code <= 0xFFFF {
+                write_u_escape(writer, code as u16)?;
+            } else {
+                let shifted = code - 0x1_0000;
+                let high = 0xD800 + ((shifted >> 10) as u16);
+                let low = 0xDC00 + ((shifted & 0x3FF) as u16);
+                write_u_escape(writer, high)?;
+                write_u_escape(writer, low)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_array<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if self.indent.is_some() {
+            self.current_indent += 1;
+            self.has_value = false;
+        }
+        writer.write_all(b"[")
+    }
+
+    fn end_array<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if let Some(indent) = self.indent.as_deref() {
+            self.current_indent -= 1;
+            if self.has_value {
+                writer.write_all(b"\n")?;
+                write_indent(writer, self.current_indent, indent)?;
+            }
+        }
+        writer.write_all(b"]")
+    }
+
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if let Some(indent) = self.indent.as_deref() {
+            if first {
+                writer.write_all(b"\n")?;
+            } else {
+                writer.write_all(&self.separators.item)?;
+                writer.write_all(b"\n")?;
+            }
+            write_indent(writer, self.current_indent, indent)
+        } else if first {
+            Ok(())
+        } else {
+            writer.write_all(&self.separators.item)
+        }
+    }
+
+    fn end_array_value<W>(&mut self, _writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        self.has_value = true;
+        Ok(())
+    }
+
+    fn begin_object<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if self.indent.is_some() {
+            self.current_indent += 1;
+            self.has_value = false;
+        }
+        writer.write_all(b"{")
+    }
+
+    fn end_object<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if let Some(indent) = self.indent.as_deref() {
+            self.current_indent -= 1;
+            if self.has_value {
+                writer.write_all(b"\n")?;
+                write_indent(writer, self.current_indent, indent)?;
+            }
+        }
+        writer.write_all(b"}")
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if let Some(indent) = self.indent.as_deref() {
+            if first {
+                writer.write_all(b"\n")?;
+            } else {
+                writer.write_all(&self.separators.item)?;
+                writer.write_all(b"\n")?;
+            }
+            write_indent(writer, self.current_indent, indent)
+        } else if first {
+            Ok(())
+        } else {
+            writer.write_all(&self.separators.item)
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        writer.write_all(&self.separators.key)
+    }
+
+    fn end_object_value<W>(&mut self, _writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        self.has_value = true;
+        Ok(())
+    }
+}
+
+fn invalid_tojson_option(message: impl Into<String>) -> MinijinjaError {
+    MinijinjaError::new(ErrorKind::InvalidOperation, message.into())
+}
+
+fn parse_separators(
+    separators: Option<Value>,
+    indent: Option<i64>,
+) -> std::result::Result<JsonSeparators, MinijinjaError> {
+    let Some(separators) = separators else {
+        return Ok(JsonSeparators::python_default(indent));
+    };
+    if separators.is_none() || separators.is_undefined() {
+        return Ok(JsonSeparators::python_default(indent));
+    }
+
+    let parsed: serde_json::Value = serde_json::to_value(&separators).map_err(|e| {
+        invalid_tojson_option(format!("Failed to convert separators to JSON value: {e}"))
+    })?;
+    let JsonValue::Array(values) = parsed else {
+        return Err(invalid_tojson_option(
+            "separators must be a two-item sequence",
+        ));
+    };
+    if values.len() != 2 {
+        return Err(invalid_tojson_option(
+            "separators must be a two-item sequence",
+        ));
+    }
+
+    let item = values[0]
+        .as_str()
+        .ok_or_else(|| invalid_tojson_option("item separator must be a string"))?;
+    let key = values[1]
+        .as_str()
+        .ok_or_else(|| invalid_tojson_option("key separator must be a string"))?;
+
+    Ok(JsonSeparators {
+        item: item.as_bytes().to_vec(),
+        key: key.as_bytes().to_vec(),
+    })
+}
+
+fn serialize_with_python_json<T: Serialize>(
+    value: &T,
+    indent: Option<i64>,
+    separators: JsonSeparators,
+    ensure_ascii: bool,
+) -> std::result::Result<String, MinijinjaError> {
+    let indent = indent
+        .map(|spaces| {
+            if spaces < 0 {
+                Err(invalid_tojson_option("indent cannot be negative"))
+            } else {
+                Ok(spaces as usize)
+            }
+        })
+        .transpose()?;
+
+    let formatter = PythonJsonFormatter::new(indent, separators, ensure_ascii);
+    let mut buf = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+    value.serialize(&mut serializer).map_err(|e| {
+        MinijinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("Failed to serialize JSON: {e}"),
+        )
+    })?;
+    String::from_utf8(buf).map_err(|e| {
+        MinijinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("Invalid UTF-8 in JSON output: {e}"),
+        )
+    })
 }
 
 /// Custom tojson filter compatible with HuggingFace transformers' implementation.
 ///
 /// HuggingFace transformers registers a custom `tojson` filter that accepts additional
 /// keyword arguments beyond what standard Jinja2 provides:
-/// - `ensure_ascii` (bool): Whether to escape non-ASCII characters (ignored in Rust, always UTF-8)
+/// - `ensure_ascii` (bool): Whether to escape non-ASCII characters
 /// - `indent` (int): Number of spaces for indentation (pretty-printing)
-/// - `separators` (ignored): Custom separators for JSON output
+/// - `separators`: Custom item/key separators for JSON output
 /// - `sort_keys` (bool): Whether to sort dictionary keys
 ///
 /// This is necessary for compatibility with chat templates from HuggingFace Hub models.
 /// See: https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py
 fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, MinijinjaError> {
-    let _ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
     let indent: Option<i64> = kwargs.get("indent")?;
-    let _separators: Option<Value> = kwargs.get("separators")?;
+    let separators: Option<Value> = kwargs.get("separators")?;
     let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
 
     // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
@@ -504,29 +793,6 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
         )
     })?;
 
-    // Helper to serialize with custom indentation
-    fn serialize_with_indent<T: Serialize>(
-        value: &T,
-        spaces: usize,
-    ) -> std::result::Result<String, MinijinjaError> {
-        let indent_str = vec![b' '; spaces];
-        let formatter = PrettyFormatter::with_indent(&indent_str);
-        let mut buf = Vec::new();
-        let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
-        value.serialize(&mut serializer).map_err(|e| {
-            MinijinjaError::new(
-                ErrorKind::InvalidOperation,
-                format!("Failed to serialize JSON: {e}"),
-            )
-        })?;
-        String::from_utf8(buf).map_err(|e| {
-            MinijinjaError::new(
-                ErrorKind::InvalidOperation,
-                format!("Invalid UTF-8 in JSON output: {e}"),
-            )
-        })
-    }
-
     // Serialize with options
     let json_str: std::result::Result<String, MinijinjaError> = {
         let sorted_json;
@@ -537,22 +803,13 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
             &json_value
         };
 
-        if let Some(spaces) = indent {
-            if spaces < 0 {
-                return Err(MinijinjaError::new(
-                    ErrorKind::InvalidOperation,
-                    "indent cannot be negative",
-                ));
-            }
-            serialize_with_indent(value_to_serialize, spaces as usize)
-        } else {
-            serde_json::to_string(value_to_serialize).map_err(|e| {
-                MinijinjaError::new(
-                    ErrorKind::InvalidOperation,
-                    format!("Failed to serialize JSON: {e}"),
-                )
-            })
-        }
+        let separators = parse_separators(separators, indent)?;
+        serialize_with_python_json(
+            value_to_serialize,
+            indent,
+            separators,
+            ensure_ascii.unwrap_or(false),
+        )
     };
 
     json_str.map(Value::from_safe_string)
@@ -573,6 +830,12 @@ fn sort_json_keys(value: &JsonValue) -> JsonValue {
         JsonValue::Array(arr) => JsonValue::Array(arr.iter().map(sort_json_keys).collect()),
         _ => value.clone(),
     }
+}
+
+/// Hugging Face chat-template helper for surfacing model-authored validation
+/// errors instead of a generic "unknown function" render failure.
+fn raise_exception(message: String) -> std::result::Result<String, MinijinjaError> {
+    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message))
 }
 
 /// Build a pre-configured `Environment<'static>` with the given template string,
@@ -599,6 +862,7 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // This overrides minijinja's built-in tojson to support additional kwargs
     // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
     env.add_filter("tojson", tojson_filter);
+    env.add_function("raise_exception", raise_exception);
 
     Ok(env)
 }
@@ -822,6 +1086,28 @@ impl ChatTemplateState {
                  https://huggingface.co/docs/transformers/main/en/chat_templating",
             )
         })?;
+
+        // Apply the resolved thinking preference under the template's own toggle
+        // key (`enable_thinking` vs `thinking`, per detection). Skip entirely
+        // (no clone) when the caller already set that key explicitly — the
+        // explicit value wins.
+        if let (Some(thinking), Some(key)) = (params.thinking, self.thinking_key_name) {
+            let kwarg_key = key.as_kwarg();
+            if params
+                .template_kwargs
+                .is_none_or(|k| !k.contains_key(kwarg_key))
+            {
+                let mut kwargs = params.template_kwargs.cloned().unwrap_or_default();
+                kwargs.insert(kwarg_key.to_string(), serde_json::Value::Bool(thinking));
+                let params = ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    thinking: None,
+                    ..params
+                };
+                return render_chat_template(env, messages, params);
+            }
+        }
+
         render_chat_template(env, messages, params)
     }
 
@@ -891,6 +1177,21 @@ mod tests {
     }
 
     #[test]
+    fn test_raise_exception_surfaces_template_validation_message() {
+        let state = ChatTemplateState::new(Some(
+            "{{ raise_exception('reasoning_effort is invalid') }}".to_string(),
+        ))
+        .unwrap();
+
+        let error = state
+            .apply(&[], ChatTemplateParams::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("reasoning_effort is invalid"), "{error}");
+    }
+
+    #[test]
     fn test_special_tokens_injected_into_context() {
         let template = "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}{{ eos_token }}";
         let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
@@ -947,5 +1248,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, "<s>hello");
+    }
+
+    #[test]
+    fn thinking_param_sets_template_key_and_explicit_wins() {
+        use std::collections::HashMap;
+
+        // Template echoes the enable_thinking value so we can observe what was set.
+        let state = ChatTemplateState::new(Some("{{ enable_thinking }}".to_string())).unwrap();
+        assert_eq!(
+            state.thinking_key_name(),
+            Some(ThinkingKeyName::EnableThinking)
+        );
+
+        // thinking = Some(false) injects enable_thinking=false under the model's key.
+        let out = state
+            .apply(
+                &[],
+                ChatTemplateParams {
+                    thinking: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out, "false");
+
+        // An explicit template_kwargs entry overrides the injected default.
+        let mut kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+        kwargs.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+        let out = state
+            .apply(
+                &[],
+                ChatTemplateParams {
+                    thinking: Some(false),
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out, "true");
     }
 }

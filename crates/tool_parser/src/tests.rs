@@ -2,7 +2,7 @@ use openai_protocol::common::{Function, Tool};
 
 use super::*;
 use crate::{
-    parsers::{JsonParser, QwenCoderParser},
+    parsers::{JsonParser, QwenXmlParser},
     partial_json::PartialJson,
     traits::ToolParser,
 };
@@ -78,6 +78,33 @@ fn test_partial_json_parser() {
 }
 
 #[test]
+fn test_partial_json_consumed_is_byte_offset() {
+    let parser = PartialJson::default();
+
+    // Complete object with a multibyte value: consumed must be the byte length
+    // and must land on a UTF-8 char boundary so input[..consumed] is sliceable.
+    let input = r#"{"k":"é"}"#;
+    let (value, consumed) = parser.parse_value(input, true).unwrap();
+    assert_eq!(value["k"], "é");
+    assert_eq!(consumed, input.len());
+    assert!(input.is_char_boundary(consumed));
+    let _ = &input[..consumed];
+
+    // Partial object whose multibyte char is the last consumed content.
+    let input = "{\"k\":\"é";
+    let (value, consumed) = parser.parse_value(input, true).unwrap();
+    assert_eq!(value["k"], "é");
+    assert!(input.is_char_boundary(consumed));
+    let _ = &input[..consumed];
+
+    // Emoji (4-byte) value also yields a byte offset on a char boundary.
+    let input = r#"{"k":"🌍"}"#;
+    let (_value, consumed) = parser.parse_value(input, true).unwrap();
+    assert_eq!(consumed, input.len());
+    assert!(input.is_char_boundary(consumed));
+}
+
+#[test]
 fn test_partial_json_depth_limit() {
     // max_depth of 3 allows nesting up to 3 levels
     // Set allow_incomplete to false to get errors instead of partial results
@@ -100,31 +127,6 @@ fn test_partial_json_depth_limit() {
 }
 
 // NOTE: test_stream_result_variants removed - StreamResult enum replaced by StreamingParseResult
-
-#[test]
-fn test_partial_tool_call() {
-    let mut partial = PartialToolCall {
-        name: None,
-        arguments_buffer: String::new(),
-        start_position: 0,
-        name_sent: false,
-        streamed_args: String::new(),
-    };
-
-    // Set name
-    partial.name = Some("test_function".to_string());
-    assert_eq!(partial.name.as_ref().unwrap(), "test_function");
-
-    // Append arguments
-    partial.arguments_buffer.push_str(r#"{"key": "value"}"#);
-    assert_eq!(partial.arguments_buffer, r#"{"key": "value"}"#);
-
-    // Update streaming state
-    partial.name_sent = true;
-    partial.streamed_args = r#"{"key": "#.to_string();
-    assert!(partial.name_sent);
-    assert_eq!(partial.streamed_args, r#"{"key": "#);
-}
 
 #[tokio::test]
 async fn test_json_parser_complete_single() {
@@ -574,7 +576,7 @@ mod stress_tests {
 }
 
 #[cfg(test)]
-mod qwen_coder_tests {
+mod qwen_xml_tests {
     use super::*;
 
     fn create_test_tools() -> Vec<Tool> {
@@ -596,8 +598,8 @@ mod qwen_coder_tests {
     }
 
     #[tokio::test]
-    async fn test_qwen_coder_incremental_parameter_streaming() {
-        let mut parser = QwenCoderParser::new();
+    async fn test_qwen_xml_incremental_parameter_streaming() {
+        let mut parser = QwenXmlParser::new();
         let tools = create_test_tools();
 
         let chunks = [
@@ -651,8 +653,8 @@ mod qwen_coder_tests {
     }
 
     #[tokio::test]
-    async fn test_qwen_coder_incremental_parameter_streaming_with_partial_values() {
-        let mut parser = QwenCoderParser::new();
+    async fn test_qwen_xml_incremental_parameter_streaming_with_partial_values() {
+        let mut parser = QwenXmlParser::new();
         let tools = create_test_tools();
 
         // Test with parameter values that arrive in multiple chunks
@@ -691,8 +693,8 @@ mod qwen_coder_tests {
     }
 
     #[tokio::test]
-    async fn test_qwen_coder_nested_json_parameter() {
-        let mut parser = QwenCoderParser::new();
+    async fn test_qwen_xml_nested_json_parameter() {
+        let mut parser = QwenXmlParser::new();
         let tools = vec![Tool {
             tool_type: "function".to_string(),
             function: Function {
@@ -733,5 +735,54 @@ mod qwen_coder_tests {
             params_str.contains("nested"),
             "Should contain nested parameter"
         );
+    }
+}
+
+#[cfg(test)]
+mod qwen_mapping_tests {
+    use crate::factory::ParserFactory;
+
+    #[test]
+    fn test_qwen_xml_model_mappings() {
+        let factory = ParserFactory::new();
+        let registry = factory.registry();
+
+        for model in [
+            "Qwen3.5-32B",
+            "Qwen/Qwen3.5-4B",
+            "qwen3.5-72b",
+            "qwen/qwen3.5-32b",
+            "Qwen3-Coder-480B",
+            "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+            "qwen3-coder-7b",
+            "qwen/qwen3-coder-32b",
+        ] {
+            assert_eq!(
+                registry.resolve_model_to_parser(model),
+                Some("qwen_xml".to_string()),
+                "{model} should resolve to qwen_xml"
+            );
+        }
+    }
+
+    #[test]
+    fn test_qwen_json_model_mappings() {
+        let factory = ParserFactory::new();
+        let registry = factory.registry();
+
+        for model in [
+            "Qwen2.5-72B-Instruct",
+            "Qwen2.5-Coder-32B-Instruct",
+            "qwen2.5-coder-7b",
+            "Qwen3-32B",
+            "Qwen/Qwen3-235B-A22B",
+            "qwen3-8b",
+        ] {
+            assert_eq!(
+                registry.resolve_model_to_parser(model),
+                Some("qwen".to_string()),
+                "{model} should resolve to qwen"
+            );
+        }
     }
 }

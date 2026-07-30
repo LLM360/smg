@@ -10,7 +10,7 @@ This guide covers setting up a development environment and contributing code to 
 
 ## Prerequisites
 
-- **Rust**: 1.90 or later
+- **Rust**: 1.95 or later
 - **Docker**: For running integration tests
 - **Git**: For version control
 
@@ -149,6 +149,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Fix clippy warnings automatically
 cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings
 ```
+
+!!! note "`--all-features` needs OpenCV"
+    `--all-features` enables the `opencv-video` feature, which links system
+    OpenCV. Install it once with `bash scripts/install_opencv.sh` (Homebrew on
+    macOS, apt on Debian/Ubuntu). To lint without that system dependency, drop
+    `--all-features` — it skips the multimodal video-decode code:
+
+    ```bash
+    cargo clippy --workspace --all-targets -- -D warnings
+    ```
 
 ### Linting and Formatting (Python)
 
@@ -427,6 +437,20 @@ Tests may conflict if run in parallel:
 ```bash
 # Run tests serially
 cargo test -- --test-threads=1
+```
+
+### `Failed to find installed OpenCV package`
+
+The `--all-features` build (used by `make check`, `make pre-commit`, and CI's
+lint job) enables the `opencv-video` feature, which links system OpenCV.
+Install it, or lint without `--all-features`:
+
+```bash
+# Install OpenCV (Homebrew on macOS, apt on Debian/Ubuntu)
+bash scripts/install_opencv.sh
+
+# ...or skip the feature for a quick lint
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ### Clippy Errors in CI
