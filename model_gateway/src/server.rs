@@ -37,7 +37,10 @@ use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler, WorkerStateSubscriber};
-use tokio::{signal, spawn, sync::mpsc};
+use tokio::{
+    signal, spawn,
+    sync::{mpsc, Semaphore},
+};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -80,6 +83,7 @@ pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<mpsc::Sender<QueuedRequest>>,
+    pub concurrency_queue_slots: Option<Arc<Semaphore>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
 }
@@ -1115,6 +1119,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.queue_size,
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
+    metrics::Metrics::initialize_http_admission(
+        config.router_config.max_concurrent_requests,
+        config.router_config.queue_size,
+    );
 
     if app_context.rate_limiter.is_none() {
         info!("Rate limiting is disabled (max_concurrent_requests = -1)");
@@ -1178,6 +1186,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router,
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
+        concurrency_queue_slots: limiter.queue_slots.clone(),
         router_manager: Some(router_manager),
         mesh_handler,
     });

@@ -1,6 +1,10 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -171,6 +175,58 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
+    );
+    describe_counter!(
+        "smg_http_admission_received_total",
+        "Inference requests received by the admission middleware"
+    );
+    describe_counter!(
+        "smg_http_admission_admitted_total",
+        "Inference requests admitted by the concurrency limiter"
+    );
+    describe_counter!(
+        "smg_http_admission_rejected_total",
+        "Inference requests rejected by the concurrency limiter"
+    );
+    describe_counter!(
+        "smg_http_admission_success_total",
+        "Admitted inference responses delivered with HTTP 2xx or 3xx"
+    );
+    describe_counter!(
+        "smg_http_admission_http_4xx_total",
+        "Admitted inference responses delivered with HTTP 4xx"
+    );
+    describe_counter!(
+        "smg_http_admission_http_5xx_total",
+        "Admitted inference responses delivered with HTTP 5xx"
+    );
+    describe_counter!(
+        "smg_http_admission_interrupted_total",
+        "Admitted inference responses dropped before their body completed"
+    );
+    describe_counter!(
+        "smg_http_admission_pre_admission_interrupted_total",
+        "Inference requests dropped while waiting for admission"
+    );
+    describe_gauge!(
+        "smg_http_admission_active",
+        "Admitted inference requests holding concurrency capacity"
+    );
+    describe_gauge!(
+        "smg_http_admission_queued",
+        "Inference requests currently waiting for concurrency capacity"
+    );
+    describe_gauge!(
+        "smg_http_admission_limit",
+        "Configured concurrent request limit; -1 means unbounded"
+    );
+    describe_gauge!(
+        "smg_http_admission_queue_capacity",
+        "Configured admission queue capacity"
+    );
+    describe_gauge!(
+        "smg_http_admission_process_start_time_seconds",
+        "Unix timestamp identifying the process that owns admission counters"
     );
 
     // Layer 2: Router metrics
@@ -537,6 +593,82 @@ impl Metrics {
             "result" => result
         )
         .increment(1);
+    }
+
+    /// Initialize the admission series, including zero-valued counters.
+    pub fn initialize_http_admission(limit: i32, queue_capacity: usize) {
+        let process_start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        counter!("smg_http_admission_received_total").absolute(0);
+        counter!("smg_http_admission_admitted_total").absolute(0);
+        counter!("smg_http_admission_rejected_total").absolute(0);
+        counter!("smg_http_admission_success_total").absolute(0);
+        counter!("smg_http_admission_http_4xx_total").absolute(0);
+        counter!("smg_http_admission_http_5xx_total").absolute(0);
+        counter!("smg_http_admission_interrupted_total").absolute(0);
+        counter!("smg_http_admission_pre_admission_interrupted_total").absolute(0);
+        gauge!("smg_http_admission_active").set(0.0);
+        gauge!("smg_http_admission_queued").set(0.0);
+        gauge!("smg_http_admission_limit").set(f64::from(limit));
+        gauge!("smg_http_admission_queue_capacity").set(queue_capacity as f64);
+        gauge!("smg_http_admission_process_start_time_seconds").set(process_start_time);
+    }
+
+    /// Record an inference request reaching the admission middleware.
+    pub fn record_http_admission_received() {
+        counter!("smg_http_admission_received_total").increment(1);
+    }
+
+    /// Record an inference request receiving concurrency capacity.
+    pub fn record_http_admission_admitted() {
+        counter!("smg_http_admission_admitted_total").increment(1);
+    }
+
+    /// Record an inference request leaving through an admission rejection.
+    pub fn record_http_admission_rejected() {
+        counter!("smg_http_admission_rejected_total").increment(1);
+    }
+
+    /// Record a fully delivered admitted response by HTTP status class.
+    pub fn record_http_admission_outcome(status: u16) {
+        let metric = match status {
+            200..=399 => "smg_http_admission_success_total",
+            400..=499 => "smg_http_admission_http_4xx_total",
+            _ => "smg_http_admission_http_5xx_total",
+        };
+        counter!(metric).increment(1);
+    }
+
+    /// Record an admitted response whose body did not complete.
+    pub fn record_http_admission_interrupted() {
+        counter!("smg_http_admission_interrupted_total").increment(1);
+    }
+
+    /// Record a request that disappeared before admission resolved.
+    pub fn record_http_pre_admission_interrupted() {
+        counter!("smg_http_admission_pre_admission_interrupted_total").increment(1);
+    }
+
+    /// Increment the number of admitted requests holding capacity.
+    pub fn increment_http_admission_active() {
+        gauge!("smg_http_admission_active").increment(1.0);
+    }
+
+    /// Decrement the number of admitted requests holding capacity.
+    pub fn decrement_http_admission_active() {
+        gauge!("smg_http_admission_active").decrement(1.0);
+    }
+
+    /// Increment the number of requests waiting for capacity.
+    pub fn increment_http_admission_queued() {
+        gauge!("smg_http_admission_queued").increment(1.0);
+    }
+
+    /// Decrement the number of requests waiting for capacity.
+    pub fn decrement_http_admission_queued() {
+        gauge!("smg_http_admission_queued").decrement(1.0);
     }
 
     // ========================================================================

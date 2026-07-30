@@ -191,6 +191,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         router,
         context: app_context.clone(),
         concurrency_queue_tx: None,
+        concurrency_queue_slots: None,
         router_manager: None,
         mesh_handler: None,
     });
