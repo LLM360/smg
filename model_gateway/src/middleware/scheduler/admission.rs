@@ -29,7 +29,10 @@ use super::{
     SchedulerError, SchedulerGuardBody, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
 };
 use crate::{
-    middleware::RouteRequestMeta,
+    middleware::{
+        admission_metrics::{AdmissionActiveGuard, AdmissionPendingGuard},
+        RouteRequestMeta,
+    },
     observability::metrics::{metrics_labels, Metrics},
     tenant::TenantKey,
 };
@@ -97,6 +100,8 @@ pub async fn priority_admission_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    Metrics::record_http_admission_received();
+    let mut pending_guard = AdmissionPendingGuard::new();
     let tenant = req
         .extensions()
         .get::<RouteRequestMeta>()
@@ -119,6 +124,8 @@ pub async fn priority_admission_middleware(
     if let Some(bucket) = &state.rate_limiter {
         if bucket.try_acquire(1.0).is_err() {
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_http_admission_rejected();
+            pending_guard.resolve();
             return SchedulerError::QueueFull.into_response();
         }
     }
@@ -134,6 +141,9 @@ pub async fn priority_admission_middleware(
 
     match state.scheduler.admit(class, request_id, cancel).await {
         AdmitOutcome::Admitted(permit) => {
+            pending_guard.resolve();
+            Metrics::record_http_admission_admitted();
+            let active_guard = AdmissionActiveGuard::new();
             // Hand the handler the cancel token (for preemption select!).
             req.extensions_mut().insert(permit.cancel_token());
             let response = next.run(req).await;
@@ -158,10 +168,21 @@ pub async fn priority_admission_middleware(
                 scheduler.admit_outcome = outcome,
                 "scheduler admission decision"
             );
+            let status_code = response.status();
             let (parts, body) = response.into_parts();
-            Response::from_parts(parts, Body::new(SchedulerGuardBody::new(body, permit)))
+            Response::from_parts(
+                parts,
+                Body::new(SchedulerGuardBody::new(
+                    body,
+                    permit,
+                    active_guard,
+                    status_code,
+                )),
+            )
         }
         AdmitOutcome::Rejected(reason) => {
+            Metrics::record_http_admission_rejected();
+            pending_guard.resolve();
             let outcome = rejection_outcome(reason);
             sched_metrics::record_admit(class, outcome);
             trace!(

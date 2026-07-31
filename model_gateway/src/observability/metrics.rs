@@ -206,7 +206,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_http_admission_limit",
-        "Configured concurrent request limit; -1 means unbounded"
+        "Current concurrent request limit; -1 means unbounded"
     );
     describe_gauge!(
         "smg_http_admission_queue_capacity",
@@ -781,6 +781,16 @@ impl Metrics {
     /// Decrement the number of requests waiting for capacity.
     pub fn decrement_http_admission_queued() {
         gauge!("smg_http_admission_queued").decrement(1.0);
+    }
+
+    /// Set the current concurrency capacity owned by the active admission policy.
+    pub fn set_http_admission_limit(limit: usize) {
+        gauge!("smg_http_admission_limit").set(limit as f64);
+    }
+
+    /// Set the total queue capacity owned by the active admission policy.
+    pub fn set_http_admission_queue_capacity(capacity: usize) {
+        gauge!("smg_http_admission_queue_capacity").set(capacity as f64);
     }
 
     /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.

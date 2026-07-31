@@ -4,6 +4,7 @@
 //! types and functions that `server.rs` and other call sites already
 //! reference, so this split is invisible to downstream callers.
 
+mod admission_metrics;
 pub mod auth;
 pub mod concurrency;
 pub mod logging;

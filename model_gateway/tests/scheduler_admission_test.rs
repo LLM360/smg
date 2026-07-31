@@ -42,6 +42,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
+use metrics_exporter_prometheus::PrometheusBuilder;
 use portpicker::pick_unused_port;
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -287,7 +288,144 @@ async fn join(
         .expect("spawned request task panicked")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - malformed scrape values must fail loudly"
+)]
+fn find_metric_value(rendered: &str, name: &str) -> Option<f64> {
+    rendered.lines().find_map(|line| {
+        let (metric, value) = line.split_once(' ')?;
+        (metric == name).then(|| value.parse::<f64>().expect("numeric metric value"))
+    })
+}
+
+#[expect(
+    clippy::panic,
+    reason = "test helper - missing required metrics must fail loudly"
+)]
+fn metric_value(rendered: &str, name: &str) -> f64 {
+    find_metric_value(rendered, name)
+        .unwrap_or_else(|| panic!("metric {name} missing from scrape:\n{rendered}"))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+/// The generic HTTP lifecycle metrics are the request-flow contract consumed
+/// by Comet. They must retain the same meaning when the priority scheduler is
+/// enabled: received requests split into admissions and rejections, queued and
+/// active gauges describe live work, and completed bodies record outcomes.
+#[test]
+#[serial]
+fn priority_scheduler_updates_generic_http_admission_metrics() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+
+    metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let mut yaml = SchedulerYaml::base();
+                yaml.default.queue_size = 1;
+                yaml.default.queue_timeout_secs = 30;
+                let yaml_file = write_scheduler_yaml(&yaml);
+                let config = scheduler_config(3607, "default", yaml_file.path().to_str().unwrap());
+
+                let gate = HoldGate::new();
+                let ctx =
+                    AppTestContext::new_with_config(config, vec![scheduler_worker(1, Some(&gate))])
+                        .await;
+                let app = ctx.create_app();
+
+                let held_app = app.clone();
+                let held = tokio::spawn(async move {
+                    held_app
+                        .oneshot(generate_request("held", None))
+                        .await
+                        .unwrap()
+                });
+                wait_arrivals(&gate, 1).await;
+
+                let queued_app = app.clone();
+                let queued = tokio::spawn(async move {
+                    queued_app
+                        .oneshot(generate_request("queued", None))
+                        .await
+                        .unwrap()
+                });
+
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        let scrape = handle.render();
+                        if find_metric_value(&scrape, "smg_http_admission_queued") == Some(1.0)
+                            && find_metric_value(&scrape, "smg_http_admission_limit") == Some(1.0)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("queued gauge never reached one");
+
+                let rejected = send(&app, generate_request("rejected", None)).await;
+                assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+                let _ = body_json(rejected).await;
+
+                let during = handle.render();
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_received_total"),
+                    3.0
+                );
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_admitted_total"),
+                    1.0
+                );
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_rejected_total"),
+                    1.0
+                );
+                assert_eq!(metric_value(&during, "smg_http_admission_active"), 1.0);
+                assert_eq!(metric_value(&during, "smg_http_admission_queued"), 1.0);
+                assert_eq!(metric_value(&during, "smg_http_admission_limit"), 1.0);
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_queue_capacity"),
+                    193.0
+                );
+
+                gate.release();
+                let held_response = join(held).await;
+                assert_eq!(held_response.status(), StatusCode::OK);
+                let _ = body_json(held_response).await;
+                let queued_response = join(queued).await;
+                assert_eq!(queued_response.status(), StatusCode::OK);
+                let _ = body_json(queued_response).await;
+
+                let completed = handle.render();
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_received_total"),
+                    3.0
+                );
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_admitted_total"),
+                    2.0
+                );
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_rejected_total"),
+                    1.0
+                );
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_success_total"),
+                    2.0
+                );
+                assert_eq!(metric_value(&completed, "smg_http_admission_active"), 0.0);
+                assert_eq!(metric_value(&completed, "smg_http_admission_queued"), 0.0);
+
+                ctx.shutdown().await;
+            });
+    });
+}
 
 /// Queue full → 429. Capacity 1, occupied by a held request; the Default
 /// queue has size 0 so the next admission can't even enqueue.

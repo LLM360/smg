@@ -25,7 +25,10 @@ use super::{
     slots::SlotPool,
     Class, ClassRuntimeConfig, SchedulerSettings,
 };
-use crate::worker::WorkerCapacity;
+use crate::{
+    middleware::admission_metrics::AdmissionQueuedGuard, observability::metrics::Metrics,
+    worker::WorkerCapacity,
+};
 
 /// Max time to wait, after firing a preemption cancel, for the victim's slot
 /// to free before falling back to enqueue.
@@ -261,6 +264,7 @@ impl PriorityScheduler {
         {
             return AdmitOutcome::Rejected(RejectionReason::QueueFull);
         }
+        let _queued_guard = AdmissionQueuedGuard::new();
         let enqueued_at = Instant::now();
 
         // Lost-wakeup guard: a slot may have been released after our
@@ -593,11 +597,13 @@ impl PriorityScheduler {
     fn sample_metrics(&self) {
         let capacity = self.slot_pool.capacity();
         let mut total_inflight: u32 = 0;
+        let mut total_queue_capacity: usize = 0;
         for class in Class::ALL {
             let inflight = self.slot_pool.inflight(class);
             total_inflight += u32::from(inflight);
             let depth = self.class_queues[class as usize].depth();
             let limit = self.class_queues[class as usize].capacity();
+            total_queue_capacity = total_queue_capacity.saturating_add(limit);
             super::metrics::set_inflight(class, inflight);
             super::metrics::set_queue_depth(class, depth);
             super::metrics::set_queue_size_limit(class, limit);
@@ -606,6 +612,8 @@ impl PriorityScheduler {
                 self.class_pressure(class, inflight, depth, limit, capacity),
             );
         }
+        Metrics::set_http_admission_limit(usize::from(capacity));
+        Metrics::set_http_admission_queue_capacity(total_queue_capacity);
         let utilization = if capacity == 0 {
             0.0
         } else {
