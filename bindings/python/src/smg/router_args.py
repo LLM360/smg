@@ -113,6 +113,11 @@ class RouterArgs:
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
+    # Priority-aware admission scheduler. Disabled by default for compatibility.
+    priority_scheduler_enabled: bool = False
+    priority_scheduler_default_max_class: str = "default"
+    priority_scheduler_config: str | None = None
+    priority_scheduler_tenant_metric_top_n: int = 32
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: int | None = None
     # Cluster-wide requests-per-second ceiling. Requires mesh and the same value on every gateway.
@@ -243,6 +248,9 @@ class RouterArgs:
         )
         rate_limit_group = parser.add_argument_group(
             "Rate Limiting", "Concurrent request and queue limits"
+        )
+        priority_scheduler_group = parser.add_argument_group(
+            "Priority Scheduler", "Priority-aware admission scheduling"
         )
         retry_group = parser.add_argument_group(
             "Retry Configuration", "Automatic retry behavior for failed requests"
@@ -803,6 +811,30 @@ class RouterArgs:
                 "Cluster-wide request ceiling per second."
                 " Requires mesh and the same value on every gateway"
             ),
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-enabled",
+            action="store_true",
+            default=RouterArgs.priority_scheduler_enabled,
+            help="Enable the priority-aware admission scheduler",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-default-max-class",
+            choices=["system", "interactive", "default", "bulk"],
+            default=RouterArgs.priority_scheduler_default_max_class,
+            help="Maximum priority class for tenants without an explicit policy",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-config",
+            type=str,
+            default=RouterArgs.priority_scheduler_config,
+            help="Optional path to priority scheduler YAML configuration",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-tenant-metric-top-n",
+            type=int,
+            default=RouterArgs.priority_scheduler_tenant_metric_top_n,
+            help="Maximum number of tenant labels retained in scheduler metrics",
         )
 
         # Retry configuration

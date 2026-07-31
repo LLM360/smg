@@ -45,6 +45,28 @@ class TestRouterArgs:
         assert args.disable_retries is False
         assert args.disable_circuit_breaker is False
         assert args.mesh_advertise_host is None
+        assert args.priority_scheduler_enabled is False
+        assert args.priority_scheduler_default_max_class == "default"
+        assert args.priority_scheduler_config is None
+        assert args.priority_scheduler_tenant_metric_top_n == 32
+
+    def test_parse_priority_scheduler_options(self):
+        args = parse_router_args(
+            [
+                "--priority-scheduler-enabled",
+                "--priority-scheduler-default-max-class",
+                "interactive",
+                "--priority-scheduler-config",
+                "/tmp/priority.yaml",
+                "--priority-scheduler-tenant-metric-top-n",
+                "16",
+            ]
+        )
+
+        assert args.priority_scheduler_enabled is True
+        assert args.priority_scheduler_default_max_class == "interactive"
+        assert args.priority_scheduler_config == "/tmp/priority.yaml"
+        assert args.priority_scheduler_tenant_metric_top_n == 16
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
