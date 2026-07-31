@@ -7,11 +7,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use axum::body::Body;
+use axum::{body::Body, http::StatusCode};
 use bytes::Bytes;
-use http_body::Frame;
+use http_body::{Body as HttpBody, Frame};
 
 use super::engine::SchedulerPermit;
+use crate::middleware::admission_metrics::AdmissionActiveGuard;
 
 /// Wraps a response [`Body`], holding the request's [`SchedulerPermit`]
 /// for the lifetime of the stream.
@@ -31,6 +32,9 @@ use super::engine::SchedulerPermit;
 pub struct SchedulerGuardBody {
     inner: Body,
     permit: SchedulerPermit,
+    active_guard: AdmissionActiveGuard,
+    status_code: StatusCode,
+    completed: bool,
     /// Latch so the TTFT CAS is attempted only once (on the first data
     /// frame); subsequent frames skip the check entirely.
     ttft_marked: bool,
@@ -42,12 +46,31 @@ pub struct SchedulerGuardBody {
 }
 
 impl SchedulerGuardBody {
-    pub fn new(inner: Body, permit: SchedulerPermit) -> Self {
+    pub(crate) fn new(
+        inner: Body,
+        permit: SchedulerPermit,
+        active_guard: AdmissionActiveGuard,
+        status_code: StatusCode,
+    ) -> Self {
+        let completed = inner.is_end_stream();
         Self {
             inner,
             permit,
+            active_guard,
+            status_code,
+            completed,
             ttft_marked: false,
             terminated: false,
+        }
+    }
+}
+
+impl Drop for SchedulerGuardBody {
+    fn drop(&mut self) {
+        if self.completed {
+            self.active_guard.record_outcome(self.status_code.as_u16());
+        } else {
+            self.active_guard.record_interrupted();
         }
     }
 }
@@ -79,10 +102,16 @@ impl http_body::Body for SchedulerGuardBody {
                         // Lost the TTFT race to a concurrent preemption
                         // CAS. Terminate the stream cleanly.
                         this.terminated = true;
+                        this.completed = false;
                         return Poll::Ready(None);
                     }
                 }
             }
+        }
+        match &polled {
+            Poll::Ready(None) => this.completed = true,
+            Poll::Ready(Some(Err(_))) => this.completed = false,
+            _ => {}
         }
         polled
     }
@@ -120,12 +149,16 @@ mod tests {
             .expect("slot available")
     }
 
+    fn guarded(inner: Body, permit: SchedulerPermit) -> SchedulerGuardBody {
+        SchedulerGuardBody::new(inner, permit, AdmissionActiveGuard::new(), StatusCode::OK)
+    }
+
     #[tokio::test]
     async fn test_first_data_frame_marks_ttft() {
         let sched = scheduler();
         let p = permit(&sched, "req-ttft");
         let handle = std::sync::Arc::clone(p.handle());
-        let mut guarded = SchedulerGuardBody::new(Body::from("hello world"), p);
+        let mut guarded = guarded(Body::from("hello world"), p);
 
         assert!(handle.is_preemptible(), "pre-TTFT before first frame");
         // Drive the first frame (SchedulerGuardBody is Unpin).
@@ -147,7 +180,7 @@ mod tests {
         // Scheduler wins the preempt CAS before any byte is polled.
         assert!(handle.try_mark_preempted());
 
-        let mut guarded = SchedulerGuardBody::new(Body::from("should not surface"), p);
+        let mut guarded = guarded(Body::from("should not surface"), p);
         // First poll must terminate the stream rather than yield the data.
         let next = guarded.frame().await;
         assert!(
@@ -172,7 +205,7 @@ mod tests {
         let p = permit(&sched, "req-empty");
         let handle = std::sync::Arc::clone(p.handle());
         // Empty body: no data frames at all.
-        let guarded = SchedulerGuardBody::new(Body::empty(), p);
+        let guarded = guarded(Body::empty(), p);
         let _ = guarded.collect().await; // exhaust
         assert!(
             handle.is_preemptible(),
@@ -186,7 +219,7 @@ mod tests {
         assert_eq!(sched.inflight_for_test(Class::Default), 0);
         let p = permit(&sched, "req-drop");
         assert_eq!(sched.inflight_for_test(Class::Default), 1);
-        let guarded = SchedulerGuardBody::new(Body::from("x"), p);
+        let guarded = guarded(Body::from("x"), p);
         drop(guarded);
         assert_eq!(
             sched.inflight_for_test(Class::Default),

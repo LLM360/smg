@@ -30,6 +30,9 @@ use tracing::{debug, error, warn};
 
 use super::token_bucket::TokenBucket;
 use crate::{
+    middleware::admission_metrics::{
+        AdmissionActiveGuard, AdmissionPendingGuard, AdmissionQueuedGuard,
+    },
     observability::metrics::{metrics_labels, Metrics},
     server::AppState,
 };
@@ -101,77 +104,6 @@ impl Drop for TokenGuardBody {
             // Use lock-free sync return - no runtime needed, guaranteed token return
             bucket.return_tokens_sync(self.tokens);
         }
-    }
-}
-
-struct AdmissionActiveGuard {
-    outcome_recorded: bool,
-}
-
-impl AdmissionActiveGuard {
-    fn new() -> Self {
-        Metrics::increment_http_admission_active();
-        Self {
-            outcome_recorded: false,
-        }
-    }
-
-    fn record_outcome(&mut self, status: u16) {
-        if !self.outcome_recorded {
-            Metrics::record_http_admission_outcome(status);
-            self.outcome_recorded = true;
-        }
-    }
-
-    fn record_interrupted(&mut self) {
-        if !self.outcome_recorded {
-            Metrics::record_http_admission_interrupted();
-            self.outcome_recorded = true;
-        }
-    }
-}
-
-impl Drop for AdmissionActiveGuard {
-    fn drop(&mut self) {
-        self.record_interrupted();
-        Metrics::decrement_http_admission_active();
-    }
-}
-
-struct AdmissionPendingGuard {
-    resolved: bool,
-}
-
-impl AdmissionPendingGuard {
-    fn new() -> Self {
-        Self { resolved: false }
-    }
-
-    fn resolve(&mut self) {
-        self.resolved = true;
-    }
-}
-
-impl Drop for AdmissionPendingGuard {
-    fn drop(&mut self) {
-        if !self.resolved {
-            Metrics::record_http_pre_admission_interrupted();
-        }
-    }
-}
-
-struct AdmissionQueuedGuard;
-
-impl AdmissionQueuedGuard {
-    fn new() -> Self {
-        Metrics::increment_http_admission_queued();
-        Self
-    }
-}
-
-impl Drop for AdmissionQueuedGuard {
-    fn drop(&mut self) {
-        Metrics::decrement_http_admission_queued();
     }
 }
 
