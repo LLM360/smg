@@ -490,6 +490,10 @@ struct Router {
     encode_policy: Option<PolicyType>,
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
+    priority_scheduler_enabled: bool,
+    priority_scheduler_default_max_class: String,
+    priority_scheduler_config: Option<String>,
+    priority_scheduler_tenant_metric_top_n: u32,
 }
 
 impl Router {
@@ -754,6 +758,10 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .priority_scheduler_enabled(self.priority_scheduler_enabled)
+            .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
+            .priority_scheduler_config(self.priority_scheduler_config.clone())
+            .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -965,6 +973,10 @@ impl Router {
         encode_policy = None,
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
+        priority_scheduler_enabled = false,
+        priority_scheduler_default_max_class = String::from("default"),
+        priority_scheduler_config = None,
+        priority_scheduler_tenant_metric_top_n = 32,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1094,6 +1106,10 @@ impl Router {
         encode_policy: Option<PolicyType>,
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
+        priority_scheduler_enabled: bool,
+        priority_scheduler_default_max_class: String,
+        priority_scheduler_config: Option<String>,
+        priority_scheduler_tenant_metric_top_n: u32,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1237,6 +1253,10 @@ impl Router {
             encode_policy,
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
+            priority_scheduler_enabled,
+            priority_scheduler_default_max_class,
+            priority_scheduler_config,
+            priority_scheduler_tenant_metric_top_n,
         })
     }
 

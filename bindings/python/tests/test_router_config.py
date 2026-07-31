@@ -209,6 +209,26 @@ class TestRouterConfigValidation:
         assert args.rate_limit_tokens_per_second == 100
         assert args.global_rate_limit_requests_per_second == 75
 
+    def test_priority_scheduler_config_is_forwarded_to_rust_router(self):
+        args = RouterArgs(
+            worker_urls=[],
+            priority_scheduler_enabled=True,
+            priority_scheduler_default_max_class="interactive",
+            priority_scheduler_config="/tmp/priority.yaml",
+            priority_scheduler_tenant_metric_top_n=16,
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            from smg.router import Router
+
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["priority_scheduler_enabled"] is True
+        assert kwargs["priority_scheduler_default_max_class"] == "interactive"
+        assert kwargs["priority_scheduler_config"] == "/tmp/priority.yaml"
+        assert kwargs["priority_scheduler_tenant_metric_top_n"] == 16
+
     def test_service_discovery_config_validation(self):
         """Test service discovery configuration validation."""
         # Valid service discovery config
