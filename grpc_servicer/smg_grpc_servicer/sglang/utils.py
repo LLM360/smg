@@ -9,6 +9,21 @@ from http import HTTPStatus
 import grpc
 
 
+def prefill_prealloc_queue_reqs(disaggregation: object) -> int:
+    """Read the prefill pre-allocation queue across SGLang snapshot versions.
+
+    SGLang 0.5.16 publishes this counter as
+    ``prefill_bootstrap_queue_reqs``. Newer snapshots use the protobuf-aligned
+    ``prefill_prealloc_queue_reqs`` name. Prefer the new name while preserving
+    compatibility with the oldest SGLang release supported by this package.
+    """
+    return getattr(
+        disaggregation,
+        "prefill_prealloc_queue_reqs",
+        getattr(disaggregation, "prefill_bootstrap_queue_reqs", 0),
+    )
+
+
 def to_token_id_array(token_ids: Iterable[int] | None) -> array | None:
     """Coerce a token-id sequence to the ``array("q")`` the SGLang scheduler expects.
 

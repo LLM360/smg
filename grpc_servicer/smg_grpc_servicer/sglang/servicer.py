@@ -59,7 +59,11 @@ from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
-from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
+from smg_grpc_servicer.sglang.utils import (
+    abort_code_from_output,
+    prefill_prealloc_queue_reqs,
+    to_token_id_array,
+)
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
 logger = logging.getLogger(__name__)
@@ -149,7 +153,7 @@ def _convert_loads_to_protobuf(
         scheduler_load.disaggregation.CopyFrom(
             sglang_scheduler_pb2.DisaggregationMetrics(
                 mode=result.disaggregation.mode,
-                prefill_prealloc_queue_reqs=result.disaggregation.prefill_prealloc_queue_reqs,
+                prefill_prealloc_queue_reqs=prefill_prealloc_queue_reqs(result.disaggregation),
                 prefill_inflight_queue_reqs=result.disaggregation.prefill_inflight_queue_reqs,
                 decode_prealloc_queue_reqs=result.disaggregation.decode_prealloc_queue_reqs,
                 decode_transfer_queue_reqs=result.disaggregation.decode_transfer_queue_reqs,
