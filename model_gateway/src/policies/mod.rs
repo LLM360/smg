@@ -139,6 +139,9 @@ pub struct CacheAwareConfig {
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    /// Output-token estimate used by the size-aware P2C fallback and cached
+    /// owner reservations.
+    pub fallback_output_token_estimate: u64,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
     /// Used by `compute_request_content_hashes` to chunk request tokens into blocks.
     /// Must match the backend's block size. Default: 16 (SGLang page size).
@@ -147,7 +150,7 @@ pub struct CacheAwareConfig {
     pub engine_load: bool,
     /// KV-usage **spread** (hottest minus coldest backend, 0.0–1.0) above which
     /// the pool is treated as imbalanced and cache affinity is abandoned for
-    /// shortest-queue. This is the balance signal for long-context workloads
+    /// size-aware P2C. This is the balance signal for long-context workloads
     /// where a few requests saturate one engine's KV without tripping the
     /// request-count thresholds; being backend-reported, it is invariant to the
     /// number of gateway replicas. Requires the backend to report `token_usage`
@@ -169,6 +172,7 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+            fallback_output_token_estimate: DEFAULT_OUTPUT_TOKEN_ESTIMATE,
             block_size: 16,
             engine_load: false,
             // Both KV triggers disabled by default (>= 1.0 never trips). Set

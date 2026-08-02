@@ -50,6 +50,7 @@ class RouterArgs:
 
     # Routing policy
     policy: str = "cache_aware"
+    model_policies: dict[str, str] = dataclasses.field(default_factory=dict)
     encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
     prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
     decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
@@ -354,6 +355,16 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}model-policy",
+            action="append",
+            default=[],
+            metavar="MODEL=POLICY",
+            help=(
+                "Per-model routing policy override. Repeat for multiple models; "
+                "cache-aware overrides use the gateway's cache and output-token settings."
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}encode-policy",
             type=str,
             default=None,
@@ -447,7 +458,7 @@ class RouterArgs:
             help=(
                 "Cache-aware KV-usage SPREAD threshold (0.0-1.0): the hottest minus"
                 " coldest backend KV utilization above which cache affinity is"
-                " abandoned for shortest-queue. Catches long-context KV imbalance that"
+                " abandoned for size-aware P2C. Catches long-context KV imbalance that"
                 " in-flight request counts miss, and is invariant to gateway replica"
                 " count. Backend must report token_usage. Defaults to 1.0 (disabled)."
             ),
@@ -1382,6 +1393,9 @@ class RouterArgs:
         args_dict["storage_context_headers"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
+        args_dict["model_policies"] = cls._parse_model_policies(
+            cli_args_dict.get(f"{prefix}model_policy", None)
+        )
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
@@ -1397,6 +1411,28 @@ class RouterArgs:
         )
 
         return cls(**args_dict)
+
+    @staticmethod
+    def _parse_model_policies(values: list[str] | None) -> dict[str, str]:
+        policies: dict[str, str] = {}
+        allowed = {*COMMON_POLICY_CHOICES, "size_aware_power_of_two", "bucket"}
+        for value in values or []:
+            if "=" not in value:
+                raise ValueError(f"invalid model policy '{value}'; expected MODEL=POLICY")
+            model_id, policy = value.split("=", 1)
+            model_id = model_id.strip()
+            policy = policy.strip()
+            if not model_id:
+                raise ValueError("model policy must have a non-empty model ID")
+            if policy not in allowed:
+                raise ValueError(
+                    f"invalid policy '{policy}' for model '{model_id}'; "
+                    f"expected one of {sorted(allowed)}"
+                )
+            if model_id in policies:
+                raise ValueError(f"duplicate model policy for '{model_id}'")
+            policies[model_id] = policy
+        return policies
 
     def _validate_router_args(self):
         if self.global_rate_limit_requests_per_second is not None:

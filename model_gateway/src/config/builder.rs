@@ -107,6 +107,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn model_policies(mut self, policies: HashMap<String, PolicyConfig>) -> Self {
+        self.config.model_policies = policies;
+        self
+    }
+
     pub fn random_policy(mut self) -> Self {
         self.config.policy = PolicyConfig::Random;
         self
@@ -131,6 +136,7 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            fallback_output_token_estimate: 4096,
             block_size: 16,
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,

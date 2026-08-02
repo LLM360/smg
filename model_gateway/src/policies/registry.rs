@@ -36,6 +36,9 @@ pub struct PolicyRegistry {
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
 
+    /// Explicit model policy configurations supplied at router startup.
+    model_policy_configs: Arc<HashMap<String, PolicyConfig>>,
+
     /// Prefill policy for PD mode (set once at startup, lock-free reads via OnceLock)
     prefill_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
@@ -75,6 +78,15 @@ impl PolicyRegistry {
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
     ) -> Self {
+        Self::with_model_policies(default_policy_config, routing_key_override, HashMap::new())
+    }
+
+    /// Create a registry with explicit per-model policy overrides.
+    pub fn with_model_policies(
+        default_policy_config: PolicyConfig,
+        routing_key_override: RoutingKeyOverrideConfig,
+        model_policy_configs: HashMap<String, PolicyConfig>,
+    ) -> Self {
         let default_policy = Self::create_policy_from_config(&default_policy_config);
         let routing_key_sticky = routing_key_override.enabled.then(|| {
             Arc::new(ManualPolicy::with_config(ManualConfig {
@@ -88,6 +100,7 @@ impl PolicyRegistry {
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
+            model_policy_configs: Arc::new(model_policy_configs),
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             encode_policy: Arc::new(OnceLock::new()),
@@ -290,13 +303,23 @@ impl PolicyRegistry {
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
-        // 1. Check policy hint from worker
+        // 1. Explicit router configuration wins over worker-supplied labels.
+        if let Some(config) = self.model_policy_configs.get(model_id) {
+            debug!(
+                "Using configured policy '{}' for model {}",
+                config.name(),
+                model_id
+            );
+            return self.create_configured_policy(config);
+        }
+
+        // 2. Check policy hint from worker
         if let Some(policy_type) = policy_hint {
             debug!("Using policy hint '{}' for model {}", policy_type, model_id);
             return self.create_policy_from_type(policy_type);
         }
 
-        // 2. Use default policy
+        // 3. Use default policy
         debug!("Using default policy for model {}", model_id);
         Arc::clone(&self.default_policy)
     }
@@ -324,6 +347,19 @@ impl PolicyRegistry {
                 Arc::clone(&self.default_policy)
             })
         }
+    }
+
+    fn create_configured_policy(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        let policy = Self::create_policy_from_config(config);
+        {
+            let guard = self.kv_event_monitor.read();
+            Self::maybe_inject_monitor(&policy, guard.as_ref());
+        }
+        {
+            let guard = self.load_rx.read();
+            Self::maybe_inject_load_rx(&policy, guard.as_ref());
+        }
+        policy
     }
 
     /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
@@ -498,7 +534,7 @@ impl PolicyRegistry {
         if let Some(policy) = self.get_policy(model_id) {
             if policy.name() == "cache_aware" {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_worker_by_url(worker_url);
+                    cache_aware.remove_worker_from_model(model_id, worker_url);
                     debug!(
                         "Removed worker {} from cache-aware policy for model {}",
                         worker_url, model_id
@@ -811,6 +847,37 @@ mod tests {
         assert_eq!(model_a.name(), "size_aware_power_of_two");
         assert_eq!(model_b.name(), "size_aware_power_of_two");
         assert!(Arc::ptr_eq(&model_a, &model_b));
+    }
+
+    #[test]
+    fn test_explicit_model_policy_overrides_default_and_worker_hint() {
+        let registry = PolicyRegistry::with_model_policies(
+            PolicyConfig::SizeAwarePowerOfTwo {
+                output_token_estimate: 2048,
+            },
+            RoutingKeyOverrideConfig::default(),
+            HashMap::from([(
+                "kimi-k3".to_string(),
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.0,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 30,
+                    max_tree_size: 1_000_000,
+                    fallback_output_token_estimate: 4096,
+                    block_size: 16,
+                    engine_load: true,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                },
+            )]),
+        );
+
+        let k3 = registry.on_worker_added("kimi-k3", Some("round_robin"));
+        let other = registry.on_worker_added("other-model", None);
+
+        assert_eq!(k3.name(), "cache_aware");
+        assert_eq!(other.name(), "size_aware_power_of_two");
     }
 
     #[test]

@@ -79,6 +79,16 @@ impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
+        for (model_id, policy) in &config.model_policies {
+            if model_id.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policies".to_string(),
+                    value: model_id.clone(),
+                    reason: "Model ID must not be empty".to_string(),
+                });
+            }
+            Self::validate_policy(policy)?;
+        }
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_tenant_resolution(config)?;
@@ -418,11 +428,20 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                fallback_output_token_estimate,
                 block_size,
                 engine_load: _,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
             } => {
+                if *fallback_output_token_estimate == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "fallback_output_token_estimate".to_string(),
+                        value: fallback_output_token_estimate.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
                         field: "block_size".to_string(),
@@ -1366,6 +1385,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                fallback_output_token_estimate: 4096,
                 block_size: 16,
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
@@ -1389,6 +1409,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                fallback_output_token_estimate: 4096,
                 block_size: 16,
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
@@ -1447,6 +1468,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                fallback_output_token_estimate: 4096,
                 block_size: 16,
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
@@ -1495,6 +1517,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    fallback_output_token_estimate: 4096,
                     block_size: 16,
                     engine_load: Default::default(),
                     balance_token_usage_threshold: 1.0,
@@ -1622,6 +1645,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    fallback_output_token_estimate: 4096,
                     block_size: 16,
                     engine_load: false,
                     balance_token_usage_threshold: 1.0,

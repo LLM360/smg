@@ -48,45 +48,47 @@ impl SizeAwarePowerOfTwoPolicy {
         input_tokens.saturating_add(output_tokens).max(1)
     }
 
-    #[cfg(test)]
-    fn reserved_for(&self, worker_url: &str) -> u64 {
-        self.reserved_work
-            .lock()
-            .get(worker_url)
+    fn eligible_candidates(
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        candidate_indices: &[usize],
+    ) -> Vec<usize> {
+        candidate_indices
+            .iter()
             .copied()
-            .unwrap_or_default()
+            .filter(|&idx| {
+                let state = workers[idx].routing_state();
+                state.healthy
+                    && state.can_execute
+                    && worker_url_is_allowed(info.headers, workers[idx].url())
+            })
+            .collect()
     }
-}
 
-impl Default for SizeAwarePowerOfTwoPolicy {
-    fn default() -> Self {
-        Self::new(DEFAULT_OUTPUT_TOKEN_ESTIMATE)
-    }
-}
-
-impl LoadBalancingPolicy for SizeAwarePowerOfTwoPolicy {
-    fn select_worker(
+    /// Select by size-aware P2C within an already-filtered candidate set.
+    ///
+    /// Cache-aware routing uses this for cold-prefix and pressure fallbacks so
+    /// its outer engine-pressure filter cannot be bypassed by a second global
+    /// worker scan.
+    pub(crate) fn select_worker_from_candidates(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
+        candidate_indices: &[usize],
     ) -> Option<usize> {
-        let healthy_indices: Vec<_> = get_healthy_worker_indices(workers)
-            .into_iter()
-            .filter(|idx| worker_url_is_allowed(info.headers, workers[*idx].url()))
-            .collect();
-        if healthy_indices.is_empty() {
+        let eligible = Self::eligible_candidates(workers, info, candidate_indices);
+        if eligible.is_empty() {
             return None;
         }
 
         let estimated_work = self.estimated_work(info);
-        let (worker_idx1, worker_idx2) = if healthy_indices.len() == 1 {
-            (healthy_indices[0], healthy_indices[0])
+        let (worker_idx1, worker_idx2) = if eligible.len() == 1 {
+            (eligible[0], eligible[0])
         } else {
             let mut rng = rand::rng();
-            let idx1 = rng.random_range(0..healthy_indices.len());
-            let idx2 =
-                (idx1 + 1 + rng.random_range(0..healthy_indices.len() - 1)) % healthy_indices.len();
-            (healthy_indices[idx1], healthy_indices[idx2])
+            let idx1 = rng.random_range(0..eligible.len());
+            let idx2 = (idx1 + 1 + rng.random_range(0..eligible.len() - 1)) % eligible.len();
+            (eligible[idx1], eligible[idx2])
         };
 
         if !info.reserve_work {
@@ -131,6 +133,86 @@ impl LoadBalancingPolicy for SizeAwarePowerOfTwoPolicy {
         Some(selected_idx)
     }
 
+    /// Select the least-loaded member of a cached-owner set and reserve its
+    /// estimated work atomically. This keeps hot prefixes balanced across all
+    /// healthy owners without discarding their cache affinity.
+    pub(crate) fn select_least_loaded_from_candidates(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        candidate_indices: &[usize],
+    ) -> Option<usize> {
+        let eligible = Self::eligible_candidates(workers, info, candidate_indices);
+        if eligible.is_empty() {
+            return None;
+        }
+
+        if !info.reserve_work {
+            let selected_idx = eligible.into_iter().min_by_key(|&idx| {
+                let state = workers[idx].routing_state();
+                (state.load, state.processed, idx)
+            })?;
+            workers[selected_idx].increment_processed();
+            return Some(selected_idx);
+        }
+
+        let estimated_work = self.estimated_work(info);
+        let mut reserved = self.reserved_work.lock();
+        let selected_idx = eligible.into_iter().min_by_key(|&idx| {
+            let state = workers[idx].routing_state();
+            (
+                reserved
+                    .get(workers[idx].url())
+                    .copied()
+                    .unwrap_or_default(),
+                state.load,
+                state.processed,
+                idx,
+            )
+        })?;
+        let selected_url = workers[selected_idx].url();
+        let entry = reserved.entry(selected_url.to_string()).or_default();
+        *entry = entry.saturating_add(estimated_work);
+        let selected_load = *entry;
+        drop(reserved);
+
+        workers[selected_idx].increment_processed();
+        debug!(
+            worker_url = selected_url,
+            estimated_work,
+            reserved_work = selected_load,
+            owner_count = candidate_indices.len(),
+            "Size-aware cached-owner selection"
+        );
+        Some(selected_idx)
+    }
+
+    #[cfg(test)]
+    fn reserved_for(&self, worker_url: &str) -> u64 {
+        self.reserved_work
+            .lock()
+            .get(worker_url)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl Default for SizeAwarePowerOfTwoPolicy {
+    fn default() -> Self {
+        Self::new(DEFAULT_OUTPUT_TOKEN_ESTIMATE)
+    }
+}
+
+impl LoadBalancingPolicy for SizeAwarePowerOfTwoPolicy {
+    fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        let healthy_indices = get_healthy_worker_indices(workers);
+        self.select_worker_from_candidates(workers, info, &healthy_indices)
+    }
+
     fn reservation_cost(&self, info: &SelectWorkerInfo<'_>) -> Option<u64> {
         info.reserve_work.then(|| self.estimated_work(info))
     }
@@ -153,6 +235,10 @@ impl LoadBalancingPolicy for SizeAwarePowerOfTwoPolicy {
         if *current == 0 {
             reserved.remove(worker_url);
         }
+    }
+
+    fn remove_worker(&self, url: &str) {
+        self.reserved_work.lock().remove(url);
     }
 
     fn name(&self) -> &'static str {

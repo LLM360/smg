@@ -494,6 +494,7 @@ struct Router {
     priority_scheduler_default_max_class: String,
     priority_scheduler_config: Option<String>,
     priority_scheduler_tenant_metric_top_n: u32,
+    model_policies: HashMap<String, PolicyType>,
 }
 
 impl Router {
@@ -565,6 +566,7 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
+                    fallback_output_token_estimate: self.output_token_estimate,
                     block_size: self.block_size,
                     engine_load: self.cache_aware_engine_load,
                     balance_token_usage_threshold: self.balance_token_usage_threshold,
@@ -655,6 +657,11 @@ impl Router {
         };
 
         let policy = convert_policy(&self.policy)?;
+        let model_policies = self
+            .model_policies
+            .iter()
+            .map(|(model_id, policy)| Ok((model_id.clone(), convert_policy(policy)?)))
+            .collect::<config::ConfigResult<HashMap<_, _>>>()?;
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
@@ -746,6 +753,7 @@ impl Router {
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .model_policies(model_policies)
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
@@ -977,6 +985,7 @@ impl Router {
         priority_scheduler_default_max_class = String::from("default"),
         priority_scheduler_config = None,
         priority_scheduler_tenant_metric_top_n = 32,
+        model_policies = HashMap::new(),
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1110,6 +1119,7 @@ impl Router {
         priority_scheduler_default_max_class: String,
         priority_scheduler_config: Option<String>,
         priority_scheduler_tenant_metric_top_n: u32,
+        model_policies: HashMap<String, PolicyType>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1257,6 +1267,7 @@ impl Router {
             priority_scheduler_default_max_class,
             priority_scheduler_config,
             priority_scheduler_tenant_metric_top_n,
+            model_policies,
         })
     }
 
