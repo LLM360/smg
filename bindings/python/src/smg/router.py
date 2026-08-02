@@ -264,6 +264,10 @@ class Router:
             else args_dict["worker_urls"]
         )
         args_dict["policy"] = policy_from_str(args_dict["policy"])
+        args_dict["model_policies"] = {
+            model_id: policy_from_str(policy)
+            for model_id, policy in args_dict["model_policies"].items()
+        }
         args_dict["encode_urls"] = (
             args_dict["encode_urls"] if args_dict["epd_disaggregation"] else None
         )

@@ -550,6 +550,38 @@ class TestParseRouterArgs:
         assert router_args.policy == "size_aware_power_of_two"
         assert router_args.output_token_estimate == 2048
 
+    def test_parse_per_model_policy_args(self):
+        router_args = parse_router_args(
+            [
+                "--policy",
+                "size_aware_power_of_two",
+                "--model-policy",
+                "kimi-k3=cache_aware",
+                "--model-policy",
+                "other-model=round_robin",
+            ]
+        )
+
+        assert router_args.model_policies == {
+            "kimi-k3": "cache_aware",
+            "other-model": "round_robin",
+        }
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            ["missing-separator"],
+            ["=cache_aware"],
+            ["kimi-k3=unknown"],
+            ["kimi-k3=cache_aware", "kimi-k3=round_robin"],
+        ],
+    )
+    def test_rejects_invalid_per_model_policy_args(self, values):
+        args = [item for value in values for item in ("--model-policy", value)]
+
+        with pytest.raises(ValueError, match="model policy|invalid policy|duplicate"):
+            parse_router_args(args)
+
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [

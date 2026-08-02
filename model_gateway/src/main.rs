@@ -191,6 +191,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 4096, help_heading = "Routing Policy")]
     output_token_estimate: u64,
 
+    /// Per-model routing policy override in MODEL=POLICY form. Repeatable.
+    #[arg(long = "model-policy", action = ArgAction::Append, help_heading = "Routing Policy")]
+    model_policy: Vec<String>,
+
     /// Cache threshold (0.0-1.0) for cache-aware routing
     #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
     cache_threshold: f32,
@@ -204,7 +208,7 @@ struct CliArgs {
     balance_rel_threshold: f32,
 
     /// Cache-aware KV-usage spread (hottest minus coldest backend, 0.0-1.0)
-    /// above which cache affinity is abandoned for shortest-queue, even if
+    /// above which cache affinity is abandoned for size-aware P2C, even if
     /// request counts look balanced (catches long-context KV imbalance). Backend
     /// must report token_usage. >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
@@ -1077,6 +1081,7 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                fallback_output_token_estimate: self.output_token_estimate,
                 block_size: self.block_size,
                 engine_load: self.cache_aware_engine_load,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
@@ -1111,6 +1116,52 @@ impl CliArgs {
             },
             _ => PolicyConfig::RoundRobin,
         }
+    }
+
+    fn parse_model_policies(&self) -> ConfigResult<HashMap<String, PolicyConfig>> {
+        let allowed = [
+            "random",
+            "round_robin",
+            "passthrough",
+            "cache_aware",
+            "power_of_two",
+            "size_aware_power_of_two",
+            "least_load",
+            "bucket",
+            "prefix_hash",
+            "consistent_hashing",
+            "manual",
+        ];
+        let mut policies = HashMap::new();
+        for value in &self.model_policy {
+            let Some((model_id, policy)) = value.split_once('=') else {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policy".to_string(),
+                    value: value.clone(),
+                    reason: "expected MODEL=POLICY".to_string(),
+                });
+            };
+            let model_id = model_id.trim();
+            let policy = policy.trim();
+            if model_id.is_empty() || !allowed.contains(&policy) {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policy".to_string(),
+                    value: value.clone(),
+                    reason: "model must be non-empty and policy must be supported".to_string(),
+                });
+            }
+            if policies
+                .insert(model_id.to_string(), self.parse_policy(policy))
+                .is_some()
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policy".to_string(),
+                    value: value.clone(),
+                    reason: format!("duplicate policy for model '{model_id}'"),
+                });
+            }
+        }
+        Ok(policies)
     }
 
     #[expect(
@@ -1313,6 +1364,7 @@ impl CliArgs {
         };
 
         let policy = self.parse_policy(&self.policy);
+        let model_policies = self.parse_model_policies()?;
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
@@ -1407,6 +1459,7 @@ impl CliArgs {
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .model_policies(model_policies)
             .connection_mode(connection_mode)
             .host(&self.host)
             .port(self.port)

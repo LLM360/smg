@@ -169,6 +169,7 @@ mod pd_routing_unit_tests {
                     engine_load: Default::default(),
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    fallback_output_token_estimate: 4096,
                 },
             ),
             (

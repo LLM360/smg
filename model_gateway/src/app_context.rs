@@ -543,9 +543,10 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
+        self.policy_registry = Some(Arc::new(PolicyRegistry::with_model_policies(
             config.policy.clone(),
             config.routing_key_override.clone(),
+            config.model_policies.clone(),
         )));
         self
     }
@@ -660,14 +661,19 @@ impl AppContextBuilder {
 
     /// Create KV event monitor for event-driven cache-aware routing.
     ///
-    /// The monitor is created when the default policy is cache_aware, regardless
-    /// of connection mode. The monitor itself is cheap (empty DashMaps) and stays
-    /// dormant until workers are added. The UpdatePoliciesStep gates subscriptions
-    /// on `cache_aware && gRPC`, so HTTP workers are never subscribed.
+    /// The monitor is created when the default or an explicit model policy is
+    /// cache_aware, regardless of connection mode. The monitor itself is cheap
+    /// (empty DashMaps) and stays dormant until workers are added. The
+    /// UpdatePoliciesStep gates subscriptions on `cache_aware && gRPC`, so HTTP
+    /// workers are never subscribed.
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
         use crate::config::types::PolicyConfig;
 
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. });
+        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
+            || config
+                .model_policies
+                .values()
+                .any(|policy| matches!(policy, PolicyConfig::CacheAware { .. }));
 
         if is_cache_aware {
             let monitor = Arc::new(KvEventMonitor::new(None));
@@ -748,11 +754,40 @@ mod tests {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 1000,
+            fallback_output_token_estimate: 4096,
             block_size: 16,
             engine_load: false,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
         }));
+    }
+
+    #[test]
+    fn test_cache_aware_model_override_creates_kv_event_monitor() {
+        let mut config = config_with_policy(PolicyConfig::SizeAwarePowerOfTwo {
+            output_token_estimate: 4096,
+        });
+        config.model_policies.insert(
+            "kimi-k3".to_string(),
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 30,
+                max_tree_size: 1_000_000,
+                fallback_output_token_estimate: 4096,
+                block_size: 16,
+                engine_load: true,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+            },
+        );
+
+        assert!(AppContextBuilder::new()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor(&config)
+            .kv_event_monitor
+            .is_some());
     }
 
     #[test]

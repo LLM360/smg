@@ -12,8 +12,8 @@
     -------------------------------------------
     Uses PositionalIndexer overlap scoring from KvEventMonitor. Routes based
     on actual backend KV cache state. Selects the worker with the highest
-    overlap count; tie-breaks by load (lower) then tree size (smaller).
-    Falls back to min-load when no cache overlap exists.
+    overlap count, then chooses the least-loaded matching owner.
+    Falls back to size-aware power-of-two when no cache overlap exists.
 
     2. Approximate Token Tree (gRPC, no KV events)
     -------------------------------------------
@@ -24,12 +24,13 @@
     3. Approximate String Tree (HTTP)
     -------------------------------------------
     Same algorithm as (2) but operates on raw text characters instead of
-    token IDs, avoiding tokenization overhead.
+    token IDs, avoiding tokenization overhead. Both approximate paths retain
+    every recorded owner of the longest match and balance within that set.
 
-    Load Balancing (Shortest Queue)
+    Load Balancing (Size-Aware Power-of-Two)
     -------------------------------------------
-    When the system is imbalanced, routes to the least busy worker regardless
-    of cache affinity.
+    Cache misses, stale owners, and imbalanced pools use size-aware
+    power-of-two. The selected fallback becomes another prefix owner.
 
     Engine Pressure Guard (Optional)
     -------------------------------------------
@@ -62,14 +63,13 @@ use dashmap::DashMap;
 use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use super::{
     normalize_model_key, utils::PeriodicTask, CacheAwareConfig, LoadBalancingPolicy,
-    SelectWorkerInfo,
+    SelectWorkerInfo, SizeAwarePowerOfTwoPolicy,
 };
 use crate::{
     mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage},
@@ -117,6 +117,9 @@ pub(crate) type LoadReceiver = watch::Receiver<HashMap<String, WorkerLoadRespons
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
+    /// Atomic token-work reservations used for cold-prefix fallback and for
+    /// balancing requests across every healthy owner of a hot prefix.
+    fallback: SizeAwarePowerOfTwoPolicy,
     /// String-based trees for HTTP connections (text input)
     string_trees: Arc<DashMap<String, Arc<Tree>>>,
     /// Token-based trees for gRPC connections (pre-tokenized input)
@@ -256,8 +259,10 @@ impl CacheAwarePolicy {
             None
         };
 
+        let fallback = SizeAwarePowerOfTwoPolicy::new(config.fallback_output_token_estimate);
         Self {
             config,
+            fallback,
             string_trees,
             token_trees,
             _eviction_task: eviction_task,
@@ -511,29 +516,35 @@ impl CacheAwarePolicy {
         token_tree.insert_tokens(&[], url);
     }
 
-    /// Remove a worker from the trees
-    ///
-    /// Note: Currently a no-op. Stale entries are cleaned up by LRU eviction.
-    /// Worker registry removes workers first, so routing will skip them anyway.
-    /// TODO: Implement efficient remove_tenant in kv_index with reverse index.
-    #[expect(
-        clippy::unused_self,
-        reason = "no-op stub; will use self once remove_tenant is implemented"
-    )]
-    pub fn remove_worker(&self, _worker: &dyn Worker) {
-        // No-op: rely on LRU eviction to clean up stale entries
+    /// Remove a worker from the model-scoped trees as soon as it drains.
+    pub fn remove_worker(&self, worker: &dyn Worker) {
+        self.remove_worker_from_model(worker.model_id(), worker.url());
     }
 
-    /// Remove a worker by URL (removes from all model trees for backward compatibility)
-    ///
-    /// Note: Currently a no-op. Stale entries are cleaned up by LRU eviction.
-    /// TODO: Implement efficient remove_tenant in kv_index with reverse index.
-    #[expect(
-        clippy::unused_self,
-        reason = "no-op stub; will use self once remove_tenant is implemented"
-    )]
-    pub fn remove_worker_by_url(&self, _url: &str) {
-        // No-op: rely on LRU eviction to clean up stale entries
+    pub fn remove_worker_from_model(&self, model_id: &str, url: &str) {
+        let model_id = normalize_model_key(model_id);
+        let tenant: Arc<str> = Arc::from(url);
+        if let Some(tree) = self.string_trees.get(model_id) {
+            tree.remove_tenant_all(&tenant);
+        }
+        if let Some(tree) = self.token_trees.get(model_id) {
+            tree.evict_tenant(&tenant, 0);
+        }
+        self.engine_loads.write().remove(url);
+        LoadBalancingPolicy::remove_worker(&self.fallback, url);
+    }
+
+    /// Remove a worker by URL from every model tree for PD and legacy callers.
+    pub fn remove_worker_by_url(&self, url: &str) {
+        let tenant: Arc<str> = Arc::from(url);
+        for tree in self.string_trees.iter() {
+            tree.remove_tenant_all(&tenant);
+        }
+        for tree in self.token_trees.iter() {
+            tree.evict_tenant(&tenant, 0);
+        }
+        self.engine_loads.write().remove(url);
+        LoadBalancingPolicy::remove_worker(&self.fallback, url);
     }
 
     /// Run cache eviction to prevent unbounded growth
@@ -580,13 +591,13 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Select worker with minimum load (used when load is imbalanced)
-    /// Handles both HTTP (text-based) and gRPC (token-based) requests.
-    fn select_worker_min_load(
+    /// Use size-aware P2C when no suitable cached owner exists, then record the
+    /// destination as an additional owner of the routed prefix.
+    fn select_worker_fallback(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
-        min_load_idx: Option<usize>,
+        candidate_indices: &[usize],
         model_id: &str,
     ) -> Option<usize> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
@@ -596,12 +607,10 @@ impl CacheAwarePolicy {
             debug!("Load balancing triggered | workers: {:?}", worker_loads);
         }
 
-        // Shortest queue when imbalanced. The min-load index is gathered upstream
-        // in select_worker with the (load, processed_requests, idx) tie-break
-        // from #1714 (spreads load when decode outpaces prefill).
-        let min_load_idx = min_load_idx?;
-
-        let worker_url = workers[min_load_idx].url();
+        let selected_idx =
+            self.fallback
+                .select_worker_from_candidates(workers, info, candidate_indices)?;
+        let worker_url = workers[selected_idx].url();
 
         // Even in imbalanced mode, update the appropriate tree to maintain cache state
         // Prefer token tree for gRPC requests, fall back to string tree for HTTP
@@ -667,10 +676,7 @@ impl CacheAwarePolicy {
             }
         }
 
-        // Increment processed counter
-        workers[min_load_idx].increment_processed();
-
-        Some(min_load_idx)
+        Some(selected_idx)
     }
 }
 
@@ -886,29 +892,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Single O(workers) gather: read each worker once via routing_state()
         // (status + load + processed under one ArcSwap guard), replacing the
         // former separate passes whose per-worker guard traffic dominated routing
-        // CPU at scale. Collects healthy indices, load min/max, and the min-load
-        // index; cache-hit tenant lookup is a hash-free scan over healthy_indices.
+        // CPU at scale. Collects healthy indices and load min/max; cache-owner
+        // lookup is a hash-free scan over healthy_indices.
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
         let mut min_load = usize::MAX;
         let mut max_load = 0usize;
-        // Min-load worker, (load, processed_requests, idx) tie-break (#1714);
-        // `processed` rides the same guard as `load`, so it is free here.
-        let mut min_key: Option<(usize, usize, usize)> = None;
-        let mut min_load_idx: Option<usize> = None;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
             if state.healthy && state.can_execute {
                 healthy_indices.push(idx);
                 min_load = min_load.min(state.load);
                 max_load = max_load.max(state.load);
-                let key = (state.load, state.processed, idx);
-                match min_key {
-                    Some(best) if key >= best => {}
-                    _ => {
-                        min_key = Some(key);
-                        min_load_idx = Some(idx);
-                    }
-                }
             }
         }
 
@@ -924,41 +918,29 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         };
 
         // Engine pressure is the outer safety filter. When it narrows the
-        // candidate set, recompute upstream's imbalance bounds and min-load
-        // tie-break inside that set so shortest-queue cannot bypass the guard.
+        // candidate set, recompute upstream's imbalance bounds inside that set
+        // so fallback routing cannot bypass the guard.
         // With engine pressure disabled or unavailable, reuse the original
         // single-pass values and preserve upstream behavior exactly.
-        let (selection_min_load, selection_max_load, selection_min_load_idx) =
-            if pressure_plan.is_some() {
-                let mut filtered_min_load = usize::MAX;
-                let mut filtered_max_load = 0usize;
-                let mut filtered_min_key: Option<(usize, usize, usize)> = None;
-                let mut filtered_min_load_idx = None;
-                for &idx in selection_indices {
-                    let state = workers[idx].routing_state();
-                    filtered_min_load = filtered_min_load.min(state.load);
-                    filtered_max_load = filtered_max_load.max(state.load);
-                    let key = (state.load, state.processed, idx);
-                    match filtered_min_key {
-                        Some(best) if key >= best => {}
-                        _ => {
-                            filtered_min_key = Some(key);
-                            filtered_min_load_idx = Some(idx);
-                        }
-                    }
-                }
-                (
-                    if filtered_min_load == usize::MAX {
-                        0
-                    } else {
-                        filtered_min_load
-                    },
-                    filtered_max_load,
-                    filtered_min_load_idx,
-                )
-            } else {
-                (min_load, max_load, min_load_idx)
-            };
+        let (selection_min_load, selection_max_load) = if pressure_plan.is_some() {
+            let mut filtered_min_load = usize::MAX;
+            let mut filtered_max_load = 0usize;
+            for &idx in selection_indices {
+                let state = workers[idx].routing_state();
+                filtered_min_load = filtered_min_load.min(state.load);
+                filtered_max_load = filtered_max_load.max(state.load);
+            }
+            (
+                if filtered_min_load == usize::MAX {
+                    0
+                } else {
+                    filtered_min_load
+                },
+                filtered_max_load,
+            )
+        } else {
+            (min_load, max_load)
+        };
 
         // Determine the model for this set of workers (router pre-filters by model).
         let model_id = normalize_model_key(workers[selection_indices[0]].model_id());
@@ -971,31 +953,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             selection_min_load,
             selection_max_load,
         ) {
-            self.select_worker_min_load(workers, info, selection_min_load_idx, model_id)
+            self.select_worker_fallback(workers, info, selection_indices, model_id)
         } else if let Some(tokens) = request_tokens {
             if self.has_event_indexer(model_id) {
-                self.select_worker_event_driven(
-                    workers,
-                    tokens,
-                    selection_indices,
-                    selection_min_load_idx,
-                    model_id,
-                )
+                self.select_worker_event_driven(workers, tokens, selection_indices, info, model_id)
             } else {
-                self.select_worker_with_tokens(
-                    workers,
-                    tokens,
-                    selection_indices,
-                    selection_min_load_idx,
-                    model_id,
-                )
+                self.select_worker_with_tokens(workers, tokens, selection_indices, info, model_id)
             }
         } else {
             self.select_worker_with_text(
                 workers,
                 request_text.unwrap_or(""),
                 selection_indices,
-                selection_min_load_idx,
+                info,
                 model_id,
             )
         }?;
@@ -1063,6 +1033,18 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
     }
 
+    fn reservation_cost(&self, info: &SelectWorkerInfo<'_>) -> Option<u64> {
+        self.fallback.reservation_cost(info)
+    }
+
+    fn release_reservation(&self, worker_url: &str, cost: u64) {
+        self.fallback.release_reservation(worker_url, cost);
+    }
+
+    fn remove_worker(&self, url: &str) {
+        self.remove_worker_by_url(url);
+    }
+
     fn name(&self) -> &'static str {
         "cache_aware"
     }
@@ -1094,13 +1076,13 @@ impl CacheAwarePolicy {
     ///
     /// Self-contained — when overlap is found, selects the worker with the best
     /// cache match. When no overlap (cold start, novel tokens, short request),
-    /// falls back to min-load. Does NOT fall back to approximate token tree.
+    /// falls back to size-aware P2C. Does not fall back to the approximate token tree.
     fn select_worker_event_driven(
         &self,
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
-        min_load_idx: Option<usize>,
+        info: &SelectWorkerInfo,
         model_id: &str,
     ) -> Option<usize> {
         let guard = self.kv_monitor.read();
@@ -1112,26 +1094,33 @@ impl CacheAwarePolicy {
             .block_size(model_id)
             .unwrap_or(self.config.block_size);
 
-        if let Some(idx) =
-            Self::score_overlap(workers, tokens, healthy_indices, &indexer, block_size)
-        {
+        let owners = Self::score_overlap(workers, tokens, healthy_indices, &indexer, block_size);
+        if !owners.is_empty() {
+            let idx = self
+                .fallback
+                .select_least_loaded_from_candidates(workers, info, &owners)?;
+            debug!(
+                worker = workers[idx].url(),
+                owner_count = owners.len(),
+                model_id,
+                "Event-driven routing: overlap match"
+            );
             return Some(idx);
         }
 
-        // No cache overlap — min-load fallback (min-load index gathered upstream)
-        let min_idx = min_load_idx?;
+        // No cache overlap: size-aware P2C fallback records a provisional
+        // approximate owner until the engine's KV event confirms actual state.
+        let idx = self.select_worker_fallback(workers, info, healthy_indices, model_id)?;
         debug!(
-            worker = workers[min_idx].url(),
-            model_id, "Event-driven routing: no overlap, min-load fallback"
+            worker = workers[idx].url(),
+            model_id, "Event-driven routing: no overlap, size-aware fallback"
         );
-        workers[min_idx].increment_processed();
-        Some(min_idx)
+        Some(idx)
     }
 
-    /// Score healthy workers by PositionalIndexer overlap and select the best.
+    /// Return every healthy worker tied for the highest PositionalIndexer overlap.
     ///
-    /// Returns `Some(idx)` if at least one worker has cached blocks matching the
-    /// request. Returns `None` if the request is too short for a full block or
+    /// Returns an empty vector if the request is too short for a full block or
     /// no workers have matching data.
     fn score_overlap(
         workers: &[Arc<dyn Worker>],
@@ -1139,20 +1128,34 @@ impl CacheAwarePolicy {
         healthy_indices: &[usize],
         indexer: &PositionalIndexer,
         block_size: usize,
-    ) -> Option<usize> {
+    ) -> Vec<usize> {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
         if content_hashes.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         let overlap = indexer.find_matches(&content_hashes, false);
         if overlap.scores.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        // Select worker with best overlap among those that actually match.
-        // Tie-break: lower load, then smaller tree size.
-        let best_idx = healthy_indices
+        let best_score = healthy_indices
+            .iter()
+            .copied()
+            .filter_map(|idx| {
+                indexer
+                    .worker_id(workers[idx].url())
+                    .and_then(|id| overlap.scores.get(&id))
+                    .copied()
+                    .filter(|score| *score > 0)
+            })
+            .max()
+            .unwrap_or(0);
+        if best_score == 0 {
+            return Vec::new();
+        }
+
+        healthy_indices
             .iter()
             .copied()
             .filter(|&idx| {
@@ -1160,34 +1163,9 @@ impl CacheAwarePolicy {
                     .worker_id(workers[idx].url())
                     .and_then(|id| overlap.scores.get(&id))
                     .copied()
-                    .unwrap_or(0)
-                    > 0
+                    == Some(best_score)
             })
-            .max_by_key(|&idx| {
-                let wid = indexer.worker_id(workers[idx].url());
-                let score = wid
-                    .and_then(|id| overlap.scores.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                let load = workers[idx].load();
-                let tree_size = wid
-                    .and_then(|id| overlap.tree_sizes.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                (score, std::cmp::Reverse(load), std::cmp::Reverse(tree_size))
-            })?;
-
-        debug!(
-            worker = workers[best_idx].url(),
-            score = indexer
-                .worker_id(workers[best_idx].url())
-                .and_then(|id| overlap.scores.get(&id))
-                .copied()
-                .unwrap_or(0),
-            "Event-driven routing: overlap match"
-        );
-        workers[best_idx].increment_processed();
-        Some(best_idx)
+            .collect()
     }
 
     /// Select worker using token-based tree (gRPC path)
@@ -1196,7 +1174,7 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
-        min_load_idx: Option<usize>,
+        info: &SelectWorkerInfo,
         model_id: &str,
     ) -> Option<usize> {
         let tree = self
@@ -1209,13 +1187,10 @@ impl CacheAwarePolicy {
             // result, then insert for it — replacing the former
             // match_prefix_with_counts + insert_tokens pair (two full descents
             // over the same prefix). The selection closure runs once, after the
-            // match, mirroring the previous branch exactly:
-            //   * cache hit  (match_rate > threshold): route to the matched
-            //     worker if it is still healthy — insert for it;
-            //   * cache miss (match_rate <= threshold): route to the least-loaded
-            //     worker — insert for it;
-            //   * matched worker gone/unhealthy: select nothing and DON'T insert
-            //     (closure returns None), falling back to first-healthy below.
+            // match:
+            //   * cache hit: choose the least-loaded healthy owner and insert for it;
+            //   * cache miss: use size-aware P2C and insert for the destination;
+            //   * no suitable owner: defer insertion until the fallback selects.
             let mut selected_idx: Option<usize> = None;
             let result = tree.match_and_insert_with(tokens, |result| {
                 let match_rate = if result.input_token_count == 0 {
@@ -1225,16 +1200,21 @@ impl CacheAwarePolicy {
                 };
 
                 selected_idx = if match_rate > self.config.cache_threshold {
-                    // Cache hit: scan healthy_indices for the tenant (hash-free;
-                    // url() is cheap). "Healthy" excludes circuit-broken workers, so
-                    // a CB-tripped tenant falls through to min-load (intended).
-                    let tenant_url: &str = &result.tenant;
-                    healthy_indices
+                    let owner_indices: Vec<_> = healthy_indices
                         .iter()
                         .copied()
-                        .find(|&idx| workers[idx].url() == tenant_url)
+                        .filter(|&idx| {
+                            result
+                                .tenants
+                                .iter()
+                                .any(|tenant| tenant.as_ref() == workers[idx].url())
+                        })
+                        .collect();
+                    self.fallback
+                        .select_least_loaded_from_candidates(workers, info, &owner_indices)
                 } else {
-                    min_load_idx
+                    self.fallback
+                        .select_worker_from_candidates(workers, info, healthy_indices)
                 };
 
                 // Insert for the selected worker (None => no insert, exactly
@@ -1262,21 +1242,16 @@ impl CacheAwarePolicy {
                         .token_tree
                         .insert(kv_index::hash_token_path(tokens), matched_prefix);
                 }
-                workers[idx].increment_processed();
                 return Some(idx);
             }
 
-            // Selected worker no longer exists or unhealthy - fall back to first healthy
-            // Stale entries will be cleaned up by LRU eviction
-            healthy_indices.first().copied()
+            self.select_worker_fallback(workers, info, healthy_indices, model_id)
         } else {
             debug!(
-                "Warning: No token tree found for model '{}', using random worker selection",
+                "Warning: No token tree found for model '{}', using size-aware fallback",
                 model_id
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            self.select_worker_fallback(workers, info, healthy_indices, model_id)
         }
     }
 
@@ -1286,7 +1261,7 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         text: &str,
         healthy_indices: &[usize],
-        min_load_idx: Option<usize>,
+        info: &SelectWorkerInfo,
         model_id: &str,
     ) -> Option<usize> {
         let tree = self
@@ -1297,8 +1272,7 @@ impl CacheAwarePolicy {
         if let Some(tree) = tree {
             // Single tree descent: match, pick the worker from the match result,
             // then insert for it — replacing the former match_prefix_with_counts
-            // + insert_text pair. Selection logic is unchanged (see the token
-            // path for the per-branch rationale).
+            // + insert_text pair. See the token path for the branch rationale.
             let mut selected_idx: Option<usize> = None;
             let result = tree.match_and_insert_with(text, |result| {
                 let match_rate = if result.input_char_count == 0 {
@@ -1308,16 +1282,21 @@ impl CacheAwarePolicy {
                 };
 
                 selected_idx = if match_rate > self.config.cache_threshold {
-                    // Cache hit: scan healthy_indices for the tenant (hash-free;
-                    // url() is cheap). "Healthy" excludes circuit-broken workers, so
-                    // a CB-tripped tenant falls through to min-load (intended).
-                    let tenant_url: &str = &result.tenant;
-                    healthy_indices
+                    let owner_indices: Vec<_> = healthy_indices
                         .iter()
                         .copied()
-                        .find(|&idx| workers[idx].url() == tenant_url)
+                        .filter(|&idx| {
+                            result
+                                .tenants
+                                .iter()
+                                .any(|tenant| tenant.as_ref() == workers[idx].url())
+                        })
+                        .collect();
+                    self.fallback
+                        .select_least_loaded_from_candidates(workers, info, &owner_indices)
                 } else {
-                    min_load_idx
+                    self.fallback
+                        .select_worker_from_candidates(workers, info, healthy_indices)
                 };
 
                 // Insert for the selected worker (None => no insert, exactly
@@ -1344,21 +1323,16 @@ impl CacheAwarePolicy {
                         .insert(path_hash, matched_prefix);
                 }
 
-                workers[idx].increment_processed();
                 return Some(idx);
             }
 
-            // Selected worker no longer exists or unhealthy - fall back to first healthy
-            // Stale entries will be cleaned up by LRU eviction
-            healthy_indices.first().copied()
+            self.select_worker_fallback(workers, info, healthy_indices, model_id)
         } else {
             debug!(
-                "Warning: No string tree found for model '{}', using random worker selection",
+                "Warning: No string tree found for model '{}', using size-aware fallback",
                 model_id
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            self.select_worker_fallback(workers, info, healthy_indices, model_id)
         }
     }
 }
@@ -1428,16 +1402,12 @@ mod tests {
         text: &str,
     ) {
         policy.init_workers(workers);
-        let selected = policy
-            .select_worker(
-                workers,
-                &SelectWorkerInfo {
-                    request_text: Some(text),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(selected, 0);
+        let model_id = normalize_model_key(workers[0].model_id());
+        policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .insert_text(text, workers[0].url());
     }
 
     #[test]
@@ -1603,6 +1573,91 @@ mod tests {
     }
 
     #[test]
+    fn test_http_prefix_balances_across_all_cached_owners() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers = two_workers();
+        policy.init_workers(&workers);
+
+        let model_id = normalize_model_key(workers[0].model_id());
+        let tree = policy.string_trees.get(model_id).unwrap().value().clone();
+        tree.insert_text("shared prefix", workers[0].url());
+        tree.insert_text("shared prefix", workers[1].url());
+
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            max_output_tokens: Some(512),
+            reserve_work: true,
+            ..Default::default()
+        };
+        let first = policy.select_worker(&workers, &info).unwrap();
+        let second = policy.select_worker(&workers, &info).unwrap();
+
+        assert_ne!(
+            first, second,
+            "atomic reservations should spread a hot prefix across its owners"
+        );
+        let matched = tree.match_prefix_with_counts("shared prefix");
+        assert_eq!(
+            matched
+                .tenants
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec![workers[0].url(), workers[1].url()]
+        );
+    }
+
+    #[test]
+    fn test_http_fallback_adds_owner_and_worker_removal_prunes_it() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers = two_workers();
+        policy.init_workers(&workers);
+
+        let model_id = normalize_model_key(workers[0].model_id());
+        let tree = policy.string_trees.get(model_id).unwrap().value().clone();
+        tree.insert_text("hot prefix", workers[0].url());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-excluded-worker-urls",
+            workers[0].url().parse().unwrap(),
+        );
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hot prefix"),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 1);
+
+        let matched = tree.match_prefix_with_counts("hot prefix");
+        assert_eq!(matched.tenants.len(), 2, "fallback must add another owner");
+
+        policy.remove_worker_from_model(model_id, workers[0].url());
+        let matched = tree.match_prefix_with_counts("hot prefix");
+        assert_eq!(
+            matched
+                .tenants
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec![workers[1].url()]
+        );
+    }
+
+    #[test]
     fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
@@ -1610,6 +1665,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            fallback_output_token_estimate: 4096,
             block_size: 16,
             engine_load: false,
             balance_token_usage_threshold: 1.0,
@@ -2216,7 +2272,7 @@ mod tests {
             &indexer,
             4,
         );
-        assert_eq!(result, Some(0)); // w1
+        assert_eq!(result, vec![0]); // w1
     }
 
     #[test]
@@ -2241,7 +2297,7 @@ mod tests {
             &indexer,
             4,
         );
-        assert_eq!(result, None);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -2286,9 +2342,9 @@ mod tests {
             .apply_stored(w2_id, &blocks2, None, &mut wb2)
             .unwrap();
 
-        // Equal overlap → tie-break by load → w2 wins (lower load)
+        // Equal overlap returns both owners; routing applies the atomic load tie-break.
         let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4);
-        assert_eq!(result, Some(1)); // w2 (lower load)
+        assert_eq!(result, vec![0, 1]);
     }
 
     #[test]
@@ -2339,9 +2395,9 @@ mod tests {
             .apply_stored(w2_id, &extra, Some(SequenceHash(1)), &mut wb2)
             .unwrap();
 
-        // Equal overlap, equal load → tie-break by tree size → w1 wins (smaller)
+        // Equal overlap returns both owners; tree size no longer hides a valid owner.
         let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4);
-        assert_eq!(result, Some(0)); // w1 (smaller tree)
+        assert_eq!(result, vec![0, 1]);
     }
 
     #[test]
@@ -2357,7 +2413,7 @@ mod tests {
 
         // Request shorter than block_size → no full blocks → None
         let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3], &[0], &indexer, 4);
-        assert_eq!(result, None);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -2425,7 +2481,7 @@ mod tests {
             &indexer,
             4,
         );
-        assert_eq!(result, Some(0)); // w1 (higher overlap)
+        assert_eq!(result, vec![0]); // w1 (higher overlap)
     }
 
     // -- select_worker_event_driven integration tests --

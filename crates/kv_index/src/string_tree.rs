@@ -47,6 +47,10 @@ fn new_tenant_map() -> DashMap<TenantId, u64> {
 pub struct PrefixMatchResult {
     /// The tenant that owns the matched prefix (zero-copy)
     pub tenant: TenantId,
+    /// Every tenant recorded as an owner of the longest matched prefix.
+    /// Empty when no input characters matched, even though the root records
+    /// all registered tenants for tree initialization.
+    pub tenants: Vec<TenantId>,
     /// Number of characters matched
     pub matched_char_count: usize,
     /// Total number of characters in the input text
@@ -649,9 +653,21 @@ impl Tree {
         // This is equivalent to matched_chars + remaining.chars().count() but avoids
         // needing to track remaining precisely through the traversal.
         let input_char_count = text.chars().count();
+        let tenants = if matched_chars == 0 {
+            Vec::new()
+        } else {
+            let mut tenants: Vec<_> = curr
+                .tenant_last_access_time
+                .iter()
+                .map(|entry| Arc::clone(entry.key()))
+                .collect();
+            tenants.sort();
+            tenants
+        };
 
         PrefixMatchResult {
             tenant,
+            tenants,
             matched_char_count: matched_chars,
             input_char_count,
         }
@@ -847,9 +863,21 @@ impl Tree {
         }
 
         let input_char_count = text.chars().count();
+        let tenants = if matched_chars == 0 {
+            Vec::new()
+        } else {
+            let mut tenants: Vec<_> = match_node
+                .tenant_last_access_time
+                .iter()
+                .map(|entry| Arc::clone(entry.key()))
+                .collect();
+            tenants.sort();
+            tenants
+        };
 
         PrefixMatchResult {
             tenant: Arc::clone(tenant),
+            tenants,
             matched_char_count: matched_chars,
             input_char_count,
         }
@@ -2525,6 +2553,11 @@ mod tests {
         let (matched, tenant) = tree.prefix_match_legacy("app");
         assert_eq!(matched, "app");
         assert!(tenant == "tenant1" || tenant == "tenant2");
+        let result = tree.match_prefix_with_counts("app");
+        assert_eq!(
+            result.tenants.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            vec!["tenant1", "tenant2"]
+        );
 
         // Match longer string
         let (matched, tenant) = tree.prefix_match_legacy("application");

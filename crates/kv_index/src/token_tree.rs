@@ -137,6 +137,9 @@ fn new_tenant_map() -> DashMap<TenantId, u64> {
 pub struct PrefixMatchResult {
     /// The tenant that owns the matched prefix
     pub tenant: TenantId,
+    /// Every tenant recorded as an owner of the longest page-aligned match.
+    /// Empty when no tokens matched, even though the root records all workers.
+    pub tenants: Vec<TenantId>,
     /// Number of tokens matched
     pub matched_token_count: usize,
     /// Total number of tokens in the input
@@ -266,6 +269,16 @@ impl Node {
             .iter()
             .next()
             .map(|entry| Arc::clone(entry.key()))
+    }
+
+    fn get_tenants(&self) -> Vec<TenantId> {
+        let mut tenants: Vec<_> = self
+            .tenant_last_access_time
+            .iter()
+            .map(|entry| Arc::clone(entry.key()))
+            .collect();
+        tenants.sort();
+        tenants
     }
 
     /// Update tenant access and cache (with probabilistic update to reduce contention).
@@ -629,6 +642,7 @@ impl TokenTree {
                     .root
                     .get_any_tenant()
                     .unwrap_or_else(|| intern_tenant("empty")),
+                tenants: Vec::new(),
                 matched_token_count: 0,
                 input_token_count,
             };
@@ -637,6 +651,7 @@ impl TokenTree {
 
         let mut matched_tokens = 0;
         let mut last_tenant: Option<TenantId> = None;
+        let mut last_match_node: Option<NodeRef> = None;
         let mut remaining = tokens;
         let mut current = Arc::clone(&self.root);
 
@@ -687,6 +702,7 @@ impl TokenTree {
                         if tenant.is_none() {
                             MatchStep::Done
                         } else {
+                            last_match_node = Some(Arc::clone(&child));
                             // Update timestamp on match to keep LRU in sync with backend
                             // SGLang does: child.last_access_time = access_time
                             if let Some(ref t) = tenant {
@@ -737,8 +753,12 @@ impl TokenTree {
             }
         }
 
+        let tenants = last_match_node
+            .map(|node| node.get_tenants())
+            .unwrap_or_default();
         PrefixMatchResult {
             tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
+            tenants,
             matched_token_count: matched_tokens,
             input_token_count,
         }
@@ -766,6 +786,7 @@ impl TokenTree {
                     .root
                     .get_any_tenant()
                     .unwrap_or_else(|| intern_tenant("empty")),
+                tenants: Vec::new(),
                 matched_token_count: 0,
                 input_token_count,
             };
@@ -790,6 +811,7 @@ impl TokenTree {
         // Match-result accumulators.
         let mut matched_tokens = 0usize;
         let mut last_tenant: Option<TenantId> = None;
+        let mut last_tenants: Vec<TenantId> = Vec::new();
         // Once the match descent would have stopped (empty node or partial
         // match), stop updating the match result; insert keeps descending.
         let mut match_frozen = false;
@@ -854,6 +876,7 @@ impl TokenTree {
                                     matched_tokens += common_len;
                                     child.touch_tenant(&t_match, track_lfu);
                                     last_tenant = Some(t_match);
+                                    last_tenants = child.get_tenants();
                                 }
                             }
                         }
@@ -885,6 +908,7 @@ impl TokenTree {
                                     matched_tokens += common_len;
                                     child.touch_tenant(&t_match, track_lfu);
                                     last_tenant = Some(t_match);
+                                    last_tenants = child.get_tenants();
                                 }
                             }
                         }
@@ -939,6 +963,7 @@ impl TokenTree {
                                     matched_tokens += common_len;
                                     child.touch_tenant(&t_match, track_lfu);
                                     last_tenant = Some(t_match);
+                                    last_tenants = child.get_tenants();
                                 }
                             }
                         }
@@ -1018,6 +1043,7 @@ impl TokenTree {
 
         PrefixMatchResult {
             tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
+            tenants: last_tenants,
             matched_token_count: matched_tokens,
             input_token_count,
         }
@@ -1053,6 +1079,7 @@ impl TokenTree {
                     .root
                     .get_any_tenant()
                     .unwrap_or_else(|| intern_tenant("empty")),
+                tenants: Vec::new(),
                 matched_token_count: 0,
                 input_token_count,
             };
@@ -1069,6 +1096,7 @@ impl TokenTree {
         // remaining slice for the splice.
         let mut matched_tokens = 0usize;
         let mut last_tenant: Option<TenantId> = None;
+        let mut last_match_node: Option<NodeRef> = None;
         let mut remaining = tokens;
         let mut current = Arc::clone(&self.root);
         // (node, advance) for each edge we descended through, in order.
@@ -1110,6 +1138,7 @@ impl TokenTree {
                                 child.touch_tenant(&t, track_lfu);
                                 matched_tokens += match_len;
                                 last_tenant = Some(t);
+                                last_match_node = Some(Arc::clone(&child));
                             }
                             // (If the node is all-evicted, match records nothing
                             // and simply stops — same as match_prefix_with_counts.)
@@ -1133,6 +1162,7 @@ impl TokenTree {
                                     child.touch_tenant(&t, track_lfu);
                                     matched_tokens += match_len;
                                     last_tenant = Some(t);
+                                    last_match_node = Some(Arc::clone(&child));
                                 }
                             }
                         }
@@ -1155,8 +1185,12 @@ impl TokenTree {
         }
 
         // ---- Decide the insert tenant from the match result ----
+        let tenants = last_match_node
+            .map(|node| node.get_tenants())
+            .unwrap_or_default();
         let result = PrefixMatchResult {
             tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
+            tenants,
             matched_token_count: matched_tokens,
             input_token_count,
         };
@@ -1715,6 +1749,10 @@ mod tests {
         assert_eq!(result.matched_token_count, PAGE_SIZE);
         // Either tenant is valid
         assert!(result.tenant.as_ref() == "tenant1" || result.tenant.as_ref() == "tenant2");
+        assert_eq!(
+            result.tenants.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            vec!["tenant1", "tenant2"]
+        );
     }
 
     #[test]

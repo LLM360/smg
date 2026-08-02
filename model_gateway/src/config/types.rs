@@ -18,6 +18,11 @@ pub struct RouterConfig {
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     pub policy: PolicyConfig,
+    /// Explicit per-model policy overrides. Values are fully configured policy
+    /// instances, so cache-aware models inherit the same CLI tuning as the
+    /// gateway default without making that default cache-aware.
+    #[serde(default)]
+    pub model_policies: HashMap<String, PolicyConfig>,
     /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
     #[serde(default)]
     pub routing_key_override: RoutingKeyOverrideConfig,
@@ -441,12 +446,16 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        /// Output-token estimate used for cached-owner reservations and the
+        /// size-aware P2C fallback.
+        #[serde(default = "default_output_token_estimate")]
+        fallback_output_token_estimate: u64,
         #[serde(default = "default_block_size")]
         block_size: usize,
         #[serde(default)]
         engine_load: bool,
         /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
-        /// cache affinity is abandoned for shortest-queue. `>= 1.0` disables.
+        /// cache affinity is abandoned for size-aware P2C. `>= 1.0` disables.
         #[serde(default = "default_balance_token_usage_threshold")]
         balance_token_usage_threshold: f32,
         /// Backend KV-utilization ceiling (0.0–1.0): a single engine above it
@@ -791,6 +800,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
+            model_policies: HashMap::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
@@ -1114,6 +1124,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            fallback_output_token_estimate: 4096,
             block_size: 16,
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
@@ -1139,6 +1150,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            fallback_output_token_estimate: 4096,
             block_size: 16,
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
@@ -1165,6 +1177,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            fallback_output_token_estimate: 4096,
             block_size: 16,
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
@@ -1577,6 +1590,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                fallback_output_token_estimate: 4096,
                 block_size: 16,
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
@@ -1611,6 +1625,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                fallback_output_token_estimate: 4096,
                 block_size: 16,
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
@@ -1671,6 +1686,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            fallback_output_token_estimate: 4096,
             block_size: 16,
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
