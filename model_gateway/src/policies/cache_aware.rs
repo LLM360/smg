@@ -48,6 +48,10 @@
     max_tree_size:           Max nodes per approximate tree before eviction
     block_size:              Backend KV cache block size for event-driven routing
     engine_load:             Enable the engine pressure guard
+    max_cached_owners_per_prefix:
+                             Soft replication target (0 disables)
+    cache_owner_spill_cooldown_secs:
+                             Minimum interval between new prefix owners
 */
 
 use std::{
@@ -59,7 +63,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
@@ -80,6 +84,38 @@ use crate::{
 const ENGINE_LOAD_MAX_AGE: Duration = Duration::from_secs(30);
 const ENGINE_PRESSURE_SLACK: f64 = 0.10;
 const ENGINE_PRESSURE_HIGH_WATERMARK: f64 = 0.90;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImbalanceReason {
+    BackendOverload,
+    BackendSpread,
+    RequestCount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PrefixKind {
+    String,
+    Token,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PrefixBudgetKey {
+    model_hash: u64,
+    prefix_hash: u64,
+    kind: PrefixKind,
+}
+
+#[derive(Debug, Clone)]
+struct PrefixReplicationState {
+    last_spill: Instant,
+    provisional_owner: String,
+}
+
+#[derive(Debug)]
+struct PrefixOwnership {
+    key: PrefixBudgetKey,
+    owners: Vec<usize>,
+}
 
 #[derive(Debug, Clone)]
 struct TimedWorkerLoad {
@@ -159,6 +195,11 @@ pub struct CacheAwarePolicy {
     populate_hash_index: AtomicBool,
     /// Last successful engine load snapshot per worker.
     engine_loads: RwLock<HashMap<String, TimedWorkerLoad>>,
+    /// Per-prefix replication throttle. This controls creation of new owners,
+    /// not the authoritative owner catalog, which always records every worker
+    /// reported by the backend event stream.
+    replication_state: Arc<DashMap<PrefixBudgetKey, PrefixReplicationState>>,
+    _replication_gc_task: Option<PeriodicTask>,
 }
 
 /// Per-model inner container for [`CacheAwarePolicy::hash_index`].
@@ -182,6 +223,7 @@ impl CacheAwarePolicy {
         let string_trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
         let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
         let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
+        let replication_state = Arc::new(DashMap::<PrefixBudgetKey, PrefixReplicationState>::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.eviction_interval_secs > 0 {
@@ -260,6 +302,20 @@ impl CacheAwarePolicy {
         };
 
         let fallback = SizeAwarePowerOfTwoPolicy::new(config.fallback_output_token_estimate);
+        let replication_gc_task = if config.max_cached_owners_per_prefix > 0
+            && config.cache_owner_spill_cooldown_secs > 0
+        {
+            let state = Arc::clone(&replication_state);
+            let cooldown = Duration::from_secs(config.cache_owner_spill_cooldown_secs);
+            let retention = cooldown.saturating_mul(4).max(Duration::from_secs(60));
+            Some(PeriodicTask::spawn(
+                config.cache_owner_spill_cooldown_secs.max(1),
+                "Prefix replication budget GC",
+                move || state.retain(|_, entry| entry.last_spill.elapsed() <= retention),
+            ))
+        } else {
+            None
+        };
         Self {
             config,
             fallback,
@@ -271,6 +327,8 @@ impl CacheAwarePolicy {
             hash_index,
             populate_hash_index: AtomicBool::new(false),
             engine_loads: RwLock::new(HashMap::new()),
+            replication_state,
+            _replication_gc_task: replication_gc_task,
         }
     }
 
@@ -398,6 +456,38 @@ impl CacheAwarePolicy {
     /// or by request-count spread. `min_load`/`max_load` are the request-count
     /// bounds over the healthy workers, which `select_worker` gathers in its
     /// single worker pass (tests use the `imbalanced` helper to fold them).
+    fn imbalance_reason(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        min_load: usize,
+        max_load: usize,
+    ) -> Option<ImbalanceReason> {
+        // KV-based triggers — need a load snapshot; both default 1.0 = disabled.
+        if let Some((min_usage, max_usage)) =
+            self.backend_token_usage_bounds(workers, healthy_indices)
+        {
+            // Overload: a single engine is critically saturated.
+            if max_usage > f64::from(self.config.overload_token_usage_threshold) {
+                return Some(ImbalanceReason::BackendOverload);
+            }
+            // KV imbalance: a hot engine with a materially cooler home.
+            if max_usage - min_usage > f64::from(self.config.balance_token_usage_threshold) {
+                return Some(ImbalanceReason::BackendSpread);
+            }
+        }
+
+        // Count spread (abs AND rel) over healthy workers.
+        if max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold)
+        {
+            Some(ImbalanceReason::RequestCount)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
     fn is_imbalanced(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -405,23 +495,8 @@ impl CacheAwarePolicy {
         min_load: usize,
         max_load: usize,
     ) -> bool {
-        // KV-based triggers — need a load snapshot; both default 1.0 = disabled.
-        if let Some((min_usage, max_usage)) =
-            self.backend_token_usage_bounds(workers, healthy_indices)
-        {
-            // Overload: a single engine is critically saturated.
-            if max_usage > f64::from(self.config.overload_token_usage_threshold) {
-                return true;
-            }
-            // KV imbalance: a hot engine with a materially cooler home.
-            if max_usage - min_usage > f64::from(self.config.balance_token_usage_threshold) {
-                return true;
-            }
-        }
-
-        // Count spread (abs AND rel) over healthy workers.
-        max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold)
+        self.imbalance_reason(workers, healthy_indices, min_load, max_load)
+            .is_some()
     }
 
     /// Min and max backend KV-cache utilization (0.0–1.0) across healthy workers
@@ -947,13 +1022,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         // Apply upstream's imbalance and cache-affinity behavior only within
         // the candidates admitted by the engine-pressure guard.
-        let selected_idx = if self.is_imbalanced(
+        let imbalance_reason = self.imbalance_reason(
             workers,
             selection_indices,
             selection_min_load,
             selection_max_load,
-        ) {
-            self.select_worker_fallback(workers, info, selection_indices, model_id)
+        );
+        let selected_idx = if let Some(reason) = imbalance_reason {
+            self.select_worker_imbalanced_with_budget(
+                workers,
+                info,
+                &healthy_indices,
+                selection_indices,
+                model_id,
+                reason,
+            )
         } else if let Some(tokens) = request_tokens {
             if self.has_event_indexer(model_id) {
                 self.select_worker_event_driven(workers, tokens, selection_indices, info, model_id)
@@ -1072,6 +1155,339 @@ impl CacheAwarePolicy {
             .is_some_and(|indexer| indexer.current_size() > 0)
     }
 
+    fn token_tree_ownership(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        healthy_indices: &[usize],
+        model_id: &str,
+    ) -> PrefixOwnership {
+        let mut owners = Vec::new();
+        let mut matched_tokens = 0usize;
+        if let Some(tree) = self
+            .token_trees
+            .get(model_id)
+            .map(|entry| entry.value().clone())
+        {
+            let result = tree.match_prefix_with_counts(tokens);
+            let match_rate = if result.input_token_count == 0 {
+                0.0
+            } else {
+                result.matched_token_count as f32 / result.input_token_count as f32
+            };
+            if match_rate > self.config.cache_threshold {
+                matched_tokens = result.matched_token_count;
+                owners = healthy_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        result
+                            .tenants
+                            .iter()
+                            .any(|tenant| tenant.as_ref() == workers[idx].url())
+                    })
+                    .collect();
+            }
+        }
+
+        let prefix_tokens = if matched_tokens > 0 {
+            &tokens[..matched_tokens]
+        } else {
+            tokens
+        };
+        PrefixOwnership {
+            key: PrefixBudgetKey {
+                model_hash: kv_index::hash_node_path(model_id),
+                prefix_hash: kv_index::hash_token_path(prefix_tokens),
+                kind: PrefixKind::Token,
+            },
+            owners,
+        }
+    }
+
+    fn prefix_ownership(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        model_id: &str,
+    ) -> PrefixOwnership {
+        if let Some(tokens) = info.tokens {
+            let guard = self.kv_monitor.read();
+            if let Some(monitor) = guard.as_ref() {
+                if let Some(indexer) = monitor.get_indexer(model_id) {
+                    if indexer.current_size() > 0 {
+                        let block_size = monitor
+                            .block_size(model_id)
+                            .unwrap_or(self.config.block_size);
+                        let (owners, matched_blocks) = Self::score_overlap_with_depth(
+                            workers,
+                            tokens,
+                            healthy_indices,
+                            &indexer,
+                            block_size,
+                        );
+                        if !owners.is_empty() {
+                            let matched_tokens =
+                                matched_blocks.saturating_mul(block_size).min(tokens.len());
+                            return PrefixOwnership {
+                                key: PrefixBudgetKey {
+                                    model_hash: kv_index::hash_node_path(model_id),
+                                    prefix_hash: kv_index::hash_token_path(
+                                        &tokens[..matched_tokens],
+                                    ),
+                                    kind: PrefixKind::Token,
+                                },
+                                owners,
+                            };
+                        }
+                    }
+                }
+            }
+            drop(guard);
+
+            // The event stream is authoritative once it catches up, but the
+            // approximate tree supplies provisional ownership during the short
+            // store-event delay after a fallback destination was selected.
+            return self.token_tree_ownership(workers, tokens, healthy_indices, model_id);
+        }
+
+        let text = info.request_text.unwrap_or("");
+        let mut owners = Vec::new();
+        let mut matched_chars = 0usize;
+        if let Some(tree) = self
+            .string_trees
+            .get(model_id)
+            .map(|entry| entry.value().clone())
+        {
+            let result = tree.match_prefix_with_counts(text);
+            let match_rate = if result.input_char_count == 0 {
+                0.0
+            } else {
+                result.matched_char_count as f32 / result.input_char_count as f32
+            };
+            if match_rate > self.config.cache_threshold {
+                matched_chars = result.matched_char_count;
+                owners = healthy_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        result
+                            .tenants
+                            .iter()
+                            .any(|tenant| tenant.as_ref() == workers[idx].url())
+                    })
+                    .collect();
+            }
+        }
+        let prefix = if matched_chars > 0 {
+            text.chars().take(matched_chars).collect::<String>()
+        } else {
+            text.to_string()
+        };
+        PrefixOwnership {
+            key: PrefixBudgetKey {
+                model_hash: kv_index::hash_node_path(model_id),
+                prefix_hash: kv_index::hash_node_path(&prefix),
+                kind: PrefixKind::String,
+            },
+            owners,
+        }
+    }
+
+    fn recent_provisional_owner(
+        &self,
+        key: PrefixBudgetKey,
+        workers: &[Arc<dyn Worker>],
+        candidate_indices: &[usize],
+    ) -> Option<usize> {
+        let cooldown = Duration::from_secs(self.config.cache_owner_spill_cooldown_secs);
+        if cooldown.is_zero() {
+            return None;
+        }
+        let state = self.replication_state.get(&key)?;
+        if state.last_spill.elapsed() >= cooldown {
+            return None;
+        }
+        candidate_indices
+            .iter()
+            .copied()
+            .find(|&idx| workers[idx].url() == state.provisional_owner)
+    }
+
+    fn record_replication_spill(&self, key: PrefixBudgetKey, worker_url: &str) {
+        if self.config.cache_owner_spill_cooldown_secs == 0 {
+            return;
+        }
+        self.replication_state.insert(
+            key,
+            PrefixReplicationState {
+                last_spill: Instant::now(),
+                provisional_owner: worker_url.to_string(),
+            },
+        );
+    }
+
+    /// Atomically claim the next replication slot for a prefix. The first
+    /// caller after a cooldown selects a size-aware P2C destination and stores
+    /// it as the provisional owner while holding the map shard. Concurrent
+    /// callers then join that same destination instead of opening several new
+    /// replicas before the approximate tree or backend event stream catches up.
+    ///
+    /// Returns `(selected_worker, claimed_spill_slot)`. The caller compares the
+    /// destination with the authoritative owners to determine whether the claim
+    /// actually created a new owner.
+    fn select_or_join_replication_spill(
+        &self,
+        key: PrefixBudgetKey,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        candidate_indices: &[usize],
+        model_id: &str,
+    ) -> Option<(usize, bool)> {
+        let cooldown = Duration::from_secs(self.config.cache_owner_spill_cooldown_secs);
+        if cooldown.is_zero() {
+            let selected =
+                self.select_worker_fallback(workers, info, candidate_indices, model_id)?;
+            return Some((selected, true));
+        }
+
+        match self.replication_state.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let active = entry.get().last_spill.elapsed() < cooldown;
+                if active {
+                    let provisional_owner = entry.get().provisional_owner.as_str();
+                    if let Some(idx) = candidate_indices
+                        .iter()
+                        .copied()
+                        .find(|&idx| workers[idx].url() == provisional_owner)
+                    {
+                        drop(entry);
+                        let selected = self.fallback.select_least_loaded_from_candidates(
+                            workers,
+                            info,
+                            &[idx],
+                        )?;
+                        return Some((selected, false));
+                    }
+                }
+
+                // An expired claim, or an active provisional owner excluded by
+                // pressure, may be replaced by a new suitable P2C destination.
+                let selected =
+                    self.select_worker_fallback(workers, info, candidate_indices, model_id)?;
+                entry.insert(PrefixReplicationState {
+                    last_spill: Instant::now(),
+                    provisional_owner: workers[selected].url().to_string(),
+                });
+                Some((selected, true))
+            }
+            Entry::Vacant(entry) => {
+                let selected =
+                    self.select_worker_fallback(workers, info, candidate_indices, model_id)?;
+                entry.insert(PrefixReplicationState {
+                    last_spill: Instant::now(),
+                    provisional_owner: workers[selected].url().to_string(),
+                });
+                Some((selected, true))
+            }
+        }
+    }
+
+    fn select_worker_imbalanced_with_budget(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        candidate_indices: &[usize],
+        model_id: &str,
+        reason: ImbalanceReason,
+    ) -> Option<usize> {
+        if self.config.max_cached_owners_per_prefix == 0 {
+            return self.select_worker_fallback(workers, info, candidate_indices, model_id);
+        }
+
+        let eligible_indices =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, candidate_indices);
+        if eligible_indices.is_empty() {
+            return None;
+        }
+        let ownership = self.prefix_ownership(workers, info, healthy_indices, model_id);
+        let mut owner_candidates: Vec<usize> = ownership
+            .owners
+            .iter()
+            .copied()
+            .filter(|idx| eligible_indices.contains(idx))
+            .collect();
+        let provisional_owner =
+            self.recent_provisional_owner(ownership.key, workers, healthy_indices);
+        if let Some(idx) = provisional_owner.filter(|idx| eligible_indices.contains(idx)) {
+            if !owner_candidates.contains(&idx) {
+                owner_candidates.push(idx);
+            }
+        }
+
+        let mut healthy_owners = ownership.owners.clone();
+        if let Some(idx) = provisional_owner {
+            if !healthy_owners.contains(&idx) {
+                healthy_owners.push(idx);
+            }
+        }
+        let owner_count = healthy_owners.len();
+        let hard_overload = reason == ImbalanceReason::BackendOverload;
+        let cooldown_active = provisional_owner.is_some();
+        let at_target = owner_count >= self.config.max_cached_owners_per_prefix;
+
+        if !owner_candidates.is_empty() && !hard_overload && (at_target || cooldown_active) {
+            let result = if at_target {
+                "owner_target_hold"
+            } else {
+                "spill_cooldown_hold"
+            };
+            Metrics::record_cache_aware_replication_decision(model_id, result, owner_count);
+            return self.fallback.select_least_loaded_from_candidates(
+                workers,
+                info,
+                &owner_candidates,
+            );
+        }
+
+        let had_suitable_owner = !owner_candidates.is_empty();
+        let (selected, claimed_new_owner) = if hard_overload {
+            let selected =
+                self.select_worker_fallback(workers, info, candidate_indices, model_id)?;
+            let creates_owner = !ownership.owners.contains(&selected);
+            if creates_owner {
+                self.record_replication_spill(ownership.key, workers[selected].url());
+            }
+            (selected, creates_owner)
+        } else {
+            self.select_or_join_replication_spill(
+                ownership.key,
+                workers,
+                info,
+                &eligible_indices,
+                model_id,
+            )?
+        };
+        let creates_owner = !ownership.owners.contains(&selected) && claimed_new_owner;
+        let result = if hard_overload && creates_owner {
+            "hard_overload_spill"
+        } else if hard_overload {
+            "hard_overload_existing_owner"
+        } else if !claimed_new_owner {
+            "spill_cooldown_hold"
+        } else if !had_suitable_owner {
+            "no_suitable_owner_spill"
+        } else if creates_owner {
+            "budgeted_spill"
+        } else {
+            "fallback_existing_owner"
+        };
+        Metrics::record_cache_aware_replication_decision(model_id, result, owner_count);
+        Some(selected)
+    }
+
     /// Event-driven routing: PositionalIndexer overlap scoring (Type 1).
     ///
     /// Self-contained — when overlap is found, selects the worker with the best
@@ -1129,14 +1545,27 @@ impl CacheAwarePolicy {
         indexer: &PositionalIndexer,
         block_size: usize,
     ) -> Vec<usize> {
+        Self::score_overlap_with_depth(workers, tokens, healthy_indices, indexer, block_size).0
+    }
+
+    /// Return the best owners together with the number of matching full blocks.
+    /// The depth lets the replication budget identify the exact shared prefix
+    /// without storing request text or token vectors in its cooldown map.
+    fn score_overlap_with_depth(
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        healthy_indices: &[usize],
+        indexer: &PositionalIndexer,
+        block_size: usize,
+    ) -> (Vec<usize>, usize) {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
         if content_hashes.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
 
         let overlap = indexer.find_matches(&content_hashes, false);
         if overlap.scores.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
 
         let best_score = healthy_indices
@@ -1152,10 +1581,10 @@ impl CacheAwarePolicy {
             .max()
             .unwrap_or(0);
         if best_score == 0 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
 
-        healthy_indices
+        let owners = healthy_indices
             .iter()
             .copied()
             .filter(|&idx| {
@@ -1165,7 +1594,8 @@ impl CacheAwarePolicy {
                     .copied()
                     == Some(best_score)
             })
-            .collect()
+            .collect();
+        (owners, best_score as usize)
     }
 
     /// Select worker using token-based tree (gRPC path)
@@ -1657,6 +2087,241 @@ mod tests {
         );
     }
 
+    fn replication_budget_policy(max_owners: usize, cooldown_secs: u64) -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: max_owners,
+            cache_owner_spill_cooldown_secs: cooldown_secs,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn replication_budget_holds_on_least_loaded_owner_at_target() {
+        let policy = replication_budget_policy(1, 5);
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hot prefix"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(selected, 0, "the soft owner target must stop replication");
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("hot prefix");
+        assert_eq!(matched.tenants.len(), 1);
+    }
+
+    #[test]
+    fn replication_budget_never_prunes_authoritative_owners() {
+        let policy = replication_budget_policy(1, 5);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let model_id = normalize_model_key(workers[0].model_id());
+        let tree = policy.string_trees.get(model_id).unwrap().value().clone();
+        for worker in &workers {
+            tree.insert_text("hot prefix", worker.url());
+        }
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+        for _ in 0..10 {
+            workers[1].increment_load();
+        }
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hot prefix"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(selected, 2, "all known owners remain routing candidates");
+        let matched = tree.match_prefix_with_counts("hot prefix");
+        assert_eq!(
+            matched.tenants.len(),
+            3,
+            "the target is not a hard catalog cap"
+        );
+    }
+
+    #[test]
+    fn replication_budget_cooldown_allows_only_one_new_owner() {
+        let policy = replication_budget_policy(8, 60);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+        let info = SelectWorkerInfo {
+            request_text: Some("hot prefix"),
+            ..Default::default()
+        };
+
+        let first = policy.select_worker(&workers, &info).unwrap();
+        let second = policy.select_worker(&workers, &info).unwrap();
+
+        assert_ne!(first, 0, "the first imbalance may create one owner");
+        assert_eq!(second, first, "the next request must join that spill");
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("hot prefix");
+        assert_eq!(matched.tenants.len(), 2);
+    }
+
+    #[test]
+    fn replication_budget_hard_overload_bypasses_owner_target() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            balance_abs_threshold: usize::MAX,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 0.9,
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: 1,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+        let _tx = inject_kv(&policy, &workers, &[0.95, 0.20]);
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hot prefix"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(selected, 1);
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("hot prefix");
+        assert_eq!(matched.tenants.len(), 2);
+    }
+
+    #[test]
+    fn replication_budget_excluded_owner_falls_back_and_replication_continues() {
+        let policy = replication_budget_policy(1, 60);
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-excluded-worker-urls",
+            workers[0].url().parse().unwrap(),
+        );
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hot prefix"),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(selected, 1, "an unsuitable owner must not trap the request");
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("hot prefix");
+        assert_eq!(matched.tenants.len(), 2);
+    }
+
+    #[test]
+    fn replication_spill_claim_is_atomic_under_concurrency() {
+        let policy = replication_budget_policy(8, 60);
+        let workers = make_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        policy.init_workers(&workers);
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let selected = std::sync::Mutex::new(Vec::new());
+        let key = PrefixBudgetKey {
+            model_hash: 1,
+            prefix_hash: 2,
+            kind: PrefixKind::String,
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let barrier = Arc::clone(&barrier);
+                let selected = &selected;
+                let policy = &policy;
+                let workers = &workers;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let info = SelectWorkerInfo {
+                        request_text: Some("cold hot-prefix request"),
+                        reserve_work: true,
+                        ..Default::default()
+                    };
+                    let (idx, _) = policy
+                        .select_or_join_replication_spill(
+                            key,
+                            workers,
+                            &info,
+                            &(0..workers.len()).collect::<Vec<_>>(),
+                            model_id,
+                        )
+                        .unwrap();
+                    selected.lock().unwrap().push(idx);
+                });
+            }
+        });
+
+        let selected = selected.into_inner().unwrap();
+        assert!(selected.iter().all(|idx| *idx == selected[0]));
+        assert_eq!(policy.replication_state.len(), 1);
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("cold hot-prefix request");
+        assert_eq!(matched.tenants.len(), 1);
+    }
+
     #[test]
     fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
@@ -1670,6 +2335,7 @@ mod tests {
             engine_load: false,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            ..Default::default()
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -2523,6 +3189,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 0); // w1 (has cached blocks)
+    }
+
+    #[test]
+    fn test_event_driven_replication_budget_uses_least_loaded_cached_owner() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            max_cached_owners_per_prefix: 2,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+        for _ in 0..10 {
+            workers[1].increment_load();
+        }
+        policy.init_workers(&workers);
+
+        let indexer = Arc::new(PositionalIndexer::new(4));
+        let block = vec![StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: compute_content_hash(&[1, 2, 3, 4]),
+        }];
+        let w1_id = indexer.intern_worker(workers[0].url()).unwrap();
+        let w2_id = indexer.intern_worker(workers[1].url()).unwrap();
+        indexer
+            .apply_stored(w1_id, &block, None, &mut WorkerBlockMap::default())
+            .unwrap();
+        indexer
+            .apply_stored(w2_id, &block, None, &mut WorkerBlockMap::default())
+            .unwrap();
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[1, 2, 3, 4]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            selected, 1,
+            "the event index must expose both owners and avoid uncached worker 3"
+        );
     }
 
     #[test]

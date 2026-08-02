@@ -433,6 +433,8 @@ impl ConfigValidator {
                 engine_load: _,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                max_cached_owners_per_prefix,
+                cache_owner_spill_cooldown_secs,
             } => {
                 if *fallback_output_token_estimate == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -463,6 +465,14 @@ impl ConfigValidator {
                         field: "overload_token_usage_threshold".to_string(),
                         value: overload_token_usage_threshold.to_string(),
                         reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                    });
+                }
+
+                if *max_cached_owners_per_prefix == 0 && *cache_owner_spill_cooldown_secs > 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_owner_spill_cooldown_secs".to_string(),
+                        value: cache_owner_spill_cooldown_secs.to_string(),
+                        reason: "Requires max_cached_owners_per_prefix > 0".to_string(),
                     });
                 }
 
@@ -1390,6 +1400,8 @@ mod tests {
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                max_cached_owners_per_prefix: 0,
+                cache_owner_spill_cooldown_secs: 0,
             },
         );
 
@@ -1414,10 +1426,40 @@ mod tests {
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                max_cached_owners_per_prefix: 0,
+                cache_owner_spill_cooldown_secs: 0,
             },
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_cache_owner_cooldown_requires_owner_target() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+                fallback_output_token_estimate: 4096,
+                block_size: 16,
+                engine_load: false,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                max_cached_owners_per_prefix: 0,
+                cache_owner_spill_cooldown_secs: 5,
+            },
+        );
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cache_owner_spill_cooldown_secs"));
     }
 
     #[test]
@@ -1473,6 +1515,8 @@ mod tests {
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                max_cached_owners_per_prefix: 0,
+                cache_owner_spill_cooldown_secs: 0,
             },
         );
 
@@ -1522,6 +1566,8 @@ mod tests {
                     engine_load: Default::default(),
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    max_cached_owners_per_prefix: 0,
+                    cache_owner_spill_cooldown_secs: 0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -1650,6 +1696,8 @@ mod tests {
                     engine_load: false,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    max_cached_owners_per_prefix: 0,
+                    cache_owner_spill_cooldown_secs: 0,
                 }),
                 prefill_policy: None,
                 decode_policy: None,

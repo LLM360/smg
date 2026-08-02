@@ -45,6 +45,8 @@ impl PolicyFactory {
                 engine_load,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                max_cached_owners_per_prefix,
+                cache_owner_spill_cooldown_secs,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -57,6 +59,8 @@ impl PolicyFactory {
                     engine_load: *engine_load,
                     balance_token_usage_threshold: *balance_token_usage_threshold,
                     overload_token_usage_threshold: *overload_token_usage_threshold,
+                    max_cached_owners_per_prefix: *max_cached_owners_per_prefix,
+                    cache_owner_spill_cooldown_secs: *cache_owner_spill_cooldown_secs,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -157,6 +161,8 @@ mod tests {
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 0,
+            cache_owner_spill_cooldown_secs: 0,
         });
         assert_eq!(policy.name(), "cache_aware");
 

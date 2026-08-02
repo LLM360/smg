@@ -221,6 +221,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
+    /// Soft maximum number of healthy cached owners per prefix. Zero disables.
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    max_cached_owners_per_prefix: usize,
+
+    /// Minimum seconds between adding cached owners to one prefix. Zero disables.
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    cache_owner_spill_cooldown_secs: u64,
+
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
@@ -1086,6 +1094,8 @@ impl CliArgs {
                 engine_load: self.cache_aware_engine_load,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
+                max_cached_owners_per_prefix: self.max_cached_owners_per_prefix,
+                cache_owner_spill_cooldown_secs: self.cache_owner_spill_cooldown_secs,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

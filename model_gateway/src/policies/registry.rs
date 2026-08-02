@@ -869,6 +869,8 @@ mod tests {
                     engine_load: true,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    max_cached_owners_per_prefix: 0,
+                    cache_owner_spill_cooldown_secs: 0,
                 },
             )]),
         );

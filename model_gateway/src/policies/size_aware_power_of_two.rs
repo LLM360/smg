@@ -48,7 +48,7 @@ impl SizeAwarePowerOfTwoPolicy {
         input_tokens.saturating_add(output_tokens).max(1)
     }
 
-    fn eligible_candidates(
+    pub(crate) fn eligible_candidates(
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
         candidate_indices: &[usize],
