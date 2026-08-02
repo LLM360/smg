@@ -193,6 +193,23 @@ impl TokenBucket {
 
         inner.tokens
     }
+
+    /// Estimate the whole seconds until `tokens` can be acquired. This is
+    /// intended for HTTP `Retry-After`, so any positive deficit rounds up to
+    /// at least one second. A zero-refill concurrency bucket has no computed
+    /// release time; use one second as a bounded hint rather than omitting the
+    /// header entirely.
+    pub fn retry_after_secs(&self, tokens: f64) -> u64 {
+        let available = self.available_tokens();
+        let deficit = (tokens - available).max(0.0);
+        if deficit == 0.0 {
+            return 0;
+        }
+        if self.refill_rate <= 0.0 {
+            return 1;
+        }
+        (deficit / self.refill_rate).ceil().max(1.0) as u64
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +302,19 @@ mod tests {
         // Use sync return
         bucket.return_tokens_sync(1.0);
         assert!(bucket.try_acquire(1.0).is_ok());
+    }
+
+    #[test]
+    fn test_retry_after_rounds_positive_deficit_up() {
+        let bucket = TokenBucket::new(2, 2);
+        bucket.try_acquire(2.0).unwrap();
+        assert_eq!(bucket.retry_after_secs(1.0), 1);
+    }
+
+    #[test]
+    fn test_retry_after_for_zero_refill_bucket_is_bounded() {
+        let bucket = TokenBucket::new(1, 0);
+        bucket.try_acquire(1.0).unwrap();
+        assert_eq!(bucket.retry_after_secs(1.0), 1);
     }
 }

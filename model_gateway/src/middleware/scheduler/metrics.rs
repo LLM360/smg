@@ -30,13 +30,14 @@ const INFLIGHT: &str = "smg_scheduler_inflight";
 const QUEUE_DEPTH: &str = "smg_scheduler_queue_depth";
 const UTILIZATION: &str = "smg_scheduler_utilization";
 const QUEUE_SIZE_LIMIT: &str = "smg_scheduler_queue_size_limit";
+const RETRY_AFTER_SECONDS: &str = "smg_scheduler_retry_after_seconds";
 const CLASS_CAPACITY_PRESSURE: &str = "smg_scheduler_class_capacity_pressure";
 
 /// `outcome` label values for [`record_admit`].
 pub mod outcome {
     /// Admitted (fast path or after queueing — not distinguished).
     pub const ADMITTED: &str = "admitted";
-    /// Per-class queue was at its limit.
+    /// Shared global queue budget was exhausted.
     pub const REJECTED_QUEUE_FULL: &str = "rejected_queue_full";
     /// Queued waiter aged past `queue_timeout`.
     pub const REJECTED_QUEUE_TIMEOUT: &str = "rejected_queue_timeout";
@@ -78,7 +79,14 @@ pub fn describe() {
         UTILIZATION,
         "Total in-flight requests divided by backend capacity (0.0-1.0+)"
     );
-    describe_gauge!(QUEUE_SIZE_LIMIT, "Configured queue limit per class");
+    describe_gauge!(
+        QUEUE_SIZE_LIMIT,
+        "Configured soft share of the work-conserving global queue per class"
+    );
+    describe_gauge!(
+        RETRY_AFTER_SECONDS,
+        "Current Retry-After estimate in whole seconds by priority class"
+    );
     describe_gauge!(
         CLASS_CAPACITY_PRESSURE,
         "Normalized 0.0-1.0 per-class pressure (max of queue and slot pressure)"
@@ -148,6 +156,11 @@ pub fn set_utilization(utilization: f64) {
 /// Set the queue-size-limit gauge for a class (sampler).
 pub fn set_queue_size_limit(class: Class, limit: usize) {
     gauge!(QUEUE_SIZE_LIMIT, "class" => class.as_str()).set(limit as f64);
+}
+
+/// Set the current Retry-After estimate for a class (sampler).
+pub fn set_retry_after_seconds(class: Class, seconds: u64) {
+    gauge!(RETRY_AFTER_SECONDS, "class" => class.as_str()).set(seconds as f64);
 }
 
 /// Set the normalized capacity-pressure gauge for a class (sampler).

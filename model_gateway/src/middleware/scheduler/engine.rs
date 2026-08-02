@@ -8,11 +8,14 @@
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smg_auth::RequestId;
 use thiserror::Error;
 use tokio::sync::{oneshot, watch, Notify};
@@ -21,7 +24,7 @@ use tracing::{info, warn};
 
 use super::{
     inflight::InflightHandle,
-    queue::{ClassQueue, FifoClassQueue, Waiter},
+    queue::{ClassQueue, FifoClassQueue, QueueBudget, Waiter},
     slots::SlotPool,
     Class, ClassRuntimeConfig, SchedulerSettings,
 };
@@ -36,6 +39,21 @@ const PREEMPTION_WAIT_BUDGET: Duration = Duration::from_millis(50);
 
 /// Poll interval while waiting for a preempted slot to free.
 const PREEMPTION_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Minimum observation window before refreshing the release-rate estimate.
+/// This prevents a burst of queue-full responses from turning a handful of
+/// microseconds into an implausibly large requests-per-second value.
+const TURNOVER_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Weight applied to the newest slot-release-rate sample.
+const TURNOVER_EWMA_ALPHA: f64 = 0.25;
+
+#[derive(Debug)]
+struct TurnoverEstimate {
+    sampled_at: Instant,
+    sampled_releases: u64,
+    ewma_per_second: Option<f64>,
+}
 
 /// Construction-time failures for [`PriorityScheduler::new`].
 ///
@@ -58,9 +76,9 @@ pub enum AdmitOutcome {
 /// status in the admission middleware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionReason {
-    /// Per-class queue is at its configured limit. → 429.
+    /// Shared global queue budget is exhausted. → 429 + Retry-After.
     QueueFull,
-    /// Queued waiter aged past `queue_timeout`. → 408.
+    /// Queued waiter aged past `queue_timeout`. → 408 + Retry-After.
     QueueTimeout,
     /// Scheduler cancelled this inflight to admit a higher-priority
     /// waiter. → 503 + Retry-After.
@@ -81,6 +99,8 @@ pub enum RejectionReason {
 pub struct PriorityScheduler {
     slot_pool: SlotPool,
     class_queues: [Arc<dyn ClassQueue>; 4],
+    /// One work-conserving occupancy ceiling shared by all class queues.
+    queue_budget: Arc<QueueBudget>,
     inflight_registry: RwLock<HashMap<RequestId, Arc<InflightHandle>>>,
     /// Arc so the dispatcher task can await on it without holding a strong
     /// reference to the scheduler. On scheduler `Drop` we fire `notify_one`
@@ -96,6 +116,11 @@ pub struct PriorityScheduler {
     /// Per-class reservation shares of capacity (immutable baseline).
     /// Effective = `max(floor, ceil(share × capacity))`.
     reserved_per_slot: [f64; 4],
+    /// Slot releases are counted atomically on the hot path. Queue-full
+    /// responses sample the counter to estimate how quickly a retry could
+    /// advance through the queue.
+    released_total: AtomicU64,
+    turnover_estimate: Mutex<TurnoverEstimate>,
 }
 
 impl Drop for PriorityScheduler {
@@ -129,18 +154,31 @@ impl PriorityScheduler {
             });
         }
 
-        let class_queues: [Arc<dyn ClassQueue>; 4] = Class::ALL.map(|c| queue_for(settings, c));
+        let total_queue_capacity = Class::ALL
+            .iter()
+            .map(|class| settings.class_config(*class).queue_size as usize)
+            .fold(0_usize, usize::saturating_add);
+        let queue_budget = Arc::new(QueueBudget::new(total_queue_capacity));
+        let class_queues: [Arc<dyn ClassQueue>; 4] =
+            Class::ALL.map(|c| queue_for(settings, c, Arc::clone(&queue_budget)));
         let class_config: [ClassRuntimeConfig; 4] =
             Class::ALL.map(|c| ClassRuntimeConfig::from_class_config(settings.class_config(c)));
 
         Ok(Arc::new(Self {
             slot_pool: SlotPool::new(capacity, desired),
             class_queues,
+            queue_budget,
             inflight_registry: RwLock::new(HashMap::new()),
             release_notify: Arc::new(Notify::new()),
             class_config,
             reserved_floor,
             reserved_per_slot,
+            released_total: AtomicU64::new(0),
+            turnover_estimate: Mutex::new(TurnoverEstimate {
+                sampled_at: Instant::now(),
+                sampled_releases: 0,
+                ewma_per_second: None,
+            }),
         }))
     }
 
@@ -307,7 +345,52 @@ impl PriorityScheduler {
     fn release_inflight(&self, handle: &InflightHandle) {
         self.inflight_registry.write().remove(handle.request_id());
         self.slot_pool.release(handle.class());
+        self.released_total.fetch_add(1, Ordering::Relaxed);
         self.release_notify.notify_one();
+    }
+
+    /// Estimate how many whole seconds a rejected caller should wait before
+    /// retrying. The numerator is the number of same-or-higher-priority
+    /// waiters that can dispatch first; the denominator is an EWMA of recent
+    /// slot releases across the router. When no turnover sample exists yet,
+    /// fall back to the class queue timeout. The result is always bounded to
+    /// `[1, queue_timeout]` so clients receive a useful integer without an
+    /// unbounded or falsely immediate retry instruction.
+    pub fn retry_after_secs(&self, class: Class) -> u64 {
+        let now = Instant::now();
+        let released = self.released_total.load(Ordering::Relaxed);
+        let mut estimate = self.turnover_estimate.lock();
+        let elapsed = now.duration_since(estimate.sampled_at);
+        if elapsed >= TURNOVER_SAMPLE_INTERVAL {
+            let delta = released.saturating_sub(estimate.sampled_releases);
+            let observed = delta as f64 / elapsed.as_secs_f64();
+            if observed > 0.0 && observed.is_finite() {
+                estimate.ewma_per_second = Some(match estimate.ewma_per_second {
+                    Some(previous) => {
+                        TURNOVER_EWMA_ALPHA * observed + (1.0 - TURNOVER_EWMA_ALPHA) * previous
+                    }
+                    None => observed,
+                });
+            }
+            estimate.sampled_at = now;
+            estimate.sampled_releases = released;
+        }
+
+        let ahead: usize = Class::ALL
+            .iter()
+            .filter(|&&queued_class| queued_class >= class)
+            .map(|queued_class| self.class_queues[*queued_class as usize].depth())
+            .sum();
+        let timeout = self.class_config[class as usize]
+            .queue_timeout
+            .as_secs()
+            .max(1);
+        let seconds = estimate
+            .ewma_per_second
+            .filter(|rate| *rate > 0.0)
+            .map(|rate| ((ahead.saturating_add(1)) as f64 / rate).ceil() as u64)
+            .unwrap_or(timeout);
+        seconds.clamp(1, timeout)
     }
 
     /// Test-only in-flight count for a class. Lets sibling-module tests
@@ -597,23 +680,22 @@ impl PriorityScheduler {
     fn sample_metrics(&self) {
         let capacity = self.slot_pool.capacity();
         let mut total_inflight: u32 = 0;
-        let mut total_queue_capacity: usize = 0;
         for class in Class::ALL {
             let inflight = self.slot_pool.inflight(class);
             total_inflight += u32::from(inflight);
             let depth = self.class_queues[class as usize].depth();
             let limit = self.class_queues[class as usize].capacity();
-            total_queue_capacity = total_queue_capacity.saturating_add(limit);
             super::metrics::set_inflight(class, inflight);
             super::metrics::set_queue_depth(class, depth);
             super::metrics::set_queue_size_limit(class, limit);
+            super::metrics::set_retry_after_seconds(class, self.retry_after_secs(class));
             super::metrics::set_class_capacity_pressure(
                 class,
                 self.class_pressure(class, inflight, depth, limit, capacity),
             );
         }
         Metrics::set_http_admission_limit(usize::from(capacity));
-        Metrics::set_http_admission_queue_capacity(total_queue_capacity);
+        Metrics::set_http_admission_queue_capacity(self.queue_budget.capacity());
         let utilization = if capacity == 0 {
             0.0
         } else {
@@ -753,10 +835,17 @@ fn clamp_reservations_to_capacity(desired: [u16; 4], capacity: u16) -> [u16; 4] 
     out
 }
 
-/// Build the per-class queue with its configured fixed depth limit.
-fn queue_for(settings: &SchedulerSettings, class: Class) -> Arc<dyn ClassQueue> {
-    Arc::new(FifoClassQueue::new(
+/// Build a per-class FIFO lane backed by the scheduler's shared queue budget.
+/// The configured class queue size remains a soft share for observability;
+/// it never strands otherwise-idle global capacity.
+fn queue_for(
+    settings: &SchedulerSettings,
+    class: Class,
+    queue_budget: Arc<QueueBudget>,
+) -> Arc<dyn ClassQueue> {
+    Arc::new(FifoClassQueue::with_shared_budget(
         settings.class_config(class).queue_size as usize,
+        queue_budget,
     ))
 }
 
@@ -923,6 +1012,7 @@ mod tests {
             let mut cfg = ClassConfig::default_for(c);
             cfg.reserved_floor = 0;
             cfg.reserved_per_slot = 0.0;
+            cfg.queue_size = 0;
             if c == class {
                 cfg.queue_size = queue_size;
                 cfg.queue_timeout_secs = queue_timeout_secs;
@@ -975,6 +1065,36 @@ mod tests {
             outcome,
             AdmitOutcome::Rejected(RejectionReason::QueueFull)
         ));
+    }
+
+    #[test]
+    fn test_retry_after_uses_queue_depth_and_observed_turnover() {
+        let settings = settings_with(Class::Default, 64, 60);
+        let scheduler = PriorityScheduler::new(&settings, 1).unwrap();
+        for index in 0..20 {
+            let (tx, _rx) = oneshot::channel();
+            scheduler.class_queues[Class::Default as usize]
+                .try_enqueue(Waiter::new(
+                    Class::Default,
+                    CancellationToken::new(),
+                    rid(&format!("queued-{index}")),
+                    tx,
+                ))
+                .unwrap();
+        }
+        scheduler.released_total.store(100, Ordering::Relaxed);
+        scheduler.turnover_estimate.lock().sampled_at = Instant::now() - Duration::from_secs(10);
+
+        // Roughly 10 releases/s and 21 positions including the rejected
+        // caller gives ceil(21/10) = 3 seconds.
+        assert_eq!(scheduler.retry_after_secs(Class::Default), 3);
+    }
+
+    #[test]
+    fn test_retry_after_falls_back_to_class_timeout_without_turnover() {
+        let settings = settings_with(Class::Default, 8, 17);
+        let scheduler = PriorityScheduler::new(&settings, 1).unwrap();
+        assert_eq!(scheduler.retry_after_secs(Class::Default), 17);
     }
 
     #[tokio::test(start_paused = true)]

@@ -40,7 +40,10 @@ use std::{io::Write, sync::Arc, time::Duration};
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, RETRY_AFTER},
+        StatusCode,
+    },
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use portpicker::pick_unused_port;
@@ -107,6 +110,13 @@ impl SchedulerYaml {
             interactive: ClassYaml::base(),
             system: ClassYaml::base(),
         }
+    }
+
+    fn clear_queue_budget(&mut self) {
+        self.bulk.queue_size = 0;
+        self.default.queue_size = 0;
+        self.interactive.queue_size = 0;
+        self.system.queue_size = 0;
     }
 }
 
@@ -327,6 +337,7 @@ fn priority_scheduler_updates_generic_http_admission_metrics() {
             .expect("build test runtime")
             .block_on(async {
                 let mut yaml = SchedulerYaml::base();
+                yaml.clear_queue_budget();
                 yaml.default.queue_size = 1;
                 yaml.default.queue_timeout_secs = 30;
                 let yaml_file = write_scheduler_yaml(&yaml);
@@ -391,7 +402,7 @@ fn priority_scheduler_updates_generic_http_admission_metrics() {
                 assert_eq!(metric_value(&during, "smg_http_admission_limit"), 1.0);
                 assert_eq!(
                     metric_value(&during, "smg_http_admission_queue_capacity"),
-                    193.0
+                    1.0
                 );
 
                 gate.release();
@@ -427,8 +438,8 @@ fn priority_scheduler_updates_generic_http_admission_metrics() {
     });
 }
 
-/// Queue full → 429. Capacity 1, occupied by a held request; the Default
-/// queue has size 0 so the next admission can't even enqueue.
+/// Queue full → 429. Capacity 1, occupied by a held request; the shared
+/// global queue budget is 0 so the next admission can't enqueue.
 #[expect(
     clippy::disallowed_methods,
     reason = "test infra: holds a request open in a spawned task"
@@ -437,7 +448,7 @@ fn priority_scheduler_updates_generic_http_admission_metrics() {
 #[serial]
 async fn queue_full_returns_429() {
     let mut yaml = SchedulerYaml::base();
-    yaml.default.queue_size = 0; // nowhere to wait → immediate reject
+    yaml.clear_queue_budget(); // nowhere to wait → immediate reject
     let yaml_file = write_scheduler_yaml(&yaml);
     let config = scheduler_config(3601, "default", yaml_file.path().to_str().unwrap());
 
@@ -463,6 +474,7 @@ async fn queue_full_returns_429() {
         "queue full must map to 429"
     );
     assert_eq!(error_code(&resp).as_deref(), Some("scheduler_queue_full"));
+    assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "30");
     let body = body_json(resp).await;
     assert_eq!(body["error"]["code"], "scheduler_queue_full");
 
@@ -515,6 +527,7 @@ async fn queue_timeout_returns_408() {
         error_code(&resp).as_deref(),
         Some("scheduler_queue_timeout")
     );
+    assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "1");
 
     gate.release();
     let held_resp = join(held).await;
@@ -631,8 +644,7 @@ async fn tenant_clamp_strips_system_header_of_preemption_power() {
     // request to Default before it ever gets here.
     yaml.system.can_preempt = true;
     yaml.interactive.can_preempt = true;
-    yaml.default.queue_size = 0; // a non-preempting probe has nowhere to wait
-    yaml.bulk.queue_size = 4;
+    yaml.clear_queue_budget(); // a non-preempting probe has nowhere to wait
     yaml.bulk.queue_timeout_secs = 30;
     let yaml_file = write_scheduler_yaml(&yaml);
     // Clamp ceiling is Default for the anonymous tenant.
@@ -653,7 +665,7 @@ async fn tenant_clamp_strips_system_header_of_preemption_power() {
     wait_arrivals(&gate, 1).await;
 
     // Probe asks for `system` but is clamped to Default → cannot preempt →
-    // hits a zero-size queue → 429 (and the bulk victim is untouched).
+    // hits the zero-size global queue → 429 (and the bulk victim is untouched).
     let resp = send(&app, generate_request("probe", Some("system"))).await;
     assert_eq!(
         resp.status(),
