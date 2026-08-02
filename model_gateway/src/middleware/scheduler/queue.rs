@@ -3,6 +3,10 @@
 
 use std::{
     collections::VecDeque,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -12,6 +16,61 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{engine::SchedulerPermit, Class};
+
+/// One work-conserving occupancy budget shared by all priority queues.
+///
+/// Each class keeps its own FIFO lane for dispatch policy, but enqueueing
+/// consumes from this common counter. An idle class therefore never strands
+/// queue capacity that another class could use.
+#[derive(Debug)]
+pub struct QueueBudget {
+    used: AtomicUsize,
+    capacity: usize,
+}
+
+impl QueueBudget {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            capacity,
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            if used >= self.capacity {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => used = observed,
+            }
+        }
+    }
+
+    fn release(&self) {
+        let released = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_sub(1)
+            });
+        debug_assert!(released.is_ok(), "queue budget released below zero");
+    }
+
+    pub fn depth(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
 
 /// A request waiting for admission in a class queue.
 ///
@@ -58,9 +117,9 @@ impl Waiter {
 /// and admission, so it uses `parking_lot::Mutex` rather than an async
 /// mutex.
 pub trait ClassQueue: Send + Sync {
-    /// Append a waiter. Returns `Err(waiter)` when the queue is at its
-    /// configured limit so the caller can convert the rejection into a
-    /// 429 response.
+    /// Append a waiter. Returns `Err(waiter)` when the shared global queue
+    /// budget is exhausted so the caller can convert the rejection into a
+    /// saturation response.
     fn try_enqueue(&self, waiter: Waiter) -> Result<(), Waiter>;
 
     /// Pop the next waiter, or `None` when empty.
@@ -73,7 +132,7 @@ pub trait ClassQueue: Send + Sync {
     /// Current depth, including waiters whose cancel token has fired.
     fn depth(&self) -> usize;
 
-    /// Configured maximum depth (the queue-size limit), for metrics.
+    /// Configured soft share of the global queue budget, for metrics.
     fn capacity(&self) -> usize;
 
     /// Drain any leading run of waiters whose cancel token has fired
@@ -83,33 +142,46 @@ pub trait ClassQueue: Send + Sync {
     fn drop_cancelled_head(&self);
 }
 
-/// First-in, first-out per-class queue with a fixed maximum depth.
+/// First-in, first-out per-class queue backed by a shared occupancy budget.
 pub struct FifoClassQueue {
     waiters: Mutex<VecDeque<Waiter>>,
-    max: usize,
+    soft_limit: usize,
+    budget: Arc<QueueBudget>,
 }
 
 impl FifoClassQueue {
+    /// Construct a standalone queue. Production scheduler queues use
+    /// [`Self::with_shared_budget`]; the private budget keeps the queue useful
+    /// in focused tests and for future isolated callers.
     pub fn new(max: usize) -> Self {
+        Self::with_shared_budget(max, Arc::new(QueueBudget::new(max)))
+    }
+
+    pub fn with_shared_budget(soft_limit: usize, budget: Arc<QueueBudget>) -> Self {
         Self {
-            waiters: Mutex::new(VecDeque::with_capacity(max.min(64))),
-            max,
+            waiters: Mutex::new(VecDeque::with_capacity(soft_limit.min(64))),
+            soft_limit,
+            budget,
         }
     }
 }
 
 impl ClassQueue for FifoClassQueue {
     fn try_enqueue(&self, waiter: Waiter) -> Result<(), Waiter> {
-        let mut guard = self.waiters.lock();
-        if guard.len() >= self.max {
+        if !self.budget.try_acquire() {
             return Err(waiter);
         }
+        let mut guard = self.waiters.lock();
         guard.push_back(waiter);
         Ok(())
     }
 
     fn pop_eligible(&self) -> Option<Waiter> {
-        self.waiters.lock().pop_front()
+        let waiter = self.waiters.lock().pop_front();
+        if waiter.is_some() {
+            self.budget.release();
+        }
+        waiter
     }
 
     fn head_age(&self) -> Option<Duration> {
@@ -121,13 +193,14 @@ impl ClassQueue for FifoClassQueue {
     }
 
     fn capacity(&self) -> usize {
-        self.max
+        self.soft_limit
     }
 
     fn drop_cancelled_head(&self) {
         let mut guard = self.waiters.lock();
         while guard.front().is_some_and(|w| w.cancel.is_cancelled()) {
             guard.pop_front();
+            self.budget.release();
         }
     }
 }
@@ -264,5 +337,61 @@ mod tests {
             Class::Interactive,
             "first live waiter is now the head"
         );
+    }
+
+    #[test]
+    fn test_shared_budget_is_work_conserving_across_class_queues() {
+        let budget = Arc::new(QueueBudget::new(3));
+        let default = FifoClassQueue::with_shared_budget(1, Arc::clone(&budget));
+        let bulk = FifoClassQueue::with_shared_budget(2, Arc::clone(&budget));
+
+        default.try_enqueue(waiter(Class::Default)).unwrap();
+        default.try_enqueue(waiter(Class::Default)).unwrap();
+        default.try_enqueue(waiter(Class::Default)).unwrap();
+        assert_eq!(default.depth(), 3, "default borrows both idle shares");
+        assert_eq!(default.capacity(), 1, "configured share remains visible");
+        assert_eq!(budget.depth(), 3);
+        assert!(bulk.try_enqueue(waiter(Class::Bulk)).is_err());
+
+        default.pop_eligible().unwrap();
+        assert_eq!(budget.depth(), 2);
+        bulk.try_enqueue(waiter(Class::Bulk)).unwrap();
+        assert_eq!(budget.depth(), 3);
+    }
+
+    #[test]
+    fn test_cancelled_waiter_releases_shared_budget() {
+        let budget = Arc::new(QueueBudget::new(1));
+        let default = FifoClassQueue::with_shared_budget(1, Arc::clone(&budget));
+        let bulk = FifoClassQueue::with_shared_budget(0, Arc::clone(&budget));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        default
+            .try_enqueue(waiter_with_cancel(Class::Default, cancelled))
+            .unwrap();
+        assert!(bulk.try_enqueue(waiter(Class::Bulk)).is_err());
+
+        default.drop_cancelled_head();
+        assert_eq!(budget.depth(), 0);
+        bulk.try_enqueue(waiter(Class::Bulk)).unwrap();
+    }
+
+    #[test]
+    fn test_shared_budget_never_overadmits_under_concurrency() {
+        let budget = Arc::new(QueueBudget::new(64));
+        let queue = Arc::new(FifoClassQueue::with_shared_budget(16, budget));
+        let threads: Vec<_> = (0..200)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                std::thread::spawn(move || queue.try_enqueue(waiter(Class::Default)).is_ok())
+            })
+            .collect();
+        let admitted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 64);
+        assert_eq!(queue.depth(), 64);
     }
 }

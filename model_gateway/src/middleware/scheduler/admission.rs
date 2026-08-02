@@ -13,13 +13,7 @@ use std::sync::{
     Arc,
 };
 
-use axum::{
-    body::Body,
-    extract::State,
-    http::Request,
-    middleware::Next,
-    response::{IntoResponse, Response},
-};
+use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
 use smg_auth::RequestId;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
@@ -126,7 +120,7 @@ pub async fn priority_admission_middleware(
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             Metrics::record_http_admission_rejected();
             pending_guard.resolve();
-            return SchedulerError::QueueFull.into_response();
+            return crate::rate_limit::rejection_response(bucket.retry_after_secs(1.0));
         }
     }
 
@@ -192,7 +186,8 @@ pub async fn priority_admission_middleware(
                 scheduler.admit_outcome = outcome,
                 "scheduler admission decision"
             );
-            SchedulerError::from(reason).into_response()
+            SchedulerError::from(reason)
+                .into_response_with_retry_after(state.scheduler.retry_after_secs(class))
         }
     }
 }

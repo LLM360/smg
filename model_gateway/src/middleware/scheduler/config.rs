@@ -27,7 +27,9 @@ pub struct ClassConfig {
     /// finite and non-negative.
     #[serde(default)]
     pub reserved_per_slot: f64,
-    /// Per-class queue depth limit.
+    /// Per-class soft share of the global work-conserving queue budget.
+    /// Dispatch remains class-aware, but an active class may borrow unused
+    /// queue capacity from another class.
     pub queue_size: u32,
     /// How long a queued waiter waits before the admission middleware
     /// returns 408. Seconds at rest; converted to [`Duration`] in

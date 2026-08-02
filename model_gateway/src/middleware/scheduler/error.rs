@@ -24,9 +24,9 @@ const STATUS_CLIENT_CLOSED_REQUEST: u16 = 499;
 /// How the scheduler's admission decision surfaces to the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerError {
-    /// Per-class queue at its configured limit. → 429.
+    /// Shared global queue budget exhausted. → 429 + Retry-After.
     QueueFull,
-    /// Queued waiter aged past `queue_timeout`. → 408.
+    /// Queued waiter aged past `queue_timeout`. → 408 + Retry-After.
     QueueTimeout,
     /// Cancelled in-flight to admit a higher-priority waiter, before TTFT.
     /// → 503 + `Retry-After: 1` + `X-SMG-Preempted: true`.
@@ -60,11 +60,37 @@ impl SchedulerError {
 
     fn message(self) -> &'static str {
         match self {
-            Self::QueueFull => "request queue is full for this priority class",
+            Self::QueueFull => "global request queue is full",
             Self::QueueTimeout => "timed out waiting for an admission slot",
             Self::Preempted => "request preempted by higher-priority traffic",
             Self::ClientCancelled => "client closed the request before admission",
         }
+    }
+
+    /// Render a scheduler saturation response with the router's current
+    /// quantitative retry estimate. Preemption keeps its fixed one-second
+    /// retry hint; queue-full and queue-timeout responses use `seconds`.
+    pub fn into_response_with_retry_after(self, seconds: u64) -> Response {
+        self.response(Some(seconds.max(1)))
+    }
+
+    fn response(self, saturation_retry_after: Option<u64>) -> Response {
+        let mut resp = create_error(self.status(), self.code(), self.message());
+        let retry_after = match self {
+            Self::Preempted => Some(1),
+            Self::QueueFull | Self::QueueTimeout => saturation_retry_after,
+            Self::ClientCancelled => None,
+        };
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                resp.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        if self == Self::Preempted {
+            resp.headers_mut()
+                .insert(HEADER_X_SMG_PREEMPTED, HeaderValue::from_static("true"));
+        }
+        resp
     }
 }
 
@@ -82,15 +108,10 @@ impl From<RejectionReason> for SchedulerError {
 impl IntoResponse for SchedulerError {
     fn into_response(self) -> Response {
         // Reuse the gateway's standard error shape (JSON body + the
-        // X-SMG-Error-Code header), then layer the preemption-specific
-        // headers on top.
-        let mut resp = create_error(self.status(), self.code(), self.message());
-        if self == Self::Preempted {
-            let headers = resp.headers_mut();
-            headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
-            headers.insert(HEADER_X_SMG_PREEMPTED, HeaderValue::from_static("true"));
-        }
-        resp
+        // X-SMG-Error-Code header), then layer retry/preemption headers on
+        // top. Callers that know the live saturation estimate use
+        // `into_response_with_retry_after` instead.
+        self.response(None)
     }
 }
 
@@ -137,6 +158,21 @@ mod tests {
         let resp = SchedulerError::QueueFull.into_response();
         assert!(resp.headers().get(HEADER_X_SMG_PREEMPTED).is_none());
         assert!(resp.headers().get(RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn test_queue_full_with_estimate_sets_retry_after() {
+        let resp = SchedulerError::QueueFull.into_response_with_retry_after(23);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "23");
+        assert!(resp.headers().get(HEADER_X_SMG_PREEMPTED).is_none());
+    }
+
+    #[test]
+    fn test_queue_timeout_with_estimate_sets_retry_after() {
+        let resp = SchedulerError::QueueTimeout.into_response_with_retry_after(7);
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "7");
     }
 
     #[test]
