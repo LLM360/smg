@@ -79,14 +79,19 @@ impl AdmissionMode {
         registry: Arc<WorkerRegistry>,
         rate_limiter: Option<Arc<TokenBucket>>,
     ) -> Result<Self, String> {
-        // Tier-4 fallback for WorkerCapacity comes from the legacy
-        // --max-concurrent-requests (clamped to u16; <=0 means "disabled",
-        // for which we keep the tracker default).
+        // The configured concurrency value is one global ceiling across the
+        // entire healthy worker fleet. Worker-reported capacity may lower the
+        // scheduler limit, but it must never raise it above this contract.
+        let configured_max = if rc.max_concurrent_requests > 0 {
+            Some(u16::try_from(rc.max_concurrent_requests).unwrap_or(u16::MAX))
+        } else {
+            None
+        };
         let cap_settings = CapacityTrackerSettings {
-            legacy_max_concurrent_requests: u16::try_from(rc.max_concurrent_requests)
-                .unwrap_or_else(|_| {
-                    CapacityTrackerSettings::default().legacy_max_concurrent_requests
-                }),
+            max_capacity: configured_max,
+            legacy_max_concurrent_requests: configured_max.unwrap_or_else(|| {
+                CapacityTrackerSettings::default().legacy_max_concurrent_requests
+            }),
             ..CapacityTrackerSettings::default()
         };
         let worker_capacity = WorkerCapacity::spawn(registry, cap_settings);
@@ -98,13 +103,16 @@ impl AdmissionMode {
 
         let default_max_class = Class::parse_header(&rc.priority_scheduler_default_max_class);
         let yaml = load_yaml(rc.priority_scheduler_config.as_deref())?;
-        let settings = SchedulerSettings::from_cli_and_yaml(
+        let mut settings = SchedulerSettings::from_cli_and_yaml(
             true,
             default_max_class,
             rc.priority_scheduler_tenant_metric_top_n,
             yaml.as_ref(),
         )
         .map_err(|e| e.to_string())?;
+        if yaml.is_none() {
+            settings = settings.with_global_queue_budget(rc.queue_size);
+        }
 
         // The atomic value covers any update that won the race before the
         // receiver subscribed; subsequent updates remain queued for the
@@ -204,5 +212,44 @@ mod tests {
             attempt += 1;
             sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn priority_mode_caps_aggregate_worker_capacity_at_configured_maximum() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut labels = HashMap::new();
+        labels.insert("max_running_requests".to_string(), "512".to_string());
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://capacity-test:8000")
+                .labels(labels)
+                .status(openai_protocol::worker::WorkerStatus::Ready)
+                .build(),
+        );
+        registry.register(worker).expect("worker should register");
+
+        let config = RouterConfig {
+            max_concurrent_requests: 256,
+            priority_scheduler_enabled: true,
+            ..RouterConfig::default()
+        };
+        let AdmissionMode::Priority(state) =
+            AdmissionMode::try_build_priority(&config, registry, None).unwrap()
+        else {
+            panic!("priority scheduler should start");
+        };
+
+        let permits: Vec<_> = (0..256)
+            .map(|index| {
+                state
+                    .scheduler
+                    .acquire_inflight(Class::System, RequestId(format!("cap-{index}")))
+                    .expect("configured capacity should remain available")
+            })
+            .collect();
+        let overflow = state
+            .scheduler
+            .acquire_inflight(Class::System, RequestId("cap-overflow".into()));
+        assert!(overflow.is_none());
+        drop(permits);
     }
 }

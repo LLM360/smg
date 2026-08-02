@@ -180,6 +180,35 @@ impl SchedulerSettings {
         &self.classes[class as usize]
     }
 
+    /// Scale the built-in per-class queue weights to one exact global budget.
+    /// This is used when no scheduler YAML overrides the class limits, so the
+    /// legacy `--queue-size` flag remains the total queue contract after the
+    /// priority scheduler is enabled.
+    pub fn with_global_queue_budget(mut self, total: usize) -> Self {
+        let total = u32::try_from(total).unwrap_or(u32::MAX);
+        let current_total: u64 = Class::ALL
+            .iter()
+            .map(|class| u64::from(self.classes[*class as usize].queue_size))
+            .sum();
+        if current_total == 0 {
+            return self;
+        }
+
+        let mut allocated = 0_u32;
+        for (index, class) in Class::ALL.iter().enumerate() {
+            let queue_size = if index + 1 == Class::ALL.len() {
+                total.saturating_sub(allocated)
+            } else {
+                let weight = u64::from(self.classes[*class as usize].queue_size);
+                let scaled = (u64::from(total) * weight) / current_total;
+                u32::try_from(scaled).unwrap_or(u32::MAX)
+            };
+            self.classes[*class as usize].queue_size = queue_size;
+            allocated = allocated.saturating_add(queue_size);
+        }
+        self
+    }
+
     /// Assemble settings from CLI flags + optional YAML, validating
     /// per-field invariants. Reservations are clamped to the live capacity
     /// by the scheduler, so there is no capacity-vs-reserved check here.
@@ -395,6 +424,31 @@ tenant_policies:
             assert_eq!(s.class_config(class), &ClassConfig::default_for(class));
         }
         assert!(s.tenant_policies.is_empty());
+    }
+
+    #[test]
+    fn test_global_queue_budget_scales_defaults_to_exact_total() {
+        let s = SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, None)
+            .unwrap()
+            .with_global_queue_budget(2_000);
+        let total: u32 = Class::ALL
+            .iter()
+            .map(|class| s.class_config(*class).queue_size)
+            .sum();
+        assert_eq!(total, 2_000);
+        assert!(
+            s.class_config(Class::Bulk).queue_size > s.class_config(Class::Interactive).queue_size
+        );
+    }
+
+    #[test]
+    fn test_global_queue_budget_can_disable_queues() {
+        let s = SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, None)
+            .unwrap()
+            .with_global_queue_budget(0);
+        assert!(Class::ALL
+            .iter()
+            .all(|class| s.class_config(*class).queue_size == 0));
     }
 
     #[test]
