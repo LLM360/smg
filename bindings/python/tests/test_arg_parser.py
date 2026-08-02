@@ -24,6 +24,8 @@ class TestRouterArgs:
         assert args.port == 30000
         assert args.policy == "cache_aware"
         assert args.output_token_estimate == 4096
+        assert args.max_cached_owners_per_prefix == 0
+        assert args.cache_owner_spill_cooldown_secs == 0
         assert args.worker_urls == []
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
@@ -549,6 +551,21 @@ class TestParseRouterArgs:
 
         assert router_args.policy == "size_aware_power_of_two"
         assert router_args.output_token_estimate == 2048
+
+    def test_parse_cache_owner_replication_budget_args(self):
+        router_args = parse_router_args(
+            [
+                "--policy",
+                "cache_aware",
+                "--max-cached-owners-per-prefix",
+                "8",
+                "--cache-owner-spill-cooldown-secs",
+                "5",
+            ]
+        )
+
+        assert router_args.max_cached_owners_per_prefix == 8
+        assert router_args.cache_owner_spill_cooldown_secs == 5
 
     def test_parse_per_model_policy_args(self):
         router_args = parse_router_args(

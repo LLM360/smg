@@ -28,6 +28,8 @@ fn test_backward_compatibility_with_empty_model_id() {
         balance_token_usage_threshold: 1.0,
         overload_token_usage_threshold: 1.0,
         fallback_output_token_estimate: 4096,
+        max_cached_owners_per_prefix: 0,
+        cache_owner_spill_cooldown_secs: 0,
     };
 
     let policy = CacheAwarePolicy::with_config(config);
@@ -84,6 +86,8 @@ fn test_mixed_model_ids() {
         balance_token_usage_threshold: 1.0,
         overload_token_usage_threshold: 1.0,
         fallback_output_token_estimate: 4096,
+        max_cached_owners_per_prefix: 0,
+        cache_owner_spill_cooldown_secs: 0,
     };
 
     let policy = CacheAwarePolicy::with_config(config);

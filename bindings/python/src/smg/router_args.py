@@ -63,6 +63,8 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     balance_token_usage_threshold: float = 1.0
     overload_token_usage_threshold: float = 1.0
+    max_cached_owners_per_prefix: int = 0
+    cache_owner_spill_cooldown_secs: int = 0
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     block_size: int = 16
@@ -472,6 +474,24 @@ class RouterArgs:
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
                 " Backend must report token_usage. Defaults to 1.0 (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-cached-owners-per-prefix",
+            type=int,
+            default=RouterArgs.max_cached_owners_per_prefix,
+            help=(
+                "Soft maximum number of healthy cached owners per prefix. New"
+                " owners are held back while suitable owners remain. Zero disables."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-owner-spill-cooldown-secs",
+            type=int,
+            default=RouterArgs.cache_owner_spill_cooldown_secs,
+            help=(
+                "Minimum interval between adding owners to one cached prefix."
+                " Hard overload and no-suitable-owner safety paths bypass it."
             ),
         )
         routing_group.add_argument(

@@ -462,6 +462,12 @@ pub enum PolicyConfig {
         /// triggers shedding regardless of spread. `>= 1.0` disables (default).
         #[serde(default = "default_balance_token_usage_threshold")]
         overload_token_usage_threshold: f32,
+        /// Soft owner target per cached prefix. `0` disables the budget.
+        #[serde(default)]
+        max_cached_owners_per_prefix: usize,
+        /// Minimum interval between adding owners to one prefix. `0` disables.
+        #[serde(default)]
+        cache_owner_spill_cooldown_secs: u64,
     },
 
     #[serde(rename = "power_of_two")]
@@ -1129,6 +1135,8 @@ mod tests {
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 0,
+            cache_owner_spill_cooldown_secs: 0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1155,6 +1163,8 @@ mod tests {
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 0,
+            cache_owner_spill_cooldown_secs: 0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1170,6 +1180,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_aware_replication_budget_defaults_preserve_legacy_configs() {
+        let json = r#"{
+            "type":"cache_aware",
+            "cache_threshold":0.8,
+            "balance_abs_threshold":10,
+            "balance_rel_threshold":1.5,
+            "eviction_interval_secs":300,
+            "max_tree_size":1000,
+            "fallback_output_token_estimate":4096,
+            "block_size":16,
+            "engine_load":false,
+            "balance_token_usage_threshold":1.0,
+            "overload_token_usage_threshold":1.0
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+
+        match policy {
+            PolicyConfig::CacheAware {
+                max_cached_owners_per_prefix,
+                cache_owner_spill_cooldown_secs,
+                ..
+            } => {
+                assert_eq!(max_cached_owners_per_prefix, 0);
+                assert_eq!(cache_owner_spill_cooldown_secs, 0);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
     fn test_cache_aware_parameters() {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.75,
@@ -1182,6 +1222,8 @@ mod tests {
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 0,
+            cache_owner_spill_cooldown_secs: 0,
         };
 
         match cache_aware {
@@ -1595,6 +1637,8 @@ mod tests {
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                max_cached_owners_per_prefix: 0,
+                cache_owner_spill_cooldown_secs: 0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1630,6 +1674,8 @@ mod tests {
                 engine_load: Default::default(),
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                max_cached_owners_per_prefix: 0,
+                cache_owner_spill_cooldown_secs: 0,
             }),
             decode_policy: None,
         };
@@ -1691,6 +1737,8 @@ mod tests {
             engine_load: Default::default(),
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 0,
+            cache_owner_spill_cooldown_secs: 0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

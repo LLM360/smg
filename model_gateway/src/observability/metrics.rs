@@ -314,6 +314,14 @@ pub(crate) fn init_metrics() {
         "Cache-aware engine-pressure decisions by result"
     );
     describe_counter!(
+        "smg_cache_aware_replication_decisions_total",
+        "Cache-aware prefix replication-budget decisions by model and result"
+    );
+    describe_histogram!(
+        "smg_cache_aware_prefix_owner_count",
+        "Healthy cached owners observed when applying the replication budget"
+    );
+    describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
@@ -1235,6 +1243,26 @@ impl Metrics {
             "result" => result
         )
         .increment(1);
+    }
+
+    /// Record one prefix replication-budget decision.
+    pub fn record_cache_aware_replication_decision(
+        model_id: &str,
+        result: &'static str,
+        owner_count: usize,
+    ) {
+        let model = intern_string(model_id);
+        counter!(
+            "smg_cache_aware_replication_decisions_total",
+            "model" => Arc::clone(&model),
+            "result" => result
+        )
+        .increment(1);
+        histogram!(
+            "smg_cache_aware_prefix_owner_count",
+            "model" => model
+        )
+        .record(owner_count as f64);
     }
 
     /// Record worker error
