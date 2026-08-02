@@ -131,6 +131,29 @@ impl PolicyRegistry {
         policy.select_worker(workers, info)
     }
 
+    /// Select a worker and report any router-local work reserved by the policy.
+    ///
+    /// The sticky routing-key override does not reserve work in `policy`, so it
+    /// must return no reservation. Callers use the returned cost to attach a
+    /// request-lifetime release guard to the selected worker.
+    pub fn select_worker_with_reservation(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<(usize, Option<u64>)> {
+        if let Some(sticky) = self.routing_key_sticky.as_ref() {
+            if Self::routing_key_override_applies(policy.name())
+                && extract_routing_key(info.headers).is_some()
+            {
+                return sticky.select_worker(workers, info).map(|idx| (idx, None));
+            }
+        }
+
+        let idx = policy.select_worker(workers, info)?;
+        Some((idx, policy.reservation_cost(info)))
+    }
+
     /// Policies that already honor `X-SMG-Routing-Key` keep their own handling; all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
@@ -847,6 +870,70 @@ mod tests {
         assert_eq!(model_a.name(), "size_aware_power_of_two");
         assert_eq!(model_b.name(), "size_aware_power_of_two");
         assert!(Arc::ptr_eq(&model_a, &model_b));
+    }
+
+    #[test]
+    fn select_worker_with_reservation_reports_atomic_size_aware_work() {
+        let registry = PolicyRegistry::new(PolicyConfig::SizeAwarePowerOfTwo {
+            output_token_estimate: 2048,
+        });
+        let policy = registry.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let tokens = vec![0; 100];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            max_output_tokens: Some(500),
+            reserve_work: true,
+            ..Default::default()
+        };
+
+        let (first, first_cost) = registry
+            .select_worker_with_reservation(&policy, &workers, &info)
+            .unwrap();
+        let (second, second_cost) = registry
+            .select_worker_with_reservation(&policy, &workers, &info)
+            .unwrap();
+
+        assert_ne!(
+            first, second,
+            "the second admission must see the first reservation"
+        );
+        assert_eq!(first_cost, Some(600));
+        assert_eq!(second_cost, Some(600));
+        policy.release_reservation(workers[first].url(), first_cost.unwrap());
+        policy.release_reservation(workers[second].url(), second_cost.unwrap());
+    }
+
+    #[test]
+    fn sticky_override_does_not_report_an_unmade_policy_reservation() {
+        let registry = PolicyRegistry::with_override(
+            PolicyConfig::SizeAwarePowerOfTwo {
+                output_token_estimate: 2048,
+            },
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let policy = registry.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let headers = headers_with_key("session-A");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            reserve_work: true,
+            ..Default::default()
+        };
+
+        let (_, reservation) = registry
+            .select_worker_with_reservation(&policy, &workers, &info)
+            .unwrap();
+        assert_eq!(reservation, None);
     }
 
     #[test]

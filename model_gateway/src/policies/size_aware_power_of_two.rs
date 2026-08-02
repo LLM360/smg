@@ -48,6 +48,37 @@ impl SizeAwarePowerOfTwoPolicy {
         input_tokens.saturating_add(output_tokens).max(1)
     }
 
+    /// True when router-local work reservations are materially imbalanced.
+    ///
+    /// One configured output estimate is the absolute noise floor, so a lone
+    /// tiny request does not defeat cache affinity. Long prompts and admission
+    /// bursts exceed it immediately, before backend load polling catches up.
+    pub(crate) fn is_reserved_work_imbalanced(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidate_indices: &[usize],
+        rel_threshold: f32,
+    ) -> bool {
+        if candidate_indices.len() < 2 {
+            return false;
+        }
+
+        let reserved = self.reserved_work.lock();
+        let mut min_work = u64::MAX;
+        let mut max_work = 0u64;
+        for &idx in candidate_indices {
+            let work = reserved
+                .get(workers[idx].url())
+                .copied()
+                .unwrap_or_default();
+            min_work = min_work.min(work);
+            max_work = max_work.max(work);
+        }
+        let min_work = if min_work == u64::MAX { 0 } else { min_work };
+        max_work.saturating_sub(min_work) > self.output_token_estimate
+            && (max_work as f64) > (min_work as f64 * f64::from(rel_threshold))
+    }
+
     pub(crate) fn eligible_candidates(
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,

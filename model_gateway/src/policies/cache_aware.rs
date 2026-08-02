@@ -89,6 +89,7 @@ const ENGINE_PRESSURE_HIGH_WATERMARK: f64 = 0.90;
 enum ImbalanceReason {
     BackendOverload,
     BackendSpread,
+    ReservedWork,
     RequestCount,
 }
 
@@ -435,7 +436,7 @@ impl CacheAwarePolicy {
 
     /// True when the pool is imbalanced enough to abandon cache affinity.
     ///
-    /// Three independent triggers, OR'd together. The two KV-based triggers
+    /// Four independent triggers, OR'd together. The two KV-based triggers
     /// require a backend `token_usage` snapshot and are disabled at their `1.0`
     /// default (utilization and spread are both `<= 1.0`, so `> 1.0` never
     /// fires):
@@ -448,6 +449,10 @@ impl CacheAwarePolicy {
     ///   exists to spill toward. This is the true balance signal for long-context
     ///   workloads, and — unlike request counts, which each gateway sees only
     ///   locally — it is invariant to the number of gateway replicas.
+    /// - **reserved-work spread**: router-local prompt plus expected-output
+    ///   reservations differ by more than one fallback output-work quantum and
+    ///   exceed the relative threshold. This catches long prompts and bursts
+    ///   synchronously, before backend polling or active-request guards update.
     /// - **count spread**: request-count dispersion (abs AND rel) over healthy
     ///   workers. Always evaluated, so high-count / low-KV imbalance is still
     ///   caught when KV looks even.
@@ -475,6 +480,14 @@ impl CacheAwarePolicy {
             if max_usage - min_usage > f64::from(self.config.balance_token_usage_threshold) {
                 return Some(ImbalanceReason::BackendSpread);
             }
+        }
+
+        if self.fallback.is_reserved_work_imbalanced(
+            workers,
+            healthy_indices,
+            self.config.balance_rel_threshold,
+        ) {
+            return Some(ImbalanceReason::ReservedWork);
         }
 
         // Count spread (abs AND rel) over healthy workers.
@@ -1490,9 +1503,12 @@ impl CacheAwarePolicy {
 
     /// Event-driven routing: PositionalIndexer overlap scoring (Type 1).
     ///
-    /// Self-contained — when overlap is found, selects the worker with the best
-    /// cache match. When no overlap (cold start, novel tokens, short request),
-    /// falls back to size-aware P2C. Does not fall back to the approximate token tree.
+    /// When exact overlap is found, selects the worker with the best cache
+    /// match. When the event index has no overlap, consults the approximate
+    /// token tree before size-aware P2C. This repairs affinity after a late
+    /// event subscription: SGLang's live-only stream can begin with a block
+    /// whose parent predates the subscription, while routed traffic still
+    /// gives us bounded provisional ownership that later exact events replace.
     fn select_worker_event_driven(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1524,12 +1540,14 @@ impl CacheAwarePolicy {
             return Some(idx);
         }
 
-        // No cache overlap: size-aware P2C fallback records a provisional
-        // approximate owner until the engine's KV event confirms actual state.
-        let idx = self.select_worker_fallback(workers, info, healthy_indices, model_id)?;
+        // No exact overlap: recover from the provisional token tree populated
+        // by earlier routed requests. A miss there uses size-aware P2C and
+        // records that destination as a provisional owner.
+        let idx =
+            self.select_worker_with_tokens(workers, tokens, healthy_indices, info, model_id)?;
         debug!(
             worker = workers[idx].url(),
-            model_id, "Event-driven routing: no overlap, size-aware fallback"
+            model_id, "Event-driven routing: no exact overlap, provisional-tree fallback"
         );
         Some(idx)
     }
@@ -3542,5 +3560,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, idx2); // token tree cache affinity preserved
+    }
+
+    #[test]
+    fn test_nonempty_event_index_miss_uses_provisional_token_owner() {
+        // A late SGLang subscription can yield a nonempty event index whose
+        // first stored block references an unseen parent. Exact lookup then
+        // misses even though earlier routed traffic established an owner in
+        // the provisional token tree.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = two_workers();
+        policy.init_workers(&workers);
+
+        let tokens: Vec<u32> = (1..=16).collect();
+        let model_id = normalize_model_key(workers[0].model_id());
+        policy
+            .token_trees
+            .get(model_id)
+            .unwrap()
+            .insert_tokens(&tokens, workers[0].url());
+
+        // Make a plain P2C miss prefer w2, proving the result below comes from
+        // provisional cache affinity rather than load balancing coincidence.
+        workers[0].increment_load();
+
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer = Arc::new(PositionalIndexer::new(4));
+        let worker_id = indexer.intern_worker(workers[1].url()).unwrap();
+        let mut worker_blocks = WorkerBlockMap::default();
+        indexer
+            .apply_stored(
+                worker_id,
+                &[StoredBlock {
+                    seq_hash: SequenceHash(999),
+                    content_hash: compute_content_hash(&[100, 101, 102, 103]),
+                }],
+                None,
+                &mut worker_blocks,
+            )
+            .unwrap();
+        monitor.indexers.insert(model_id.to_string(), indexer);
+        monitor.set_block_size(model_id, 4);
+        policy.set_kv_event_monitor(Some(monitor));
+        assert!(policy.has_event_indexer(model_id));
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn test_reserved_long_prompt_spills_without_request_count_imbalance() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            balance_abs_threshold: usize::MAX,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            fallback_output_token_estimate: 4096,
+            ..Default::default()
+        });
+        let workers = two_workers();
+        policy.init_workers(&workers);
+
+        let tokens: Vec<u32> = (1..=16).collect();
+        let model_id = normalize_model_key(workers[0].model_id());
+        policy
+            .token_trees
+            .get(model_id)
+            .unwrap()
+            .insert_tokens(&tokens, workers[0].url());
+
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            reserve_work: true,
+            ..Default::default()
+        };
+        let first = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(
+            first, 0,
+            "the existing cached owner should receive the first request"
+        );
+
+        // Active-request counts are still equal because no execution guard was
+        // created. The synchronous 4,112-token reservation alone must make the
+        // second admission use P2C and choose the unreserved worker.
+        let second = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(second, 1);
+
+        let cost = policy.reservation_cost(&info).unwrap();
+        policy.release_reservation(workers[first].url(), cost);
+        policy.release_reservation(workers[second].url(), cost);
     }
 }

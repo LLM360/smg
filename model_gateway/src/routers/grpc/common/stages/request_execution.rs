@@ -171,10 +171,12 @@ impl PipelineStage for RequestExecutionStage {
             ExecutionPlan::Batch { requests, .. } => requests.len(),
             _ => 1,
         };
+        let policy_reservation = ctx.state.policy_reservation.take();
         ctx.state.load_guards = Some(LoadGuards::scaled(
             workers,
             ctx.input.headers.as_ref(),
             sub_requests,
+            policy_reservation,
         ));
 
         // Extract dispatch metadata for tracing span
