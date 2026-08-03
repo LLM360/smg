@@ -119,18 +119,58 @@ pub struct TenantPolicyConfig {
     pub max_class: Class,
 }
 
+/// Hard admission budget for one trusted upstream partition selector.
+///
+/// Partition capacities are non-borrowable while the fleet is healthy. This
+/// guarantees that a saturated model cannot consume another model's reserved
+/// admission headroom. When aggregate worker capacity falls, the partition
+/// coordinator scales all configured capacities down while preserving the
+/// global ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionPartitionConfig {
+    /// Maximum requests admitted concurrently in this partition.
+    pub max_concurrent_requests: u16,
+    /// Work-conserving queue budget shared by the priority classes inside
+    /// this partition.
+    pub queue_size: u32,
+}
+
+fn default_admission_partition() -> String {
+    "default".to_string()
+}
+
 /// Optional YAML config loaded via `--priority-scheduler-config <path>`.
 ///
 /// Both maps are absent-as-empty: an empty document parses to
 /// `PrioritySchedulerYaml::default()`, and downstream
 /// [`SchedulerSettings::from_cli_and_yaml`] fills in built-in defaults
 /// for any class that wasn't overridden.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrioritySchedulerYaml {
     #[serde(default)]
     pub classes: HashMap<Class, ClassConfig>,
     #[serde(default)]
     pub tenant_policies: HashMap<String, TenantPolicyConfig>,
+    /// Optional admission partitions keyed by the exact value of the trusted
+    /// `x-smg-admission-partition` header. An empty map preserves the original
+    /// single global scheduler.
+    #[serde(default)]
+    pub admission_partitions: HashMap<String, AdmissionPartitionConfig>,
+    /// Partition used when the trusted header is absent, invalid, or does not
+    /// match a configured key.
+    #[serde(default = "default_admission_partition")]
+    pub default_admission_partition: String,
+}
+
+impl Default for PrioritySchedulerYaml {
+    fn default() -> Self {
+        Self {
+            classes: HashMap::new(),
+            tenant_policies: HashMap::new(),
+            admission_partitions: HashMap::new(),
+            default_admission_partition: default_admission_partition(),
+        }
+    }
 }
 
 /// Per-field validation failures discovered while assembling
@@ -209,6 +249,28 @@ impl SchedulerSettings {
             allocated = allocated.saturating_add(queue_size);
         }
         self
+    }
+
+    /// Scale absolute class floors to a partition's share of the configured
+    /// global capacity, then apply that partition's queue budget. Percentage
+    /// reservations remain unchanged and therefore continue to scale against
+    /// the partition's live capacity.
+    pub fn for_admission_partition(
+        mut self,
+        partition_capacity: u16,
+        global_capacity: u16,
+        queue_size: usize,
+    ) -> Self {
+        if global_capacity > 0 {
+            for class in Class::ALL {
+                let floor = u64::from(self.classes[class as usize].reserved_floor);
+                let numerator = floor.saturating_mul(u64::from(partition_capacity));
+                let scaled = numerator.div_ceil(u64::from(global_capacity));
+                self.classes[class as usize].reserved_floor =
+                    u16::try_from(scaled).unwrap_or(u16::MAX);
+            }
+        }
+        self.with_global_queue_budget(queue_size)
     }
 
     /// Assemble settings from CLI flags + optional YAML, validating
@@ -387,6 +449,33 @@ tenant_policies:
     }
 
     #[test]
+    fn test_yaml_admission_partitions_round_trip() {
+        let yaml = r#"
+admission_partitions:
+  kimi-k3:
+    max_concurrent_requests: 7168
+    queue_size: 1600
+  private:
+    max_concurrent_requests: 64
+    queue_size: 40
+  default:
+    max_concurrent_requests: 128
+    queue_size: 80
+default_admission_partition: default
+"#;
+        let parsed: PrioritySchedulerYaml = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.admission_partitions.len(), 3);
+        assert_eq!(
+            parsed.admission_partitions["kimi-k3"],
+            AdmissionPartitionConfig {
+                max_concurrent_requests: 7168,
+                queue_size: 1600,
+            }
+        );
+        assert_eq!(parsed.default_admission_partition, "default");
+    }
+
+    #[test]
     fn test_yaml_unknown_class_value_is_serde_error() {
         let yaml = r#"
 tenant_policies:
@@ -404,6 +493,7 @@ tenant_policies:
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: Default::default(),
+            ..Default::default()
         };
         let rendered = serde_yaml::to_string(&yaml).unwrap();
         assert!(
@@ -454,6 +544,30 @@ tenant_policies:
     }
 
     #[test]
+    fn test_admission_partition_scales_absolute_floors_but_keeps_shares() {
+        let settings = SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, None)
+            .unwrap()
+            .for_admission_partition(64, 8000, 40);
+        assert_eq!(settings.class_config(Class::System).reserved_floor, 1);
+        assert_eq!(settings.class_config(Class::Interactive).reserved_floor, 2);
+        assert_eq!(
+            settings.class_config(Class::Interactive).reserved_per_slot,
+            0.25
+        );
+        assert_eq!(
+            settings.class_config(Class::Default).reserved_per_slot,
+            0.10
+        );
+        assert_eq!(
+            Class::ALL
+                .iter()
+                .map(|class| settings.class_config(*class).queue_size)
+                .sum::<u32>(),
+            40
+        );
+    }
+
+    #[test]
     fn test_settings_yaml_partial_override_merges_with_defaults() {
         let mut classes = HashMap::new();
         let mut interactive = ClassConfig::default_for(Class::Interactive);
@@ -462,6 +576,7 @@ tenant_policies:
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: Default::default(),
+            ..Default::default()
         };
         let s =
             SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
@@ -485,6 +600,7 @@ tenant_policies:
         let yaml = PrioritySchedulerYaml {
             classes: Default::default(),
             tenant_policies,
+            ..Default::default()
         };
         let s =
             SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
@@ -502,6 +618,7 @@ tenant_policies:
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: Default::default(),
+            ..Default::default()
         };
         let err = SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml))
             .unwrap_err();
@@ -520,6 +637,7 @@ tenant_policies:
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: Default::default(),
+            ..Default::default()
         };
         let err = SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml))
             .unwrap_err();

@@ -63,6 +63,7 @@ fn settings(queue_size: u32) -> SchedulerSettings {
     let yaml = PrioritySchedulerYaml {
         classes,
         tenant_policies: HashMap::new(),
+        ..Default::default()
     };
     SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
 }

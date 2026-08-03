@@ -124,6 +124,7 @@ pub async fn priority_admission_middleware(
         }
     }
 
+    let partition = state.partition_for(req.headers());
     let request_id = next_registry_id();
 
     // NOTE: client-disconnect detection during the queue wait is not yet
@@ -133,7 +134,7 @@ pub async fn priority_admission_middleware(
     // once admitted, releasing the slot.
     let cancel = CancellationToken::new();
 
-    match state.scheduler.admit(class, request_id, cancel).await {
+    match partition.scheduler.admit(class, request_id, cancel).await {
         AdmitOutcome::Admitted(permit) => {
             pending_guard.resolve();
             Metrics::record_http_admission_admitted();
@@ -155,10 +156,12 @@ pub async fn priority_admission_middleware(
                 sched_metrics::outcome::ADMITTED
             };
             sched_metrics::record_admit(class, outcome);
+            sched_metrics::record_partition_admit(&partition.name, class, outcome);
             trace!(
                 scheduler.class = class.as_str(),
                 scheduler.requested_class = resolved.requested.as_str(),
                 scheduler.tenant = %tenant,
+                scheduler.partition = %partition.name,
                 scheduler.admit_outcome = outcome,
                 "scheduler admission decision"
             );
@@ -179,15 +182,17 @@ pub async fn priority_admission_middleware(
             pending_guard.resolve();
             let outcome = rejection_outcome(reason);
             sched_metrics::record_admit(class, outcome);
+            sched_metrics::record_partition_admit(&partition.name, class, outcome);
             trace!(
                 scheduler.class = class.as_str(),
                 scheduler.requested_class = resolved.requested.as_str(),
                 scheduler.tenant = %tenant,
+                scheduler.partition = %partition.name,
                 scheduler.admit_outcome = outcome,
                 "scheduler admission decision"
             );
             SchedulerError::from(reason)
-                .into_response_with_retry_after(state.scheduler.retry_after_secs(class))
+                .into_response_with_retry_after(partition.scheduler.retry_after_secs(class))
         }
     }
 }
