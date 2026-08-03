@@ -121,6 +121,15 @@ class RouterArgs:
     priority_scheduler_default_max_class: str = "default"
     priority_scheduler_config: str | None = None
     priority_scheduler_tenant_metric_top_n: int = 32
+    # Engine telemetry and predictive token-work admission.
+    engine_metrics: bool = False
+    adaptive_admission_mode: str = "off"
+    adaptive_admission_work_horizon_secs: float = 30.0
+    adaptive_admission_estimator_half_life_secs: float = 900.0
+    adaptive_admission_prior_observations: float = 20.0
+    adaptive_admission_max_segments: int = 50_000
+    adaptive_admission_min_load_coverage: float = 0.8
+    adaptive_admission_cold_start_output_tokens: int = 4096
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: int | None = None
     # Cluster-wide requests-per-second ceiling. Requires mesh and the same value on every gateway.
@@ -254,6 +263,9 @@ class RouterArgs:
         )
         priority_scheduler_group = parser.add_argument_group(
             "Priority Scheduler", "Priority-aware admission scheduling"
+        )
+        adaptive_admission_group = parser.add_argument_group(
+            "Adaptive Admission", "Predictive token-work admission"
         )
         retry_group = parser.add_argument_group(
             "Retry Configuration", "Automatic retry behavior for failed requests"
@@ -866,6 +878,54 @@ class RouterArgs:
             type=int,
             default=RouterArgs.priority_scheduler_tenant_metric_top_n,
             help="Maximum number of tenant labels retained in scheduler metrics",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}engine-metrics",
+            action="store_true",
+            default=RouterArgs.engine_metrics,
+            help="Poll and export engine load metrics regardless of routing policy",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-mode",
+            choices=["off", "shadow", "enforce"],
+            default=RouterArgs.adaptive_admission_mode,
+            help="Predictive token-work admission mode",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-work-horizon-secs",
+            type=float,
+            default=RouterArgs.adaptive_admission_work_horizon_secs,
+            help="Maximum predicted outstanding decode-work horizon in seconds",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-estimator-half-life-secs",
+            type=float,
+            default=RouterArgs.adaptive_admission_estimator_half_life_secs,
+            help="Half-life for recency weighting of observed output lengths",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-prior-observations",
+            type=float,
+            default=RouterArgs.adaptive_admission_prior_observations,
+            help="Hierarchical shrinkage strength in effective observations",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-max-segments",
+            type=int,
+            default=RouterArgs.adaptive_admission_max_segments,
+            help="Maximum predictor segments before stale-segment eviction",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-min-load-coverage",
+            type=float,
+            default=RouterArgs.adaptive_admission_min_load_coverage,
+            help="Minimum healthy-replica engine-load telemetry coverage",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-cold-start-output-tokens",
+            type=int,
+            default=RouterArgs.adaptive_admission_cold_start_output_tokens,
+            help="Cold-start output-token prediction before observations",
         )
 
         # Retry configuration

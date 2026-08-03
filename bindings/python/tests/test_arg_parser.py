@@ -51,6 +51,14 @@ class TestRouterArgs:
         assert args.priority_scheduler_default_max_class == "default"
         assert args.priority_scheduler_config is None
         assert args.priority_scheduler_tenant_metric_top_n == 32
+        assert args.engine_metrics is False
+        assert args.adaptive_admission_mode == "off"
+        assert args.adaptive_admission_work_horizon_secs == 30.0
+        assert args.adaptive_admission_estimator_half_life_secs == 900.0
+        assert args.adaptive_admission_prior_observations == 20.0
+        assert args.adaptive_admission_max_segments == 50_000
+        assert args.adaptive_admission_min_load_coverage == 0.8
+        assert args.adaptive_admission_cold_start_output_tokens == 4096
 
     def test_parse_priority_scheduler_options(self):
         args = parse_router_args(
@@ -69,6 +77,36 @@ class TestRouterArgs:
         assert args.priority_scheduler_default_max_class == "interactive"
         assert args.priority_scheduler_config == "/tmp/priority.yaml"
         assert args.priority_scheduler_tenant_metric_top_n == 16
+
+    def test_parse_adaptive_admission_options(self):
+        args = parse_router_args(
+            [
+                "--engine-metrics",
+                "--adaptive-admission-mode",
+                "shadow",
+                "--adaptive-admission-work-horizon-secs",
+                "45",
+                "--adaptive-admission-estimator-half-life-secs",
+                "600",
+                "--adaptive-admission-prior-observations",
+                "12",
+                "--adaptive-admission-max-segments",
+                "12345",
+                "--adaptive-admission-min-load-coverage",
+                "0.75",
+                "--adaptive-admission-cold-start-output-tokens",
+                "2048",
+            ]
+        )
+
+        assert args.engine_metrics is True
+        assert args.adaptive_admission_mode == "shadow"
+        assert args.adaptive_admission_work_horizon_secs == 45.0
+        assert args.adaptive_admission_estimator_half_life_secs == 600.0
+        assert args.adaptive_admission_prior_observations == 12.0
+        assert args.adaptive_admission_max_segments == 12_345
+        assert args.adaptive_admission_min_load_coverage == 0.75
+        assert args.adaptive_admission_cold_start_output_tokens == 2048
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
