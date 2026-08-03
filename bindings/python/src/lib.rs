@@ -497,6 +497,14 @@ struct Router {
     priority_scheduler_config: Option<String>,
     priority_scheduler_tenant_metric_top_n: u32,
     model_policies: HashMap<String, PolicyType>,
+    engine_metrics: bool,
+    adaptive_admission_mode: String,
+    adaptive_admission_work_horizon_secs: f64,
+    adaptive_admission_estimator_half_life_secs: f64,
+    adaptive_admission_prior_observations: f64,
+    adaptive_admission_max_segments: usize,
+    adaptive_admission_min_load_coverage: f64,
+    adaptive_admission_cold_start_output_tokens: u32,
 }
 
 impl Router {
@@ -699,6 +707,14 @@ impl Router {
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
 
+        let adaptive_admission_mode = self.adaptive_admission_mode.parse().map_err(|reason| {
+            config::ConfigError::InvalidValue {
+                field: "adaptive_admission_mode".to_string(),
+                value: self.adaptive_admission_mode.clone(),
+                reason,
+            }
+        })?;
+
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -767,6 +783,7 @@ impl Router {
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .engine_metrics(self.engine_metrics)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -774,6 +791,15 @@ impl Router {
             .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
             .priority_scheduler_config(self.priority_scheduler_config.clone())
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .adaptive_admission(config::AdaptiveAdmissionConfig {
+                mode: adaptive_admission_mode,
+                work_horizon_secs: self.adaptive_admission_work_horizon_secs,
+                estimator_half_life_secs: self.adaptive_admission_estimator_half_life_secs,
+                prior_observations: self.adaptive_admission_prior_observations,
+                max_segments: self.adaptive_admission_max_segments,
+                min_load_coverage: self.adaptive_admission_min_load_coverage,
+                cold_start_output_tokens: self.adaptive_admission_cold_start_output_tokens,
+            })
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -992,6 +1018,14 @@ impl Router {
         priority_scheduler_config = None,
         priority_scheduler_tenant_metric_top_n = 32,
         model_policies = HashMap::new(),
+        engine_metrics = false,
+        adaptive_admission_mode = String::from("off"),
+        adaptive_admission_work_horizon_secs = 30.0,
+        adaptive_admission_estimator_half_life_secs = 900.0,
+        adaptive_admission_prior_observations = 20.0,
+        adaptive_admission_max_segments = 50000,
+        adaptive_admission_min_load_coverage = 0.8,
+        adaptive_admission_cold_start_output_tokens = 4096,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1128,6 +1162,14 @@ impl Router {
         priority_scheduler_config: Option<String>,
         priority_scheduler_tenant_metric_top_n: u32,
         model_policies: HashMap<String, PolicyType>,
+        engine_metrics: bool,
+        adaptive_admission_mode: String,
+        adaptive_admission_work_horizon_secs: f64,
+        adaptive_admission_estimator_half_life_secs: f64,
+        adaptive_admission_prior_observations: f64,
+        adaptive_admission_max_segments: usize,
+        adaptive_admission_min_load_coverage: f64,
+        adaptive_admission_cold_start_output_tokens: u32,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1278,6 +1320,14 @@ impl Router {
             priority_scheduler_config,
             priority_scheduler_tenant_metric_top_n,
             model_policies,
+            engine_metrics,
+            adaptive_admission_mode,
+            adaptive_admission_work_horizon_secs,
+            adaptive_admission_estimator_half_life_secs,
+            adaptive_admission_prior_observations,
+            adaptive_admission_max_segments,
+            adaptive_admission_min_load_coverage,
+            adaptive_admission_cold_start_output_tokens,
         })
     }
 
