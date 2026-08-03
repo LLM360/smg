@@ -1,10 +1,14 @@
 //! Startup wiring for the priority scheduler: builds the admission mode
 //! the route layer branches on.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::http::HeaderMap;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use super::{
@@ -14,7 +18,7 @@ use crate::{
     config::types::RouterConfig,
     middleware::token_bucket::TokenBucket,
     observability::metrics::Metrics,
-    worker::{CapacityTrackerSettings, WorkerCapacity, WorkerRegistry},
+    worker::{event::WorkerEvent, CapacityTrackerSettings, WorkerCapacity, WorkerRegistry},
 };
 
 /// How often the metrics sampler refreshes the capacity / autoscaling gauges.
@@ -24,6 +28,10 @@ const SAMPLER_INTERVAL: Duration = Duration::from_secs(5);
 /// client-supplied value. Ordinary requests carry their model id; requests
 /// routed to a private reservation carry `private`.
 pub const ADMISSION_PARTITION_HEADER: &str = "x-smg-admission-partition";
+
+/// Worker metadata label used by trusted control planes to assign a healthy
+/// replica to a partition other than its primary model id.
+pub const ADMISSION_PARTITION_LABEL: &str = "admission_partition";
 
 #[derive(Clone)]
 pub struct SchedulerPartition {
@@ -132,7 +140,7 @@ impl AdmissionMode {
             }),
             ..CapacityTrackerSettings::default()
         };
-        let worker_capacity = WorkerCapacity::spawn(registry, cap_settings);
+        let worker_capacity = WorkerCapacity::spawn(Arc::clone(&registry), cap_settings);
         // Keep a receiver alive as soon as the tracker exists. Tokio's
         // `watch::Sender::send` does not retain a value when no receiver is
         // subscribed, so parsing the scheduler configuration must not create
@@ -190,30 +198,43 @@ impl AdmissionMode {
             rc.queue_size,
         )?;
 
-        let limits: Vec<(String, u16)> = {
+        let partition_configs: Vec<(String, super::AdmissionPartitionConfig)> = {
             let mut entries: Vec<_> = partition_config
                 .admission_partitions
                 .iter()
-                .map(|(name, config)| (name.clone(), config.max_concurrent_requests))
+                .map(|(name, config)| (name.clone(), *config))
                 .collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             entries
         };
-        let initial = allocate_partition_capacities(&limits, worker_capacity.current());
+        // Subscribe before the initial registry snapshot so worker changes
+        // cannot land in the gap between startup allocation and coordinator
+        // activation.
+        let worker_events = registry.subscribe_events();
+        let (initial, initial_replicas) = allocate_partition_capacities(
+            &partition_configs,
+            &partition_config.default_admission_partition,
+            worker_capacity.current(),
+            &registry,
+        );
         let mut partitions = HashMap::new();
-        let mut capacity_senders = Vec::with_capacity(limits.len());
+        let mut capacity_senders = Vec::with_capacity(partition_configs.len());
 
-        for (name, limit) in &limits {
-            let config = partition_config
-                .admission_partitions
-                .get(name)
-                .ok_or_else(|| format!("partition {name} disappeared during startup"))?;
+        for (name, config) in &partition_configs {
+            let nominal_capacity = config
+                .max_concurrent_requests
+                .or(config.max_concurrent_requests_per_healthy_replica)
+                .unwrap_or_else(|| initial.get(name).copied().unwrap_or(0));
             let partition_settings = settings.clone().for_admission_partition(
-                *limit,
+                nominal_capacity,
                 configured_max,
                 config.queue_size as usize,
             );
             let capacity = initial.get(name).copied().unwrap_or(0);
+            super::metrics::set_partition_healthy_replicas(
+                name,
+                initial_replicas.get(name).copied().unwrap_or(0),
+            );
             let scheduler = PriorityScheduler::new(&partition_settings, capacity)
                 .map_err(|e| format!("partition {name}: {e}"))?;
             let (capacity_tx, capacity_rx) = watch::channel(capacity);
@@ -228,7 +249,9 @@ impl AdmissionMode {
             );
             info!(
                 admission.partition = %name,
-                admission.max_concurrent_requests = *limit,
+                admission.max_concurrent_requests = ?config.max_concurrent_requests,
+                admission.capacity_from_healthy_replicas = config.capacity_from_healthy_replicas,
+                admission.healthy_replicas = initial_replicas.get(name).copied().unwrap_or(0),
                 admission.initial_capacity = capacity,
                 admission.queue_size = config.queue_size,
                 "priority admission partition enabled"
@@ -249,7 +272,10 @@ impl AdmissionMode {
         spawn_partition_capacity_coordinator(
             capacity_watch,
             worker_capacity,
-            limits,
+            registry,
+            worker_events,
+            partition_configs,
+            default_partition_name.clone(),
             capacity_senders,
         );
         spawn_partition_metrics_sampler(partitions.values().cloned().collect());
@@ -368,23 +394,48 @@ fn validate_partitions(
             "default admission partition {default_partition:?} is not configured"
         ));
     }
-    let mut total_capacity = 0_u32;
+    let mut total_static_capacity = 0_u32;
     let mut total_queue = 0_u64;
+    let mut dynamic_mode = None;
     for (name, config) in partitions {
         if name.is_empty() || name.trim() != name {
             return Err(format!("invalid admission partition name {name:?}"));
         }
-        if config.max_concurrent_requests == 0 {
-            return Err(format!(
-                "partition {name}: max_concurrent_requests must be > 0"
-            ));
+        match (
+            config.capacity_from_healthy_replicas,
+            config.max_concurrent_requests,
+            config.max_concurrent_requests_per_healthy_replica,
+        ) {
+            (true, None, Some(per_replica)) if per_replica > 0 => {}
+            (true, _, _) => {
+                return Err(format!(
+                    "partition {name}: replica-aware capacity must omit max_concurrent_requests and set max_concurrent_requests_per_healthy_replica > 0"
+                ));
+            }
+            (false, Some(limit), None) if limit > 0 => {
+                total_static_capacity += u32::from(limit);
+            }
+            (false, _, _) => {
+                return Err(format!(
+                    "partition {name}: static capacity requires max_concurrent_requests > 0 and must omit max_concurrent_requests_per_healthy_replica"
+                ));
+            }
         }
-        total_capacity += u32::from(config.max_concurrent_requests);
+        if let Some(expected) = dynamic_mode {
+            if expected != config.capacity_from_healthy_replicas {
+                return Err(
+                    "admission partitions must all use static capacity or all use replica-aware capacity"
+                        .to_string(),
+                );
+            }
+        } else {
+            dynamic_mode = Some(config.capacity_from_healthy_replicas);
+        }
         total_queue += u64::from(config.queue_size);
     }
-    if total_capacity > u32::from(global_max) {
+    if total_static_capacity > u32::from(global_max) {
         return Err(format!(
-            "admission partition capacities sum to {total_capacity}, above global max {global_max}"
+            "admission partition capacities sum to {total_static_capacity}, above global max {global_max}"
         ));
     }
     if total_queue > global_queue_size as u64 {
@@ -395,26 +446,22 @@ fn validate_partitions(
     Ok(())
 }
 
-/// Proportionally shrink configured caps to the live global capacity using
-/// largest remainders. The result is deterministic and always sums to
-/// `min(global_capacity, sum(configured caps))`.
-fn allocate_partition_capacities(
-    limits: &[(String, u16)],
-    global_capacity: u16,
-) -> HashMap<String, u16> {
-    let total_limit: u64 = limits.iter().map(|(_, limit)| u64::from(*limit)).sum();
-    if total_limit == 0 {
-        return HashMap::new();
+/// Allocate `target` slots in proportion to non-negative integer weights
+/// using deterministic largest-remainder rounding.
+fn allocate_weighted_capacities(weights: &[(String, u64)], target: u16) -> HashMap<String, u16> {
+    let total_weight: u64 = weights.iter().map(|(_, weight)| *weight).sum();
+    if total_weight == 0 {
+        return weights.iter().map(|(name, _)| (name.clone(), 0)).collect();
     }
-    let target = u64::from(global_capacity).min(total_limit);
+    let target = u64::from(target);
     let mut allocated = 0_u64;
-    let mut rows: Vec<(String, u16, u64)> = limits
+    let mut rows: Vec<(String, u16, u64)> = weights
         .iter()
-        .map(|(name, limit)| {
-            let numerator = u64::from(*limit) * target;
-            let base = (numerator / total_limit) as u16;
+        .map(|(name, weight)| {
+            let numerator = *weight * target;
+            let base = (numerator / total_weight) as u16;
             allocated += u64::from(base);
-            (name.clone(), base, numerator % total_limit)
+            (name.clone(), base, numerator % total_weight)
         })
         .collect();
     rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
@@ -431,10 +478,105 @@ fn allocate_partition_capacities(
         .collect()
 }
 
+/// Count each healthy worker once. An explicit control-plane label moves the
+/// worker to that partition; otherwise its primary model id is used. Unknown
+/// labels/models land in the configured default partition.
+fn healthy_replica_counts(
+    partition_names: &HashSet<String>,
+    default_partition: &str,
+    registry: &WorkerRegistry,
+) -> HashMap<String, u16> {
+    let mut counts: HashMap<String, u16> = partition_names
+        .iter()
+        .map(|name| (name.clone(), 0))
+        .collect();
+    for worker in registry.get_all().into_iter().filter(|w| w.is_healthy()) {
+        let requested = worker
+            .metadata()
+            .spec
+            .labels
+            .get(ADMISSION_PARTITION_LABEL)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| worker.model_id());
+        let partition = if partition_names.contains(requested) {
+            requested
+        } else {
+            default_partition
+        };
+        counts
+            .entry(partition.to_string())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+    counts
+}
+
+/// Static mode preserves the original configured-cap behavior. Replica-aware
+/// mode uses healthy replica counts as weights and distributes the entire live
+/// global capacity across the currently healthy fleet.
+fn allocate_partition_capacities(
+    configs: &[(String, super::AdmissionPartitionConfig)],
+    default_partition: &str,
+    global_capacity: u16,
+    registry: &WorkerRegistry,
+) -> (HashMap<String, u16>, HashMap<String, u16>) {
+    let replica_aware = configs
+        .first()
+        .is_some_and(|(_, config)| config.capacity_from_healthy_replicas);
+    if !replica_aware {
+        let Some(limits): Option<Vec<_>> = configs
+            .iter()
+            .map(|(name, config)| {
+                config
+                    .max_concurrent_requests
+                    .map(|capacity| (name.clone(), u64::from(capacity)))
+            })
+            .collect()
+        else {
+            error!("validated static admission partition is missing its capacity");
+            return (HashMap::new(), HashMap::new());
+        };
+        let total_limit: u64 = limits.iter().map(|(_, limit)| *limit).sum();
+        let target = u64::from(global_capacity).min(total_limit) as u16;
+        return (
+            allocate_weighted_capacities(&limits, target),
+            HashMap::new(),
+        );
+    }
+
+    let names: HashSet<_> = configs.iter().map(|(name, _)| name.clone()).collect();
+    let counts = healthy_replica_counts(&names, default_partition, registry);
+    let Some(weights): Option<Vec<_>> = configs
+        .iter()
+        .map(|(name, config)| {
+            let replicas = counts.get(name).copied().unwrap_or(0);
+            config
+                .max_concurrent_requests_per_healthy_replica
+                .map(|per_replica| {
+                    (
+                        name.clone(),
+                        u64::from(replicas).saturating_mul(u64::from(per_replica)),
+                    )
+                })
+        })
+        .collect()
+    else {
+        error!("validated replica-aware admission partition is missing its per-replica capacity");
+        return (HashMap::new(), counts);
+    };
+    let desired: u64 = weights.iter().map(|(_, weight)| *weight).sum();
+    let target = u64::from(global_capacity).min(desired) as u16;
+    (allocate_weighted_capacities(&weights, target), counts)
+}
+
 fn spawn_partition_capacity_coordinator(
     mut capacity_watch: watch::Receiver<u16>,
     worker_capacity: Arc<WorkerCapacity>,
-    limits: Vec<(String, u16)>,
+    registry: Arc<WorkerRegistry>,
+    mut worker_events: broadcast::Receiver<WorkerEvent>,
+    configs: Vec<(String, super::AdmissionPartitionConfig)>,
+    default_partition: String,
     capacity_senders: Vec<(String, watch::Sender<u16>)>,
 ) {
     #[expect(
@@ -443,12 +585,34 @@ fn spawn_partition_capacity_coordinator(
     )]
     tokio::spawn(async move {
         let _worker_capacity = worker_capacity;
-        while capacity_watch.changed().await.is_ok() {
-            let allocations = allocate_partition_capacities(&limits, *capacity_watch.borrow());
+        loop {
+            tokio::select! {
+                changed = capacity_watch.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                event = worker_events.recv() => {
+                    match event {
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+            let (allocations, replica_counts) = allocate_partition_capacities(
+                &configs,
+                &default_partition,
+                *capacity_watch.borrow(),
+                &registry,
+            );
             for (name, sender) in &capacity_senders {
                 if let Some(capacity) = allocations.get(name) {
                     sender.send_replace(*capacity);
                 }
+                super::metrics::set_partition_healthy_replicas(
+                    name,
+                    replica_counts.get(name).copied().unwrap_or(0),
+                );
             }
         }
     });
@@ -571,16 +735,16 @@ mod tests {
 
     #[test]
     fn proportional_partition_allocation_preserves_global_ceiling() {
-        let limits = vec![
+        let weights = vec![
             ("default".to_string(), 1),
             ("dsv4".to_string(), 2),
             ("kimi-k3".to_string(), 7),
         ];
-        let full = allocate_partition_capacities(&limits, 10);
+        let full = allocate_weighted_capacities(&weights, 10);
         assert_eq!(full.values().copied().sum::<u16>(), 10);
         assert_eq!(full["kimi-k3"], 7);
 
-        let drained = allocate_partition_capacities(&limits, 5);
+        let drained = allocate_weighted_capacities(&weights, 5);
         assert_eq!(drained.values().copied().sum::<u16>(), 5);
         assert_eq!(drained["kimi-k3"], 3);
         assert_eq!(drained["dsv4"], 1);
@@ -593,14 +757,18 @@ mod tests {
             (
                 "default".to_string(),
                 super::super::AdmissionPartitionConfig {
-                    max_concurrent_requests: 4,
+                    max_concurrent_requests: Some(4),
+                    capacity_from_healthy_replicas: false,
+                    max_concurrent_requests_per_healthy_replica: None,
                     queue_size: 2,
                 },
             ),
             (
                 "kimi-k3".to_string(),
                 super::super::AdmissionPartitionConfig {
-                    max_concurrent_requests: 7,
+                    max_concurrent_requests: Some(7),
+                    capacity_from_healthy_replicas: false,
+                    max_concurrent_requests_per_healthy_replica: None,
                     queue_size: 3,
                 },
             ),
@@ -611,6 +779,231 @@ mod tests {
         assert!(validate_partitions(&partitions, "default", 11, 4)
             .unwrap_err()
             .contains("above global queue size"));
+    }
+
+    #[test]
+    fn replica_aware_allocation_tracks_healthy_workers_and_private_labels() {
+        let registry = WorkerRegistry::new();
+        let ready = openai_protocol::worker::WorkerStatus::Ready;
+        for index in 0..3 {
+            let worker = Arc::new(
+                BasicWorkerBuilder::new(format!("http://k3-{index}:8000"))
+                    .model(openai_protocol::model_card::ModelCard::new("kimi-k3"))
+                    .status(ready)
+                    .build(),
+            );
+            registry.register(worker).unwrap();
+        }
+        let mut private_labels = HashMap::new();
+        private_labels.insert(ADMISSION_PARTITION_LABEL.to_string(), "private".to_string());
+        let private = Arc::new(
+            BasicWorkerBuilder::new("http://private-k3:8000")
+                .model(openai_protocol::model_card::ModelCard::new("kimi-k3"))
+                .labels(private_labels)
+                .status(ready)
+                .build(),
+        );
+        registry.register(private).unwrap();
+        let dsv4 = Arc::new(
+            BasicWorkerBuilder::new("http://dsv4:8000")
+                .model(openai_protocol::model_card::ModelCard::new("dsv4"))
+                .status(ready)
+                .build(),
+        );
+        registry.register(dsv4).unwrap();
+
+        let dynamic = |queue_size| super::super::AdmissionPartitionConfig {
+            max_concurrent_requests: None,
+            capacity_from_healthy_replicas: true,
+            max_concurrent_requests_per_healthy_replica: Some(100),
+            queue_size,
+        };
+        let configs = vec![
+            ("default".to_string(), dynamic(1)),
+            ("dsv4".to_string(), dynamic(1)),
+            ("kimi-k3".to_string(), dynamic(3)),
+            ("private".to_string(), dynamic(1)),
+        ];
+        let (allocation, counts) =
+            allocate_partition_capacities(&configs, "default", 500, &registry);
+        assert_eq!(counts["kimi-k3"], 3);
+        assert_eq!(counts["private"], 1);
+        assert_eq!(counts["dsv4"], 1);
+        assert_eq!(counts["default"], 0);
+        assert_eq!(allocation["kimi-k3"], 300);
+        assert_eq!(allocation["private"], 100);
+        assert_eq!(allocation["dsv4"], 100);
+        assert_eq!(allocation.values().copied().sum::<u16>(), 500);
+    }
+
+    #[test]
+    fn replica_aware_allocation_sends_unconfigured_models_to_default() {
+        let registry = WorkerRegistry::new();
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://new-model:8000")
+                .model(openai_protocol::model_card::ModelCard::new("new-model"))
+                .status(openai_protocol::worker::WorkerStatus::Ready)
+                .build(),
+        );
+        registry.register(worker).unwrap();
+        let dynamic = super::super::AdmissionPartitionConfig {
+            max_concurrent_requests: None,
+            capacity_from_healthy_replicas: true,
+            max_concurrent_requests_per_healthy_replica: Some(64),
+            queue_size: 1,
+        };
+        let configs = vec![
+            ("default".to_string(), dynamic),
+            ("kimi-k3".to_string(), dynamic),
+        ];
+        let (allocation, counts) =
+            allocate_partition_capacities(&configs, "default", 64, &registry);
+        assert_eq!(counts["default"], 1);
+        assert_eq!(allocation["default"], 64);
+        assert_eq!(allocation["kimi-k3"], 0);
+    }
+
+    #[tokio::test]
+    async fn replica_aware_coordinator_reacts_to_worker_registration() {
+        let mut yaml = NamedTempFile::new().unwrap();
+        write!(
+            yaml,
+            r#"
+admission_partitions:
+  kimi-k3:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 3
+    queue_size: 3
+  dsv4:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 3
+    queue_size: 1
+  private:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 3
+    queue_size: 0
+  default:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 3
+    queue_size: 0
+default_admission_partition: default
+"#
+        )
+        .unwrap();
+        let registry = Arc::new(WorkerRegistry::new());
+        let config = RouterConfig {
+            max_concurrent_requests: 9,
+            queue_size: 4,
+            priority_scheduler_enabled: true,
+            priority_scheduler_config: Some(yaml.path().to_string_lossy().into_owned()),
+            ..RouterConfig::default()
+        };
+        let AdmissionMode::Priority(state) =
+            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None).unwrap()
+        else {
+            panic!("priority scheduler should start");
+        };
+
+        let mut k3_headers = HeaderMap::new();
+        k3_headers.insert(
+            ADMISSION_PARTITION_HEADER,
+            HeaderValue::from_static("kimi-k3"),
+        );
+        assert!(state
+            .partition_for(&k3_headers)
+            .scheduler
+            .acquire_inflight(Class::System, RequestId("empty-fleet".into()))
+            .is_none());
+
+        let mut first_k3 = None;
+        for index in 0..3 {
+            let worker_id = registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("http://k3-live-{index}:8000"))
+                        .model(openai_protocol::model_card::ModelCard::new("kimi-k3"))
+                        .status(openai_protocol::worker::WorkerStatus::Ready)
+                        .build(),
+                ))
+                .unwrap();
+            if index == 0 {
+                first_k3 = Some(worker_id);
+            }
+        }
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://dsv4-live:8000")
+                    .model(openai_protocol::model_card::ModelCard::new("dsv4"))
+                    .status(openai_protocol::worker::WorkerStatus::Ready)
+                    .build(),
+            ))
+            .unwrap();
+
+        let k3 = state.partition_for(&k3_headers);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let permits: Vec<_> = (0..7)
+                .filter_map(|index| {
+                    k3.scheduler
+                        .acquire_inflight(Class::System, RequestId(format!("dynamic-k3-{index}")))
+                })
+                .collect();
+            let full = permits.len() == 7
+                && k3
+                    .scheduler
+                    .acquire_inflight(Class::System, RequestId("dynamic-k3-full".into()))
+                    .is_none();
+            drop(permits);
+            if full {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition coordinator did not apply replica weights"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut private_labels = HashMap::new();
+        private_labels.insert(ADMISSION_PARTITION_LABEL.to_string(), "private".to_string());
+        let moved = Arc::new(
+            BasicWorkerBuilder::new("http://k3-live-0:8000")
+                .model(openai_protocol::model_card::ModelCard::new("kimi-k3"))
+                .labels(private_labels)
+                .status(openai_protocol::worker::WorkerStatus::Ready)
+                .build(),
+        );
+        assert!(registry.replace(&first_k3.unwrap(), moved));
+
+        let mut private_headers = HeaderMap::new();
+        private_headers.insert(
+            ADMISSION_PARTITION_HEADER,
+            HeaderValue::from_static("private"),
+        );
+        let private = state.partition_for(&private_headers);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let first = private
+                .scheduler
+                .acquire_inflight(Class::System, RequestId("private-first".into()));
+            let second = private
+                .scheduler
+                .acquire_inflight(Class::System, RequestId("private-second".into()));
+            let overflow = private
+                .scheduler
+                .acquire_inflight(Class::System, RequestId("private-full".into()));
+            let moved = first.is_some() && second.is_some() && overflow.is_none();
+            drop(overflow);
+            drop(second);
+            drop(first);
+            if moved {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition coordinator did not apply worker label replacement"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ const QUEUE_SIZE_LIMIT: &str = "smg_scheduler_queue_size_limit";
 const RETRY_AFTER_SECONDS: &str = "smg_scheduler_retry_after_seconds";
 const CLASS_CAPACITY_PRESSURE: &str = "smg_scheduler_class_capacity_pressure";
 const PARTITION_CAPACITY: &str = "smg_scheduler_partition_capacity";
+const PARTITION_HEALTHY_REPLICAS: &str = "smg_scheduler_partition_healthy_replicas";
 const PARTITION_INFLIGHT: &str = "smg_scheduler_partition_inflight";
 const PARTITION_QUEUE_DEPTH: &str = "smg_scheduler_partition_queue_depth";
 const PARTITION_QUEUE_SIZE_LIMIT: &str = "smg_scheduler_partition_queue_size_limit";
@@ -104,6 +105,10 @@ pub fn describe() {
     describe_gauge!(
         PARTITION_CAPACITY,
         "Current hard admission capacity by partition"
+    );
+    describe_gauge!(
+        PARTITION_HEALTHY_REPLICAS,
+        "Current healthy worker count used to weight each admission partition"
     );
     describe_gauge!(
         PARTITION_INFLIGHT,
@@ -210,6 +215,11 @@ pub fn set_class_capacity_pressure(class: Class, pressure: f64) {
 
 pub fn set_partition_capacity(partition: &str, capacity: u16) {
     gauge!(PARTITION_CAPACITY, "partition" => intern_string(partition)).set(f64::from(capacity));
+}
+
+pub fn set_partition_healthy_replicas(partition: &str, replicas: u16) {
+    gauge!(PARTITION_HEALTHY_REPLICAS, "partition" => intern_string(partition))
+        .set(f64::from(replicas));
 }
 
 pub fn set_partition_inflight(partition: &str, class: Class, count: u16) {
