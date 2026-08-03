@@ -16,7 +16,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
+            context::{EncodeWorkerAssignment, PolicyReservation, RequestContext, WorkerSelection},
             multimodal,
         },
     },
@@ -95,7 +95,10 @@ impl PipelineStage for WorkerSelectionStage {
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(model_id, text, tokens, headers) {
-                    Some(w) => WorkerSelection::Single { worker: w },
+                    Some((worker, reservation)) => {
+                        ctx.state.policy_reservation = reservation;
+                        WorkerSelection::Single { worker }
+                    }
                     None => {
                         error!(
                             function = "WorkerSelectionStage::execute",
@@ -220,7 +223,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Option<PolicyReservation>)> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
             None
@@ -251,22 +254,25 @@ impl WorkerSelectionStage {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        // Select worker via the registry (applies the routing-key sticky override
-        // when enabled; otherwise delegates to the configured policy).
-        let idx = self.policy_registry.select_worker(
-            &policy,
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens,
-                headers,
-                hash_ring,
-                max_output_tokens: None,
-                reserve_work: false,
-                leg: WorkerLeg::Single,
-            },
-        )?;
+        let info = SelectWorkerInfo {
+            request_text: text,
+            tokens,
+            headers,
+            hash_ring,
+            max_output_tokens: None,
+            reserve_work: true,
+            leg: WorkerLeg::Single,
+        };
+
+        // Select and reserve prompt/output work atomically. The returned guard
+        // releases the reservation when the request finishes or any later
+        // gRPC pipeline stage fails.
+        let (idx, reservation_cost) = self
+            .policy_registry
+            .select_worker_with_reservation(&policy, &available, &info)?;
         let selected = available[idx].clone();
+        let reservation = reservation_cost
+            .map(|cost| PolicyReservation::new(policy.clone(), selected.url().to_string(), cost));
 
         // Record worker selection metric
         Metrics::record_worker_selection(
@@ -276,7 +282,7 @@ impl WorkerSelectionStage {
             policy.name(),
         );
 
-        Some(selected)
+        Some((selected, reservation))
     }
 
     fn select_pd_pair(

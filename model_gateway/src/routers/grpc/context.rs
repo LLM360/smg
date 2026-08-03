@@ -32,6 +32,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
+    policies::LoadBalancingPolicy,
     worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
@@ -169,6 +170,11 @@ pub(crate) struct ProcessingState {
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
+
+    /// Router-local work reserved atomically by the regular gRPC policy.
+    /// Kept separately from `WorkerSelection` so an early pipeline failure
+    /// still releases it when the request context is dropped.
+    pub policy_reservation: Option<PolicyReservation>,
 
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
@@ -382,6 +388,37 @@ pub(crate) enum WorkerSelection {
     },
 }
 
+/// A policy reservation tied to the request lifetime.
+///
+/// Selection increments the policy's router-local work synchronously. Moving
+/// this guard into `LoadGuards` keeps it until the backend request finishes;
+/// leaving it in `ProcessingState` releases it on any earlier error path.
+pub(crate) struct PolicyReservation {
+    policy: Arc<dyn LoadBalancingPolicy>,
+    worker_url: String,
+    cost: u64,
+}
+
+impl PolicyReservation {
+    pub fn new(
+        policy: Arc<dyn LoadBalancingPolicy>,
+        worker_url: impl Into<String>,
+        cost: u64,
+    ) -> Self {
+        Self {
+            policy,
+            worker_url: worker_url.into(),
+            cost,
+        }
+    }
+}
+
+impl Drop for PolicyReservation {
+    fn drop(&mut self) {
+        self.policy.release_reservation(&self.worker_url, self.cost);
+    }
+}
+
 /// Client selection (Step 3)
 #[derive(Clone)]
 pub(crate) enum ClientSelection {
@@ -410,6 +447,7 @@ pub(crate) struct DispatchMetadata {
 pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
+        _policy_reservation: Option<PolicyReservation>,
     },
     /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
     /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
@@ -421,31 +459,48 @@ pub(crate) enum LoadGuards {
     /// policies see the real backend concurrency.
     Batch {
         _guards: Vec<LoadGuards>,
+        _policy_reservation: Option<PolicyReservation>,
     },
 }
 
 impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
+    pub fn new(
+        selection: &WorkerSelection,
+        headers: Option<&HeaderMap>,
+        policy_reservation: Option<PolicyReservation>,
+    ) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::new(worker.clone(), headers),
+                _policy_reservation: policy_reservation,
             },
             WorkerSelection::Disaggregated {
                 prefill, decode, ..
-            } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
-            },
+            } => {
+                debug_assert!(policy_reservation.is_none());
+                LoadGuards::Disaggregated {
+                    _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
+                    _decode: WorkerLoadGuard::new(decode.clone(), headers),
+                }
+            }
         }
     }
 
     /// One guard set per concurrent sub-request.
-    pub fn scaled(selection: &WorkerSelection, headers: Option<&HeaderMap>, count: usize) -> Self {
+    pub fn scaled(
+        selection: &WorkerSelection,
+        headers: Option<&HeaderMap>,
+        count: usize,
+        policy_reservation: Option<PolicyReservation>,
+    ) -> Self {
         if count <= 1 {
-            Self::new(selection, headers)
+            Self::new(selection, headers, policy_reservation)
         } else {
             Self::Batch {
-                _guards: (0..count).map(|_| Self::new(selection, headers)).collect(),
+                _guards: (0..count)
+                    .map(|_| Self::new(selection, headers, None))
+                    .collect(),
+                _policy_reservation: policy_reservation,
             }
         }
     }
