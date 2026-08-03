@@ -123,6 +123,19 @@ pub struct PriorityScheduler {
     turnover_estimate: Mutex<TurnoverEstimate>,
 }
 
+/// Point-in-time scheduler state used by either the legacy global sampler or
+/// the partition coordinator. Keeping collection here avoids exposing queue
+/// and slot internals to startup wiring.
+pub(crate) struct SchedulerMetricsSnapshot {
+    pub capacity: u16,
+    pub queue_capacity: usize,
+    pub inflight: [u16; 4],
+    pub queue_depth: [usize; 4],
+    pub queue_limit: [usize; 4],
+    pub retry_after_secs: [u64; 4],
+    pub class_pressure: [f64; 4],
+}
+
 impl Drop for PriorityScheduler {
     fn drop(&mut self) {
         // Kick the dispatcher one last time so it can observe the Weak
@@ -133,11 +146,14 @@ impl Drop for PriorityScheduler {
 
 impl PriorityScheduler {
     /// Build a scheduler against the given settings and live backend
-    /// capacity. Refuses if the configured reservation floors + shares, at
-    /// the initial capacity, sum to more than the available capacity (a
-    /// too-small fleet or misconfiguration — the caller falls back to legacy
-    /// admission). Runtime capacity dips are handled gracefully by the
-    /// priority-ordered clamp in `apply_new_capacity`, not by rejection.
+    /// capacity. Reservation floors + shares are clamped in priority order
+    /// when they do not fit. The same rule is used for runtime capacity dips,
+    /// so a small admission partition has identical startup and drain
+    /// behavior.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the public constructor API while startup reservation overflow becomes a safe clamp"
+    )]
     pub fn new(
         settings: &SchedulerSettings,
         capacity: u16,
@@ -147,12 +163,15 @@ impl PriorityScheduler {
 
         let desired = desired_reservations(reserved_floor, &reserved_per_slot, capacity);
         let total: u32 = desired.iter().map(|&r| u32::from(r)).sum();
-        if total > u32::from(capacity) {
-            return Err(SchedulerInitError::ReservationsExceedCapacity {
-                reserved: total,
-                capacity,
-            });
-        }
+        let effective_reserved = if total > u32::from(capacity) {
+            warn!(
+                desired_total_reserved = total,
+                capacity, "scheduler: initial reservations clamped to capacity (priority order)"
+            );
+            clamp_reservations_to_capacity(desired, capacity)
+        } else {
+            desired
+        };
 
         let total_queue_capacity = Class::ALL
             .iter()
@@ -165,7 +184,7 @@ impl PriorityScheduler {
             Class::ALL.map(|c| ClassRuntimeConfig::from_class_config(settings.class_config(c)));
 
         Ok(Arc::new(Self {
-            slot_pool: SlotPool::new(capacity, desired),
+            slot_pool: SlotPool::new(capacity, effective_reserved),
             class_queues,
             queue_budget,
             inflight_registry: RwLock::new(HashMap::new()),
@@ -678,30 +697,57 @@ impl PriorityScheduler {
     /// Refresh the capacity / autoscaling gauges. Reads the slot pool and
     /// queues under their own locks; never touches the inflight registry.
     fn sample_metrics(&self) {
-        let capacity = self.slot_pool.capacity();
+        let snapshot = self.metrics_snapshot();
         let mut total_inflight: u32 = 0;
         for class in Class::ALL {
-            let inflight = self.slot_pool.inflight(class);
+            let inflight = snapshot.inflight[class as usize];
             total_inflight += u32::from(inflight);
-            let depth = self.class_queues[class as usize].depth();
-            let limit = self.class_queues[class as usize].capacity();
             super::metrics::set_inflight(class, inflight);
-            super::metrics::set_queue_depth(class, depth);
-            super::metrics::set_queue_size_limit(class, limit);
-            super::metrics::set_retry_after_seconds(class, self.retry_after_secs(class));
+            super::metrics::set_queue_depth(class, snapshot.queue_depth[class as usize]);
+            super::metrics::set_queue_size_limit(class, snapshot.queue_limit[class as usize]);
+            super::metrics::set_retry_after_seconds(
+                class,
+                snapshot.retry_after_secs[class as usize],
+            );
             super::metrics::set_class_capacity_pressure(
                 class,
-                self.class_pressure(class, inflight, depth, limit, capacity),
+                snapshot.class_pressure[class as usize],
             );
         }
-        Metrics::set_http_admission_limit(usize::from(capacity));
-        Metrics::set_http_admission_queue_capacity(self.queue_budget.capacity());
-        let utilization = if capacity == 0 {
+        Metrics::set_http_admission_limit(usize::from(snapshot.capacity));
+        Metrics::set_http_admission_queue_capacity(snapshot.queue_capacity);
+        let utilization = if snapshot.capacity == 0 {
             0.0
         } else {
-            f64::from(total_inflight) / f64::from(capacity)
+            f64::from(total_inflight) / f64::from(snapshot.capacity)
         };
         super::metrics::set_utilization(utilization);
+    }
+
+    pub(crate) fn metrics_snapshot(&self) -> SchedulerMetricsSnapshot {
+        let capacity = self.slot_pool.capacity();
+        let inflight = Class::ALL.map(|class| self.slot_pool.inflight(class));
+        let queue_depth = Class::ALL.map(|class| self.class_queues[class as usize].depth());
+        let queue_limit = Class::ALL.map(|class| self.class_queues[class as usize].capacity());
+        let retry_after_secs = Class::ALL.map(|class| self.retry_after_secs(class));
+        let class_pressure = Class::ALL.map(|class| {
+            self.class_pressure(
+                class,
+                inflight[class as usize],
+                queue_depth[class as usize],
+                queue_limit[class as usize],
+                capacity,
+            )
+        });
+        SchedulerMetricsSnapshot {
+            capacity,
+            queue_capacity: self.queue_budget.capacity(),
+            inflight,
+            queue_depth,
+            queue_limit,
+            retry_after_secs,
+            class_pressure,
+        }
     }
 
     /// Normalized 0.0–1.0 pressure for `class`: the worse of queue pressure
@@ -924,19 +970,33 @@ mod tests {
     }
 
     #[test]
-    fn test_new_rejects_when_reservations_exceed_capacity() {
+    fn test_new_clamps_when_reservations_exceed_capacity() {
         // Capacity 100: desired is System 32, Interactive min(128,100)=100,
-        // Default 10 — Σ 142 > 100, so construction rejects (caller falls
-        // back to legacy).
+        // Default 10 — Σ 142 > 100. Construction clamps in priority order,
+        // matching the runtime capacity-shrink path.
         let s = default_settings();
-        let result = PriorityScheduler::new(&s, 100);
-        assert!(matches!(
-            result,
-            Err(SchedulerInitError::ReservationsExceedCapacity {
-                reserved: 142,
-                capacity: 100
+        let scheduler = PriorityScheduler::new(&s, 100).unwrap();
+        assert_eq!(scheduler.slot_pool.reserved(Class::System), 32);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Interactive), 68);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Default), 0);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Bulk), 0);
+    }
+
+    #[test]
+    fn test_small_partition_retains_default_class_headroom() {
+        let settings = default_settings().for_admission_partition(64, 8000, 40);
+        let scheduler = PriorityScheduler::new(&settings, 64).unwrap();
+        let permits: Vec<_> = (0..47)
+            .map(|index| {
+                scheduler
+                    .acquire_inflight(Class::Default, rid(&format!("default-{index}")))
+                    .expect("scaled floors should leave default headroom")
             })
-        ));
+            .collect();
+        assert!(scheduler
+            .acquire_inflight(Class::Default, rid("default-overflow"))
+            .is_none());
+        drop(permits);
     }
 
     #[test]
@@ -1022,6 +1082,7 @@ mod tests {
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: StdMap::new(),
+            ..Default::default()
         };
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
     }
@@ -1327,6 +1388,7 @@ mod tests {
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: StdMap::new(),
+            ..Default::default()
         };
         let settings =
             SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
@@ -1371,6 +1433,7 @@ mod tests {
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: StdMap::new(),
+            ..Default::default()
         };
         let settings =
             SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
@@ -1637,6 +1700,7 @@ mod tests {
         let yaml = PrioritySchedulerYaml {
             classes,
             tenant_policies: StdMap::new(),
+            ..Default::default()
         };
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
     }

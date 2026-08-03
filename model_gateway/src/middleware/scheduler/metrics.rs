@@ -24,6 +24,7 @@ const PREEMPTION_TOTAL: &str = "smg_scheduler_preemption_total";
 const CLAMP_TOTAL: &str = "smg_scheduler_clamp_total";
 const UNKNOWN_PRIORITY_TOTAL: &str = "smg_scheduler_unknown_priority_value_total";
 const STARVATION_PROMOTION_TOTAL: &str = "smg_scheduler_starvation_promotion_total";
+const PARTITION_ADMIT_TOTAL: &str = "smg_scheduler_partition_admit_total";
 
 // Capacity / autoscaling gauges, refreshed by the sampler task.
 const INFLIGHT: &str = "smg_scheduler_inflight";
@@ -32,6 +33,11 @@ const UTILIZATION: &str = "smg_scheduler_utilization";
 const QUEUE_SIZE_LIMIT: &str = "smg_scheduler_queue_size_limit";
 const RETRY_AFTER_SECONDS: &str = "smg_scheduler_retry_after_seconds";
 const CLASS_CAPACITY_PRESSURE: &str = "smg_scheduler_class_capacity_pressure";
+const PARTITION_CAPACITY: &str = "smg_scheduler_partition_capacity";
+const PARTITION_INFLIGHT: &str = "smg_scheduler_partition_inflight";
+const PARTITION_QUEUE_DEPTH: &str = "smg_scheduler_partition_queue_depth";
+const PARTITION_QUEUE_SIZE_LIMIT: &str = "smg_scheduler_partition_queue_size_limit";
+const PARTITION_UTILIZATION: &str = "smg_scheduler_partition_utilization";
 
 /// `outcome` label values for [`record_admit`].
 pub mod outcome {
@@ -73,6 +79,10 @@ pub fn describe() {
         STARVATION_PROMOTION_TOTAL,
         "Queued waiters admitted via the starvation override path"
     );
+    describe_counter!(
+        PARTITION_ADMIT_TOTAL,
+        "Priority-scheduler admission outcomes by partition, class, and outcome"
+    );
     describe_gauge!(INFLIGHT, "Current in-flight request count per class");
     describe_gauge!(QUEUE_DEPTH, "Current queued waiter count per class");
     describe_gauge!(
@@ -91,11 +101,41 @@ pub fn describe() {
         CLASS_CAPACITY_PRESSURE,
         "Normalized 0.0-1.0 per-class pressure (max of queue and slot pressure)"
     );
+    describe_gauge!(
+        PARTITION_CAPACITY,
+        "Current hard admission capacity by partition"
+    );
+    describe_gauge!(
+        PARTITION_INFLIGHT,
+        "Current in-flight request count by admission partition and class"
+    );
+    describe_gauge!(
+        PARTITION_QUEUE_DEPTH,
+        "Current queued waiter count by admission partition and class"
+    );
+    describe_gauge!(
+        PARTITION_QUEUE_SIZE_LIMIT,
+        "Configured queue budget share by admission partition and class"
+    );
+    describe_gauge!(
+        PARTITION_UTILIZATION,
+        "Partition in-flight requests divided by partition capacity"
+    );
 }
 
 /// Record the outcome of an admission attempt for `class`.
 pub fn record_admit(class: Class, outcome: &'static str) {
     counter!(ADMIT_TOTAL, "class" => class.as_str(), "outcome" => outcome).increment(1);
+}
+
+pub fn record_partition_admit(partition: &str, class: Class, outcome: &'static str) {
+    counter!(
+        PARTITION_ADMIT_TOTAL,
+        "partition" => intern_string(partition),
+        "class" => class.as_str(),
+        "outcome" => outcome
+    )
+    .increment(1);
 }
 
 /// Record the time a request waited in a class queue.
@@ -166,4 +206,39 @@ pub fn set_retry_after_seconds(class: Class, seconds: u64) {
 /// Set the normalized capacity-pressure gauge for a class (sampler).
 pub fn set_class_capacity_pressure(class: Class, pressure: f64) {
     gauge!(CLASS_CAPACITY_PRESSURE, "class" => class.as_str()).set(pressure);
+}
+
+pub fn set_partition_capacity(partition: &str, capacity: u16) {
+    gauge!(PARTITION_CAPACITY, "partition" => intern_string(partition)).set(f64::from(capacity));
+}
+
+pub fn set_partition_inflight(partition: &str, class: Class, count: u16) {
+    gauge!(
+        PARTITION_INFLIGHT,
+        "partition" => intern_string(partition),
+        "class" => class.as_str()
+    )
+    .set(f64::from(count));
+}
+
+pub fn set_partition_queue_depth(partition: &str, class: Class, depth: usize) {
+    gauge!(
+        PARTITION_QUEUE_DEPTH,
+        "partition" => intern_string(partition),
+        "class" => class.as_str()
+    )
+    .set(depth as f64);
+}
+
+pub fn set_partition_queue_size_limit(partition: &str, class: Class, limit: usize) {
+    gauge!(
+        PARTITION_QUEUE_SIZE_LIMIT,
+        "partition" => intern_string(partition),
+        "class" => class.as_str()
+    )
+    .set(limit as f64);
+}
+
+pub fn set_partition_utilization(partition: &str, utilization: f64) {
+    gauge!(PARTITION_UTILIZATION, "partition" => intern_string(partition)).set(utilization);
 }

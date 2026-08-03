@@ -18,8 +18,8 @@ pub use admission::priority_admission_middleware;
 pub use body::SchedulerGuardBody;
 pub use class::{Class, PRIORITY_HEADER};
 pub use config::{
-    ClassConfig, ClassRuntimeConfig, PrioritySchedulerYaml, SchedulerSettings,
-    SettingsValidationError, TenantPolicyConfig,
+    AdmissionPartitionConfig, ClassConfig, ClassRuntimeConfig, PrioritySchedulerYaml,
+    SchedulerSettings, SettingsValidationError, TenantPolicyConfig,
 };
 pub use engine::{
     AdmitOutcome, PriorityScheduler, RejectionReason, SchedulerInitError, SchedulerPermit,
@@ -27,4 +27,4 @@ pub use engine::{
 pub use error::{SchedulerError, HEADER_X_SMG_PREEMPTED};
 pub use extract::PreemptionGuard;
 pub use policy::{StaticTenantPolicyResolver, TenantPolicy, TenantPolicyResolver};
-pub use state::{AdmissionMode, SchedulerState};
+pub use state::{AdmissionMode, SchedulerState, ADMISSION_PARTITION_HEADER};
