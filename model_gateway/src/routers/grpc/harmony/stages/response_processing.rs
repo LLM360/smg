@@ -80,6 +80,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             execution_result,
                             ctx.chat_request_arc(),
                             dispatch,
+                            ctx.state.adaptive_request.take(),
                         );
 
                     // Attach load guards to response body for proper RAII lifecycle
@@ -97,6 +98,12 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                     .processor
                     .process_non_streaming_chat_response(execution_result, chat_request, dispatch)
                     .await?;
+
+                if let (Some(tracker), Some(usage)) =
+                    (ctx.state.adaptive_request.take(), response.usage.as_ref())
+                {
+                    tracker.complete(usage.completion_tokens);
+                }
 
                 ctx.state.response.final_response = Some(FinalResponse::Chat(response));
                 Ok(None)

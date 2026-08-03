@@ -724,6 +724,55 @@ impl ConfigValidator {
             });
         }
 
+        let adaptive = &config.adaptive_admission;
+        if !adaptive.work_horizon_secs.is_finite() || adaptive.work_horizon_secs <= 0.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.work_horizon_secs".to_string(),
+                value: adaptive.work_horizon_secs.to_string(),
+                reason: "Must be finite and > 0".to_string(),
+            });
+        }
+        if !adaptive.estimator_half_life_secs.is_finite()
+            || adaptive.estimator_half_life_secs <= 0.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.estimator_half_life_secs".to_string(),
+                value: adaptive.estimator_half_life_secs.to_string(),
+                reason: "Must be finite and > 0".to_string(),
+            });
+        }
+        if !adaptive.prior_observations.is_finite() || adaptive.prior_observations < 0.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.prior_observations".to_string(),
+                value: adaptive.prior_observations.to_string(),
+                reason: "Must be finite and >= 0".to_string(),
+            });
+        }
+        if adaptive.max_segments < 4 {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.max_segments".to_string(),
+                value: adaptive.max_segments.to_string(),
+                reason: "Must be >= 4".to_string(),
+            });
+        }
+        if !adaptive.min_load_coverage.is_finite()
+            || adaptive.min_load_coverage <= 0.0
+            || adaptive.min_load_coverage > 1.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.min_load_coverage".to_string(),
+                value: adaptive.min_load_coverage.to_string(),
+                reason: "Must be finite and in (0, 1]".to_string(),
+            });
+        }
+        if adaptive.cold_start_output_tokens == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.cold_start_output_tokens".to_string(),
+                value: adaptive.cold_start_output_tokens.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
         Ok(())
     }
 

@@ -163,6 +163,7 @@ mod tests {
                 smg_data_connector::MemoryConversationItemStorage::new(),
             ),
             worker_monitor: None,
+            adaptive_admission: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
             worker_job_queue: Arc::clone(&job_queue),

@@ -22,6 +22,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::debug;
 
 use super::{
+    adaptive_admission::{AdaptiveAdmissionController, AdaptiveRequestTracker},
     client::GrpcClient,
     common::stages::encode::EncodeDispatchPlan,
     multimodal::{MultimodalComponents, MultimodalIntermediate},
@@ -146,6 +147,7 @@ pub(crate) struct SharedComponents {
     pub configured_reasoning_parser: Option<String>,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    pub adaptive_admission: Option<Arc<AdaptiveAdmissionController>>,
 }
 
 /// Mutable processing state (evolves through pipeline stages)
@@ -167,6 +169,12 @@ pub(crate) struct ProcessingState {
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
+
+    /// Predicted token-work reservation. Non-streaming response processing
+    /// completes it from the final usage counters; streaming processing moves
+    /// it into the background stream task. Any earlier error drops it and
+    /// releases predicted outstanding work without training on a partial run.
+    pub adaptive_request: Option<AdaptiveRequestTracker>,
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
@@ -329,6 +337,18 @@ pub(crate) struct CompletionItem {
 }
 
 impl PreparationOutput {
+    /// Total prompt tokens represented by this request. Completion batches
+    /// sum every prompt because they fan out into independent backend work.
+    pub fn total_token_count(&self) -> u32 {
+        let count = match self {
+            Self::Completion { items, .. } => {
+                items.iter().map(|item| item.token_ids.len()).sum::<usize>()
+            }
+            _ => self.token_ids().len(),
+        };
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
     /// Token IDs (common to all variants). Batched completions expose the
     /// first prompt's tokens as the routing-affinity proxy.
     pub fn token_ids(&self) -> &[u32] {

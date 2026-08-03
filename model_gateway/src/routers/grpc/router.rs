@@ -354,6 +354,7 @@ impl GrpcRouter {
             configured_tool_parser: ctx.configured_tool_parser.clone(),
             configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
             multimodal,
+            adaptive_admission: ctx.adaptive_admission.clone(),
         });
 
         // Deps for the parser-consuming endpoints (chat/messages/harmony).

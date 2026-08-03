@@ -88,6 +88,7 @@ impl PipelineStage for CompletionResponseProcessingStage {
                     ctx.completion_request_arc(),
                     dispatch,
                     tokenizer,
+                    ctx.state.adaptive_request.take(),
                 );
 
             let response = match ctx.state.load_guards.take() {
@@ -122,6 +123,12 @@ impl PipelineStage for CompletionResponseProcessingStage {
                 stop_decoder,
             )
             .await?;
+
+        if let (Some(tracker), Some(usage)) =
+            (ctx.state.adaptive_request.take(), response.usage.as_ref())
+        {
+            tracker.complete(usage.completion_tokens);
+        }
 
         ctx.state.response.final_response = Some(FinalResponse::Completion(response));
 
