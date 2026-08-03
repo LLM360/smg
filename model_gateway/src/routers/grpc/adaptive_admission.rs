@@ -1,4 +1,4 @@
-//! Adaptive, token-work admission for the gRPC serving path.
+//! Adaptive, token-work admission shared by the gRPC and HTTP serving paths.
 //!
 //! The existing priority scheduler remains the infrastructure safety layer.
 //! This controller estimates request work after tokenization, learns output
@@ -46,6 +46,12 @@ const ENGINE_WAITING: &str = "smg_adaptive_admission_engine_waiting_requests";
 const ENGINE_WAITING_TOKENS: &str = "smg_adaptive_admission_engine_waiting_uncached_tokens";
 const ENGINE_TOKEN_USAGE: &str = "smg_adaptive_admission_engine_max_token_usage";
 const SEGMENTS: &str = "smg_adaptive_admission_estimator_segments";
+
+pub(crate) const FLAG_MULTIPLE_COMPLETIONS: u16 = 1 << 0;
+pub(crate) const FLAG_TOOLS: u16 = 1 << 1;
+pub(crate) const FLAG_STRUCTURED_OUTPUT: u16 = 1 << 2;
+pub(crate) const FLAG_REASONING: u16 = 1 << 3;
+pub(crate) const FLAG_STREAMING: u16 = 1 << 4;
 
 pub(crate) fn describe_metrics() {
     describe_counter!(
