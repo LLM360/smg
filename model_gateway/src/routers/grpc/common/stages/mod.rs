@@ -39,6 +39,7 @@ pub trait PipelineStage: Send + Sync {
     }
 }
 
+mod adaptive_admission;
 mod client_acquisition;
 mod dispatch_metadata;
 pub(crate) mod encode;
@@ -47,6 +48,7 @@ mod request_execution;
 mod worker_selection;
 
 // Export stage implementations
+pub(crate) use adaptive_admission::AdaptiveAdmissionStage;
 pub(crate) use client_acquisition::ClientAcquisitionStage;
 pub(crate) use dispatch_metadata::DispatchMetadataStage;
 pub(crate) use encode::EncodeStage;

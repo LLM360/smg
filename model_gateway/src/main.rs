@@ -5,11 +5,11 @@ use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
-        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig,
+        validate_mesh_server_name, AdaptiveAdmissionConfig, AdaptiveAdmissionMode,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
+        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -94,6 +94,34 @@ impl std::fmt::Display for Backend {
             Backend::Gemini => "gemini",
         };
         write!(f, "{s}")
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum AdaptiveAdmissionCliMode {
+    #[default]
+    Off,
+    Shadow,
+    Enforce,
+}
+
+impl std::fmt::Display for AdaptiveAdmissionCliMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        })
+    }
+}
+
+impl From<AdaptiveAdmissionCliMode> for AdaptiveAdmissionMode {
+    fn from(value: AdaptiveAdmissionCliMode) -> Self {
+        match value {
+            AdaptiveAdmissionCliMode::Off => Self::Off,
+            AdaptiveAdmissionCliMode::Shadow => Self::Shadow,
+            AdaptiveAdmissionCliMode::Enforce => Self::Enforce,
+        }
     }
 }
 
@@ -487,6 +515,42 @@ struct CliArgs {
     /// Cap on per-tenant scheduler metric label cardinality (top-N + "other").
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
+
+    // ==================== Adaptive Admission ====================
+    /// Predictive token-work admission mode. Shadow mode learns and records
+    /// hypothetical decisions without delaying or rejecting requests.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AdaptiveAdmissionCliMode::Off,
+        help_heading = "Adaptive Admission"
+    )]
+    adaptive_admission_mode: AdaptiveAdmissionCliMode,
+
+    /// Maximum predicted outstanding decode-work horizon in seconds.
+    #[arg(long, default_value_t = 30.0, help_heading = "Adaptive Admission")]
+    adaptive_admission_work_horizon_secs: f64,
+
+    /// Half-life for recency weighting of observed output lengths.
+    #[arg(long, default_value_t = 900.0, help_heading = "Adaptive Admission")]
+    adaptive_admission_estimator_half_life_secs: f64,
+
+    /// Hierarchical shrinkage strength in effective observations.
+    #[arg(long, default_value_t = 20.0, help_heading = "Adaptive Admission")]
+    adaptive_admission_prior_observations: f64,
+
+    /// Maximum in-memory predictor segments before stale-segment eviction.
+    #[arg(long, default_value_t = 50000, help_heading = "Adaptive Admission")]
+    adaptive_admission_max_segments: usize,
+
+    /// Minimum fraction of healthy replicas with fresh load telemetry before
+    /// a token-work decision is considered usable.
+    #[arg(long, default_value_t = 0.8, help_heading = "Adaptive Admission")]
+    adaptive_admission_min_load_coverage: f64,
+
+    /// Cold-start output-token prediction before a model has observations.
+    #[arg(long, default_value_t = 4096, help_heading = "Adaptive Admission")]
+    adaptive_admission_cold_start_output_tokens: u32,
 
     // ==================== Tenant Rate Limit ====================
     /// Enable per-tenant LLM token/request rate limiting. When unset
@@ -1490,6 +1554,15 @@ impl CliArgs {
             .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
             .priority_scheduler_config(self.priority_scheduler_config.clone())
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .adaptive_admission(AdaptiveAdmissionConfig {
+                mode: self.adaptive_admission_mode.into(),
+                work_horizon_secs: self.adaptive_admission_work_horizon_secs,
+                estimator_half_life_secs: self.adaptive_admission_estimator_half_life_secs,
+                prior_observations: self.adaptive_admission_prior_observations,
+                max_segments: self.adaptive_admission_max_segments,
+                min_load_coverage: self.adaptive_admission_min_load_coverage,
+                cold_start_output_tokens: self.adaptive_admission_cold_start_output_tokens,
+            })
             .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
             .cors_allowed_origins(self.cors_allowed_origins.clone())

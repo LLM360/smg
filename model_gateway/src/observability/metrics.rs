@@ -480,7 +480,9 @@ pub(crate) fn init_metrics() {
     // Priority scheduler metrics (no-op at scrape time unless the scheduler
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
+    use crate::routers::grpc::adaptive_admission as adaptive_admission_metrics;
     scheduler_metrics::describe();
+    adaptive_admission_metrics::describe_metrics();
 }
 
 #[expect(

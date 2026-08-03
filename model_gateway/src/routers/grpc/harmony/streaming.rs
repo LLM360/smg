@@ -38,6 +38,7 @@ use crate::{
             sse::SseEncoder,
         },
         grpc::{
+            adaptive_admission::AdaptiveRequestTracker,
             common::{
                 response_formatting::CompletionTokenTracker,
                 responses::{
@@ -105,6 +106,7 @@ impl HarmonyStreamingProcessor {
         execution_result: context::ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
+        adaptive_request: Option<AdaptiveRequestTracker>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -116,9 +118,16 @@ impl HarmonyStreamingProcessor {
                     let result =
                         Self::process_single_stream(stream, dispatch, chat_request, &tx).await;
 
-                    if let Err(e) = result {
-                        error!("Harmony streaming error: {}", e);
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Harmony streaming error: {}", e);
+                            utils::send_error_sse(&tx, &e, "internal_error");
+                        }
                     }
 
                     let _ = tx.send(Ok(SseEncoder::done()));
@@ -140,9 +149,16 @@ impl HarmonyStreamingProcessor {
                     )
                     .await;
 
-                    if let Err(e) = result {
-                        error!("Harmony prefill/decode streaming error: {}", e);
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Harmony prefill/decode streaming error: {}", e);
+                            utils::send_error_sse(&tx, &e, "internal_error");
+                        }
                     }
 
                     let _ = tx.send(Ok(SseEncoder::done()));
@@ -179,7 +195,7 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
         Self::process_chat_decode_stream(
@@ -200,7 +216,7 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         // Phase 1: Process prefill stream (collect metadata)
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
@@ -215,7 +231,7 @@ impl HarmonyStreamingProcessor {
         }
 
         // Phase 2: Decode (shared helper)
-        Self::process_chat_decode_stream(
+        let completion_tokens = Self::process_chat_decode_stream(
             decode_stream,
             &dispatch,
             &original_request,
@@ -228,7 +244,7 @@ impl HarmonyStreamingProcessor {
         // Mark prefill stream completed AFTER decode succeeds
         // This ensures that if client disconnects during decode, BOTH streams send abort
         prefill_stream.mark_completed();
-        Ok(())
+        Ok(completion_tokens)
     }
 
     /// Process the decode phase of a Chat Completion stream.
@@ -244,7 +260,7 @@ impl HarmonyStreamingProcessor {
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         // Timing for metrics
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -389,7 +405,7 @@ impl HarmonyStreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        Ok(())
+        Ok(total_completion)
     }
 
     /// Emit a chunk delta from Harmony channels

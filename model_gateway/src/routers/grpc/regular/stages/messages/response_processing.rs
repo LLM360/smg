@@ -94,6 +94,7 @@ impl PipelineStage for MessageResponseProcessingStage {
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
+                    ctx.state.adaptive_request.take(),
                 );
 
             // Attach load guards for RAII lifecycle
@@ -129,6 +130,10 @@ impl PipelineStage for MessageResponseProcessingStage {
                 stop_decoder,
             )
             .await?;
+
+        if let Some(tracker) = ctx.state.adaptive_request.take() {
+            tracker.complete(response.usage.output_tokens);
+        }
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Messages(response));

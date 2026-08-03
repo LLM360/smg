@@ -259,6 +259,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 let mut stages: Vec<Box<dyn PipelineStage>> = vec![
                     Box::new(ChatGeneratePreparationStage::new()),
+                    Box::new(AdaptiveAdmissionStage),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -287,6 +288,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 let mut stages: Vec<Box<dyn PipelineStage>> = vec![
                     Box::new(MessagePreparationStage),
+                    Box::new(AdaptiveAdmissionStage),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -316,6 +318,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
                 let mut stages: Vec<Box<dyn PipelineStage>> = vec![
                     Box::new(CompletionPreparationStage),
+                    Box::new(AdaptiveAdmissionStage),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -347,6 +350,7 @@ impl RequestPipeline {
                 }
                 vec![
                     Box::new(harmony::stages::HarmonyPreparationStage::new()),
+                    Box::new(AdaptiveAdmissionStage),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -1109,7 +1113,8 @@ impl RequestPipeline {
 
         // Extract ResponsesIterationResult from context
         // This should have been set by HarmonyResponseProcessingStage
-        ctx.state
+        let result = ctx
+            .state
             .response
             .responses_iteration_result
             .take()
@@ -1122,7 +1127,17 @@ impl RequestPipeline {
                     "no_responses_iteration_result",
                     "No ResponsesIterationResult produced by pipeline",
                 )
-            })
+            })?;
+        if let Some(tracker) = ctx.state.adaptive_request.take() {
+            let completion_tokens = match &result {
+                harmony::ResponsesIterationResult::ToolCallsFound { usage, .. }
+                | harmony::ResponsesIterationResult::Completed { usage, .. } => {
+                    usage.completion_tokens
+                }
+            };
+            tracker.complete(completion_tokens);
+        }
+        Ok(result)
     }
 
     /// Execute Harmony Responses pipeline iteration with streaming support
@@ -1135,7 +1150,14 @@ impl RequestPipeline {
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
-    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
+    ) -> Result<
+        (
+            ExecutionResult,
+            Option<LoadGuards>,
+            Option<super::adaptive_admission::AdaptiveRequestTracker>,
+        ),
+        Response,
+    > {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
@@ -1181,8 +1203,9 @@ impl RequestPipeline {
         })?;
 
         let load_guards = ctx.state.load_guards.take();
+        let adaptive_request = ctx.state.adaptive_request.take();
 
-        Ok((execution_result, load_guards))
+        Ok((execution_result, load_guards, adaptive_request))
     }
 }
 
@@ -1216,6 +1239,7 @@ mod build_parity_tests {
             (Endpoint::Chat, Mode::Regular) => (
                 v(&[
                     "ChatGeneratePreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata=false, Single), GenerateRequestBuildingStage(inject_pd_metadata=false, Single))",
@@ -1228,6 +1252,7 @@ mod build_parity_tests {
             (Endpoint::Chat, Mode::PrefillDecode) => (
                 v(&[
                     "ChatGeneratePreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata=true, PrefillDecode), GenerateRequestBuildingStage(inject_pd_metadata=true, PrefillDecode))",
@@ -1240,6 +1265,7 @@ mod build_parity_tests {
             (Endpoint::Chat, Mode::EncodePrefillDecode) => (
                 v(&[
                     "ChatGeneratePreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(EncodePrefillDecode)",
                     "ClientAcquisitionStage",
                     "EncodeStage",
@@ -1253,6 +1279,7 @@ mod build_parity_tests {
             (Endpoint::Messages, Mode::Regular) => (
                 v(&[
                     "MessagePreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "MessageRequestBuildingStage(inject_pd_metadata=false, Single)",
@@ -1265,6 +1292,7 @@ mod build_parity_tests {
             (Endpoint::Messages, Mode::PrefillDecode) => (
                 v(&[
                     "MessagePreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "MessageRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
@@ -1277,6 +1305,7 @@ mod build_parity_tests {
             (Endpoint::Messages, Mode::EncodePrefillDecode) => (
                 v(&[
                     "MessagePreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(EncodePrefillDecode)",
                     "ClientAcquisitionStage",
                     "EncodeStage",
@@ -1290,6 +1319,7 @@ mod build_parity_tests {
             (Endpoint::Completion, Mode::Regular) => (
                 v(&[
                     "CompletionPreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "CompletionRequestBuildingStage(inject_pd_metadata=false, Single)",
@@ -1302,6 +1332,7 @@ mod build_parity_tests {
             (Endpoint::Completion, Mode::PrefillDecode) => (
                 v(&[
                     "CompletionPreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "CompletionRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
@@ -1314,6 +1345,7 @@ mod build_parity_tests {
             (Endpoint::Completion, Mode::EncodePrefillDecode) => (
                 v(&[
                     "CompletionPreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(EncodePrefillDecode)",
                     "ClientAcquisitionStage",
                     "EncodeStage",
@@ -1327,6 +1359,7 @@ mod build_parity_tests {
             (Endpoint::Harmony, Mode::Regular) => (
                 v(&[
                     "HarmonyPreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "HarmonyRequestBuildingStage(inject_pd_metadata=false, Single)",
@@ -1339,6 +1372,7 @@ mod build_parity_tests {
             (Endpoint::Harmony, Mode::PrefillDecode) => (
                 v(&[
                     "HarmonyPreparationStage",
+                    "AdaptiveAdmissionStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "HarmonyRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
@@ -1491,6 +1525,7 @@ mod alias_pipeline_tests {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             multimodal: None,
+            adaptive_admission: None,
         });
         let request: GenerateRequest = serde_json::from_value(json!({
             "model": MODEL_ALIAS,

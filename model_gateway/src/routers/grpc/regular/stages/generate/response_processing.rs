@@ -99,6 +99,7 @@ impl GenerateResponseProcessingStage {
                 ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
                 dispatch,
                 tokenizer,
+                ctx.state.adaptive_request.take(),
             );
 
             // Attach load guards to response body for proper RAII lifecycle
@@ -136,6 +137,13 @@ impl GenerateResponseProcessingStage {
                 start_time,
             )
             .await?;
+
+        if let Some(tracker) = ctx.state.adaptive_request.take() {
+            let completion_tokens = result_array.iter().fold(0u32, |total, response| {
+                total.saturating_add(response.meta_info.completion_tokens)
+            });
+            tracker.complete(completion_tokens);
+        }
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));
