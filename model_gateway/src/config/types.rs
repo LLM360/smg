@@ -11,6 +11,100 @@ pub use smg_data_connector::{
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
 
+/// Runtime mode for predictive, token-work admission.
+///
+/// `shadow` learns from completed requests and records the decision that would
+/// have been made, but never delays or rejects a request. `enforce` is kept as
+/// an explicit operator action so a newly deployed estimator cannot change
+/// serving behavior before its calibration is measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAdmissionMode {
+    #[default]
+    Off,
+    Shadow,
+    Enforce,
+}
+
+impl std::str::FromStr for AdaptiveAdmissionMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "enforce" => Ok(Self::Enforce),
+            _ => Err(format!(
+                "adaptive admission mode must be one of off, shadow, enforce; got {value:?}"
+            )),
+        }
+    }
+}
+
+fn default_adaptive_work_horizon_secs() -> f64 {
+    30.0
+}
+
+fn default_adaptive_estimator_half_life_secs() -> f64 {
+    900.0
+}
+
+fn default_adaptive_prior_observations() -> f64 {
+    20.0
+}
+
+fn default_adaptive_max_segments() -> usize {
+    50_000
+}
+
+fn default_adaptive_min_load_coverage() -> f64 {
+    0.8
+}
+
+fn default_adaptive_cold_start_output_tokens() -> u32 {
+    4096
+}
+
+/// Predictive token-work admission settings.
+///
+/// The work horizon is an operator-facing latency objective rather than a
+/// request-concurrency guess: recent per-replica generation capacity multiplied
+/// by healthy replica count and this horizon gives the maximum predicted
+/// outstanding decode work. Router reservations are reconciled with engine
+/// running and waiting counts. Missing or insufficient telemetry fails open to
+/// the existing priority scheduler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveAdmissionConfig {
+    #[serde(default)]
+    pub mode: AdaptiveAdmissionMode,
+    #[serde(default = "default_adaptive_work_horizon_secs")]
+    pub work_horizon_secs: f64,
+    #[serde(default = "default_adaptive_estimator_half_life_secs")]
+    pub estimator_half_life_secs: f64,
+    #[serde(default = "default_adaptive_prior_observations")]
+    pub prior_observations: f64,
+    #[serde(default = "default_adaptive_max_segments")]
+    pub max_segments: usize,
+    #[serde(default = "default_adaptive_min_load_coverage")]
+    pub min_load_coverage: f64,
+    #[serde(default = "default_adaptive_cold_start_output_tokens")]
+    pub cold_start_output_tokens: u32,
+}
+
+impl Default for AdaptiveAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: AdaptiveAdmissionMode::Off,
+            work_horizon_secs: default_adaptive_work_horizon_secs(),
+            estimator_half_life_secs: default_adaptive_estimator_half_life_secs(),
+            prior_observations: default_adaptive_prior_observations(),
+            max_segments: default_adaptive_max_segments(),
+            min_load_coverage: default_adaptive_min_load_coverage(),
+            cold_start_output_tokens: default_adaptive_cold_start_output_tokens(),
+        }
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -104,6 +198,10 @@ pub struct RouterConfig {
     /// by inflight; the remainder bucket under `tenant="other"`).
     #[serde(default = "default_priority_scheduler_tenant_metric_top_n")]
     pub priority_scheduler_tenant_metric_top_n: u32,
+    /// Optional predictive token-work admission. Off by default. Shadow mode
+    /// is behavior-preserving and is the required first deployment state.
+    #[serde(default)]
+    pub adaptive_admission: AdaptiveAdmissionConfig,
     /// Enable per-tenant LLM token/request rate limiting. When false
     /// (default), no rate limiter is constructed — zero behavior change
     /// for existing deployments.
@@ -842,6 +940,7 @@ impl Default for RouterConfig {
             priority_scheduler_config: None,
             priority_scheduler_tenant_metric_top_n: default_priority_scheduler_tenant_metric_top_n(
             ),
+            adaptive_admission: AdaptiveAdmissionConfig::default(),
             tenant_rate_limit_enabled: false,
             tenant_rate_limit_config: None,
             cors_allowed_origins: vec![],

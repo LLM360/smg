@@ -220,7 +220,7 @@ async fn execute_mcp_tool_loop_streaming(
         );
 
         // Execute pipeline and get stream + load guards
-        let (execution_result, _load_guards) = match ctx
+        let (execution_result, _load_guards, adaptive_request) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
@@ -266,6 +266,10 @@ async fn execute_mcp_tool_loop_streaming(
                 usage,
                 request_id: _,
             } => {
+                if let Some(tracker) = adaptive_request {
+                    tracker.complete(usage.completion_tokens);
+                }
+
                 debug!(
                     tool_call_count = tool_calls.len(),
                     has_analysis = analysis.is_some(),
@@ -384,6 +388,10 @@ async fn execute_mcp_tool_loop_streaming(
                 // Continue loop
             }
             ResponsesIterationResult::Completed { response, usage } => {
+                if let Some(tracker) = adaptive_request {
+                    tracker.complete(usage.completion_tokens);
+                }
+
                 debug!(
                     output_items = response.output.len(),
                     input_tokens = usage.prompt_tokens,
@@ -440,7 +448,7 @@ async fn execute_without_mcp_streaming(
     debug!("No MCP tools - executing single iteration");
 
     // Execute pipeline and get stream + load guards
-    let (execution_result, _load_guards) = match ctx
+    let (execution_result, _load_guards, adaptive_request) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(current_request, ctx, Some(tenant_request_meta))
         .await
@@ -479,6 +487,9 @@ async fn execute_without_mcp_streaming(
         ResponsesIterationResult::ToolCallsFound { usage, .. } => usage,
         ResponsesIterationResult::Completed { usage, .. } => usage,
     };
+    if let Some(tracker) = adaptive_request {
+        tracker.complete(usage.completion_tokens);
+    }
 
     // Finalize response from emitter's accumulated data
     let final_response = emitter.finalize(Some(usage.clone()));

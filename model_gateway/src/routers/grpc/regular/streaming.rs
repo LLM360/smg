@@ -39,6 +39,7 @@ use crate::{
     routers::{
         common::sse::SseEncoder,
         grpc::{
+            adaptive_admission::AdaptiveRequestTracker,
             common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
             context,
             proto_wrapper::{ProtoResponseVariant, ProtoStream},
@@ -120,6 +121,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
+        adaptive_request: Option<AdaptiveRequestTracker>,
     ) -> Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
@@ -157,8 +159,13 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => utils::send_error_sse(&tx, &e, "internal_error"),
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
@@ -189,8 +196,13 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => utils::send_error_sse(&tx, &e, "internal_error"),
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
@@ -228,7 +240,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         self.process_streaming_chunks_inner(
             grpc_stream,
             dispatch,
@@ -254,7 +266,7 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: Option<context::PdTiming>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         // Metrics timing
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -679,7 +691,7 @@ impl StreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        Ok(())
+        Ok(total_completion)
     }
 
     /// Process prefill/decode streaming chunks (prefill + decode) - PD mode
@@ -694,7 +706,7 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: context::PdTiming,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
         if original_request.logprobs {
             while let Some(response) = prefill_stream.next().await {
@@ -747,6 +759,7 @@ impl StreamingProcessor {
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        adaptive_request: Option<AdaptiveRequestTracker>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -775,8 +788,13 @@ impl StreamingProcessor {
                     let result =
                         Self::process_generate_streaming(tokenizer, stream, ctx, &tx).await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => utils::send_error_sse(&tx, &e, "internal_error"),
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
@@ -799,8 +817,13 @@ impl StreamingProcessor {
                     )
                     .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => utils::send_error_sse(&tx, &e, "internal_error"),
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
@@ -836,7 +859,7 @@ impl StreamingProcessor {
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
@@ -941,7 +964,7 @@ impl StreamingProcessor {
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
-        Ok(())
+        Ok(total_completion)
     }
 
     /// Process prefill/decode streaming for generate endpoint (PD mode with logprobs support)
@@ -952,7 +975,7 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: context::PdTiming,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         // Collect input_logprobs from prefill stream if requested
         let input_token_logprobs = if ctx.return_logprob {
             let mut input_logprobs = None;
@@ -1006,7 +1029,7 @@ impl StreamingProcessor {
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: Option<context::PdTiming>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
@@ -1161,7 +1184,7 @@ impl StreamingProcessor {
         let total_completion: u32 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
-        Ok(())
+        Ok(total_completion)
     }
 
     // ========================================================================
@@ -1576,6 +1599,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
+        adaptive_request: Option<AdaptiveRequestTracker>,
     ) -> Response {
         let stop_params = (
             messages_request
@@ -1611,15 +1635,22 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        let error_event = MessageStreamEvent::Error {
-                            error: messages::ErrorResponse {
-                                error_type: "api_error".to_string(),
-                                message: e,
-                            },
-                        };
-                        let mut buf = Vec::with_capacity(256);
-                        let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => {
+                            let error_event = MessageStreamEvent::Error {
+                                error: messages::ErrorResponse {
+                                    error_type: "api_error".to_string(),
+                                    message: e,
+                                },
+                            };
+                            let mut buf = Vec::with_capacity(256);
+                            let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                        }
                     }
                     // No data: [DONE] — Anthropic uses message_stop instead
                 });
@@ -1649,15 +1680,22 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        let error_event = MessageStreamEvent::Error {
-                            error: messages::ErrorResponse {
-                                error_type: "api_error".to_string(),
-                                message: e,
-                            },
-                        };
-                        let mut buf = Vec::with_capacity(256);
-                        let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                    match result {
+                        Ok(tokens) => {
+                            if let Some(tracker) = adaptive_request {
+                                tracker.complete(tokens);
+                            }
+                        }
+                        Err(e) => {
+                            let error_event = MessageStreamEvent::Error {
+                                error: messages::ErrorResponse {
+                                    error_type: "api_error".to_string(),
+                                    message: e,
+                                },
+                            };
+                            let mut buf = Vec::with_capacity(256);
+                            let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                        }
                     }
                 });
             }
@@ -1699,7 +1737,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
@@ -2310,7 +2348,7 @@ impl StreamingProcessor {
             output_tokens: u64::from(completion_tokens.total()),
         });
 
-        Ok(())
+        Ok(completion_tokens.total())
     }
 
     /// Process prefill/decode streaming chunks for Messages API (PD mode).
@@ -2327,7 +2365,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
         while let Some(response) = prefill_stream.next().await {
             let gen_response =
@@ -2372,6 +2410,7 @@ impl StreamingProcessor {
         completion_request: Arc<CompletionRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        adaptive_request: Option<AdaptiveRequestTracker>,
     ) -> Response {
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
@@ -2511,6 +2550,9 @@ impl StreamingProcessor {
                         input_tokens: Some(total_prompt as u64),
                         output_tokens: total_completion as u64,
                     });
+                    if let Some(tracker) = adaptive_request {
+                        tracker.complete(total_completion);
+                    }
                 }
             }
 

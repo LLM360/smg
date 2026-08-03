@@ -22,6 +22,7 @@ use crate::{
     rate_limit::RateLimitManager,
     routers::{
         common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
+        grpc::adaptive_admission::AdaptiveAdmissionController,
         grpc::multimodal::MultimodalConfigRegistry,
         router_manager::RouterManager,
     },
@@ -65,6 +66,7 @@ pub struct AppContext {
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
     pub worker_monitor: Option<Arc<WorkerMonitor>>,
+    pub(crate) adaptive_admission: Option<Arc<AdaptiveAdmissionController>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
@@ -338,6 +340,20 @@ impl AppContextBuilder {
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
+        let worker_monitor = self.worker_monitor;
+        let adaptive_admission =
+            if router_config.adaptive_admission.mode == crate::config::AdaptiveAdmissionMode::Off {
+                None
+            } else {
+                let controller = AdaptiveAdmissionController::new(
+                    router_config.adaptive_admission.clone(),
+                    worker_registry.clone(),
+                );
+                if let Some(monitor) = &worker_monitor {
+                    controller.start_load_updates(monitor.subscribe());
+                }
+                Some(controller)
+            };
 
         // Create WorkerService from the already-built components
         let worker_service = Arc::new(WorkerService::new(
@@ -373,7 +389,8 @@ impl AppContextBuilder {
             conversation_item_storage: self.conversation_item_storage.ok_or(
                 AppContextBuildError::MissingField("conversation_item_storage"),
             )?,
-            worker_monitor: self.worker_monitor,
+            worker_monitor,
+            adaptive_admission,
             configured_reasoning_parser,
             configured_tool_parser,
             worker_job_queue,
@@ -605,7 +622,8 @@ impl AppContextBuilder {
                 .clone(),
             client.clone(),
             config.load_monitor_interval_secs,
-            config.engine_metrics,
+            config.engine_metrics
+                || config.adaptive_admission.mode != crate::config::AdaptiveAdmissionMode::Off,
         )));
         Ok(self)
     }

@@ -289,6 +289,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn adaptive_admission(mut self, config: super::types::AdaptiveAdmissionConfig) -> Self {
+        self.config.adaptive_admission = config;
+        self
+    }
+
     // ==================== Tenant Rate Limit ====================
 
     pub fn tenant_rate_limit_enabled(mut self, enabled: bool) -> Self {
