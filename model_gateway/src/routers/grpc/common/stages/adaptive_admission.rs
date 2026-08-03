@@ -12,7 +12,10 @@ use crate::{
     routers::{
         error,
         grpc::{
-            adaptive_admission::PredictionFeatures,
+            adaptive_admission::{
+                PredictionFeatures, FLAG_MULTIPLE_COMPLETIONS, FLAG_REASONING, FLAG_STREAMING,
+                FLAG_STRUCTURED_OUTPUT, FLAG_TOOLS,
+            },
             context::{RequestContext, RequestType},
         },
     },
@@ -20,12 +23,6 @@ use crate::{
 
 const COMET_USER_HEADER: &str = "x-comet-user";
 const COMET_WORKLOAD_TYPE_HEADER: &str = "x-comet-workload-type";
-
-const FLAG_MULTIPLE_COMPLETIONS: u16 = 1 << 0;
-const FLAG_TOOLS: u16 = 1 << 1;
-const FLAG_STRUCTURED_OUTPUT: u16 = 1 << 2;
-const FLAG_REASONING: u16 = 1 << 3;
-const FLAG_STREAMING: u16 = 1 << 4;
 
 pub(crate) struct AdaptiveAdmissionStage;
 

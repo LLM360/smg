@@ -3,7 +3,10 @@ use std::{error::Error as _, sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, RETRY_AFTER},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -35,7 +38,7 @@ use tracing::error;
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{scheduler::ADMISSION_PARTITION_HEADER, TenantRequestMeta},
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -53,7 +56,14 @@ use crate::{
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
-        grpc::utils::{error_type_from_status, route_to_endpoint},
+        grpc::{
+            adaptive_admission::{
+                AdaptiveAdmissionController, AdaptiveRequestTracker, PredictionFeatures,
+                FLAG_MULTIPLE_COMPLETIONS, FLAG_REASONING, FLAG_STREAMING, FLAG_STRUCTURED_OUTPUT,
+                FLAG_TOOLS,
+            },
+            utils::{error_type_from_status, route_to_endpoint},
+        },
         openai::strip_default_sglang_fields,
         RouterTrait,
     },
@@ -62,6 +72,9 @@ use crate::{
 
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
+const ADAPTIVE_RESPONSE_TAIL_LIMIT: usize = 256 * 1024;
+const COMET_USER_HEADER: &str = "x-comet-user";
+const COMET_WORKLOAD_TYPE_HEADER: &str = "x-comet-workload-type";
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -72,12 +85,249 @@ pub struct Router {
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+    adaptive_admission: Option<Arc<AdaptiveAdmissionController>>,
 }
 
 struct WorkerSelection {
     worker: Arc<dyn Worker>,
     policy: Arc<dyn LoadBalancingPolicy>,
     reservation_cost: Option<u64>,
+}
+
+fn trusted_header(headers: Option<&HeaderMap>, name: &str) -> Option<String> {
+    headers
+        .and_then(|headers| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn approximate_prompt_tokens(text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let chars = text.chars().count();
+    chars
+        .saturating_add(3)
+        .checked_div(4)
+        .unwrap_or(usize::MAX)
+        .min(u32::MAX as usize) as u32
+}
+
+fn value_u32(value: Option<&serde_json::Value>) -> Option<u32> {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.min(u64::from(u32::MAX)) as u32)
+}
+
+fn positive_u32(value: Option<&serde_json::Value>) -> Option<u32> {
+    value_u32(value).filter(|value| *value > 0)
+}
+
+fn request_multiplicity(value: &serde_json::Value) -> u32 {
+    let returned = positive_u32(value.get("n"))
+        .or_else(|| positive_u32(value.pointer("/sampling_params/n")))
+        .unwrap_or(1);
+    positive_u32(value.get("best_of"))
+        .unwrap_or(returned)
+        .max(returned)
+}
+
+fn populated(value: &serde_json::Value, field: &str) -> bool {
+    value.get(field).is_some_and(|value| {
+        !value.is_null()
+            && !value.as_array().is_some_and(Vec::is_empty)
+            && !value.as_object().is_some_and(serde_json::Map::is_empty)
+    })
+}
+
+fn http_prediction_features<T: GenerationRequest + serde::Serialize>(
+    typed_req: &T,
+    headers: Option<&HeaderMap>,
+    route: &'static str,
+    model_id: &str,
+    text: &str,
+) -> PredictionFeatures {
+    let value = serde_json::to_value(typed_req).unwrap_or(serde_json::Value::Null);
+    let multiplicity = request_multiplicity(&value);
+    let mut flags = 0;
+    if multiplicity > 1 {
+        flags |= FLAG_MULTIPLE_COMPLETIONS;
+    }
+    if populated(&value, "tools") {
+        flags |= FLAG_TOOLS;
+    }
+    if ["response_format", "regex", "ebnf", "json_schema", "text"]
+        .into_iter()
+        .any(|field| populated(&value, field))
+        || value.get("sampling_params").is_some_and(|params| {
+            ["regex", "ebnf", "json_schema"]
+                .into_iter()
+                .any(|field| populated(params, field))
+        })
+    {
+        flags |= FLAG_STRUCTURED_OUTPUT;
+    }
+    if ["reasoning_effort", "reasoning", "thinking"]
+        .into_iter()
+        .any(|field| populated(&value, field))
+    {
+        flags |= FLAG_REASONING;
+    }
+    if typed_req.is_stream() {
+        flags |= FLAG_STREAMING;
+    }
+
+    PredictionFeatures {
+        model: model_id.to_string(),
+        user: trusted_header(headers, COMET_USER_HEADER).unwrap_or_else(|| "anonymous".to_string()),
+        workload_type: trusted_header(headers, COMET_WORKLOAD_TYPE_HEADER)
+            .unwrap_or_else(|| "unclassified".to_string()),
+        endpoint: route_to_endpoint(route),
+        prompt_tokens: approximate_prompt_tokens(text),
+        max_output_tokens: typed_req
+            .max_output_tokens_for_routing()
+            .map(|limit| limit.saturating_mul(multiplicity)),
+        generation_flags: flags,
+    }
+}
+
+fn output_tokens_from_value(value: &serde_json::Value) -> Option<u32> {
+    [
+        "/usage/completion_tokens",
+        "/usage/output_tokens",
+        "/meta_info/completion_tokens",
+    ]
+    .into_iter()
+    .find_map(|pointer| value_u32(value.pointer(pointer)))
+}
+
+fn output_tokens_from_truncated_json_tail(body: &[u8]) -> Option<u32> {
+    [b"\"usage\"".as_slice(), b"\"meta_info\"".as_slice()]
+        .into_iter()
+        .find_map(|key| {
+            let offset = body.windows(key.len()).rposition(|window| window == key)? + key.len();
+            let remainder = &body[offset..];
+            let object = &remainder[remainder.iter().position(|byte| *byte == b':')? + 1..];
+            let value = serde_json::Deserializer::from_slice(object)
+                .into_iter::<serde_json::Value>()
+                .next()?
+                .ok()?;
+            value_u32(value.get("completion_tokens"))
+                .or_else(|| value_u32(value.get("output_tokens")))
+        })
+}
+
+fn observed_output_tokens(body: &[u8]) -> Option<u32> {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(tokens) = output_tokens_from_value(&value) {
+            return Some(tokens);
+        }
+    }
+    if let Some(tokens) = output_tokens_from_truncated_json_tail(body) {
+        return Some(tokens);
+    }
+
+    body.split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let line = line
+                .strip_suffix(b"\r")
+                .unwrap_or(line)
+                .strip_prefix(b"data:")?;
+            let line = line.strip_prefix(b" ").unwrap_or(line);
+            if line == b"[DONE]" {
+                return None;
+            }
+            serde_json::from_slice::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| output_tokens_from_value(&value))
+        })
+        .next_back()
+}
+
+struct AdaptiveTrackingBody {
+    inner: Body,
+    tracker: Option<AdaptiveRequestTracker>,
+    tail: Vec<u8>,
+}
+
+impl AdaptiveTrackingBody {
+    fn wrap_response(response: Response, tracker: AdaptiveRequestTracker) -> Response {
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(Self {
+                inner: body,
+                tracker: Some(tracker),
+                tail: Vec::new(),
+            }),
+        )
+    }
+
+    fn append_tail(&mut self, data: &[u8]) {
+        if data.len() >= ADAPTIVE_RESPONSE_TAIL_LIMIT {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&data[data.len() - ADAPTIVE_RESPONSE_TAIL_LIMIT..]);
+            return;
+        }
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(data.len())
+            .saturating_sub(ADAPTIVE_RESPONSE_TAIL_LIMIT);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+        }
+        self.tail.extend_from_slice(data);
+    }
+
+    fn finish(&mut self) {
+        let Some(tracker) = self.tracker.take() else {
+            return;
+        };
+        if let Some(tokens) = observed_output_tokens(&self.tail) {
+            tracker.complete(tokens);
+        }
+    }
+}
+
+impl http_body::Body for AdaptiveTrackingBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.append_tail(data);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.tracker.take();
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.finish();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl std::fmt::Debug for Router {
@@ -106,6 +356,7 @@ impl Router {
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
+            adaptive_admission: ctx.adaptive_admission.clone(),
         })
     }
 
@@ -250,6 +501,41 @@ impl Router {
             .await
     }
 
+    fn begin_http_admission<T: GenerationRequest + serde::Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: &str,
+        text: &str,
+    ) -> Result<Option<AdaptiveRequestTracker>, Box<Response>> {
+        let Some(controller) = self.adaptive_admission.clone() else {
+            return Ok(None);
+        };
+        if matches!(route, "/v1/embeddings" | "/v1/classify" | "/v1/rerank") {
+            return Ok(None);
+        }
+        let partition = trusted_header(headers, ADMISSION_PARTITION_HEADER)
+            .unwrap_or_else(|| model_id.to_string());
+        let tracker = controller.begin(
+            partition,
+            http_prediction_features(typed_req, headers, route, model_id, text),
+        );
+        if tracker.should_reject() {
+            let mut response = error::create_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "adaptive_admission_saturated",
+                "model fleet is temporarily saturated",
+            );
+            if let Ok(value) = HeaderValue::from_str(&tracker.retry_after_secs().max(1).to_string())
+            {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+            return Err(Box::new(response));
+        }
+        Ok(Some(tracker))
+    }
+
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -268,6 +554,11 @@ impl Router {
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
         let model = model_id;
         let endpoint = route_to_endpoint(route);
+        let adaptive_tracker =
+            match self.begin_http_admission(headers, typed_req, route, model_id, &text) {
+                Ok(tracker) => tracker,
+                Err(response) => return *response,
+            };
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -285,7 +576,7 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let mut response = RetryExecutor::execute_response_with_retry(
             retry_config,
             // operation per attempt
             |_: u32| async {
@@ -344,6 +635,12 @@ impl Router {
                 endpoint,
                 error_type_from_status(response.status()),
             );
+        }
+
+        if let Some(tracker) = adaptive_tracker {
+            if response.status().is_success() {
+                response = AdaptiveTrackingBody::wrap_response(response, tracker);
+            }
         }
 
         response
@@ -1511,15 +1808,113 @@ impl RouterTrait for Router {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use serde::Serialize;
 
     use super::*;
     use crate::{config::types::PolicyConfig, worker::BasicWorkerBuilder};
+
+    #[derive(Serialize)]
+    struct TestGenerationRequest {
+        stream: bool,
+        n: u32,
+        max_tokens: u32,
+        tools: Vec<serde_json::Value>,
+        response_format: serde_json::Value,
+        reasoning_effort: String,
+    }
+
+    impl GenerationRequest for TestGenerationRequest {
+        fn is_stream(&self) -> bool {
+            self.stream
+        }
+
+        fn get_model(&self) -> Option<&str> {
+            Some("test-model")
+        }
+
+        fn extract_text_for_routing(&self) -> String {
+            "abcdefgh".to_string()
+        }
+
+        fn max_output_tokens_for_routing(&self) -> Option<u32> {
+            Some(self.max_tokens)
+        }
+    }
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_http_prediction_features_use_trusted_headers_and_request_shape() {
+        let request = TestGenerationRequest {
+            stream: true,
+            n: 3,
+            max_tokens: 100,
+            tools: vec![serde_json::json!({"type": "function"})],
+            response_format: serde_json::json!({"type": "json_object"}),
+            reasoning_effort: "high".to_string(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(COMET_USER_HEADER, HeaderValue::from_static("junu.kim"));
+        headers.insert(
+            COMET_WORKLOAD_TYPE_HEADER,
+            HeaderValue::from_static("batch-eval"),
+        );
+
+        let features = http_prediction_features(
+            &request,
+            Some(&headers),
+            "/v1/chat/completions",
+            "test-model",
+            "abcdefgh",
+        );
+
+        assert_eq!(features.model, "test-model");
+        assert_eq!(features.user, "junu.kim");
+        assert_eq!(features.workload_type, "batch-eval");
+        assert_eq!(features.endpoint, metrics_labels::ENDPOINT_CHAT);
+        assert_eq!(features.prompt_tokens, 2);
+        assert_eq!(features.max_output_tokens, Some(300));
+        assert_ne!(features.generation_flags & FLAG_MULTIPLE_COMPLETIONS, 0);
+        assert_ne!(features.generation_flags & FLAG_TOOLS, 0);
+        assert_ne!(features.generation_flags & FLAG_STRUCTURED_OUTPUT, 0);
+        assert_ne!(features.generation_flags & FLAG_REASONING, 0);
+        assert_ne!(features.generation_flags & FLAG_STREAMING, 0);
+    }
+
+    #[test]
+    fn test_observed_output_tokens_support_json_and_terminal_sse_usage() {
+        assert_eq!(
+            observed_output_tokens(br#"{"usage":{"completion_tokens":42}}"#),
+            Some(42)
+        );
+        assert_eq!(
+            observed_output_tokens(br#"{"usage":{"output_tokens":13}}"#),
+            Some(13)
+        );
+        assert_eq!(
+            observed_output_tokens(
+                b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"completion_tokens\":17}}\n\ndata: [DONE]\n\n"
+            ),
+            Some(17)
+        );
+        assert_eq!(
+            observed_output_tokens(br#"{"usage":{"completion_tokens":0}}"#),
+            Some(0)
+        );
+        assert_eq!(observed_output_tokens(br#"{"choices":[]}"#), None);
+
+        let large_response = format!(
+            "{{\"choices\":[{{\"text\":\"{}\"}}],\"usage\":{{\"completion_tokens\":29}}}}",
+            "x".repeat(ADAPTIVE_RESPONSE_TAIL_LIMIT)
+        );
+        let tail =
+            &large_response.as_bytes()[large_response.len() - ADAPTIVE_RESPONSE_TAIL_LIMIT..];
+        assert_eq!(observed_output_tokens(tail), Some(29));
     }
 
     fn create_test_regular_router() -> Router {
@@ -1547,6 +1942,7 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            adaptive_admission: None,
         }
     }
 
