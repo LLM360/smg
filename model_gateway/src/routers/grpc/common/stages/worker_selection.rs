@@ -14,6 +14,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
+        common::header_utils::worker_url_is_allowed,
         error,
         grpc::{
             context::{EncodeWorkerAssignment, PolicyReservation, RequestContext, WorkerSelection},
@@ -216,6 +217,10 @@ fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
     }
 }
 
+fn worker_is_available_for_request(worker: &dyn Worker, headers: Option<&HeaderMap>) -> bool {
+    worker.is_available() && worker_url_is_allowed(headers, worker.url())
+}
+
 impl WorkerSelectionStage {
     fn select_single_worker(
         &self,
@@ -241,8 +246,10 @@ impl WorkerSelectionStage {
         );
 
         // Use into_iter() to take ownership of Arcs without cloning (avoids atomic inc/dec)
-        let available: Vec<Arc<dyn Worker>> =
-            workers.into_iter().filter(|w| w.is_available()).collect();
+        let available: Vec<Arc<dyn Worker>> = workers
+            .into_iter()
+            .filter(|w| worker_is_available_for_request(w.as_ref(), headers))
+            .collect();
 
         if available.is_empty() {
             return None;
@@ -311,7 +318,7 @@ impl WorkerSelectionStage {
             all_workers
                 .into_iter()
                 .fold((Vec::new(), Vec::new()), |mut acc, w| {
-                    if w.is_available() {
+                    if worker_is_available_for_request(w.as_ref(), headers) {
                         match w.metadata().spec.worker_type {
                             WorkerType::Prefill => acc.0.push(w),
                             WorkerType::Decode => acc.1.push(w),
@@ -454,7 +461,7 @@ impl WorkerSelectionStage {
         let (all_encode, all_prefill, all_decode): (Vec<_>, Vec<_>, Vec<_>) = all_workers
             .into_iter()
             .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, w| {
-                if w.is_available() {
+                if worker_is_available_for_request(w.as_ref(), headers) {
                     match w.metadata().spec.worker_type {
                         WorkerType::Encode => acc.0.push(w),
                         WorkerType::Prefill => acc.1.push(w),
@@ -667,4 +674,55 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::worker::HealthCheckConfig;
+
+    use super::*;
+    use crate::worker::BasicWorkerBuilder;
+
+    fn ready_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    #[test]
+    fn trusted_worker_url_constraints_filter_before_policy_selection() {
+        let public = ready_worker("grpc://public:30000");
+        let reserved = ready_worker("grpc://reserved:30000");
+
+        let mut shared_headers = HeaderMap::new();
+        shared_headers.insert(
+            "x-smg-excluded-worker-urls",
+            reserved.url().parse().unwrap(),
+        );
+        assert!(worker_is_available_for_request(
+            public.as_ref(),
+            Some(&shared_headers)
+        ));
+        assert!(!worker_is_available_for_request(
+            reserved.as_ref(),
+            Some(&shared_headers)
+        ));
+
+        let mut private_headers = HeaderMap::new();
+        private_headers.insert("x-smg-target-worker-url", reserved.url().parse().unwrap());
+        assert!(!worker_is_available_for_request(
+            public.as_ref(),
+            Some(&private_headers)
+        ));
+        assert!(worker_is_available_for_request(
+            reserved.as_ref(),
+            Some(&private_headers)
+        ));
+    }
 }
