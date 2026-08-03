@@ -138,6 +138,44 @@ management endpoints are not restored.
 
 ---
 
+## Replica-Aware Admission Partitions
+
+The priority scheduler can isolate trusted model or reservation selectors while
+letting their concurrency shares follow the healthy fleet. Configure every
+partition with `capacity_from_healthy_replicas: true`:
+
+```yaml
+admission_partitions:
+  model-a:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 34
+    queue_size: 400
+  private:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 34
+    queue_size: 40
+  default:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 34
+    queue_size: 60
+default_admission_partition: default
+```
+
+Each partition first contributes `healthy replicas * configured slots per
+replica`. When those raw limits exceed the live global capacity `C`, SMG scales
+them proportionally to `C`, rounded deterministically with largest remainders.
+SMG recomputes the allocation on worker lifecycle events. A trusted worker label
+named `admission_partition` overrides the worker's primary model id, allowing a
+control plane to move a reserved replica into `private` without restarting it.
+Workers whose model or label does not name a configured partition count toward
+`default`.
+
+All partitions in one configuration must use the same mode. Existing static
+configurations continue to set `max_concurrent_requests` on every partition.
+Queue budgets remain fixed and isolated in both modes.
+
+---
+
 ## Response Codes
 
 | Code | Meaning | When |

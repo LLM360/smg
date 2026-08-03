@@ -119,17 +119,32 @@ pub struct TenantPolicyConfig {
     pub max_class: Class,
 }
 
-/// Hard admission budget for one trusted upstream partition selector.
+/// Admission budget for one trusted upstream partition selector.
 ///
-/// Partition capacities are non-borrowable while the fleet is healthy. This
-/// guarantees that a saturated model cannot consume another model's reserved
-/// admission headroom. When aggregate worker capacity falls, the partition
-/// coordinator scales all configured capacities down while preserving the
-/// global ceiling.
+/// A deployment chooses one capacity mode for every configured partition:
+///
+/// - static: set `max_concurrent_requests` (the original behavior), or
+/// - replica-aware: set `capacity_from_healthy_replicas: true`, configure
+///   `max_concurrent_requests_per_healthy_replica`, and omit the static maximum.
+///
+/// Replica-aware partitions divide the live global scheduler capacity in
+/// proportion to the number of healthy workers assigned to each partition.
+/// A worker's `admission_partition` metadata label takes precedence over its
+/// primary model id, which lets an upstream controller move reserved replicas
+/// into a private lane without restarting the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionPartitionConfig {
-    /// Maximum requests admitted concurrently in this partition.
-    pub max_concurrent_requests: u16,
+    /// Static maximum requests admitted concurrently in this partition.
+    /// Required in static mode and omitted in replica-aware mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<u16>,
+    /// Derive this partition's share from its healthy replica count.
+    #[serde(default)]
+    pub capacity_from_healthy_replicas: bool,
+    /// Admission slots contributed by each healthy replica in replica-aware
+    /// mode. Omitted in static mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests_per_healthy_replica: Option<u16>,
     /// Work-conserving queue budget shared by the priority classes inside
     /// this partition.
     pub queue_size: u32,
@@ -468,11 +483,39 @@ default_admission_partition: default
         assert_eq!(
             parsed.admission_partitions["kimi-k3"],
             AdmissionPartitionConfig {
-                max_concurrent_requests: 7168,
+                max_concurrent_requests: Some(7168),
+                capacity_from_healthy_replicas: false,
+                max_concurrent_requests_per_healthy_replica: None,
                 queue_size: 1600,
             }
         );
         assert_eq!(parsed.default_admission_partition, "default");
+    }
+
+    #[test]
+    fn test_yaml_replica_aware_admission_partition_round_trip() {
+        let yaml = r#"
+admission_partitions:
+  kimi-k3:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 34
+    queue_size: 1600
+  default:
+    capacity_from_healthy_replicas: true
+    max_concurrent_requests_per_healthy_replica: 34
+    queue_size: 80
+default_admission_partition: default
+"#;
+        let parsed: PrioritySchedulerYaml = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            parsed.admission_partitions["kimi-k3"],
+            AdmissionPartitionConfig {
+                max_concurrent_requests: None,
+                capacity_from_healthy_replicas: true,
+                max_concurrent_requests_per_healthy_replica: Some(34),
+                queue_size: 1600,
+            }
+        );
     }
 
     #[test]
