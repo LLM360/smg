@@ -59,6 +59,7 @@ from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
+from smg_grpc_servicer.sglang.request_metrics import metric_suppression_kwargs
 from smg_grpc_servicer.sglang.utils import (
     abort_code_from_output,
     prefill_prealloc_queue_reqs,
@@ -406,9 +407,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 logprob_start_len=-1,
                 top_logprobs_num=0,
                 stream=False,
-                log_metrics=False,
                 token_ids_logprob=None,
                 require_reasoning=False,
+                **metric_suppression_kwargs(TokenizedGenerateReqInput),
             )
             # Set disaggregation params if needed
             if self.server_args.disaggregation_mode != DisaggregationMode.NULL.value:

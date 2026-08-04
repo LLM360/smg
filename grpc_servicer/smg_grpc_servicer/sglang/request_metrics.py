@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from collections.abc import Mapping
 from typing import Any
 
@@ -12,6 +13,32 @@ def streaming_scheduler_request(obj: Any) -> Any:
     scheduler_obj = copy.copy(obj)
     scheduler_obj.stream = True
     return scheduler_obj
+
+
+def request_logs_metrics(obj: Any) -> bool:
+    """Return whether this SGLang request should emit tokenizer metrics."""
+    return not getattr(obj, "no_logs", False) and getattr(obj, "log_metrics", True)
+
+
+def disable_request_metrics(obj: Any) -> None:
+    """Suppress metrics across old ``no_logs`` and new ``log_metrics`` requests."""
+    if hasattr(obj, "no_logs"):
+        obj.no_logs = True
+    if hasattr(obj, "log_metrics"):
+        obj.log_metrics = False
+
+
+def metric_suppression_kwargs(request_type: Any) -> dict[str, bool]:
+    """Build compatible constructor kwargs for the installed SGLang request type."""
+    try:
+        parameters = inspect.signature(request_type).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "log_metrics" in parameters:
+        return {"log_metrics": False}
+    if "no_logs" in parameters:
+        return {"no_logs": True}
+    return {}
 
 
 def _request_has_grammar(obj: Any) -> bool:
@@ -32,7 +59,7 @@ def observe_generation_metrics(
     observe_ttft: bool,
 ) -> None:
     """Mirror SGLang tokenizer metrics for one gRPC scheduler output."""
-    if collector is None or not getattr(state.obj, "log_metrics", True):
+    if collector is None or not request_logs_metrics(state.obj):
         return
 
     labels = dict(collector.labels)
