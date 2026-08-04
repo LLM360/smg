@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import inspect
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
 
@@ -41,6 +42,26 @@ def metric_suppression_kwargs(request_type: Any) -> dict[str, bool]:
     return {}
 
 
+@cache
+def _collector_method_accepts_keyword(
+    collector_type: type[Any], method_name: str, keyword: str
+) -> bool:
+    """Return whether a collector method accepts a keyword argument.
+
+    SGLang's tokenizer collector contract changes independently of the gRPC
+    servicer. Inspect each collector class once so compatibility decisions do
+    not add per-token reflection or mask ``TypeError`` raised inside a metric
+    implementation.
+    """
+    try:
+        parameters = inspect.signature(getattr(collector_type, method_name)).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
 def _request_has_grammar(obj: Any) -> bool:
     sampling_params = getattr(obj, "sampling_params", None)
     grammar_fields = ("json_schema", "regex", "ebnf", "structural_tag")
@@ -73,9 +94,18 @@ def observe_generation_metrics(
     if not state.ttft_observed and observe_ttft:
         state.ttft_observed = True
         state.last_completion_tokens = completion_tokens
+        ttft_kwargs = {}
+        if _collector_method_accepts_keyword(
+            type(collector), "observe_time_to_first_token", "stream"
+        ):
+            # ``state.obj`` retains the external client's requested mode. The
+            # scheduler receives a forced-streaming copy solely so TTFT/TPOT
+            # remain observable for non-streaming gRPC calls.
+            ttft_kwargs["stream"] = bool(getattr(state.obj, "stream", False))
         collector.observe_time_to_first_token(
             labels,
             state.time_stats.get_first_token_latency(),
+            **ttft_kwargs,
         )
     else:
         num_new_tokens = completion_tokens - state.last_completion_tokens
