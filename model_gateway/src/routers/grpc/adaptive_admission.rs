@@ -433,10 +433,49 @@ struct WorkState {
 }
 
 #[derive(Debug)]
+struct PredictionSampleState {
+    skip_per_model: u64,
+    limit_per_model: u64,
+    seen_per_model: HashMap<String, u64>,
+}
+
+impl PredictionSampleState {
+    fn from_env() -> Option<Self> {
+        let limit_per_model =
+            std::env::var("SMG_ADAPTIVE_ADMISSION_PREDICTION_SAMPLE_LIMIT_PER_MODEL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+        if limit_per_model == 0 {
+            return None;
+        }
+        let skip_per_model =
+            std::env::var("SMG_ADAPTIVE_ADMISSION_PREDICTION_SAMPLE_SKIP_PER_MODEL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+        Some(Self {
+            skip_per_model,
+            limit_per_model,
+            seen_per_model: HashMap::new(),
+        })
+    }
+
+    fn should_record(&mut self, model: &str) -> bool {
+        let seen = self.seen_per_model.entry(model.to_string()).or_default();
+        let record = *seen >= self.skip_per_model
+            && *seen < self.skip_per_model.saturating_add(self.limit_per_model);
+        *seen = seen.saturating_add(1);
+        record
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct AdaptiveAdmissionController {
     config: AdaptiveAdmissionConfig,
     predictor: Mutex<HierarchicalPredictor>,
     work: Mutex<WorkState>,
+    prediction_samples: Option<Mutex<PredictionSampleState>>,
     registry: Arc<WorkerRegistry>,
 }
 
@@ -446,6 +485,7 @@ impl AdaptiveAdmissionController {
             predictor: Mutex::new(HierarchicalPredictor::new(&config)),
             config,
             work: Mutex::new(WorkState::default()),
+            prediction_samples: PredictionSampleState::from_env().map(Mutex::new),
             registry,
         })
     }
@@ -700,6 +740,23 @@ impl AdaptiveAdmissionController {
         histogram!(ABSOLUTE_ERROR_TOKENS, "model" => model_label)
             .record((f64::from(observed) - f64::from(inner.prediction.output_tokens)).abs());
         gauge!(SEGMENTS).set(self.predictor.lock().segments.len() as f64);
+
+        let Some(samples) = &self.prediction_samples else {
+            return;
+        };
+        if samples.lock().should_record(&inner.features.model) {
+            tracing::info!(
+                target: "smg::adaptive_admission_prediction_sample",
+                model = %inner.features.model,
+                predicted_output_tokens = inner.prediction.output_tokens,
+                observed_output_tokens = observed,
+                prediction_source = inner.prediction.source.as_str(),
+                prompt_tokens = inner.features.prompt_tokens,
+                output_limit_tokens = inner.features.max_output_tokens.unwrap_or(0),
+                generation_flags = inner.features.generation_flags,
+                "adaptive admission prediction sample"
+            );
+        }
     }
 }
 
@@ -795,6 +852,24 @@ mod tests {
             max_output_tokens: maximum,
             generation_flags: 0,
         }
+    }
+
+    #[test]
+    fn prediction_samples_skip_warmup_and_cap_each_model() {
+        let mut samples = PredictionSampleState {
+            skip_per_model: 2,
+            limit_per_model: 2,
+            seen_per_model: HashMap::new(),
+        };
+
+        assert!(!samples.should_record("model-a"));
+        assert!(!samples.should_record("model-a"));
+        assert!(samples.should_record("model-a"));
+        assert!(samples.should_record("model-a"));
+        assert!(!samples.should_record("model-a"));
+        assert!(!samples.should_record("model-b"));
+        assert!(!samples.should_record("model-b"));
+        assert!(samples.should_record("model-b"));
     }
 
     #[test]
