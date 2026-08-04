@@ -406,6 +406,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 logprob_start_len=-1,
                 top_logprobs_num=0,
                 stream=False,
+                log_metrics=False,
                 token_ids_logprob=None,
                 require_reasoning=False,
             )

@@ -41,6 +41,11 @@ from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
+from smg_grpc_servicer.sglang.request_metrics import (
+    observe_generation_metrics,
+    streaming_scheduler_request,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -144,6 +149,7 @@ class GrpcReqState:
     # Metrics (same as TokenizerManager's ReqState)
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
+    ttft_observed: bool = False
 
     # Streaming state
     stream_finished: bool = False
@@ -234,6 +240,37 @@ class GrpcRequestManager:
         # disaggregation mode
         self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
 
+        self.metrics_collector = None
+        if server_args.enable_metrics:
+            from sglang.srt.observability.metrics_collector import (
+                STAT_LOGGER_ROLE_TOKENIZER,
+                TokenizerMetricsCollector,
+                resolve_collector_class,
+            )
+
+            labels = {
+                "model_name": server_args.served_model_name,
+                "engine_type": DisaggregationMode.to_engine_type(server_args.disaggregation_mode),
+            }
+            if server_args.enable_priority_scheduling:
+                labels["priority"] = ""
+            for label in server_args.tokenizer_metrics_allowed_custom_labels or ():
+                labels[label] = ""
+            if server_args.extra_metric_labels:
+                labels.update(server_args.extra_metric_labels)
+            collector_cls = resolve_collector_class(
+                server_args,
+                STAT_LOGGER_ROLE_TOKENIZER,
+                TokenizerMetricsCollector,
+            )
+            self.metrics_collector = collector_cls(
+                server_args=server_args,
+                labels=labels,
+                bucket_time_to_first_token=server_args.bucket_time_to_first_token,
+                bucket_e2e_request_latency=server_args.bucket_e2e_request_latency,
+                bucket_inter_token_latency=server_args.bucket_inter_token_latency,
+            )
+
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
 
@@ -303,6 +340,7 @@ class GrpcRequestManager:
         prefix_obj.sampling_params = copy.copy(obj.sampling_params)
         prefix_obj.sampling_params.max_new_tokens = 0  # Prefill-only
         prefix_obj.sampling_params.n = 1  # Don't replicate prefix request
+        prefix_obj.log_metrics = False
 
         # Send prefix caching request and consume response
         async for _ in self._handle_single_request(
@@ -395,9 +433,17 @@ class GrpcRequestManager:
         self.record_request_for_crash_dump(obj)
 
         try:
-            # Send to scheduler - let exceptions bubble up to grpc_server.py
+            # Always request incremental scheduler output so TTFT and TPOT are
+            # observable even when the external gRPC request is non-streaming.
+            # The original object retains the client streaming mode, which
+            # controls buffering and response semantics below.
+            scheduler_obj = (
+                streaming_scheduler_request(obj)
+                if self.metrics_collector is not None and getattr(obj, "log_metrics", True)
+                else obj
+            )
             state.time_stats.set_api_server_dispatch_time()
-            await self._send_to_scheduler(obj)
+            await self._send_to_scheduler(scheduler_obj)
             state.time_stats.set_api_server_dispatch_finish_time()
 
             is_stream = getattr(obj, "stream", False)
@@ -654,11 +700,9 @@ class GrpcRequestManager:
                 logger.debug(f"Skipping output for aborted request {rid}")
                 continue
 
-            # Update metrics
+            # The first scheduler output is the first observable token.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
-            else:
-                state.time_stats.set_last_time()
 
             # Extract output for this request
             prompt_tokens = batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
@@ -669,6 +713,19 @@ class GrpcRequestManager:
             token_ids = batch_out.output_ids[i] if batch_out.output_ids else []
             finished = batch_out.finished_reasons[i] is not None
             finish_reason = batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
+
+            if finished:
+                state.finished = True
+                state.time_stats.set_finished_time()
+
+            observe_generation_metrics(
+                self.metrics_collector,
+                state,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                observe_ttft=self.disaggregation_mode != DisaggregationMode.PREFILL,
+            )
 
             output_data = {
                 "request_id": rid,
@@ -750,8 +807,6 @@ class GrpcRequestManager:
 
             # Handle completion
             if output_data["finished"]:
-                state.finished = True
-                state.time_stats.set_finished_time()
                 state.stream_finished = True
                 state.event.set()
 
