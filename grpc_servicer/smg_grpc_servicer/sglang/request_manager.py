@@ -42,7 +42,9 @@ from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 from smg_grpc_servicer.sglang.request_metrics import (
+    disable_request_metrics,
     observe_generation_metrics,
+    request_logs_metrics,
     streaming_scheduler_request,
 )
 
@@ -340,7 +342,7 @@ class GrpcRequestManager:
         prefix_obj.sampling_params = copy.copy(obj.sampling_params)
         prefix_obj.sampling_params.max_new_tokens = 0  # Prefill-only
         prefix_obj.sampling_params.n = 1  # Don't replicate prefix request
-        prefix_obj.log_metrics = False
+        disable_request_metrics(prefix_obj)
 
         # Send prefix caching request and consume response
         async for _ in self._handle_single_request(
@@ -439,7 +441,7 @@ class GrpcRequestManager:
             # controls buffering and response semantics below.
             scheduler_obj = (
                 streaming_scheduler_request(obj)
-                if self.metrics_collector is not None and getattr(obj, "log_metrics", True)
+                if self.metrics_collector is not None and request_logs_metrics(obj)
                 else obj
             )
             state.time_stats.set_api_server_dispatch_time()

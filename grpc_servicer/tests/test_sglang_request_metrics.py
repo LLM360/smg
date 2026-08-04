@@ -8,6 +8,9 @@ assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 observe_generation_metrics = _MODULE.observe_generation_metrics
+disable_request_metrics = _MODULE.disable_request_metrics
+metric_suppression_kwargs = _MODULE.metric_suppression_kwargs
+request_logs_metrics = _MODULE.request_logs_metrics
 streaming_scheduler_request = _MODULE.streaming_scheduler_request
 
 
@@ -129,3 +132,42 @@ def test_generation_metrics_skip_health_checks():
     assert collector.ttft == []
     assert collector.tpot == []
     assert collector.finished == []
+
+
+def test_no_logs_request_skips_metrics_for_older_sglang():
+    collector = FakeCollector()
+    state = make_state(finished=True)
+    state.obj.no_logs = True
+
+    observe_generation_metrics(
+        collector,
+        state,
+        prompt_tokens=1,
+        completion_tokens=1,
+        cached_tokens=0,
+        observe_ttft=True,
+    )
+
+    assert collector.ttft == []
+    assert collector.tpot == []
+    assert collector.finished == []
+
+
+def test_metric_suppression_uses_installed_request_contract():
+    class NewRequest:
+        def __init__(self, *, log_metrics=True):
+            self.log_metrics = log_metrics
+
+    class OldRequest:
+        __slots__ = ("no_logs",)
+
+        def __init__(self, *, no_logs=False):
+            self.no_logs = no_logs
+
+    assert metric_suppression_kwargs(NewRequest) == {"log_metrics": False}
+    assert metric_suppression_kwargs(OldRequest) == {"no_logs": True}
+
+    old_request = OldRequest()
+    disable_request_metrics(old_request)
+    assert old_request.no_logs is True
+    assert request_logs_metrics(old_request) is False
