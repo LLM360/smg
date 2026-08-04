@@ -29,7 +29,12 @@ use crate::{
 const ADMISSION_PARTITION_LABEL: &str = "admission_partition";
 
 const PREDICTIONS_TOTAL: &str = "smg_adaptive_admission_predictions_total";
+const BASE_PREDICTED_OUTPUT_TOKENS: &str = "smg_adaptive_admission_base_predicted_output_tokens";
+const MEDIAN_PREDICTED_OUTPUT_TOKENS: &str =
+    "smg_adaptive_admission_median_predicted_output_tokens";
 const PREDICTED_OUTPUT_TOKENS: &str = "smg_adaptive_admission_predicted_output_tokens";
+const PREDICTED_STDDEV_TOKENS: &str = "smg_adaptive_admission_predicted_stddev_tokens";
+const CALIBRATOR_OBSERVATIONS: &str = "smg_adaptive_admission_calibrator_observations";
 const OBSERVED_OUTPUT_TOKENS: &str = "smg_adaptive_admission_observed_output_tokens";
 const ABSOLUTE_ERROR_TOKENS: &str = "smg_adaptive_admission_absolute_error_tokens";
 const DECISIONS_TOTAL: &str = "smg_adaptive_admission_decisions_total";
@@ -47,6 +52,13 @@ const ENGINE_WAITING_TOKENS: &str = "smg_adaptive_admission_engine_waiting_uncac
 const ENGINE_TOKEN_USAGE: &str = "smg_adaptive_admission_engine_max_token_usage";
 const SEGMENTS: &str = "smg_adaptive_admission_estimator_segments";
 
+const CALIBRATOR_DIM: usize = 14;
+const OUTPUT_LOG_SCALE: f64 = 10.397_238_170_363_83; // ln(32_768 + 1)
+const PROMPT_LOG_SCALE: f64 = 13.862_944_611_198_906; // ln(1_048_576 + 1)
+const LIMIT_LOG_SCALE: f64 = 11.090_370_929_060_786; // ln(65_536 + 1)
+const MAX_CALIBRATION_FACTOR: f64 = 8.0;
+const MAX_RESIDUAL_RATIO: f64 = 64.0;
+
 pub(crate) const FLAG_MULTIPLE_COMPLETIONS: u16 = 1 << 0;
 pub(crate) const FLAG_TOOLS: u16 = 1 << 1;
 pub(crate) const FLAG_STRUCTURED_OUTPUT: u16 = 1 << 2;
@@ -59,8 +71,24 @@ pub(crate) fn describe_metrics() {
         "Adaptive output-token predictions by model and fallback level"
     );
     describe_histogram!(
+        BASE_PREDICTED_OUTPUT_TOKENS,
+        "Hierarchical output-token prediction before online calibration"
+    );
+    describe_histogram!(
+        MEDIAN_PREDICTED_OUTPUT_TOKENS,
+        "Online-calibrated median output-token prediction"
+    );
+    describe_histogram!(
         PREDICTED_OUTPUT_TOKENS,
-        "Predicted completion tokens per adaptive-admission request"
+        "Expected completion tokens reserved per adaptive-admission request"
+    );
+    describe_histogram!(
+        PREDICTED_STDDEV_TOKENS,
+        "Estimated output-token standard deviation per adaptive-admission request"
+    );
+    describe_gauge!(
+        CALIBRATOR_OBSERVATIONS,
+        "Completed requests learned by each per-model online calibrator"
     );
     describe_histogram!(
         OBSERVED_OUTPUT_TOKENS,
@@ -184,7 +212,11 @@ impl PredictionSource {
 
 #[derive(Debug, Clone)]
 struct Prediction {
+    base_output_tokens: u32,
+    median_output_tokens: u32,
     output_tokens: u32,
+    variance_tokens: f64,
+    calibrator_observations: u64,
     model_output_tokens: u32,
     source: PredictionSource,
 }
@@ -242,6 +274,255 @@ impl DecayedMean {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DecayedMoments {
+    weight: f64,
+    weighted_sum: f64,
+    weighted_sum_squares: f64,
+    last_update: Instant,
+}
+
+impl DecayedMoments {
+    fn with_unit_prior(prior_observations: f64, now: Instant) -> Self {
+        let weight = prior_observations.max(1.0);
+        Self {
+            weight,
+            weighted_sum: weight,
+            weighted_sum_squares: weight,
+            last_update: now,
+        }
+    }
+
+    fn current(&self) -> (f64, f64) {
+        if self.weight <= f64::EPSILON {
+            return (1.0, 0.0);
+        }
+        let mean = self.weighted_sum / self.weight;
+        let second_moment = self.weighted_sum_squares / self.weight;
+        (mean, (second_moment - mean * mean).max(0.0))
+    }
+
+    fn update(&mut self, value: f64, now: Instant, half_life_secs: f64) {
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f64();
+        let decay = 2.0_f64.powf(-elapsed / half_life_secs.max(f64::EPSILON));
+        self.weight = self.weight * decay + 1.0;
+        self.weighted_sum = self.weighted_sum * decay + value;
+        self.weighted_sum_squares = self.weighted_sum_squares * decay + value * value;
+        self.last_update = now;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CalibratedEstimate {
+    median_tokens: u32,
+    expected_tokens: u32,
+    variance_tokens: f64,
+    observations: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OnlineCalibrator {
+    weights: [f64; CALIBRATOR_DIM],
+    inverse_covariance: [[f64; CALIBRATOR_DIM]; CALIBRATOR_DIM],
+    residual_ratio: DecayedMoments,
+    observations: u64,
+    last_update: Instant,
+}
+
+impl OnlineCalibrator {
+    fn new(prior_observations: f64, now: Instant) -> Self {
+        let mut weights = [0.0; CALIBRATOR_DIM];
+        // The untrained calibrator reproduces the hierarchical prediction.
+        weights[1] = 1.0;
+        let mut inverse_covariance = [[0.0; CALIBRATOR_DIM]; CALIBRATOR_DIM];
+        for (index, row) in inverse_covariance.iter_mut().enumerate() {
+            row[index] = 1.0;
+        }
+        Self {
+            weights,
+            inverse_covariance,
+            residual_ratio: DecayedMoments::with_unit_prior(prior_observations, now),
+            observations: 0,
+            last_update: now,
+        }
+    }
+
+    fn features(
+        request: &PredictionFeatures,
+        source: PredictionSource,
+        base_output_tokens: u32,
+    ) -> [f64; CALIBRATOR_DIM] {
+        let mut values = [0.0; CALIBRATOR_DIM];
+        values[0] = 1.0;
+        values[1] = f64::from(base_output_tokens).ln_1p() / OUTPUT_LOG_SCALE;
+        values[2] = f64::from(request.prompt_tokens).ln_1p() / PROMPT_LOG_SCALE;
+        values[3] = request
+            .max_output_tokens
+            .map_or(0.0, |tokens| f64::from(tokens).ln_1p() / LIMIT_LOG_SCALE);
+        values[4] = if request.max_output_tokens.is_none() {
+            1.0
+        } else {
+            0.0
+        };
+        for bit in 0..5 {
+            values[5 + bit] = f64::from((request.generation_flags >> bit) & 1);
+        }
+        values[10] = f64::from(source == PredictionSource::Model);
+        values[11] = f64::from(source == PredictionSource::UserOrWorkload);
+        values[12] = f64::from(source == PredictionSource::UserWorkload);
+        values[13] = f64::from(source == PredictionSource::Full);
+        values
+    }
+
+    fn raw_location(&self, features: &[f64; CALIBRATOR_DIM]) -> f64 {
+        self.weights
+            .iter()
+            .zip(features)
+            .map(|(weight, feature)| weight * feature)
+            .sum()
+    }
+
+    fn reset_regression(&mut self) {
+        self.weights = [0.0; CALIBRATOR_DIM];
+        self.weights[1] = 1.0;
+        self.inverse_covariance = [[0.0; CALIBRATOR_DIM]; CALIBRATOR_DIM];
+        for (index, row) in self.inverse_covariance.iter_mut().enumerate() {
+            row[index] = 1.0;
+        }
+    }
+
+    fn regression_is_finite(&self) -> bool {
+        self.weights.iter().all(|value| value.is_finite())
+            && self
+                .inverse_covariance
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+    }
+
+    fn bounded_median(
+        &self,
+        request: &PredictionFeatures,
+        source: PredictionSource,
+        base_output_tokens: u32,
+    ) -> u32 {
+        let features = Self::features(request, source, base_output_tokens);
+        let raw = self.raw_location(&features);
+        if !raw.is_finite() {
+            return request
+                .max_output_tokens
+                .map_or(base_output_tokens, |maximum| {
+                    base_output_tokens.min(maximum.max(1))
+                });
+        }
+        let lower_tokens = (f64::from(base_output_tokens) / MAX_CALIBRATION_FACTOR).max(1.0);
+        let upper_tokens =
+            (f64::from(base_output_tokens) * MAX_CALIBRATION_FACTOR).min(f64::from(u32::MAX));
+        let lower = lower_tokens.ln_1p() / OUTPUT_LOG_SCALE;
+        let upper = upper_tokens.ln_1p() / OUTPUT_LOG_SCALE;
+        let tokens = (raw.clamp(lower, upper) * OUTPUT_LOG_SCALE)
+            .exp_m1()
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        request
+            .max_output_tokens
+            .map_or(tokens, |maximum| tokens.min(maximum.max(1)))
+    }
+
+    fn predict(
+        &self,
+        request: &PredictionFeatures,
+        source: PredictionSource,
+        base_output_tokens: u32,
+    ) -> CalibratedEstimate {
+        let median_tokens = self.bounded_median(request, source, base_output_tokens);
+        let (ratio_mean, ratio_variance) = self.residual_ratio.current();
+        let median_plus_one = f64::from(median_tokens) + 1.0;
+        let lower = (f64::from(base_output_tokens) / MAX_CALIBRATION_FACTOR).max(1.0);
+        let upper =
+            (f64::from(base_output_tokens) * MAX_CALIBRATION_FACTOR).min(f64::from(u32::MAX));
+        let mut expected = (median_plus_one * ratio_mean - 1.0).clamp(lower, upper);
+        if let Some(maximum) = request.max_output_tokens {
+            expected = expected.min(f64::from(maximum.max(1)));
+        }
+        let maximum_variance = upper * upper;
+        let variance_tokens =
+            (median_plus_one * median_plus_one * ratio_variance).clamp(0.0, maximum_variance);
+        CalibratedEstimate {
+            median_tokens,
+            expected_tokens: expected.round() as u32,
+            variance_tokens,
+            observations: self.observations,
+        }
+    }
+
+    fn update(
+        &mut self,
+        request: &PredictionFeatures,
+        prediction: &Prediction,
+        observed_tokens: u32,
+        now: Instant,
+        half_life_secs: f64,
+    ) {
+        let features = Self::features(request, prediction.source, prediction.base_output_tokens);
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f64();
+        let forgetting = 2.0_f64
+            .powf(-elapsed / half_life_secs.max(f64::EPSILON))
+            .clamp(0.5, 1.0);
+        let mut projected = [0.0; CALIBRATOR_DIM];
+        for (row_index, row) in self.inverse_covariance.iter().enumerate() {
+            projected[row_index] = row
+                .iter()
+                .zip(features)
+                .map(|(value, feature)| value * feature)
+                .sum();
+        }
+        let denominator = forgetting
+            + features
+                .iter()
+                .zip(projected)
+                .map(|(feature, value)| feature * value)
+                .sum::<f64>();
+        if denominator.is_finite() && denominator > f64::EPSILON {
+            let gain = projected.map(|value| value / denominator);
+            let target = f64::from(observed_tokens).ln_1p() / OUTPUT_LOG_SCALE;
+            let max_error = MAX_RESIDUAL_RATIO.ln() / OUTPUT_LOG_SCALE;
+            let error = (target - self.raw_location(&features)).clamp(-max_error, max_error);
+            for (weight, gain_value) in self.weights.iter_mut().zip(gain) {
+                *weight += gain_value * error;
+            }
+            for (row, gain_value) in self.inverse_covariance.iter_mut().zip(gain) {
+                for (value, projected_value) in row.iter_mut().zip(projected) {
+                    *value = (*value - gain_value * projected_value) / forgetting;
+                }
+            }
+            for row in 0..CALIBRATOR_DIM {
+                for column in (row + 1)..CALIBRATOR_DIM {
+                    let symmetric = (self.inverse_covariance[row][column]
+                        + self.inverse_covariance[column][row])
+                        / 2.0;
+                    self.inverse_covariance[row][column] = symmetric;
+                    self.inverse_covariance[column][row] = symmetric;
+                }
+            }
+            if !self.regression_is_finite() {
+                self.reset_regression();
+            }
+        }
+
+        let ratio = ((f64::from(observed_tokens) + 1.0)
+            / (f64::from(prediction.median_output_tokens) + 1.0))
+            .clamp(1.0 / MAX_RESIDUAL_RATIO, MAX_RESIDUAL_RATIO);
+        self.residual_ratio.update(ratio, now, half_life_secs);
+        self.observations = self.observations.saturating_add(1);
+        self.last_update = now;
+    }
+}
+
 #[derive(Debug)]
 struct HierarchicalPredictor {
     half_life_secs: f64,
@@ -249,6 +530,8 @@ struct HierarchicalPredictor {
     cold_start_output_tokens: u32,
     max_segments: usize,
     segments: HashMap<SegmentKey, DecayedMean>,
+    calibrator_enabled: bool,
+    calibrators: HashMap<String, OnlineCalibrator>,
 }
 
 impl HierarchicalPredictor {
@@ -259,6 +542,8 @@ impl HierarchicalPredictor {
             cold_start_output_tokens: config.cold_start_output_tokens,
             max_segments: config.max_segments,
             segments: HashMap::new(),
+            calibrator_enabled: config.calibrator_enabled,
+            calibrators: HashMap::new(),
         }
     }
 
@@ -339,15 +624,55 @@ impl HierarchicalPredictor {
         } else {
             PredictionSource::ColdStart
         };
-        let mut output_tokens = full_prediction.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+        let mut base_output_tokens = full_prediction.round().clamp(1.0, f64::from(u32::MAX)) as u32;
         if let Some(maximum) = features.max_output_tokens {
-            output_tokens = output_tokens.min(maximum.max(1));
+            base_output_tokens = base_output_tokens.min(maximum.max(1));
         }
+        let calibrated = self
+            .calibrator_enabled
+            .then(|| self.calibrators.get(&features.model))
+            .flatten()
+            .map_or(
+                CalibratedEstimate {
+                    median_tokens: base_output_tokens,
+                    expected_tokens: base_output_tokens,
+                    variance_tokens: 0.0,
+                    observations: 0,
+                },
+                |calibrator| calibrator.predict(features, source, base_output_tokens),
+            );
         Prediction {
-            output_tokens,
+            base_output_tokens,
+            median_output_tokens: calibrated.median_tokens,
+            output_tokens: calibrated.expected_tokens,
+            variance_tokens: calibrated.variance_tokens,
+            calibrator_observations: calibrated.observations,
             model_output_tokens: model_prediction.round().clamp(1.0, f64::from(u32::MAX)) as u32,
             source,
         }
+    }
+
+    fn observe_prediction_at(
+        &mut self,
+        features: &PredictionFeatures,
+        prediction: &Prediction,
+        output_tokens: u32,
+        now: Instant,
+    ) {
+        if self.calibrator_enabled {
+            self.calibrators
+                .entry(features.model.clone())
+                .or_insert_with(|| OnlineCalibrator::new(self.prior_observations, now))
+                .update(
+                    features,
+                    prediction,
+                    output_tokens,
+                    now,
+                    self.half_life_secs,
+                );
+            self.evict_oldest_calibrators();
+        }
+        self.observe_at(features, output_tokens, now);
     }
 
     fn observe_at(&mut self, features: &PredictionFeatures, output_tokens: u32, now: Instant) {
@@ -379,6 +704,22 @@ impl HierarchicalPredictor {
         oldest.sort_unstable_by_key(|(_, updated)| *updated);
         for (key, _) in oldest.into_iter().take(excess) {
             self.segments.remove(&key);
+        }
+    }
+
+    fn evict_oldest_calibrators(&mut self) {
+        if self.calibrators.len() <= self.max_segments {
+            return;
+        }
+        let excess = self.calibrators.len().saturating_sub(self.max_segments);
+        let mut oldest: Vec<_> = self
+            .calibrators
+            .iter()
+            .map(|(model, calibrator)| (model.clone(), calibrator.last_update))
+            .collect();
+        oldest.sort_unstable_by_key(|(_, updated)| *updated);
+        for (model, _) in oldest.into_iter().take(excess) {
+            self.calibrators.remove(&model);
         }
     }
 }
@@ -625,8 +966,16 @@ impl AdaptiveAdmissionController {
             "source" => prediction.source.as_str()
         )
         .increment(1);
-        histogram!(PREDICTED_OUTPUT_TOKENS, "model" => model_label)
+        histogram!(BASE_PREDICTED_OUTPUT_TOKENS, "model" => Arc::clone(&model_label))
+            .record(f64::from(prediction.base_output_tokens));
+        histogram!(MEDIAN_PREDICTED_OUTPUT_TOKENS, "model" => Arc::clone(&model_label))
+            .record(f64::from(prediction.median_output_tokens));
+        histogram!(PREDICTED_OUTPUT_TOKENS, "model" => Arc::clone(&model_label))
             .record(f64::from(prediction.output_tokens));
+        histogram!(PREDICTED_STDDEV_TOKENS, "model" => Arc::clone(&model_label))
+            .record(prediction.variance_tokens.sqrt());
+        gauge!(CALIBRATOR_OBSERVATIONS, "model" => model_label)
+            .set(prediction.calibrator_observations as f64);
 
         let decision = {
             let mut work = self.work.lock();
@@ -731,15 +1080,22 @@ impl AdaptiveAdmissionController {
         let Some(observed) = observed_output_tokens else {
             return;
         };
-        self.predictor
-            .lock()
-            .observe_at(&inner.features, observed, Instant::now());
+        let segment_count = {
+            let mut predictor = self.predictor.lock();
+            predictor.observe_prediction_at(
+                &inner.features,
+                &inner.prediction,
+                observed,
+                Instant::now(),
+            );
+            predictor.segments.len()
+        };
         let model_label = intern_string(&inner.features.model);
         histogram!(OBSERVED_OUTPUT_TOKENS, "model" => Arc::clone(&model_label))
             .record(f64::from(observed));
         histogram!(ABSOLUTE_ERROR_TOKENS, "model" => model_label)
             .record((f64::from(observed) - f64::from(inner.prediction.output_tokens)).abs());
-        gauge!(SEGMENTS).set(self.predictor.lock().segments.len() as f64);
+        gauge!(SEGMENTS).set(segment_count as f64);
 
         let Some(samples) = &self.prediction_samples else {
             return;
@@ -749,6 +1105,10 @@ impl AdaptiveAdmissionController {
                 target: "smg::adaptive_admission_prediction_sample",
                 model = %inner.features.model,
                 predicted_output_tokens = inner.prediction.output_tokens,
+                median_predicted_output_tokens = inner.prediction.median_output_tokens,
+                base_predicted_output_tokens = inner.prediction.base_output_tokens,
+                predicted_stddev_tokens = inner.prediction.variance_tokens.sqrt(),
+                calibrator_observations = inner.prediction.calibrator_observations,
                 observed_output_tokens = observed,
                 prediction_source = inner.prediction.source.as_str(),
                 prompt_tokens = inner.features.prompt_tokens,
@@ -839,6 +1199,7 @@ mod tests {
             max_segments: 20,
             min_load_coverage: 0.8,
             cold_start_output_tokens: 100,
+            calibrator_enabled: false,
         }
     }
 
@@ -901,6 +1262,80 @@ mod tests {
         predictor.observe_at(&user_a, 400, start + Duration::from_secs(600));
         let shifted = predictor.predict_at(&user_a, start + Duration::from_secs(601));
         assert!(shifted.output_tokens > prediction.output_tokens);
+    }
+
+    #[test]
+    fn online_calibrator_learns_prompt_conditioned_residuals() {
+        let start = Instant::now();
+        let mut calibrator = OnlineCalibrator::new(2.0, start);
+        let low = features("same-user", 16, None);
+        let high = features("same-user", 65_536, None);
+
+        for index in 0..200 {
+            let request = if index % 2 == 0 { &low } else { &high };
+            let now = start + Duration::from_millis(index);
+            let estimate = calibrator.predict(request, PredictionSource::Full, 100);
+            let prediction = Prediction {
+                base_output_tokens: 100,
+                median_output_tokens: estimate.median_tokens,
+                output_tokens: estimate.expected_tokens,
+                variance_tokens: estimate.variance_tokens,
+                calibrator_observations: estimate.observations,
+                model_output_tokens: 100,
+                source: PredictionSource::Full,
+            };
+            calibrator.update(
+                request,
+                &prediction,
+                if index % 2 == 0 { 20 } else { 400 },
+                now,
+                900.0,
+            );
+        }
+
+        let low_prediction = calibrator.predict(&low, PredictionSource::Full, 100);
+        let high_prediction = calibrator.predict(&high, PredictionSource::Full, 100);
+        assert!(low_prediction.median_tokens < 60, "{low_prediction:?}");
+        assert!(high_prediction.median_tokens > 200, "{high_prediction:?}");
+        assert!(
+            high_prediction.median_tokens > low_prediction.median_tokens * 4,
+            "low={low_prediction:?} high={high_prediction:?}"
+        );
+        assert_eq!(high_prediction.observations, 200);
+        assert!(high_prediction.variance_tokens.is_finite());
+    }
+
+    #[test]
+    fn online_calibrator_is_bounded_by_base_factor_and_request_limit() {
+        let start = Instant::now();
+        let mut calibrator = OnlineCalibrator::new(2.0, start);
+        let unlimited = features("u", 10, None);
+        for index in 0..100 {
+            let now = start + Duration::from_millis(index);
+            let estimate = calibrator.predict(&unlimited, PredictionSource::Full, 100);
+            let prediction = Prediction {
+                base_output_tokens: 100,
+                median_output_tokens: estimate.median_tokens,
+                output_tokens: estimate.expected_tokens,
+                variance_tokens: estimate.variance_tokens,
+                calibrator_observations: estimate.observations,
+                model_output_tokens: 100,
+                source: PredictionSource::Full,
+            };
+            calibrator.update(&unlimited, &prediction, u32::MAX, now, 900.0);
+        }
+        let unbounded = calibrator.predict(&unlimited, PredictionSource::Full, 100);
+        assert!(unbounded.median_tokens <= 800, "{unbounded:?}");
+        assert!(unbounded.expected_tokens <= 800, "{unbounded:?}");
+
+        let limited = features("u", 10, Some(50));
+        let bounded = calibrator.predict(&limited, PredictionSource::Full, 100);
+        assert!(bounded.median_tokens <= 50, "{bounded:?}");
+        assert!(bounded.expected_tokens <= 50, "{bounded:?}");
+
+        calibrator.weights[0] = f64::NAN;
+        let invalid = calibrator.predict(&unlimited, PredictionSource::Full, 100);
+        assert_eq!(invalid.median_tokens, 100);
     }
 
     #[test]

@@ -65,6 +65,10 @@ fn default_adaptive_cold_start_output_tokens() -> u32 {
     4096
 }
 
+fn default_adaptive_calibrator_enabled() -> bool {
+    false
+}
+
 /// Predictive token-work admission settings.
 ///
 /// The work horizon is an operator-facing latency objective rather than a
@@ -89,6 +93,11 @@ pub struct AdaptiveAdmissionConfig {
     pub min_load_coverage: f64,
     #[serde(default = "default_adaptive_cold_start_output_tokens")]
     pub cold_start_output_tokens: u32,
+    /// Apply a bounded per-model online residual regression to the hierarchical
+    /// output-token estimate. Disabled by default so existing enforce-mode
+    /// deployments retain their admission behavior until explicitly canaried.
+    #[serde(default = "default_adaptive_calibrator_enabled")]
+    pub calibrator_enabled: bool,
 }
 
 impl Default for AdaptiveAdmissionConfig {
@@ -101,6 +110,7 @@ impl Default for AdaptiveAdmissionConfig {
             max_segments: default_adaptive_max_segments(),
             min_load_coverage: default_adaptive_min_load_coverage(),
             cold_start_output_tokens: default_adaptive_cold_start_output_tokens(),
+            calibrator_enabled: default_adaptive_calibrator_enabled(),
         }
     }
 }

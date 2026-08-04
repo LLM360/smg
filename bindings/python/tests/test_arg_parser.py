@@ -59,6 +59,7 @@ class TestRouterArgs:
         assert args.adaptive_admission_max_segments == 50_000
         assert args.adaptive_admission_min_load_coverage == 0.8
         assert args.adaptive_admission_cold_start_output_tokens == 4096
+        assert args.adaptive_admission_calibrator_enabled is False
 
     def test_parse_priority_scheduler_options(self):
         args = parse_router_args(
@@ -96,6 +97,7 @@ class TestRouterArgs:
                 "0.75",
                 "--adaptive-admission-cold-start-output-tokens",
                 "2048",
+                "--adaptive-admission-calibrator-enabled",
             ]
         )
 
@@ -107,6 +109,7 @@ class TestRouterArgs:
         assert args.adaptive_admission_max_segments == 12_345
         assert args.adaptive_admission_min_load_coverage == 0.75
         assert args.adaptive_admission_cold_start_output_tokens == 2048
+        assert args.adaptive_admission_calibrator_enabled is True
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""

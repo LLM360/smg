@@ -130,6 +130,7 @@ class RouterArgs:
     adaptive_admission_max_segments: int = 50_000
     adaptive_admission_min_load_coverage: float = 0.8
     adaptive_admission_cold_start_output_tokens: int = 4096
+    adaptive_admission_calibrator_enabled: bool = False
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: int | None = None
     # Cluster-wide requests-per-second ceiling. Requires mesh and the same value on every gateway.
@@ -926,6 +927,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.adaptive_admission_cold_start_output_tokens,
             help="Cold-start output-token prediction before observations",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-calibrator-enabled",
+            action="store_true",
+            default=RouterArgs.adaptive_admission_calibrator_enabled,
+            help="Enable bounded online residual calibration of output-token predictions",
         )
 
         # Retry configuration

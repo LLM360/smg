@@ -552,6 +552,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 4096, help_heading = "Adaptive Admission")]
     adaptive_admission_cold_start_output_tokens: u32,
 
+    /// Enable bounded per-model online residual calibration of output-token
+    /// predictions. Off by default for admission-behavior compatibility.
+    #[arg(long, help_heading = "Adaptive Admission")]
+    adaptive_admission_calibrator_enabled: bool,
+
     // ==================== Tenant Rate Limit ====================
     /// Enable per-tenant LLM token/request rate limiting. When unset
     /// (default), no rate limiter is constructed.
@@ -1562,6 +1567,7 @@ impl CliArgs {
                 max_segments: self.adaptive_admission_max_segments,
                 min_load_coverage: self.adaptive_admission_min_load_coverage,
                 cold_start_output_tokens: self.adaptive_admission_cold_start_output_tokens,
+                calibrator_enabled: self.adaptive_admission_calibrator_enabled,
             })
             .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())

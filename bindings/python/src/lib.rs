@@ -505,6 +505,7 @@ struct Router {
     adaptive_admission_max_segments: usize,
     adaptive_admission_min_load_coverage: f64,
     adaptive_admission_cold_start_output_tokens: u32,
+    adaptive_admission_calibrator_enabled: bool,
 }
 
 impl Router {
@@ -799,6 +800,7 @@ impl Router {
                 max_segments: self.adaptive_admission_max_segments,
                 min_load_coverage: self.adaptive_admission_min_load_coverage,
                 cold_start_output_tokens: self.adaptive_admission_cold_start_output_tokens,
+                calibrator_enabled: self.adaptive_admission_calibrator_enabled,
             })
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
@@ -1026,6 +1028,7 @@ impl Router {
         adaptive_admission_max_segments = 50000,
         adaptive_admission_min_load_coverage = 0.8,
         adaptive_admission_cold_start_output_tokens = 4096,
+        adaptive_admission_calibrator_enabled = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1170,6 +1173,7 @@ impl Router {
         adaptive_admission_max_segments: usize,
         adaptive_admission_min_load_coverage: f64,
         adaptive_admission_cold_start_output_tokens: u32,
+        adaptive_admission_calibrator_enabled: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1328,6 +1332,7 @@ impl Router {
             adaptive_admission_max_segments,
             adaptive_admission_min_load_coverage,
             adaptive_admission_cold_start_output_tokens,
+            adaptive_admission_calibrator_enabled,
         })
     }
 
