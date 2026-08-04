@@ -48,10 +48,11 @@ class FakeCollector:
         self.finished.append(args)
 
 
-def make_state(*, finished: bool = False, log_metrics: bool = True):
+def make_state(*, finished: bool = False, log_metrics: bool = True, stream: bool = False):
     return SimpleNamespace(
         obj=SimpleNamespace(
             log_metrics=log_metrics,
+            stream=stream,
             sampling_params=SimpleNamespace(
                 json_schema=None,
                 regex=None,
@@ -114,6 +115,91 @@ def test_generation_metrics_record_ttft_then_tpot_and_finished_request():
             False,
         )
     ]
+
+
+def test_older_collector_receives_external_client_stream_mode():
+    class OlderCollector(FakeCollector):
+        def observe_time_to_first_token(self, labels, value, *, stream) -> None:
+            self.ttft.append((labels, value, stream))
+
+    non_streaming_collector = OlderCollector()
+    non_streaming_state = make_state(stream=False)
+    observe_generation_metrics(
+        non_streaming_collector,
+        non_streaming_state,
+        prompt_tokens=100,
+        completion_tokens=3,
+        cached_tokens=40,
+        observe_ttft=True,
+    )
+
+    streaming_collector = OlderCollector()
+    streaming_state = make_state(stream=True)
+    observe_generation_metrics(
+        streaming_collector,
+        streaming_state,
+        prompt_tokens=100,
+        completion_tokens=3,
+        cached_tokens=40,
+        observe_ttft=True,
+    )
+
+    labels = {"model_name": "kimi-k3", "engine_type": "unified"}
+    assert non_streaming_collector.ttft == [(labels, 1.25, False)]
+    assert streaming_collector.ttft == [(labels, 1.25, True)]
+
+
+def test_older_collector_records_tpot_and_finished_request():
+    class OlderCollector(FakeCollector):
+        def observe_time_to_first_token(self, labels, value, *, stream) -> None:
+            self.ttft.append((labels, value, stream))
+
+    collector = OlderCollector()
+    state = make_state(stream=False)
+    observe_generation_metrics(
+        collector,
+        state,
+        prompt_tokens=100,
+        completion_tokens=3,
+        cached_tokens=40,
+        observe_ttft=True,
+    )
+    state.finished = True
+    observe_generation_metrics(
+        collector,
+        state,
+        prompt_tokens=100,
+        completion_tokens=7,
+        cached_tokens=40,
+        observe_ttft=True,
+    )
+
+    labels = {"model_name": "kimi-k3", "engine_type": "unified"}
+    assert collector.tpot == [(labels, 0.4, 4)]
+    assert collector.finished == [(labels, 100, 7, 40, 2.5, False)]
+
+
+def test_collector_internal_type_error_is_not_masked():
+    class BrokenCollector(FakeCollector):
+        def observe_time_to_first_token(self, labels, value, *, stream) -> None:
+            raise TypeError("collector implementation failed")
+
+    collector = BrokenCollector()
+    state = make_state()
+
+    try:
+        observe_generation_metrics(
+            collector,
+            state,
+            prompt_tokens=100,
+            completion_tokens=3,
+            cached_tokens=40,
+            observe_ttft=True,
+        )
+    except TypeError as exc:
+        assert str(exc) == "collector implementation failed"
+    else:
+        raise AssertionError("collector TypeError should propagate")
 
 
 def test_generation_metrics_skip_health_checks():
