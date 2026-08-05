@@ -74,8 +74,13 @@ enum StreamResult {
     Ended,
     /// Stream produced an error.
     Error(String),
-    /// Detected a gap in sequence numbers.
-    GapDetected { expected: u64, received: u64 },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BatchResult {
+    Stale,
+    Applied,
+    GapRecovered { expected: u64, received: u64 },
 }
 
 impl KvEventMonitor {
@@ -507,15 +512,6 @@ impl KvEventMonitor {
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
-                StreamResult::GapDetected { expected, received } => {
-                    warn!(
-                        worker_url = %worker_url,
-                        expected = expected,
-                        received = received,
-                        "Sequence gap detected, reconnecting for replay from seq {last_seq}"
-                    );
-                    // No backoff — gap replay is a normal recovery path.
-                }
             }
         }
     }
@@ -542,35 +538,71 @@ impl KvEventMonitor {
                 Err(e) => return StreamResult::Error(e.to_string()),
             };
 
-            // Skip stale/duplicate batches (can occur after reconnect replay).
-            if *last_seq > 0 && batch.sequence_number <= *last_seq {
-                debug!(
-                    worker_url = %worker_url,
-                    last_seq = *last_seq,
-                    received = batch.sequence_number,
-                    "Skipping stale KV event batch"
-                );
-                continue;
-            }
-
-            // Gap detection.
-            if *last_seq > 0 && batch.sequence_number > *last_seq + 1 {
-                return StreamResult::GapDetected {
-                    expected: *last_seq + 1,
-                    received: batch.sequence_number,
-                };
-            }
-
-            on_batch(&batch);
-
-            for event in &batch.events {
-                Self::apply_event(event, worker_id, indexer, worker_blocks);
-            }
-
-            *last_seq = batch.sequence_number;
+            Self::process_batch(
+                &batch,
+                worker_url,
+                worker_id,
+                indexer,
+                worker_blocks,
+                last_seq,
+                &mut on_batch,
+            );
         }
 
         StreamResult::Ended
+    }
+
+    /// Apply one KV event batch, recovering live-only streams after a sequence gap.
+    fn process_batch(
+        batch: &KvEventBatch,
+        worker_url: &str,
+        worker_id: u32,
+        indexer: &PositionalIndexer,
+        worker_blocks: &mut WorkerBlockMap,
+        last_seq: &mut u64,
+        on_batch: &mut impl FnMut(&KvEventBatch),
+    ) -> BatchResult {
+        // Skip stale/duplicate batches (can occur after reconnect replay).
+        if *last_seq > 0 && batch.sequence_number <= *last_seq {
+            debug!(
+                worker_url = %worker_url,
+                last_seq = *last_seq,
+                received = batch.sequence_number,
+                "Skipping stale KV event batch"
+            );
+            return BatchResult::Stale;
+        }
+
+        // Some engine bridges expose a live-only event stream even though the
+        // gRPC request carries a replay cursor. Reconnecting such a stream after
+        // one dropped event starts at the current publisher position, so retrying
+        // the old cursor can never fill the gap. Clear this worker's stale view
+        // and resume from the first live batch instead. The approximate token tree
+        // remains available while new event-driven ownership is learned.
+        let expected = last_seq.saturating_add(1);
+        let gap = (*last_seq > 0 && batch.sequence_number > expected)
+            .then_some((expected, batch.sequence_number));
+        if let Some((expected, received)) = gap {
+            warn!(
+                worker_url = %worker_url,
+                expected = expected,
+                received = received,
+                "Sequence gap detected; cleared stale cache state and resumed live stream"
+            );
+            Metrics::record_kv_event_sequence_gap_recovery(worker_url);
+            indexer.apply_cleared(worker_id, worker_blocks);
+        }
+
+        on_batch(batch);
+        for event in &batch.events {
+            Self::apply_event(event, worker_id, indexer, worker_blocks);
+        }
+        *last_seq = batch.sequence_number;
+
+        match gap {
+            Some((expected, received)) => BatchResult::GapRecovered { expected, received },
+            None => BatchResult::Applied,
+        }
     }
 
     /// Apply a single KV cache event to the indexer.
@@ -860,6 +892,102 @@ mod tests {
 
         indexer.apply_cleared(w1, &mut wb);
         assert_eq!(indexer.current_size(), 0);
+    }
+
+    #[test]
+    fn test_sequence_gap_clears_stale_worker_state_before_resuming() {
+        let indexer = PositionalIndexer::new(64);
+        let worker_url = "http://w1:8000";
+        let worker_id = indexer.intern_worker(worker_url).unwrap();
+        let mut worker_blocks = WorkerBlockMap::default();
+        let mut last_seq = 1;
+
+        let stale = KvBlocksStored {
+            blocks: vec![KvBlock {
+                block_hash: 1,
+                token_ids: vec![10, 20, 30, 40],
+                block_size: 4,
+                lora_id: None,
+                cache_level: None,
+            }],
+            parent_block_hash: None,
+        };
+        KvEventMonitor::apply_stored(&stale, worker_id, &indexer, &mut worker_blocks);
+        assert_eq!(indexer.current_size(), 1);
+
+        let live = KvEventBatch {
+            sequence_number: 3,
+            timestamp: 0.0,
+            events: vec![KvCacheEvent {
+                event_id: 2,
+                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    blocks: vec![KvBlock {
+                        block_hash: 2,
+                        token_ids: vec![50, 60, 70, 80],
+                        block_size: 4,
+                        lora_id: None,
+                        cache_level: None,
+                    }],
+                    parent_block_hash: Some(999),
+                })),
+            }],
+            dp_rank: None,
+        };
+
+        let result = KvEventMonitor::process_batch(
+            &live,
+            worker_url,
+            worker_id,
+            &indexer,
+            &mut worker_blocks,
+            &mut last_seq,
+            &mut |_| {},
+        );
+
+        assert_eq!(
+            result,
+            BatchResult::GapRecovered {
+                expected: 2,
+                received: 3
+            }
+        );
+        assert_eq!(last_seq, 3);
+        assert_eq!(indexer.current_size(), 1);
+        assert!(!worker_blocks.contains_key(&SequenceHash::from(1i64)));
+        assert!(worker_blocks.contains_key(&SequenceHash::from(2i64)));
+
+        let contiguous = KvEventBatch {
+            sequence_number: 4,
+            timestamp: 0.0,
+            events: vec![KvCacheEvent {
+                event_id: 3,
+                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    blocks: vec![KvBlock {
+                        block_hash: 3,
+                        token_ids: vec![90, 100, 110, 120],
+                        block_size: 4,
+                        lora_id: None,
+                        cache_level: None,
+                    }],
+                    parent_block_hash: Some(2),
+                })),
+            }],
+            dp_rank: None,
+        };
+        let result = KvEventMonitor::process_batch(
+            &contiguous,
+            worker_url,
+            worker_id,
+            &indexer,
+            &mut worker_blocks,
+            &mut last_seq,
+            &mut |_| {},
+        );
+
+        assert_eq!(result, BatchResult::Applied);
+        assert_eq!(last_seq, 4);
+        assert_eq!(indexer.current_size(), 2);
+        assert!(worker_blocks.contains_key(&SequenceHash::from(3i64)));
     }
 
     #[test]
