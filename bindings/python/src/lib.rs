@@ -505,6 +505,11 @@ struct Router {
     adaptive_admission_max_segments: usize,
     adaptive_admission_min_load_coverage: f64,
     adaptive_admission_cold_start_output_tokens: u32,
+    adaptive_admission_strategy: String,
+    adaptive_admission_feedback_probe_requests_per_healthy_replica: u32,
+    adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: u32,
+    adaptive_admission_feedback_max_token_usage: f64,
+    adaptive_admission_feedback_throughput_improvement_ratio: f64,
 }
 
 impl Router {
@@ -714,6 +719,14 @@ impl Router {
                 reason,
             }
         })?;
+        let adaptive_admission_strategy =
+            self.adaptive_admission_strategy.parse().map_err(|reason| {
+                config::ConfigError::InvalidValue {
+                    field: "adaptive_admission_strategy".to_string(),
+                    value: self.adaptive_admission_strategy.clone(),
+                    reason,
+                }
+            })?;
 
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
@@ -793,12 +806,20 @@ impl Router {
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
             .adaptive_admission(config::AdaptiveAdmissionConfig {
                 mode: adaptive_admission_mode,
+                strategy: adaptive_admission_strategy,
                 work_horizon_secs: self.adaptive_admission_work_horizon_secs,
                 estimator_half_life_secs: self.adaptive_admission_estimator_half_life_secs,
                 prior_observations: self.adaptive_admission_prior_observations,
                 max_segments: self.adaptive_admission_max_segments,
                 min_load_coverage: self.adaptive_admission_min_load_coverage,
                 cold_start_output_tokens: self.adaptive_admission_cold_start_output_tokens,
+                feedback_probe_requests_per_healthy_replica: self
+                    .adaptive_admission_feedback_probe_requests_per_healthy_replica,
+                feedback_max_waiting_requests_per_healthy_replica: self
+                    .adaptive_admission_feedback_max_waiting_requests_per_healthy_replica,
+                feedback_max_token_usage: self.adaptive_admission_feedback_max_token_usage,
+                feedback_throughput_improvement_ratio: self
+                    .adaptive_admission_feedback_throughput_improvement_ratio,
             })
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
@@ -1026,6 +1047,11 @@ impl Router {
         adaptive_admission_max_segments = 50000,
         adaptive_admission_min_load_coverage = 0.8,
         adaptive_admission_cold_start_output_tokens = 4096,
+        adaptive_admission_strategy = String::from("predicted_work"),
+        adaptive_admission_feedback_probe_requests_per_healthy_replica = 2,
+        adaptive_admission_feedback_max_waiting_requests_per_healthy_replica = 2,
+        adaptive_admission_feedback_max_token_usage = 0.9,
+        adaptive_admission_feedback_throughput_improvement_ratio = 0.02,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1170,6 +1196,11 @@ impl Router {
         adaptive_admission_max_segments: usize,
         adaptive_admission_min_load_coverage: f64,
         adaptive_admission_cold_start_output_tokens: u32,
+        adaptive_admission_strategy: String,
+        adaptive_admission_feedback_probe_requests_per_healthy_replica: u32,
+        adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: u32,
+        adaptive_admission_feedback_max_token_usage: f64,
+        adaptive_admission_feedback_throughput_improvement_ratio: f64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1328,6 +1359,11 @@ impl Router {
             adaptive_admission_max_segments,
             adaptive_admission_min_load_coverage,
             adaptive_admission_cold_start_output_tokens,
+            adaptive_admission_strategy,
+            adaptive_admission_feedback_probe_requests_per_healthy_replica,
+            adaptive_admission_feedback_max_waiting_requests_per_healthy_replica,
+            adaptive_admission_feedback_max_token_usage,
+            adaptive_admission_feedback_throughput_improvement_ratio,
         })
     }
 

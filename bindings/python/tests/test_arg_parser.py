@@ -53,12 +53,17 @@ class TestRouterArgs:
         assert args.priority_scheduler_tenant_metric_top_n == 32
         assert args.engine_metrics is False
         assert args.adaptive_admission_mode == "off"
+        assert args.adaptive_admission_strategy == "predicted_work"
         assert args.adaptive_admission_work_horizon_secs == 30.0
         assert args.adaptive_admission_estimator_half_life_secs == 900.0
         assert args.adaptive_admission_prior_observations == 20.0
         assert args.adaptive_admission_max_segments == 50_000
         assert args.adaptive_admission_min_load_coverage == 0.8
         assert args.adaptive_admission_cold_start_output_tokens == 4096
+        assert args.adaptive_admission_feedback_probe_requests_per_healthy_replica == 2
+        assert args.adaptive_admission_feedback_max_waiting_requests_per_healthy_replica == 2
+        assert args.adaptive_admission_feedback_max_token_usage == 0.9
+        assert args.adaptive_admission_feedback_throughput_improvement_ratio == 0.02
 
     def test_parse_priority_scheduler_options(self):
         args = parse_router_args(
@@ -84,6 +89,8 @@ class TestRouterArgs:
                 "--engine-metrics",
                 "--adaptive-admission-mode",
                 "shadow",
+                "--adaptive-admission-strategy",
+                "engine_feedback",
                 "--adaptive-admission-work-horizon-secs",
                 "45",
                 "--adaptive-admission-estimator-half-life-secs",
@@ -96,17 +103,30 @@ class TestRouterArgs:
                 "0.75",
                 "--adaptive-admission-cold-start-output-tokens",
                 "2048",
+                "--adaptive-admission-feedback-probe-requests-per-healthy-replica",
+                "3",
+                "--adaptive-admission-feedback-max-waiting-requests-per-healthy-replica",
+                "4",
+                "--adaptive-admission-feedback-max-token-usage",
+                "0.85",
+                "--adaptive-admission-feedback-throughput-improvement-ratio",
+                "0.03",
             ]
         )
 
         assert args.engine_metrics is True
         assert args.adaptive_admission_mode == "shadow"
+        assert args.adaptive_admission_strategy == "engine_feedback"
         assert args.adaptive_admission_work_horizon_secs == 45.0
         assert args.adaptive_admission_estimator_half_life_secs == 600.0
         assert args.adaptive_admission_prior_observations == 12.0
         assert args.adaptive_admission_max_segments == 12_345
         assert args.adaptive_admission_min_load_coverage == 0.75
         assert args.adaptive_admission_cold_start_output_tokens == 2048
+        assert args.adaptive_admission_feedback_probe_requests_per_healthy_replica == 3
+        assert args.adaptive_admission_feedback_max_waiting_requests_per_healthy_replica == 4
+        assert args.adaptive_admission_feedback_max_token_usage == 0.85
+        assert args.adaptive_admission_feedback_throughput_improvement_ratio == 0.03
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
@@ -540,10 +560,7 @@ class TestPolicyFromStr:
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
-        assert (
-            policy_from_str("size_aware_power_of_two")
-            == PolicyType.SizeAwarePowerOfTwo
-        )
+        assert policy_from_str("size_aware_power_of_two") == PolicyType.SizeAwarePowerOfTwo
         assert policy_from_str("consistent_hashing") == PolicyType.ConsistentHashing
         assert policy_from_str("prefix_hash") == PolicyType.PrefixHash
 
