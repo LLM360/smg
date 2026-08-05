@@ -22,8 +22,9 @@ use crate::{
     rate_limit::RateLimitManager,
     routers::{
         common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
-        grpc::adaptive_admission::AdaptiveAdmissionController,
-        grpc::multimodal::MultimodalConfigRegistry,
+        grpc::{
+            adaptive_admission::AdaptiveAdmissionController, multimodal::MultimodalConfigRegistry,
+        },
         router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
