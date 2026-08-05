@@ -330,6 +330,11 @@ pub(crate) fn init_metrics() {
         "KV event subscription task failures by worker and reason \
          (panic, join_error, intern_failed)"
     );
+    describe_counter!(
+        "smg_kv_event_sequence_gap_recoveries_total",
+        "KV event sequence gaps recovered by clearing stale worker cache state and resuming the \
+         live stream"
+    );
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
@@ -1354,6 +1359,16 @@ impl Metrics {
             "smg_kv_event_subscription_failures_total",
             "worker" => worker_interned,
             "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Record recovery from a non-replayable gap in a worker's KV event stream.
+    pub fn record_kv_event_sequence_gap_recovery(worker_url: &str) {
+        let worker_interned = intern_string(worker_url);
+        counter!(
+            "smg_kv_event_sequence_gap_recoveries_total",
+            "worker" => worker_interned
         )
         .increment(1);
     }
