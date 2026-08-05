@@ -378,8 +378,7 @@ impl ClassQueue for FairClassQueue {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     use tokio_util::sync::CancellationToken;
 

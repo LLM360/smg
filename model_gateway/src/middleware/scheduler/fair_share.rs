@@ -342,6 +342,10 @@ impl GlobalFairShare {
             .entry(tenant.clone())
             .or_default()
             .queued[class as usize] += 1;
+        drop(state);
+        if is_other {
+            super::metrics::record_fair_share_unknown_tenant(self.metric_tenant(tenant));
+        }
     }
 
     fn register_global_waiter(&self, scope_id: u64, tenant: &TenantKey, class: Class) {
