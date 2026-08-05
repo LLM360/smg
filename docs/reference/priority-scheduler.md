@@ -114,6 +114,7 @@ fair_share:
   default_weight: 1
   default_output_tokens: 256
   trust_output_token_estimate_header: false
+  trust_request_model_header: false
   tenant_weights:
     "header:alice": 10
     "header:bob": 5
@@ -172,7 +173,37 @@ Priority class selection remains the outer policy.
 | `default_weight` | `1.0` | Weight assigned to a resolved tenant absent from `tenant_weights`. Must be finite and greater than zero. |
 | `default_output_tokens` | `256` | Provisional output-token charge used when no trusted estimate is available. Must be greater than zero. |
 | `trust_output_token_estimate_header` | `false` | Honor `x-smg-output-token-estimate`. Enable only behind a proxy that strips client copies and injects a validated estimate. |
+| `trust_request_model_header` | `false` | Honor `x-smg-request-model` for per-model profile selection. Model profiles require this setting. Enable only behind a proxy that strips client copies and injects the parsed request model. |
 | `tenant_weights` | `{}` | Relative weights keyed by canonical tenant key. Every value must be finite and greater than zero. |
+| `model_profiles` | `{}` | Optional model-scoped hierarchical policies. Each profile contains explicit `tenant_weights` plus one positive aggregate `other_weight`. |
+
+Per-model profiles use two-level weighted fair queueing. Explicit tenants and
+one aggregate `other` bucket contend at the outer level. Every unlisted real
+tenant retains its own identity and shares the `other` bucket equally at the
+inner level:
+
+```yaml
+fair_share:
+  default_output_tokens: 256
+  trust_output_token_estimate_header: true
+  trust_request_model_header: true
+  model_profiles:
+    deepseek-v4-flash:
+      tenant_weights:
+        "header:junu": 30
+        "header:xuezhou": 40
+        "header:zhenting": 10
+      other_weight: 20
+    kimi-k3:
+      tenant_weights:
+        "header:mukhesh": 80
+      other_weight: 20
+```
+
+The percentages apply while the corresponding buckets are simultaneously
+backlogged for that model. Idle shares are borrowed, so a free model slot is
+never held empty. Requests for models without a configured profile continue to
+use the legacy flat process-wide weights.
 
 The scheduler reserves the estimate when a request is admitted. A trustworthy
 terminal usage record replaces that estimate with actual output tokens. If a
@@ -186,10 +217,12 @@ virtual time, so idle tenants do not bank unlimited catch-up credit. The queue
 is work-conserving: a model partition with a free slot and an eligible local
 request never idles for an underserved tenant that can use only another model.
 
-One `GlobalFairShare` instance aggregates actual-token metrics and canonical
-tenant virtual finish across every partition built by one SMG process. Each
-partition chooses among only the requests eligible for its non-fungible model
-pool. Consequently:
+One `GlobalFairShare` instance aggregates actual-token accounting across every
+partition built by one SMG process. Flat configuration keeps one canonical
+tenant virtual finish across partitions. Per-model profiles instead keep
+scheduling debt and active-set virtual time separate by canonical model. A
+partition that contains multiple models selects the group containing its
+oldest eligible waiter before applying that model's policy. Consequently:
 
 - Batch and interactive requests resolve to the same tenant ledger when they
   enter the same SMG process with the same canonical tenant identity. Priority
@@ -197,6 +230,9 @@ pool. Consequently:
 - Configured percentages converge when tenants are simultaneously backlogged
   for the same constrained pool. Exact fleet-wide percentages are not
   enforceable for tenants targeting disjoint pools without idling capacity.
+- Per-model service never creates scheduling debt in another model, while
+  charged and reserved output-token accounting remains process-global by real
+  tenant.
 - The ledger does not coordinate separate M1 and M2 gateways, or overlapping
   old and new gateway processes during a rollout. Strict cross-gateway fairness
   requires a distributed ledger or one authoritative admission front door.
@@ -257,9 +293,10 @@ The scheduler exposes these Prometheus metrics (see the [Metrics Reference](metr
 | `smg_scheduler_utilization` | Gauge | — | Total in-flight divided by backend capacity. |
 | `smg_scheduler_class_capacity_pressure` | Gauge | `class` | Normalized 0.0–1.0 pressure (worse of queue and slot pressure). |
 | `smg_fair_share_charged_output_tokens_total` | Counter | `tenant` | Actual or conservative fallback output tokens charged across the process-local ledger. |
-| `smg_fair_share_virtual_finish` | Gauge | `tenant` | Process-global active-set normalized virtual finish used for local eligible-candidate dispatch. |
+| `smg_fair_share_virtual_finish` | Gauge | `model`, `tenant` | Active-set normalized tenant virtual finish. Flat mode uses `model="global"`. |
+| `smg_fair_share_other_bucket_virtual_finish` | Gauge | `model` | Outer virtual finish of a model profile's aggregate `other` bucket. |
 | `smg_fair_share_reserved_output_tokens` | Gauge | `tenant` | Provisional output-token charges held by active requests. |
-| `smg_fair_share_queue_wait_seconds` | Histogram | `tenant`, `class` | Fair-share queue wait by tenant and priority class. |
+| `smg_fair_share_queue_wait_seconds` | Histogram | `model`, `tenant`, `class` | Fair-share queue wait by model profile, tenant, and priority class. |
 | `smg_fair_share_fallback_total` | Counter | `reason` | Settlement or estimate paths that used a configured fallback. |
 | `smg_fair_share_unknown_tenant_total` | Counter | `tenant` | Requests whose canonical tenant has no explicit configured weight. |
 

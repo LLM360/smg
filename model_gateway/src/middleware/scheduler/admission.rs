@@ -25,9 +25,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use super::{
-    metrics as sched_metrics, state::SchedulerState, AdmitOutcome, Class, GlobalFairShare,
-    RejectionReason, SchedulerError, SchedulerGuardBody, HEADER_X_SMG_PREEMPTED,
-    OUTPUT_TOKEN_ESTIMATE_HEADER, PRIORITY_HEADER,
+    fair_share::FairShareProfile, metrics as sched_metrics, state::SchedulerState, AdmitOutcome,
+    Class, GlobalFairShare, RejectionReason, SchedulerError, SchedulerGuardBody,
+    HEADER_X_SMG_PREEMPTED, OUTPUT_TOKEN_ESTIMATE_HEADER, PRIORITY_HEADER,
 };
 use crate::{
     middleware::{
@@ -167,18 +167,22 @@ pub async fn priority_admission_middleware(
     // once admitted, releasing the slot.
     let cancel = CancellationToken::new();
 
-    let estimated_output_tokens = match partition.scheduler.fair_share() {
-        Some(ledger) => output_token_estimate(req.headers(), ledger),
-        None => 1,
+    let (estimated_output_tokens, fair_share_profile) = match partition.scheduler.fair_share() {
+        Some(ledger) => (
+            output_token_estimate(req.headers(), ledger),
+            state.fair_share_profile_for(req.headers(), ledger),
+        ),
+        None => (1, FairShareProfile::Global),
     };
 
     match partition
         .scheduler
-        .admit_for_tenant(
+        .admit_for_tenant_profile(
             class,
             request_id,
             cancel,
             tenant.clone(),
+            fair_share_profile,
             estimated_output_tokens,
         )
         .await
@@ -257,7 +261,9 @@ mod tests {
             default_weight: 1.0,
             default_output_tokens: 256,
             trust_output_token_estimate_header: trust_header,
+            trust_request_model_header: false,
             tenant_weights: HashMap::new(),
+            model_profiles: HashMap::new(),
         })
     }
 

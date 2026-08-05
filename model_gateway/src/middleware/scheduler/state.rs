@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use super::{
+    fair_share::{FairShareProfile, REQUEST_MODEL_HEADER},
     Class, GlobalFairShare, PriorityScheduler, SchedulerSettings, StaticTenantPolicyResolver,
     TenantPolicyResolver,
 };
@@ -49,6 +50,7 @@ pub struct SchedulerState {
     partitions: HashMap<String, SchedulerPartition>,
     default_partition: Arc<str>,
     pub resolver: Arc<dyn TenantPolicyResolver>,
+    model_registry: Arc<WorkerRegistry>,
     /// Per-second RPS sibling check, run before admission. Set only when an
     /// explicit `rate_limit_tokens_per_second` is configured; the bucket's
     /// concurrency-cap role is owned by the scheduler, so we must not consult
@@ -74,6 +76,37 @@ impl SchedulerState {
                 name: Arc::clone(&self.default_partition),
                 scheduler: Arc::clone(&self.scheduler),
             })
+    }
+
+    /// Resolve the trusted request model to a configured fair-share profile.
+    /// Model aliases are canonicalized only for accounting; the outbound
+    /// request body remains untouched by the scheduler.
+    pub(crate) fn fair_share_profile_for(
+        &self,
+        headers: &HeaderMap,
+        ledger: &GlobalFairShare,
+    ) -> FairShareProfile {
+        if !ledger.has_model_profiles() {
+            return FairShareProfile::Global;
+        }
+        if !ledger.trusts_request_model_header() {
+            super::metrics::record_fair_share_fallback("untrusted_request_model");
+            return FairShareProfile::Global;
+        }
+        let Some(raw_model) = headers
+            .get(REQUEST_MODEL_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            super::metrics::record_fair_share_fallback("missing_request_model");
+            return FairShareProfile::Global;
+        };
+        let canonical = self
+            .model_registry
+            .resolve_model_alias(raw_model)
+            .unwrap_or_else(|| Arc::from(raw_model));
+        ledger.profile_for_model(&canonical)
     }
 }
 
@@ -161,6 +194,7 @@ impl AdmissionMode {
             settings = settings.with_global_queue_budget(rc.queue_size);
         }
         let fair_share = GlobalFairShare::from_settings(&settings).map(Arc::new);
+        let model_registry = Arc::clone(&registry);
 
         let resolver: Arc<dyn TenantPolicyResolver> =
             Arc::new(StaticTenantPolicyResolver::from_settings(&settings));
@@ -192,6 +226,7 @@ impl AdmissionMode {
                 partitions: HashMap::new(),
                 default_partition: Arc::from("global"),
                 resolver,
+                model_registry,
                 rate_limiter,
             })));
         };
@@ -295,6 +330,7 @@ impl AdmissionMode {
             partitions,
             default_partition: Arc::from(default_partition_name),
             resolver,
+            model_registry,
             rate_limiter,
         })))
     }
@@ -674,7 +710,63 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::{
+        middleware::scheduler::{FairShareConfig, ModelFairShareConfig, PrioritySchedulerYaml},
+        worker::BasicWorkerBuilder,
+    };
+
+    #[test]
+    fn trusted_request_model_alias_selects_the_canonical_profile() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://alias-worker:8000")
+                .model(
+                    openai_protocol::model_card::ModelCard::new("deepseek-v4-flash")
+                        .with_alias("deepseek-flash"),
+                )
+                .build(),
+        );
+        registry.register(worker).expect("worker should register");
+        let fair_config = FairShareConfig {
+            default_weight: 1.0,
+            default_output_tokens: 10,
+            trust_output_token_estimate_header: false,
+            trust_request_model_header: true,
+            tenant_weights: HashMap::new(),
+            model_profiles: HashMap::from([(
+                "deepseek-v4-flash".to_string(),
+                ModelFairShareConfig {
+                    tenant_weights: HashMap::new(),
+                    other_weight: 1.0,
+                },
+            )]),
+        };
+        let yaml = PrioritySchedulerYaml {
+            fair_share: Some(fair_config.clone()),
+            ..Default::default()
+        };
+        let settings =
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
+        let state = SchedulerState {
+            scheduler: PriorityScheduler::new(&settings, 1).unwrap(),
+            partitions: HashMap::new(),
+            default_partition: Arc::from("global"),
+            resolver: Arc::new(StaticTenantPolicyResolver::from_settings(&settings)),
+            model_registry: Arc::clone(&registry),
+            rate_limiter: None,
+        };
+        let ledger = GlobalFairShare::from_config(&fair_config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REQUEST_MODEL_HEADER,
+            HeaderValue::from_static("deepseek-flash"),
+        );
+
+        assert_eq!(
+            state.fair_share_profile_for(&headers, &ledger),
+            FairShareProfile::Model(Arc::new("deepseek-v4-flash".to_string()))
+        );
+    }
 
     #[tokio::test]
     async fn priority_mode_applies_capacity_changes_after_startup() {

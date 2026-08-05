@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{
-    fair_share::{FairShareReservation, GlobalFairShare, SettlementKind},
+    fair_share::{FairShareProfile, FairShareReservation, GlobalFairShare, SettlementKind},
     inflight::InflightHandle,
     queue::{ClassQueue, FairClassQueue, FifoClassQueue, QueueBudget, Waiter},
     slots::SlotPool,
@@ -412,6 +412,26 @@ impl PriorityScheduler {
         tenant: TenantKey,
         estimated_output_tokens: u32,
     ) -> AdmitOutcome {
+        self.admit_for_tenant_profile(
+            class,
+            request_id,
+            cancel,
+            tenant,
+            FairShareProfile::Global,
+            estimated_output_tokens,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_for_tenant_profile(
+        self: &Arc<Self>,
+        class: Class,
+        request_id: RequestId,
+        cancel: CancellationToken,
+        tenant: TenantKey,
+        profile: FairShareProfile,
+        estimated_output_tokens: u32,
+    ) -> AdmitOutcome {
         if self.fair_share.is_none() {
             return self.admit(class, request_id, cancel).await;
         }
@@ -427,6 +447,7 @@ impl PriorityScheduler {
             request_id,
             tx,
             tenant,
+            profile,
             estimated_output_tokens,
         );
         if self.class_queues[class as usize]
@@ -681,6 +702,7 @@ impl PriorityScheduler {
                 }
                 continue;
             }
+            let fair_share_reservation = fair_share_reservation.map(|reservation| *reservation);
             let permit = self.register_inflight(class, request_id, fair_share_reservation);
             // If the receiver was dropped between is_closed() above and
             // send below (unlikely race window), cancel the provisional
@@ -2058,10 +2080,12 @@ mod tests {
                 default_weight: 1.0,
                 default_output_tokens: 10,
                 trust_output_token_estimate_header: false,
+                trust_request_model_header: false,
                 tenant_weights: HashMap::from([
                     ("header:a".to_string(), 1.0),
                     ("header:b".to_string(), 1.0),
                 ]),
+                model_profiles: HashMap::new(),
             }),
             ..Default::default()
         };
@@ -2115,6 +2139,7 @@ mod tests {
                 rid("b-queued"),
                 b_tx,
                 b,
+                FairShareProfile::Global,
                 10,
             ))
             .unwrap();
@@ -2147,6 +2172,7 @@ mod tests {
                 rid("a-queued"),
                 a_tx,
                 a,
+                FairShareProfile::Global,
                 10,
             ))
             .unwrap();

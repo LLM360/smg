@@ -127,7 +127,23 @@ fn default_fair_share_output_tokens() -> u32 {
     256
 }
 
-/// Process-wide weighted sharing with per-partition eligibility boundaries.
+/// One model's hierarchical weighted-sharing policy.
+///
+/// Explicit tenants and the aggregate `other` bucket contend at the outer
+/// level. Real tenant identities are retained inside `other` and share that
+/// bucket equally, so settlement and accounting never collapse to a synthetic
+/// tenant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelFairShareConfig {
+    /// Per-tenant outer weights keyed by canonical `TenantKey` string.
+    #[serde(default)]
+    pub tenant_weights: HashMap<String, f64>,
+    /// Aggregate outer weight for every tenant absent from `tenant_weights`.
+    #[serde(default = "default_fair_share_weight")]
+    pub other_weight: f64,
+}
+
+/// Flat process-wide sharing plus optional hierarchical per-model profiles.
 ///
 /// Weights are relative and need not sum to 100. For example, weights 10 and
 /// 5 give two continuously contending tenants a 2:1 output-token share.
@@ -144,9 +160,18 @@ pub struct FairShareConfig {
     /// strips client copies and injects a validated value.
     #[serde(default)]
     pub trust_output_token_estimate_header: bool,
+    /// Honor `x-smg-request-model` when selecting a per-model profile. Keep
+    /// false unless a trusted proxy strips client copies and injects the
+    /// authenticated request body's model value.
+    #[serde(default)]
+    pub trust_request_model_header: bool,
     /// Per-tenant relative weights keyed by canonical `TenantKey` string.
     #[serde(default)]
     pub tenant_weights: HashMap<String, f64>,
+    /// Optional hierarchical policies keyed by canonical model id. Absence
+    /// preserves the original flat process-wide ledger exactly.
+    #[serde(default)]
+    pub model_profiles: HashMap<String, ModelFairShareConfig>,
 }
 
 /// Admission budget for one trusted upstream partition selector.
@@ -244,6 +269,16 @@ pub enum SettingsValidationError {
     ZeroFairShareDefaultOutputTokens,
     #[error("fair_share.tenant_weights[{tenant:?}] must be finite and > 0")]
     InvalidFairShareTenantWeight { tenant: String },
+    #[error("fair_share.model_profiles require trust_request_model_header=true")]
+    ModelProfilesRequireTrustedModelHeader,
+    #[error("fair_share.model_profiles contains an empty or untrimmed model key {model:?}")]
+    InvalidFairShareModelKey { model: String },
+    #[error(
+        "fair_share.model_profiles[{model:?}].tenant_weights[{tenant:?}] must be finite and > 0"
+    )]
+    InvalidModelFairShareTenantWeight { model: String, tenant: String },
+    #[error("fair_share.model_profiles[{model:?}].other_weight must be finite and > 0")]
+    InvalidModelFairShareOtherWeight { model: String },
 }
 
 /// Runtime scheduler configuration assembled from CLI flags + the
@@ -389,6 +424,29 @@ impl SchedulerSettings {
                     return Err(SettingsValidationError::InvalidFairShareTenantWeight {
                         tenant: tenant.clone(),
                     });
+                }
+            }
+            if !config.model_profiles.is_empty() && !config.trust_request_model_header {
+                return Err(SettingsValidationError::ModelProfilesRequireTrustedModelHeader);
+            }
+            for (model, profile) in &config.model_profiles {
+                if model.trim().is_empty() || model.trim() != model {
+                    return Err(SettingsValidationError::InvalidFairShareModelKey {
+                        model: model.clone(),
+                    });
+                }
+                if !profile.other_weight.is_finite() || profile.other_weight <= 0.0 {
+                    return Err(SettingsValidationError::InvalidModelFairShareOtherWeight {
+                        model: model.clone(),
+                    });
+                }
+                for (tenant, weight) in &profile.tenant_weights {
+                    if !weight.is_finite() || *weight <= 0.0 {
+                        return Err(SettingsValidationError::InvalidModelFairShareTenantWeight {
+                            model: model.clone(),
+                            tenant: tenant.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -562,7 +620,9 @@ fair_share:
                     default_weight: 1.0,
                     default_output_tokens: 128,
                     trust_output_token_estimate_header: false,
+                    trust_request_model_header: false,
                     tenant_weights: HashMap::from([("header:alice".to_string(), weight)]),
+                    model_profiles: HashMap::new(),
                 }),
                 ..Default::default()
             };
@@ -571,6 +631,69 @@ fair_share:
                 Err(SettingsValidationError::InvalidFairShareTenantWeight { .. })
             ));
         }
+    }
+
+    #[test]
+    fn test_model_profiles_require_the_trusted_request_model_header() {
+        let yaml = PrioritySchedulerYaml {
+            fair_share: Some(FairShareConfig {
+                default_weight: 1.0,
+                default_output_tokens: 128,
+                trust_output_token_estimate_header: false,
+                trust_request_model_header: false,
+                tenant_weights: HashMap::new(),
+                model_profiles: HashMap::from([(
+                    "kimi-k3".to_string(),
+                    ModelFairShareConfig {
+                        tenant_weights: HashMap::new(),
+                        other_weight: 20.0,
+                    },
+                )]),
+            }),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)),
+            Err(SettingsValidationError::ModelProfilesRequireTrustedModelHeader)
+        ));
+    }
+
+    #[test]
+    fn test_per_model_hierarchical_weights_round_trip() {
+        let parsed: PrioritySchedulerYaml = serde_yaml::from_str(
+            r#"
+fair_share:
+  trust_request_model_header: true
+  model_profiles:
+    deepseek-v4-flash:
+      tenant_weights:
+        "header:junu": 30
+        "header:xuezhou": 40
+        "header:zhenting": 10
+      other_weight: 20
+    kimi-k3:
+      tenant_weights:
+        "header:mukhesh": 80
+      other_weight: 20
+"#,
+        )
+        .unwrap();
+        let fair_share = parsed.fair_share.as_ref().unwrap();
+        assert!(fair_share.trust_request_model_header);
+        assert_eq!(
+            fair_share.model_profiles["deepseek-v4-flash"].tenant_weights["header:junu"],
+            30.0
+        );
+        assert_eq!(
+            fair_share.model_profiles["deepseek-v4-flash"].other_weight,
+            20.0
+        );
+        assert_eq!(
+            fair_share.model_profiles["kimi-k3"].tenant_weights["header:mukhesh"],
+            80.0
+        );
+        SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&parsed)).unwrap();
     }
 
     #[test]

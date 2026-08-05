@@ -27,6 +27,7 @@ const STARVATION_PROMOTION_TOTAL: &str = "smg_scheduler_starvation_promotion_tot
 const PARTITION_ADMIT_TOTAL: &str = "smg_scheduler_partition_admit_total";
 const FAIR_SHARE_CHARGED_OUTPUT_TOKENS_TOTAL: &str = "smg_fair_share_charged_output_tokens_total";
 const FAIR_SHARE_VIRTUAL_FINISH: &str = "smg_fair_share_virtual_finish";
+const FAIR_SHARE_OTHER_BUCKET_VIRTUAL_FINISH: &str = "smg_fair_share_other_bucket_virtual_finish";
 const FAIR_SHARE_RESERVED_OUTPUT_TOKENS: &str = "smg_fair_share_reserved_output_tokens";
 const FAIR_SHARE_QUEUE_WAIT_SECONDS: &str = "smg_fair_share_queue_wait_seconds";
 const FAIR_SHARE_FALLBACK_TOTAL: &str = "smg_fair_share_fallback_total";
@@ -96,7 +97,11 @@ pub fn describe() {
     );
     describe_gauge!(
         FAIR_SHARE_VIRTUAL_FINISH,
-        "Process-global active-set normalized virtual finish used for weighted dispatch"
+        "Active-set normalized tenant virtual finish by model profile"
+    );
+    describe_gauge!(
+        FAIR_SHARE_OTHER_BUCKET_VIRTUAL_FINISH,
+        "Outer aggregate other-bucket virtual finish by model profile"
     );
     describe_gauge!(
         FAIR_SHARE_RESERVED_OUTPUT_TOKENS,
@@ -221,8 +226,21 @@ pub fn record_fair_share_charged_output_tokens(tenant: &str, tokens: u32) {
     .increment(u64::from(tokens));
 }
 
-pub fn set_fair_share_virtual_finish(tenant: &str, virtual_finish: f64) {
-    gauge!(FAIR_SHARE_VIRTUAL_FINISH, "tenant" => intern_string(tenant)).set(virtual_finish);
+pub fn set_fair_share_virtual_finish(model: &str, tenant: &str, virtual_finish: f64) {
+    gauge!(
+        FAIR_SHARE_VIRTUAL_FINISH,
+        "model" => intern_string(model),
+        "tenant" => intern_string(tenant)
+    )
+    .set(virtual_finish);
+}
+
+pub fn set_fair_share_other_bucket_virtual_finish(model: &str, virtual_finish: f64) {
+    gauge!(
+        FAIR_SHARE_OTHER_BUCKET_VIRTUAL_FINISH,
+        "model" => intern_string(model)
+    )
+    .set(virtual_finish);
 }
 
 pub fn set_fair_share_reserved_output_tokens(tenant: &str, tokens: u64) {
@@ -233,9 +251,10 @@ pub fn set_fair_share_reserved_output_tokens(tenant: &str, tokens: u64) {
     .set(tokens as f64);
 }
 
-pub fn record_fair_share_queue_wait(tenant: &str, class: Class, wait: Duration) {
+pub fn record_fair_share_queue_wait(model: &str, tenant: &str, class: Class, wait: Duration) {
     histogram!(
         FAIR_SHARE_QUEUE_WAIT_SECONDS,
+        "model" => intern_string(model),
         "tenant" => intern_string(tenant),
         "class" => class.as_str()
     )
