@@ -162,6 +162,15 @@ impl ConfigValidator {
     }
 
     fn validate_tenant_resolution(config: &RouterConfig) -> ConfigResult<()> {
+        if config.tenant_resolution.prefer_trusted_tenant_header
+            && !config.tenant_resolution.trust_tenant_header
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "tenant_resolution.prefer_trusted_tenant_header requires trust_tenant_header"
+                        .to_string(),
+            });
+        }
         let header_name = config.tenant_resolution.tenant_header_name.trim();
         if header_name.is_empty() {
             return Err(ConfigError::ValidationFailed {
@@ -1233,6 +1242,18 @@ mod tests {
             },
             PolicyConfig::Random,
         )
+    }
+
+    #[test]
+    fn preferred_tenant_header_requires_trust() {
+        let mut config = regular_mode_config();
+        config.tenant_resolution.prefer_trusted_tenant_header = true;
+
+        let err = ConfigValidator::validate(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::ValidationFailed { .. }));
+        assert!(err
+            .to_string()
+            .contains("prefer_trusted_tenant_header requires trust_tenant_header"));
     }
 
     #[test]

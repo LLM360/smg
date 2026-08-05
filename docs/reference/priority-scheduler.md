@@ -73,7 +73,7 @@ smg \
 | `--priority-scheduler-enabled` | `false` | Master switch. When unset, the legacy concurrency-limit middleware stays wired and no scheduler is constructed. |
 | `--priority-scheduler-default-max-class` | `default` | Maximum class for tenants not listed in the YAML (`system` \| `interactive` \| `default` \| `bulk`). Parsed with the same rules as the header — an unknown value falls back to `default`. |
 | `--priority-scheduler-config` | unset | Path to the optional priority-scheduler YAML (per-class overrides + per-tenant policy). Absent → built-in defaults and an empty tenant policy map. |
-| `--priority-scheduler-tenant-metric-top-n` | `32` | Intended cap on per-tenant metric label cardinality. **Not yet enforced** — the value is stored but no top-N bucketing is applied today; per-tenant counters currently intern the raw tenant. |
+| `--priority-scheduler-tenant-metric-top-n` | `32` | Cap on configured tenants emitted as distinct fair-share metric labels. Remaining tenants use `tenant="other"`. Existing non-fair-share tenant counters still intern their raw tenant label. |
 
 !!! warning "Fail-safe startup"
     If the scheduler is enabled but cannot start — unparsable YAML, or class reservation floors + shares that sum to more than the live backend capacity — the gateway logs at `ERROR` and **falls back to legacy admission** instead of aborting. It does not take the data plane down.
@@ -108,6 +108,15 @@ tenant_policies:
     max_class: interactive
   "auth:internal-cron":
     max_class: system
+
+# Optional weighted sharing among tenants that contend in the same model pool.
+fair_share:
+  default_weight: 1
+  default_output_tokens: 256
+  trust_output_token_estimate_header: false
+  tenant_weights:
+    "header:alice": 10
+    "header:bob": 5
 ```
 
 Class keys and `max_class` values are lowercase: `system`, `interactive`, `default`, `bulk`. An unknown class name in the YAML is a parse error (which triggers the fail-safe fallback above), unlike the lenient request header.
@@ -150,6 +159,71 @@ Any validation failure triggers the [fail-safe fallback to legacy admission](#en
 
 ---
 
+## Weighted fair sharing by output tokens
+
+The optional `fair_share` map replaces FIFO ordering within each priority-class
+queue with weighted ordering by output tokens. Weights are relative and do not
+need to sum to 100. For example, weights `10` and `5` target a 2:1 token split
+while both tenants remain backlogged and eligible for the same model pool.
+Priority class selection remains the outer policy.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `default_weight` | `1.0` | Weight assigned to a resolved tenant absent from `tenant_weights`. Must be finite and greater than zero. |
+| `default_output_tokens` | `256` | Provisional output-token charge used when no trusted estimate is available. Must be greater than zero. |
+| `trust_output_token_estimate_header` | `false` | Honor `x-smg-output-token-estimate`. Enable only behind a proxy that strips client copies and injects a validated estimate. |
+| `tenant_weights` | `{}` | Relative weights keyed by canonical tenant key. Every value must be finite and greater than zero. |
+
+The scheduler reserves the estimate when a request is admitted. A trustworthy
+terminal usage record replaces that estimate with actual output tokens. If a
+client disconnects, the backend fails, or terminal usage is missing or
+truncated, the provisional charge remains. This prevents cancellation from
+evading fair-share accounting.
+
+Fairness credit accrues only during active contention. When a new or returning
+tenant becomes active, its virtual finish is rebased to the current active-set
+virtual time, so idle tenants do not bank unlimited catch-up credit. The queue
+is work-conserving: a model partition with a free slot and an eligible local
+request never idles for an underserved tenant that can use only another model.
+
+One `GlobalFairShare` instance aggregates actual-token metrics and canonical
+tenant virtual finish across every partition built by one SMG process. Each
+partition chooses among only the requests eligible for its non-fungible model
+pool. Consequently:
+
+- Batch and interactive requests resolve to the same tenant ledger when they
+  enter the same SMG process with the same canonical tenant identity. Priority
+  classes still decide which class is considered first.
+- Configured percentages converge when tenants are simultaneously backlogged
+  for the same constrained pool. Exact fleet-wide percentages are not
+  enforceable for tenants targeting disjoint pools without idling capacity.
+- The ledger does not coordinate separate M1 and M2 gateways, or overlapping
+  old and new gateway processes during a rollout. Strict cross-gateway fairness
+  requires a distributed ledger or one authoritative admission front door.
+
+### Preferred trusted tenant identity
+
+By default, tenant resolution remains authenticated caller, then trusted
+header, then client IP, then anonymous. A deployment with a shared authenticated
+proxy identity can deliberately make the proxy-injected end-user header
+canonical by setting all three flags:
+
+```bash
+--trust-tenant-header \
+--prefer-trusted-tenant-header \
+--tenant-header-name x-comet-user
+```
+
+`--prefer-trusted-tenant-header` requires `--trust-tenant-header`. A missing,
+empty, or invalid preferred header falls back to the existing authenticated
+caller path. The option is disabled by default. Enabling it changes the
+canonical `RouteRequestMeta` tenant for every tenant-aware subsystem, including
+rate-limit policy lookup, tenant metrics, priority clamps, and fair sharing.
+The upstream proxy must strip caller-supplied copies and reinject only its
+authenticated user identity.
+
+---
+
 ## Tenant policy
 
 A tenant's priority ceiling is resolved per request:
@@ -182,6 +256,12 @@ The scheduler exposes these Prometheus metrics (see the [Metrics Reference](metr
 | `smg_scheduler_queue_size_limit` | Gauge | `class` | Configured queue limit per class. |
 | `smg_scheduler_utilization` | Gauge | — | Total in-flight divided by backend capacity. |
 | `smg_scheduler_class_capacity_pressure` | Gauge | `class` | Normalized 0.0–1.0 pressure (worse of queue and slot pressure). |
+| `smg_fair_share_charged_output_tokens_total` | Counter | `tenant` | Actual or conservative fallback output tokens charged across the process-local ledger. |
+| `smg_fair_share_virtual_finish` | Gauge | `tenant` | Process-global active-set normalized virtual finish used for local eligible-candidate dispatch. |
+| `smg_fair_share_reserved_output_tokens` | Gauge | `tenant` | Provisional output-token charges held by active requests. |
+| `smg_fair_share_queue_wait_seconds` | Histogram | `tenant`, `class` | Fair-share queue wait by tenant and priority class. |
+| `smg_fair_share_fallback_total` | Counter | `reason` | Settlement or estimate paths that used a configured fallback. |
+| `smg_fair_share_unknown_tenant_total` | Counter | `tenant` | Requests whose canonical tenant has no explicit configured weight. |
 
 ---
 

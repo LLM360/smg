@@ -119,6 +119,36 @@ pub struct TenantPolicyConfig {
     pub max_class: Class,
 }
 
+fn default_fair_share_weight() -> f64 {
+    1.0
+}
+
+fn default_fair_share_output_tokens() -> u32 {
+    256
+}
+
+/// Process-wide weighted sharing with per-partition eligibility boundaries.
+///
+/// Weights are relative and need not sum to 100. For example, weights 10 and
+/// 5 give two continuously contending tenants a 2:1 output-token share.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FairShareConfig {
+    /// Weight for a resolved tenant absent from `tenant_weights`.
+    #[serde(default = "default_fair_share_weight")]
+    pub default_weight: f64,
+    /// Provisional charge when the trusted request estimate is absent or
+    /// invalid. Terminal response usage replaces this estimate.
+    #[serde(default = "default_fair_share_output_tokens")]
+    pub default_output_tokens: u32,
+    /// Honor `x-smg-output-token-estimate`. Keep false unless a trusted proxy
+    /// strips client copies and injects a validated value.
+    #[serde(default)]
+    pub trust_output_token_estimate_header: bool,
+    /// Per-tenant relative weights keyed by canonical `TenantKey` string.
+    #[serde(default)]
+    pub tenant_weights: HashMap<String, f64>,
+}
+
 /// Admission budget for one trusted upstream partition selector.
 ///
 /// A deployment chooses one capacity mode for every configured partition:
@@ -168,6 +198,10 @@ pub struct PrioritySchedulerYaml {
     pub classes: HashMap<Class, ClassConfig>,
     #[serde(default)]
     pub tenant_policies: HashMap<String, TenantPolicyConfig>,
+    /// Optional global weighted output-token ledger. Absence preserves FIFO
+    /// queueing and all existing scheduler behavior.
+    #[serde(default)]
+    pub fair_share: Option<FairShareConfig>,
     /// Optional admission partitions keyed by the exact value of the trusted
     /// `x-smg-admission-partition` header. An empty map preserves the original
     /// single global scheduler.
@@ -184,6 +218,7 @@ impl Default for PrioritySchedulerYaml {
         Self {
             classes: HashMap::new(),
             tenant_policies: HashMap::new(),
+            fair_share: None,
             admission_partitions: HashMap::new(),
             default_admission_partition: default_admission_partition(),
         }
@@ -203,6 +238,12 @@ pub enum SettingsValidationError {
     ZeroStarvationThreshold { class: Class },
     #[error("class {class:?}: reserved_per_slot must be finite and >= 0")]
     InvalidReservedPerSlot { class: Class },
+    #[error("fair_share.default_weight must be finite and > 0")]
+    InvalidFairShareDefaultWeight,
+    #[error("fair_share.default_output_tokens must be > 0")]
+    ZeroFairShareDefaultOutputTokens,
+    #[error("fair_share.tenant_weights[{tenant:?}] must be finite and > 0")]
+    InvalidFairShareTenantWeight { tenant: String },
 }
 
 /// Runtime scheduler configuration assembled from CLI flags + the
@@ -227,9 +268,10 @@ pub struct SchedulerSettings {
     /// Per-tenant clamp lookup. Keys come from
     /// [`crate::tenant::RouteRequestMeta::tenant_key`].
     pub tenant_policies: HashMap<TenantKey, TenantPolicyConfig>,
+    fair_share: Option<FairShareConfig>,
     /// Cap on the number of tenants emitted as labels for
-    /// `scheduler_tenant_*` gauges. Everything past the cap is
-    /// bucketed under `tenant="other"`.
+    /// tenant-labeled scheduler and fair-share metrics. Everything past the
+    /// cap is bucketed under `tenant="other"`.
     pub tenant_metric_top_n: u32,
 }
 
@@ -237,6 +279,11 @@ impl SchedulerSettings {
     /// Indexed accessor for the per-class config.
     pub fn class_config(&self, class: Class) -> &ClassConfig {
         &self.classes[class as usize]
+    }
+
+    #[must_use]
+    pub fn fair_share_config(&self) -> Option<&FairShareConfig> {
+        self.fair_share.as_ref()
     }
 
     /// Scale the built-in per-class queue weights to one exact global budget.
@@ -329,6 +376,23 @@ impl SchedulerSettings {
             }
         }
 
+        let fair_share = yaml.and_then(|value| value.fair_share.clone());
+        if let Some(config) = &fair_share {
+            if !config.default_weight.is_finite() || config.default_weight <= 0.0 {
+                return Err(SettingsValidationError::InvalidFairShareDefaultWeight);
+            }
+            if config.default_output_tokens == 0 {
+                return Err(SettingsValidationError::ZeroFairShareDefaultOutputTokens);
+            }
+            for (tenant, weight) in &config.tenant_weights {
+                if !weight.is_finite() || *weight <= 0.0 {
+                    return Err(SettingsValidationError::InvalidFairShareTenantWeight {
+                        tenant: tenant.clone(),
+                    });
+                }
+            }
+        }
+
         let tenant_policies = yaml
             .map(|y| {
                 y.tenant_policies
@@ -343,6 +407,7 @@ impl SchedulerSettings {
             default_max_class,
             classes,
             tenant_policies,
+            fair_share,
             tenant_metric_top_n,
         })
     }
@@ -463,6 +528,47 @@ tenant_policies:
             parsed.tenant_policies["auth:internal-cron"].max_class,
             Class::System
         );
+    }
+
+    #[test]
+    fn test_yaml_fair_share_weights_round_trip() {
+        let yaml = r#"
+fair_share:
+  default_weight: 0.5
+  default_output_tokens: 128
+  trust_output_token_estimate_header: true
+  tenant_weights:
+    "header:alice": 10
+    "header:bob": 5
+"#;
+        let parsed: PrioritySchedulerYaml = serde_yaml::from_str(yaml).unwrap();
+        let fair_share = parsed.fair_share.as_ref().unwrap();
+        assert_eq!(fair_share.default_weight, 0.5);
+        assert_eq!(fair_share.default_output_tokens, 128);
+        assert!(fair_share.trust_output_token_estimate_header);
+        assert_eq!(fair_share.tenant_weights["header:alice"], 10.0);
+        assert_eq!(fair_share.tenant_weights["header:bob"], 5.0);
+
+        let settings =
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&parsed)).unwrap();
+        assert_eq!(settings.fair_share_config(), Some(fair_share));
+    }
+
+    #[test]
+    fn test_invalid_fair_share_weights_are_rejected() {
+        for weight in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            let mut yaml = PrioritySchedulerYaml::default();
+            yaml.fair_share = Some(FairShareConfig {
+                default_weight: 1.0,
+                default_output_tokens: 128,
+                trust_output_token_estimate_header: false,
+                tenant_weights: HashMap::from([("header:alice".to_string(), weight)]),
+            });
+            assert!(matches!(
+                SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)),
+                Err(SettingsValidationError::InvalidFairShareTenantWeight { .. })
+            ));
+        }
     }
 
     #[test]

@@ -104,6 +104,9 @@ class RouterArgs:
     prometheus_duration_buckets: list[float] | None = None
     # Request ID headers configuration
     request_id_headers: list[str] | None = None
+    trust_tenant_header: bool = False
+    prefer_trusted_tenant_header: bool = False
+    tenant_header_name: str = "x-smg-tenant-id"
     # HTTP header to storage hook context mapping
     storage_context_headers: dict[str, str] = dataclasses.field(default_factory=dict)
     # Request timeout in seconds
@@ -786,6 +789,25 @@ class RouterArgs:
                 "Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id)."
                 " If not specified, uses common defaults."
             ),
+        )
+        request_group.add_argument(
+            f"--{prefix}trust-tenant-header",
+            action="store_true",
+            help="Trust the configured upstream tenant identity header",
+        )
+        request_group.add_argument(
+            f"--{prefix}prefer-trusted-tenant-header",
+            action="store_true",
+            help=(
+                "Prefer the trusted tenant header over authenticated proxy identity; "
+                "requires --trust-tenant-header"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}tenant-header-name",
+            type=str,
+            default=RouterArgs.tenant_header_name,
+            help="Trusted tenant identity header name",
         )
         request_group.add_argument(
             f"--{prefix}storage-context-headers",

@@ -345,6 +345,7 @@ pub struct RouterConfig {
 #[serde(default)]
 pub struct TenantResolutionConfig {
     pub trust_tenant_header: bool,
+    pub prefer_trusted_tenant_header: bool,
     pub tenant_header_name: String,
 }
 
@@ -369,6 +370,7 @@ impl Default for TenantResolutionConfig {
     fn default() -> Self {
         Self {
             trust_tenant_header: false,
+            prefer_trusted_tenant_header: false,
             tenant_header_name: DEFAULT_TENANT_HEADER_NAME.to_string(),
         }
     }

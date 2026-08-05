@@ -445,6 +445,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn prefer_trusted_tenant_header(mut self, prefer: bool) -> Self {
+        self.config.tenant_resolution.prefer_trusted_tenant_header = prefer;
+        self
+    }
+
     pub fn tenant_header_name<S: Into<String>>(mut self, header_name: S) -> Self {
         self.config.tenant_resolution.tenant_header_name = header_name.into();
         self

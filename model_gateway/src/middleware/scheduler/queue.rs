@@ -15,7 +15,12 @@ use smg_auth::RequestId;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::{engine::SchedulerPermit, Class};
+use super::{
+    engine::SchedulerPermit,
+    fair_share::{FairShareCandidate, FairShareReservation, GlobalFairShare},
+    Class,
+};
+use crate::tenant::TenantKey;
 
 /// One work-conserving occupancy budget shared by all priority queues.
 ///
@@ -90,6 +95,9 @@ pub struct Waiter {
     pub cancel: CancellationToken,
     pub request_id: RequestId,
     pub permit_tx: oneshot::Sender<SchedulerPermit>,
+    pub tenant: Option<TenantKey>,
+    pub estimated_output_tokens: u32,
+    pub fair_share_reservation: Option<FairShareReservation>,
 }
 
 impl Waiter {
@@ -105,6 +113,29 @@ impl Waiter {
             cancel,
             request_id,
             permit_tx,
+            tenant: None,
+            estimated_output_tokens: 0,
+            fair_share_reservation: None,
+        }
+    }
+
+    pub fn new_fair(
+        class: Class,
+        cancel: CancellationToken,
+        request_id: RequestId,
+        permit_tx: oneshot::Sender<SchedulerPermit>,
+        tenant: TenantKey,
+        estimated_output_tokens: u32,
+    ) -> Self {
+        Self {
+            class,
+            queued_at: Instant::now(),
+            cancel,
+            request_id,
+            permit_tx,
+            tenant: Some(tenant),
+            estimated_output_tokens: estimated_output_tokens.max(1),
+            fair_share_reservation: None,
         }
     }
 }
@@ -201,6 +232,119 @@ impl ClassQueue for FifoClassQueue {
         while guard.front().is_some_and(|w| w.cancel.is_cancelled()) {
             guard.pop_front();
             self.budget.release();
+        }
+    }
+}
+
+/// Work-conserving per-partition queue ordered by one shared token ledger.
+///
+/// Only waiters in this concrete queue are candidates, so debt in another
+/// non-fungible model pool can never idle local capacity.
+pub struct FairClassQueue {
+    waiters: Mutex<VecDeque<Waiter>>,
+    soft_limit: usize,
+    budget: Arc<QueueBudget>,
+    ledger: Arc<GlobalFairShare>,
+    scope_id: u64,
+    class: Class,
+}
+
+impl FairClassQueue {
+    pub fn with_shared_budget(
+        class: Class,
+        soft_limit: usize,
+        budget: Arc<QueueBudget>,
+        ledger: Arc<GlobalFairShare>,
+        scope_id: u64,
+    ) -> Self {
+        Self {
+            waiters: Mutex::new(VecDeque::with_capacity(soft_limit.min(64))),
+            soft_limit,
+            budget,
+            ledger,
+            scope_id,
+            class,
+        }
+    }
+}
+
+impl ClassQueue for FairClassQueue {
+    fn try_enqueue(&self, waiter: Waiter) -> Result<(), Waiter> {
+        let Some(tenant) = waiter.tenant.as_ref() else {
+            return Err(waiter);
+        };
+        if !self.budget.try_acquire() {
+            return Err(waiter);
+        }
+        let mut guard = self.waiters.lock();
+        self.ledger
+            .register_waiter(self.scope_id, tenant, self.class);
+        guard.push_back(waiter);
+        Ok(())
+    }
+
+    fn pop_eligible(&self) -> Option<Waiter> {
+        let mut guard = self.waiters.lock();
+        let selection = {
+            let candidates: Vec<_> = guard
+                .iter()
+                .enumerate()
+                .filter(|(_, waiter)| !waiter.cancel.is_cancelled())
+                .filter_map(|(index, waiter)| {
+                    waiter.tenant.as_ref().map(|tenant| FairShareCandidate {
+                        index,
+                        tenant,
+                        estimated_output_tokens: waiter.estimated_output_tokens,
+                    })
+                })
+                .collect();
+            self.ledger
+                .reserve_local_candidate(self.scope_id, self.class, &candidates)
+        }?;
+        let Some(mut waiter) = guard.remove(selection.index) else {
+            selection.reservation.cancel();
+            return None;
+        };
+        self.budget.release();
+        if let Some(tenant) = waiter.tenant.as_ref() {
+            self.ledger
+                .record_queue_wait(tenant, self.class, waiter.queued_at.elapsed());
+        }
+        waiter.fair_share_reservation = Some(selection.reservation);
+        Some(waiter)
+    }
+
+    fn head_age(&self) -> Option<Duration> {
+        self.waiters
+            .lock()
+            .iter()
+            .map(|waiter| waiter.queued_at.elapsed())
+            .max()
+    }
+
+    fn depth(&self) -> usize {
+        self.waiters.lock().len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.soft_limit
+    }
+
+    fn drop_cancelled_head(&self) {
+        let mut guard = self.waiters.lock();
+        let mut index = 0;
+        while index < guard.len() {
+            if !guard[index].cancel.is_cancelled() {
+                index += 1;
+                continue;
+            }
+            let Some(waiter) = guard.remove(index) else {
+                break;
+            };
+            self.budget.release();
+            if let Some(tenant) = waiter.tenant.as_ref() {
+                self.ledger.remove_waiter(self.scope_id, tenant, self.class);
+            }
         }
     }
 }

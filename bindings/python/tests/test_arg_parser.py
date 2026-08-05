@@ -51,6 +51,9 @@ class TestRouterArgs:
         assert args.priority_scheduler_default_max_class == "default"
         assert args.priority_scheduler_config is None
         assert args.priority_scheduler_tenant_metric_top_n == 32
+        assert args.trust_tenant_header is False
+        assert args.prefer_trusted_tenant_header is False
+        assert args.tenant_header_name == "x-smg-tenant-id"
         assert args.engine_metrics is False
         assert args.adaptive_admission_mode == "off"
         assert args.adaptive_admission_strategy == "predicted_work"
@@ -82,6 +85,20 @@ class TestRouterArgs:
         assert args.priority_scheduler_default_max_class == "interactive"
         assert args.priority_scheduler_config == "/tmp/priority.yaml"
         assert args.priority_scheduler_tenant_metric_top_n == 16
+
+    def test_parse_preferred_trusted_tenant_header_options(self):
+        args = parse_router_args(
+            [
+                "--trust-tenant-header",
+                "--prefer-trusted-tenant-header",
+                "--tenant-header-name",
+                "x-comet-user",
+            ]
+        )
+
+        assert args.trust_tenant_header is True
+        assert args.prefer_trusted_tenant_header is True
+        assert args.tenant_header_name == "x-comet-user"
 
     def test_parse_adaptive_admission_options(self):
         args = parse_router_args(

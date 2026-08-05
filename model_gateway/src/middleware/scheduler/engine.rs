@@ -23,14 +23,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{
+    fair_share::{FairShareReservation, GlobalFairShare, SettlementKind},
     inflight::InflightHandle,
-    queue::{ClassQueue, FifoClassQueue, QueueBudget, Waiter},
+    queue::{ClassQueue, FairClassQueue, FifoClassQueue, QueueBudget, Waiter},
     slots::SlotPool,
     Class, ClassRuntimeConfig, SchedulerSettings,
 };
 use crate::{
     middleware::admission_metrics::AdmissionQueuedGuard, observability::metrics::Metrics,
-    worker::WorkerCapacity,
+    tenant::TenantKey, worker::WorkerCapacity,
 };
 
 /// Max time to wait, after firing a preemption cancel, for the victim's slot
@@ -99,6 +100,9 @@ pub enum RejectionReason {
 pub struct PriorityScheduler {
     slot_pool: SlotPool,
     class_queues: [Arc<dyn ClassQueue>; 4],
+    fair_share: Option<Arc<GlobalFairShare>>,
+    #[cfg(test)]
+    fair_share_scope: Option<u64>,
     /// One work-conserving occupancy ceiling shared by all class queues.
     queue_budget: Arc<QueueBudget>,
     inflight_registry: RwLock<HashMap<RequestId, Arc<InflightHandle>>>,
@@ -150,13 +154,21 @@ impl PriorityScheduler {
     /// when they do not fit. The same rule is used for runtime capacity dips,
     /// so a small admission partition has identical startup and drain
     /// behavior.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "preserve the public constructor API while startup reservation overflow becomes a safe clamp"
-    )]
     pub fn new(
         settings: &SchedulerSettings,
         capacity: u16,
+    ) -> Result<Arc<Self>, SchedulerInitError> {
+        Self::new_with_fair_share(settings, capacity, None)
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the approved constructor seam for compatibility with existing callers"
+    )]
+    pub fn new_with_fair_share(
+        settings: &SchedulerSettings,
+        capacity: u16,
+        fair_share: Option<Arc<GlobalFairShare>>,
     ) -> Result<Arc<Self>, SchedulerInitError> {
         let reserved_floor = Class::ALL.map(|c| settings.class_config(c).reserved_floor);
         let reserved_per_slot = Class::ALL.map(|c| settings.class_config(c).reserved_per_slot);
@@ -178,14 +190,24 @@ impl PriorityScheduler {
             .map(|class| settings.class_config(*class).queue_size as usize)
             .fold(0_usize, usize::saturating_add);
         let queue_budget = Arc::new(QueueBudget::new(total_queue_capacity));
-        let class_queues: [Arc<dyn ClassQueue>; 4] =
-            Class::ALL.map(|c| queue_for(settings, c, Arc::clone(&queue_budget)));
+        let fair_share_scope = fair_share.as_ref().map(|ledger| ledger.new_scope());
+        let class_queues: [Arc<dyn ClassQueue>; 4] = Class::ALL.map(|c| {
+            queue_for(
+                settings,
+                c,
+                Arc::clone(&queue_budget),
+                fair_share.as_ref().zip(fair_share_scope),
+            )
+        });
         let class_config: [ClassRuntimeConfig; 4] =
             Class::ALL.map(|c| ClassRuntimeConfig::from_class_config(settings.class_config(c)));
 
-        Ok(Arc::new(Self {
+        let scheduler = Arc::new(Self {
             slot_pool: SlotPool::new(capacity, effective_reserved),
             class_queues,
+            fair_share,
+            #[cfg(test)]
+            fair_share_scope,
             queue_budget,
             inflight_registry: RwLock::new(HashMap::new()),
             release_notify: Arc::new(Notify::new()),
@@ -198,7 +220,8 @@ impl PriorityScheduler {
                 sampled_releases: 0,
                 ewma_per_second: None,
             }),
-        }))
+        });
+        Ok(scheduler)
     }
 
     /// Try to acquire a slot under `class` for the given request id.
@@ -214,12 +237,17 @@ impl PriorityScheduler {
         if !self.slot_pool.try_acquire(class) {
             return None;
         }
-        Some(self.register_inflight(class, request_id))
+        Some(self.register_inflight(class, request_id, None))
     }
 
     /// Register a handle in the registry and wrap it in a permit.
     /// Caller already acquired a slot via the pool.
-    fn register_inflight(self: &Arc<Self>, class: Class, request_id: RequestId) -> SchedulerPermit {
+    fn register_inflight(
+        self: &Arc<Self>,
+        class: Class,
+        request_id: RequestId,
+        fair_share_reservation: Option<FairShareReservation>,
+    ) -> SchedulerPermit {
         let handle = Arc::new(InflightHandle::new(class, request_id));
         self.inflight_registry
             .write()
@@ -227,7 +255,18 @@ impl PriorityScheduler {
         SchedulerPermit {
             scheduler: Arc::clone(self),
             handle,
+            fair_share_reservation,
         }
+    }
+
+    #[must_use]
+    pub fn fair_share(&self) -> Option<&Arc<GlobalFairShare>> {
+        self.fair_share.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fair_share_scope_for_test(&self) -> Option<u64> {
+        self.fair_share_scope
     }
 
     /// Admit a request under `class`. Tries the fast path first; if the
@@ -359,6 +398,83 @@ impl PriorityScheduler {
         outcome
     }
 
+    /// Admit one request using the shared output-token ledger when enabled.
+    ///
+    /// Fair-share requests enter the queue even when a slot is currently
+    /// free, so all locally eligible contenders are visible to the weighted
+    /// selector. The queue remains work-conserving: a free partition slot
+    /// always dispatches some local waiter.
+    pub async fn admit_for_tenant(
+        self: &Arc<Self>,
+        class: Class,
+        request_id: RequestId,
+        cancel: CancellationToken,
+        tenant: TenantKey,
+        estimated_output_tokens: u32,
+    ) -> AdmitOutcome {
+        if self.fair_share.is_none() {
+            return self.admit(class, request_id, cancel).await;
+        }
+        if cancel.is_cancelled() {
+            return AdmitOutcome::Rejected(RejectionReason::ClientCancelled);
+        }
+
+        let (tx, rx) = oneshot::channel::<SchedulerPermit>();
+        let waiter_cancel = cancel.child_token();
+        let waiter = Waiter::new_fair(
+            class,
+            waiter_cancel.clone(),
+            request_id,
+            tx,
+            tenant,
+            estimated_output_tokens,
+        );
+        if self.class_queues[class as usize]
+            .try_enqueue(waiter)
+            .is_err()
+        {
+            return AdmitOutcome::Rejected(RejectionReason::QueueFull);
+        }
+        let _queued_guard = AdmissionQueuedGuard::new();
+        let enqueued_at = Instant::now();
+
+        // Drain synchronously once before yielding. This preserves the normal
+        // free-slot fast path while still making the request visible to the
+        // fair queue. If capacity is blocked, priority preemption only frees
+        // a slot; the fair queue still decides which eligible tenant receives
+        // it.
+        let made_progress = self.wake_next_waiter();
+        if !made_progress && self.class_config[class as usize].can_preempt {
+            if let Some(victim) = self.find_preemption_victim(class) {
+                if victim.try_mark_preempted() {
+                    info!(
+                        victim_id = %victim.request_id().0,
+                        victim_class = ?victim.class(),
+                        preemptor_class = ?class,
+                        "scheduler: preempting pre-TTFT request for fair-share queue"
+                    );
+                    victim.cancel();
+                    super::metrics::record_preemption(victim.class(), class);
+                }
+            }
+        }
+        self.release_notify.notify_one();
+
+        let timeout = self.class_config[class as usize].queue_timeout;
+        let outcome = tokio::select! {
+            result = rx => match result {
+                Ok(permit) => AdmitOutcome::Admitted(permit),
+                Err(_) => AdmitOutcome::Rejected(RejectionReason::ClientCancelled),
+            },
+            () = tokio::time::sleep(timeout) => AdmitOutcome::Rejected(RejectionReason::QueueTimeout),
+            () = cancel.cancelled() => AdmitOutcome::Rejected(RejectionReason::ClientCancelled),
+        };
+        super::metrics::record_queue_wait(class, enqueued_at.elapsed());
+        waiter_cancel.cancel();
+        self.release_notify.notify_one();
+        outcome
+    }
+
     /// Remove a handle from the registry, release its slot, and notify
     /// the dispatcher. Called from [`SchedulerPermit`]'s `Drop`.
     fn release_inflight(&self, handle: &InflightHandle) {
@@ -463,7 +579,7 @@ impl PriorityScheduler {
             // (this loop runs up to budget/poll-interval times per
             // preemption).
             if self.slot_pool.try_acquire(class) {
-                return Some(self.register_inflight(class, request_id));
+                return Some(self.register_inflight(class, request_id, None));
             }
             if Instant::now() >= deadline {
                 return None;
@@ -550,6 +666,7 @@ impl PriorityScheduler {
             let Some(Waiter {
                 request_id,
                 permit_tx,
+                fair_share_reservation,
                 ..
             }) = self.class_queues[class as usize].pop_eligible()
             else {
@@ -559,14 +676,19 @@ impl PriorityScheduler {
                 // Receiver gone — skip the registry write and the
                 // matched permit-drop release. Try the next waiter
                 // using the same slot we already acquired.
+                if let Some(reservation) = fair_share_reservation {
+                    reservation.cancel();
+                }
                 continue;
             }
-            let permit = self.register_inflight(class, request_id);
+            let permit = self.register_inflight(class, request_id, fair_share_reservation);
             // If the receiver was dropped between is_closed() above and
-            // send below (unlikely race window), the permit goes out of
-            // scope and its Drop releases the slot back; the caller's
-            // outer loop will try again.
-            let _ = permit_tx.send(permit);
+            // send below (unlikely race window), cancel the provisional
+            // charge because no backend work began, then let permit Drop
+            // release the slot. The caller's outer loop will try again.
+            if let Err(mut undelivered) = permit_tx.send(permit) {
+                undelivered.cancel_fair_share_reservation();
+            }
             return true;
         }
     }
@@ -888,11 +1010,19 @@ fn queue_for(
     settings: &SchedulerSettings,
     class: Class,
     queue_budget: Arc<QueueBudget>,
+    fair_share: Option<(&Arc<GlobalFairShare>, u64)>,
 ) -> Arc<dyn ClassQueue> {
-    Arc::new(FifoClassQueue::with_shared_budget(
-        settings.class_config(class).queue_size as usize,
-        queue_budget,
-    ))
+    let soft_limit = settings.class_config(class).queue_size as usize;
+    match fair_share {
+        Some((ledger, scope_id)) => Arc::new(FairClassQueue::with_shared_budget(
+            class,
+            soft_limit,
+            queue_budget,
+            Arc::clone(ledger),
+            scope_id,
+        )),
+        None => Arc::new(FifoClassQueue::with_shared_budget(soft_limit, queue_budget)),
+    }
 }
 
 /// RAII handle on one admitted request. Holding a permit keeps the slot
@@ -901,6 +1031,7 @@ fn queue_for(
 pub struct SchedulerPermit {
     scheduler: Arc<PriorityScheduler>,
     handle: Arc<InflightHandle>,
+    fair_share_reservation: Option<FairShareReservation>,
 }
 
 impl SchedulerPermit {
@@ -908,6 +1039,11 @@ impl SchedulerPermit {
     /// preemption coordination in follow-on commits).
     pub fn handle(&self) -> &Arc<InflightHandle> {
         &self.handle
+    }
+
+    #[must_use]
+    pub fn has_fair_share_reservation(&self) -> bool {
+        self.fair_share_reservation.is_some()
     }
 
     /// Mark the first response byte. Called by [`super::body::SchedulerGuardBody`]
@@ -927,6 +1063,24 @@ impl SchedulerPermit {
     pub fn cancel_token(&self) -> CancellationToken {
         self.handle.cancel_token()
     }
+
+    /// Replace the provisional fair-share charge with terminal observed
+    /// output tokens. Calling this more than once is a no-op.
+    pub fn settle_output_tokens(
+        &mut self,
+        observed_output_tokens: Option<u32>,
+        kind: SettlementKind,
+    ) {
+        if let Some(reservation) = self.fair_share_reservation.take() {
+            reservation.settle(observed_output_tokens, kind);
+        }
+    }
+
+    fn cancel_fair_share_reservation(&mut self) {
+        if let Some(reservation) = self.fair_share_reservation.take() {
+            reservation.cancel();
+        }
+    }
 }
 
 impl std::fmt::Debug for SchedulerPermit {
@@ -942,13 +1096,16 @@ impl std::fmt::Debug for SchedulerPermit {
 
 impl Drop for SchedulerPermit {
     fn drop(&mut self) {
+        if let Some(reservation) = self.fair_share_reservation.take() {
+            reservation.settle(None, SettlementKind::Interrupted);
+        }
         self.scheduler.release_inflight(&self.handle);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use super::*;
     use crate::middleware::scheduler::{ClassConfig, PrioritySchedulerYaml};
@@ -1884,5 +2041,125 @@ mod tests {
             !victim_cancel.is_cancelled(),
             "can_preempt=false class must not cancel anyone"
         );
+    }
+
+    fn fair_settings() -> SchedulerSettings {
+        let mut classes = HashMap::new();
+        for class in Class::ALL {
+            let mut config = ClassConfig::default_for(class);
+            config.reserved_floor = 0;
+            config.reserved_per_slot = 0.0;
+            config.queue_size = 16;
+            classes.insert(class, config);
+        }
+        let yaml = PrioritySchedulerYaml {
+            classes,
+            fair_share: Some(crate::middleware::scheduler::FairShareConfig {
+                default_weight: 1.0,
+                default_output_tokens: 10,
+                trust_output_token_estimate_header: false,
+                tenant_weights: HashMap::from([
+                    ("header:a".to_string(), 1.0),
+                    ("header:b".to_string(), 1.0),
+                ]),
+            }),
+            ..Default::default()
+        };
+        SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fair_share_free_slot_is_work_conserving_for_lone_user() {
+        let settings = fair_settings();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scheduler = PriorityScheduler::new_with_fair_share(&settings, 1, Some(ledger)).unwrap();
+
+        let outcome = scheduler
+            .admit_for_tenant(
+                Class::Default,
+                rid("a-1"),
+                CancellationToken::new(),
+                TenantKey::new("header:a"),
+                10,
+            )
+            .await;
+        let AdmitOutcome::Admitted(mut permit) = outcome else {
+            panic!("a lone eligible waiter must use the free partition slot");
+        };
+        permit.settle_output_tokens(Some(10), SettlementKind::Observed);
+        drop(permit);
+        assert_eq!(scheduler.inflight_for_test(Class::Default), 0);
+    }
+
+    #[test]
+    fn fair_share_underserved_local_user_wins_contention() {
+        let settings = fair_settings();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scheduler =
+            PriorityScheduler::new_with_fair_share(&settings, 1, Some(Arc::clone(&ledger)))
+                .unwrap();
+        let a = TenantKey::new("header:a");
+        let b = TenantKey::new("header:b");
+        let scope_id = scheduler
+            .fair_share_scope_for_test()
+            .expect("fair-share scheduler has a scope");
+        let held = scheduler
+            .acquire_inflight(Class::Default, rid("held"))
+            .unwrap();
+        let (a_tx, mut a_rx) = oneshot::channel();
+        let (b_tx, mut b_rx) = oneshot::channel();
+        scheduler.class_queues[Class::Default as usize]
+            .try_enqueue(Waiter::new_fair(
+                Class::Default,
+                CancellationToken::new(),
+                rid("b-queued"),
+                b_tx,
+                b,
+                10,
+            ))
+            .unwrap();
+
+        let reservation = {
+            // b is already backlogged for this partition while a receives
+            // service, so a accumulates debt only under real contention.
+            ledger.register_waiter(scope_id, &a, Class::Default);
+            ledger
+                .reserve_local_candidate(
+                    scope_id,
+                    Class::Default,
+                    &[
+                        crate::middleware::scheduler::fair_share::FairShareCandidate {
+                            index: 0,
+                            tenant: &a,
+                            estimated_output_tokens: 50,
+                        },
+                    ],
+                )
+                .unwrap()
+                .reservation
+        };
+        reservation.settle(Some(50), SettlementKind::Observed);
+
+        scheduler.class_queues[Class::Default as usize]
+            .try_enqueue(Waiter::new_fair(
+                Class::Default,
+                CancellationToken::new(),
+                rid("a-queued"),
+                a_tx,
+                a,
+                10,
+            ))
+            .unwrap();
+
+        drop(held);
+        assert!(scheduler.wake_next_waiter());
+        let permit = b_rx.try_recv().expect("underserved local user admitted");
+        assert!(matches!(
+            a_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(permit);
+        assert!(scheduler.wake_next_waiter());
+        drop(a_rx.try_recv().expect("remaining local waiter admitted"));
     }
 }

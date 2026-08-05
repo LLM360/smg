@@ -486,6 +486,11 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Request Handling")]
     trust_tenant_header: bool,
 
+    /// Prefer the trusted tenant header over an authenticated shared proxy
+    /// identity. Requires --trust-tenant-header.
+    #[arg(long, default_value_t = false, help_heading = "Request Handling")]
+    prefer_trusted_tenant_header: bool,
+
     /// Header name to use when --trust-tenant-header is enabled.
     #[arg(
         long,
@@ -1672,6 +1677,7 @@ impl CliArgs {
                     .then(|| Self::parse_selector(&self.storage_context_headers)),
             )
             .trust_tenant_header(self.trust_tenant_header)
+            .prefer_trusted_tenant_header(self.prefer_trusted_tenant_header)
             .tenant_header_name(&self.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .maybe_global_rate_limit_requests_per_second(self.global_rate_limit_requests_per_second)
