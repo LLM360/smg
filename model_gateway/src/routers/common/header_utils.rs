@@ -95,7 +95,11 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("content-length")
-        || name.eq_ignore_ascii_case("host"))
+        || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("x-comet-control-component-id")
+        || name.eq_ignore_ascii_case("x-comet-profile-component-id")
+        || name.eq_ignore_ascii_case("x-comet-smg-component-id")
+        || name.eq_ignore_ascii_case("x-comet-pool-component-id"))
 }
 
 /// API provider types for provider-specific header handling
@@ -398,6 +402,23 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+    }
+
+    #[test]
+    fn test_engine_serving_identity_headers_are_not_preserved() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x-comet-control-component-id",
+            "x-comet-profile-component-id",
+            "x-comet-smg-component-id",
+            "x-comet-pool-component-id",
+        ] {
+            headers.insert(name, "f".repeat(64).parse().unwrap());
+        }
+
+        let preserved = preserve_response_headers(&headers);
+
+        assert!(preserved.is_empty());
     }
 
     #[test]

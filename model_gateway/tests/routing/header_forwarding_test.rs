@@ -3,7 +3,7 @@
 //! Tests for header propagation through the router to workers.
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
@@ -13,12 +13,157 @@ use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
-    AppTestContext,
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
 
 #[cfg(test)]
 mod header_forwarding_tests {
     use super::*;
+
+    const POOL_HEADER: &str = "x-comet-pool-component-id";
+
+    async fn set_pool_identity(app: &axum::Router, worker_url: &str, value: &str) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let worker_id = body["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|worker| worker["url"] == worker_url)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let update = json!({"labels": {"comet_pool_component_id": value}});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/workers/{worker_id}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        for _ in 0..40 {
+            let worker = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/workers/{worker_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(worker.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            if body["labels"]["comet_pool_component_id"] == value {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+        panic!("worker label update did not finish");
+    }
+
+    async fn generate(app: &axum::Router, stream: bool) -> axum::response::Response {
+        let payload = json!({"text": "serving identity", "stream": stream});
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_responses_report_selected_pool() {
+        let worker = TestWorkerConfig::healthy(19410);
+        let ctx = AppTestContext::new(vec![worker]).await;
+        let app = ctx.create_app();
+        let pool_id = "a".repeat(64);
+        set_pool_identity(&app, "http://127.0.0.1:19410", &pool_id).await;
+
+        for stream in [false, true] {
+            let response = generate(&app, stream).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[POOL_HEADER], pool_id);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_retry_reports_the_worker_that_succeeds() {
+        let config = TestRouterConfig::round_robin_with_retry(
+            3110,
+            smg::config::RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                jitter_factor: 0.0,
+                ..Default::default()
+            },
+        );
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::flaky(19411, 1.0),
+                TestWorkerConfig::healthy(19412),
+            ],
+        )
+        .await;
+        let app = ctx.create_app();
+        set_pool_identity(&app, "http://127.0.0.1:19411", &"a".repeat(64)).await;
+        set_pool_identity(&app, "http://127.0.0.1:19412", &"b".repeat(64)).await;
+
+        let response = generate(&app, false).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[POOL_HEADER], "b".repeat(64));
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_missing_or_malformed_pool_identity_is_omitted() {
+        let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(19413)]).await;
+        let app = ctx.create_app();
+        assert!(!generate(&app, false)
+            .await
+            .headers()
+            .contains_key(POOL_HEADER));
+
+        for value in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+            set_pool_identity(&app, "http://127.0.0.1:19413", &value).await;
+            assert!(!generate(&app, false)
+                .await
+                .headers()
+                .contains_key(POOL_HEADER));
+        }
+
+        ctx.shutdown().await;
+    }
 
     /// Test that X-Request-Id header is forwarded
     #[tokio::test]

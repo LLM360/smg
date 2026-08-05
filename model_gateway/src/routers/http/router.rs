@@ -75,6 +75,33 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const ADAPTIVE_RESPONSE_TAIL_LIMIT: usize = 256 * 1024;
 const COMET_USER_HEADER: &str = "x-comet-user";
 const COMET_WORKLOAD_TYPE_HEADER: &str = "x-comet-workload-type";
+const COMET_POOL_COMPONENT_LABEL: &str = "comet_pool_component_id";
+const COMET_POOL_COMPONENT_HEADER: &str = "x-comet-pool-component-id";
+
+fn add_comet_pool_component_id(response: &mut Response, worker: &dyn Worker) {
+    if !response.status().is_success() {
+        return;
+    }
+    let Some(component_id) = worker
+        .metadata()
+        .spec
+        .labels
+        .get(COMET_POOL_COMPONENT_LABEL)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::try_from(component_id) {
+        response
+            .headers_mut()
+            .insert(COMET_POOL_COMPONENT_HEADER, value);
+    }
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -712,7 +739,7 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let response = self
+        let mut response = self
             .send_typed_request(
                 headers,
                 typed_req,
@@ -723,6 +750,8 @@ impl Router {
                 load_guard,
             )
             .await;
+
+        add_comet_pool_component_id(&mut response, worker.as_ref());
 
         events::RequestReceivedEvent {}.emit();
 
