@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     engine::SchedulerPermit,
-    fair_share::{FairShareCandidate, FairShareReservation, GlobalFairShare},
+    fair_share::{FairShareCandidate, FairShareProfile, FairShareReservation, GlobalFairShare},
     Class,
 };
 use crate::tenant::TenantKey;
@@ -96,8 +96,9 @@ pub struct Waiter {
     pub request_id: RequestId,
     pub permit_tx: oneshot::Sender<SchedulerPermit>,
     pub tenant: Option<TenantKey>,
+    pub(crate) fair_share_profile: FairShareProfile,
     pub estimated_output_tokens: u32,
-    pub fair_share_reservation: Option<FairShareReservation>,
+    pub fair_share_reservation: Option<Box<FairShareReservation>>,
 }
 
 impl Waiter {
@@ -114,17 +115,19 @@ impl Waiter {
             request_id,
             permit_tx,
             tenant: None,
+            fair_share_profile: FairShareProfile::Global,
             estimated_output_tokens: 0,
             fair_share_reservation: None,
         }
     }
 
-    pub fn new_fair(
+    pub(crate) fn new_fair(
         class: Class,
         cancel: CancellationToken,
         request_id: RequestId,
         permit_tx: oneshot::Sender<SchedulerPermit>,
         tenant: TenantKey,
+        fair_share_profile: FairShareProfile,
         estimated_output_tokens: u32,
     ) -> Self {
         Self {
@@ -134,6 +137,7 @@ impl Waiter {
             request_id,
             permit_tx,
             tenant: Some(tenant),
+            fair_share_profile,
             estimated_output_tokens: estimated_output_tokens.max(1),
             fair_share_reservation: None,
         }
@@ -277,19 +281,29 @@ impl ClassQueue for FairClassQueue {
             return Err(waiter);
         }
         let mut guard = self.waiters.lock();
-        self.ledger
-            .register_waiter(self.scope_id, tenant, self.class);
+        self.ledger.register_waiter_in_profile(
+            self.scope_id,
+            &waiter.fair_share_profile,
+            tenant,
+            self.class,
+        );
         guard.push_back(waiter);
         Ok(())
     }
 
     fn pop_eligible(&self) -> Option<Waiter> {
         let mut guard = self.waiters.lock();
+        let profile = guard
+            .iter()
+            .filter(|waiter| !waiter.cancel.is_cancelled())
+            .min_by_key(|waiter| waiter.queued_at)
+            .map(|waiter| waiter.fair_share_profile.clone())?;
         let selection = {
             let candidates: Vec<_> = guard
                 .iter()
                 .enumerate()
                 .filter(|(_, waiter)| !waiter.cancel.is_cancelled())
+                .filter(|(_, waiter)| waiter.fair_share_profile == profile)
                 .filter_map(|(index, waiter)| {
                     waiter.tenant.as_ref().map(|tenant| FairShareCandidate {
                         index,
@@ -298,8 +312,12 @@ impl ClassQueue for FairClassQueue {
                     })
                 })
                 .collect();
-            self.ledger
-                .reserve_local_candidate(self.scope_id, self.class, &candidates)
+            self.ledger.reserve_local_candidate_in_profile(
+                self.scope_id,
+                &profile,
+                self.class,
+                &candidates,
+            )
         }?;
         let Some(mut waiter) = guard.remove(selection.index) else {
             selection.reservation.cancel();
@@ -307,10 +325,14 @@ impl ClassQueue for FairClassQueue {
         };
         self.budget.release();
         if let Some(tenant) = waiter.tenant.as_ref() {
-            self.ledger
-                .record_queue_wait(tenant, self.class, waiter.queued_at.elapsed());
+            self.ledger.record_queue_wait(
+                &waiter.fair_share_profile,
+                tenant,
+                self.class,
+                waiter.queued_at.elapsed(),
+            );
         }
-        waiter.fair_share_reservation = Some(selection.reservation);
+        waiter.fair_share_reservation = Some(Box::new(selection.reservation));
         Some(waiter)
     }
 
@@ -343,7 +365,12 @@ impl ClassQueue for FairClassQueue {
             };
             self.budget.release();
             if let Some(tenant) = waiter.tenant.as_ref() {
-                self.ledger.remove_waiter(self.scope_id, tenant, self.class);
+                self.ledger.remove_waiter_in_profile(
+                    self.scope_id,
+                    &waiter.fair_share_profile,
+                    tenant,
+                    self.class,
+                );
             }
         }
     }
@@ -351,12 +378,13 @@ impl ClassQueue for FairClassQueue {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::middleware::scheduler::Class;
+    use crate::middleware::scheduler::{Class, FairShareConfig, ModelFairShareConfig};
 
     fn waiter(class: Class) -> Waiter {
         let (tx, _rx) = oneshot::channel();
@@ -366,6 +394,45 @@ mod tests {
     fn waiter_with_cancel(class: Class, cancel: CancellationToken) -> Waiter {
         let (tx, _rx) = oneshot::channel();
         Waiter::new(class, cancel, RequestId("t".into()), tx)
+    }
+
+    fn model_ledger() -> Arc<GlobalFairShare> {
+        Arc::new(GlobalFairShare::from_config(&FairShareConfig {
+            default_weight: 1.0,
+            default_output_tokens: 10,
+            trust_output_token_estimate_header: false,
+            trust_request_model_header: true,
+            tenant_weights: HashMap::new(),
+            model_profiles: HashMap::from([
+                (
+                    "model-a".to_string(),
+                    ModelFairShareConfig {
+                        tenant_weights: HashMap::new(),
+                        other_weight: 1.0,
+                    },
+                ),
+                (
+                    "model-b".to_string(),
+                    ModelFairShareConfig {
+                        tenant_weights: HashMap::new(),
+                        other_weight: 1.0,
+                    },
+                ),
+            ]),
+        }))
+    }
+
+    fn model_waiter(id: &str, tenant: &str, profile: FairShareProfile) -> Waiter {
+        let (tx, _rx) = oneshot::channel();
+        Waiter::new_fair(
+            Class::Default,
+            CancellationToken::new(),
+            RequestId(id.into()),
+            tx,
+            TenantKey::new(tenant),
+            profile,
+            10,
+        )
     }
 
     #[test]
@@ -437,6 +504,47 @@ mod tests {
             Class::Interactive,
             "live waiter exposed as new head"
         );
+    }
+
+    #[test]
+    fn oldest_model_group_wins_before_model_local_virtual_service() {
+        let ledger = model_ledger();
+        let scope_id = ledger.new_scope();
+        let queue = FairClassQueue::with_shared_budget(
+            Class::Default,
+            8,
+            Arc::new(QueueBudget::new(8)),
+            Arc::clone(&ledger),
+            scope_id,
+        );
+        let mut older = model_waiter(
+            "older-model-a",
+            "header:a",
+            ledger.profile_for_model("model-a"),
+        );
+        older.queued_at = Instant::now() - Duration::from_secs(1);
+        let newer = model_waiter(
+            "newer-model-b",
+            "header:b",
+            ledger.profile_for_model("model-b"),
+        );
+        queue.try_enqueue(older).unwrap();
+        queue.try_enqueue(newer).unwrap();
+
+        let mut first = queue.pop_eligible().expect("oldest model group dispatches");
+        assert_eq!(first.request_id.0, "older-model-a");
+        first
+            .fair_share_reservation
+            .take()
+            .expect("model waiter has reservation")
+            .cancel();
+        let mut second = queue.pop_eligible().expect("other model remains eligible");
+        assert_eq!(second.request_id.0, "newer-model-b");
+        second
+            .fair_share_reservation
+            .take()
+            .expect("model waiter has reservation")
+            .cancel();
     }
 
     #[test]

@@ -21,13 +21,16 @@ pub use body::SchedulerGuardBody;
 pub use class::{Class, PRIORITY_HEADER};
 pub use config::{
     AdmissionPartitionConfig, ClassConfig, ClassRuntimeConfig, FairShareConfig,
-    PrioritySchedulerYaml, SchedulerSettings, SettingsValidationError, TenantPolicyConfig,
+    ModelFairShareConfig, PrioritySchedulerYaml, SchedulerSettings, SettingsValidationError,
+    TenantPolicyConfig,
 };
 pub use engine::{
     AdmitOutcome, PriorityScheduler, RejectionReason, SchedulerInitError, SchedulerPermit,
 };
 pub use error::{SchedulerError, HEADER_X_SMG_PREEMPTED};
 pub use extract::PreemptionGuard;
-pub use fair_share::{GlobalFairShare, SettlementKind, OUTPUT_TOKEN_ESTIMATE_HEADER};
+pub use fair_share::{
+    GlobalFairShare, SettlementKind, OUTPUT_TOKEN_ESTIMATE_HEADER, REQUEST_MODEL_HEADER,
+};
 pub use policy::{StaticTenantPolicyResolver, TenantPolicy, TenantPolicyResolver};
 pub use state::{AdmissionMode, SchedulerState, ADMISSION_PARTITION_HEADER};
