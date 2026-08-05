@@ -48,6 +48,8 @@ const ENGINE_WAITING_TOKENS: &str = "smg_adaptive_admission_engine_waiting_uncac
 const ENGINE_TOKEN_USAGE: &str = "smg_adaptive_admission_engine_max_token_usage";
 const ENGINE_MEAN_TOKEN_USAGE: &str = "smg_adaptive_admission_engine_mean_token_usage";
 const ENGINE_MAX_RUNNING: &str = "smg_adaptive_admission_engine_max_running_requests";
+const ENGINE_MAX_RUNNING_COVERAGE: &str =
+    "smg_adaptive_admission_engine_max_running_requests_coverage";
 const ROUTER_OUTSTANDING_REQUESTS: &str = "smg_adaptive_admission_router_outstanding_requests";
 const FEEDBACK_RUNNING_LIMIT: &str = "smg_adaptive_admission_feedback_running_limit";
 const FEEDBACK_KNEE_PER_REPLICA: &str = "smg_adaptive_admission_feedback_knee_requests_per_replica";
@@ -135,6 +137,10 @@ pub(crate) fn describe_metrics() {
     describe_gauge!(
         ENGINE_MAX_RUNNING,
         "Sum of engine-reported maximum running requests in an admission partition"
+    );
+    describe_gauge!(
+        ENGINE_MAX_RUNNING_COVERAGE,
+        "Fraction of healthy replicas contributing a maximum-running-requests ceiling"
     );
     describe_gauge!(
         ROUTER_OUTSTANDING_REQUESTS,
@@ -421,6 +427,7 @@ struct PartitionLoad {
     max_token_usage: f64,
     token_usage_sum: f64,
     max_running_requests: i64,
+    max_running_observed_replicas: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +502,24 @@ impl PartitionLoad {
             0.0
         } else {
             self.token_usage_sum / f64::from(self.observed_replicas)
+        }
+    }
+
+    fn max_running_coverage(&self) -> f64 {
+        if self.healthy_replicas == 0 {
+            0.0
+        } else {
+            f64::from(self.max_running_observed_replicas) / f64::from(self.healthy_replicas)
+        }
+    }
+
+    fn scaled_max_running_requests(&self) -> f64 {
+        if self.max_running_observed_replicas == 0 {
+            0.0
+        } else {
+            (self.max_running_requests as f64 * f64::from(self.healthy_replicas)
+                / f64::from(self.max_running_observed_replicas))
+            .floor()
         }
     }
 }
@@ -636,11 +661,16 @@ impl AdaptiveAdmissionController {
                 .iter()
                 .map(|rank| i64::from(rank.max_running_requests.max(0)))
                 .sum::<i64>();
-            aggregate.max_running_requests += if reported_max_running > 0 {
+            let max_running_requests = if reported_max_running > 0 {
                 reported_max_running
             } else {
                 worker.max_running_requests().map_or(0, i64::from)
             };
+            if max_running_requests > 0 {
+                aggregate.max_running_requests += max_running_requests;
+                aggregate.max_running_observed_replicas =
+                    aggregate.max_running_observed_replicas.saturating_add(1);
+            }
         }
 
         let now = Instant::now();
@@ -709,6 +739,8 @@ impl AdaptiveAdmissionController {
                 .set(load.mean_token_usage());
             gauge!(ENGINE_MAX_RUNNING, "partition" => Arc::clone(&partition_label))
                 .set(load.max_running_requests as f64);
+            gauge!(ENGINE_MAX_RUNNING_COVERAGE, "partition" => Arc::clone(&partition_label))
+                .set(load.max_running_coverage());
             gauge!(FEEDBACK_KNEE_PER_REPLICA, "partition" => partition_label).set(
                 work.feedback_estimates
                     .get(partition)
@@ -842,12 +874,9 @@ impl AdaptiveAdmissionController {
                 }
                 AdaptiveAdmissionStrategy::EngineFeedback => {
                     let telemetry_usable = coverage >= self.config.min_load_coverage
-                        && load.observed_replicas > 0
-                        && load.max_running_requests > 0;
+                        && load.max_running_coverage() >= self.config.min_load_coverage;
                     let engine_limit = if telemetry_usable {
-                        (load.max_running_requests as f64 * f64::from(load.healthy_replicas)
-                            / f64::from(load.observed_replicas))
-                        .floor()
+                        load.scaled_max_running_requests()
                     } else {
                         0.0
                     };
@@ -1297,6 +1326,7 @@ mod tests {
                 generation_tokens_per_second: 100.0,
                 running_requests: 10,
                 max_running_requests: 64,
+                max_running_observed_replicas: 1,
                 max_token_usage: 0.5,
                 ..PartitionLoad::default()
             },
@@ -1339,6 +1369,7 @@ mod tests {
                     running_requests: 1,
                     waiting_requests,
                     max_running_requests: 64,
+                    max_running_observed_replicas: 1,
                     max_token_usage: token_usage,
                     token_usage_sum: token_usage,
                     ..PartitionLoad::default()
@@ -1367,6 +1398,7 @@ mod tests {
                 healthy_replicas: 1,
                 observed_replicas: 1,
                 max_running_requests: 2,
+                max_running_observed_replicas: 1,
                 ..PartitionLoad::default()
             },
         );
@@ -1377,6 +1409,57 @@ mod tests {
         assert!(!first.should_reject());
         assert!(!second.should_reject());
         assert!(third.should_reject());
+    }
+
+    #[test]
+    fn engine_feedback_scales_only_sufficient_max_running_coverage() {
+        let sufficiently_covered = PartitionLoad {
+            healthy_replicas: 5,
+            observed_replicas: 4,
+            max_running_requests: 256,
+            max_running_observed_replicas: 4,
+            ..PartitionLoad::default()
+        };
+        assert_eq!(sufficiently_covered.coverage(), 0.8);
+        assert_eq!(sufficiently_covered.max_running_coverage(), 0.8);
+        assert_eq!(sufficiently_covered.scaled_max_running_requests(), 320.0);
+
+        let insufficiently_covered = PartitionLoad {
+            healthy_replicas: 5,
+            observed_replicas: 5,
+            max_running_requests: 192,
+            max_running_observed_replicas: 3,
+            ..PartitionLoad::default()
+        };
+        assert_eq!(insufficiently_covered.coverage(), 1.0);
+        assert_eq!(insufficiently_covered.max_running_coverage(), 0.6);
+    }
+
+    #[test]
+    fn engine_feedback_fails_open_when_max_running_coverage_is_incomplete() {
+        let mut settings = config();
+        settings.mode = AdaptiveAdmissionMode::Enforce;
+        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        let controller =
+            AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
+        controller.work.lock().loads.insert(
+            "model".to_string(),
+            PartitionLoad {
+                healthy_replicas: 5,
+                observed_replicas: 5,
+                max_running_requests: 192,
+                max_running_observed_replicas: 3,
+                ..PartitionLoad::default()
+            },
+        );
+
+        let tracker = controller.begin("model".to_string(), features("u", 10, None));
+        assert!(!tracker.should_reject());
+        assert!(!tracker.inner.as_ref().unwrap().decision.telemetry_usable);
+        assert_eq!(
+            tracker.inner.as_ref().unwrap().decision.reason,
+            "telemetry_fallback"
+        );
     }
 
     #[test]
