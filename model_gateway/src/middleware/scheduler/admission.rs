@@ -13,14 +13,21 @@ use std::sync::{
     Arc,
 };
 
-use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{HeaderMap, Request},
+    middleware::Next,
+    response::Response,
+};
 use smg_auth::RequestId;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use super::{
-    metrics as sched_metrics, state::SchedulerState, AdmitOutcome, Class, RejectionReason,
-    SchedulerError, SchedulerGuardBody, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
+    metrics as sched_metrics, state::SchedulerState, AdmitOutcome, Class, GlobalFairShare,
+    RejectionReason, SchedulerError, SchedulerGuardBody, HEADER_X_SMG_PREEMPTED,
+    OUTPUT_TOKEN_ESTIMATE_HEADER, PRIORITY_HEADER,
 };
 use crate::{
     middleware::{
@@ -89,6 +96,32 @@ fn rejection_outcome(reason: RejectionReason) -> &'static str {
     }
 }
 
+fn output_token_estimate(headers: &HeaderMap, ledger: &GlobalFairShare) -> u32 {
+    let configured_default = ledger.default_output_tokens();
+    let header = headers.get(OUTPUT_TOKEN_ESTIMATE_HEADER);
+    if !ledger.trusts_output_token_estimate_header() {
+        if header.is_some() {
+            sched_metrics::record_fair_share_fallback("untrusted_estimate");
+        }
+        return configured_default;
+    }
+    match header {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                sched_metrics::record_fair_share_fallback("invalid_estimate");
+                configured_default
+            }),
+        None => {
+            sched_metrics::record_fair_share_fallback("missing_estimate");
+            configured_default
+        }
+    }
+}
+
 pub async fn priority_admission_middleware(
     State(state): State<Arc<SchedulerState>>,
     mut req: Request<Body>,
@@ -134,7 +167,22 @@ pub async fn priority_admission_middleware(
     // once admitted, releasing the slot.
     let cancel = CancellationToken::new();
 
-    match partition.scheduler.admit(class, request_id, cancel).await {
+    let estimated_output_tokens = match partition.scheduler.fair_share() {
+        Some(ledger) => output_token_estimate(req.headers(), ledger),
+        None => 1,
+    };
+
+    match partition
+        .scheduler
+        .admit_for_tenant(
+            class,
+            request_id,
+            cancel,
+            tenant.clone(),
+            estimated_output_tokens,
+        )
+        .await
+    {
         AdmitOutcome::Admitted(permit) => {
             pending_guard.resolve();
             Metrics::record_http_admission_admitted();
@@ -194,5 +242,36 @@ pub async fn priority_admission_middleware(
             SchedulerError::from(reason)
                 .into_response_with_retry_after(partition.scheduler.retry_after_secs(class))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::middleware::scheduler::FairShareConfig;
+
+    fn ledger(trust_header: bool) -> GlobalFairShare {
+        GlobalFairShare::from_config(&FairShareConfig {
+            default_weight: 1.0,
+            default_output_tokens: 256,
+            trust_output_token_estimate_header: trust_header,
+            tenant_weights: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn untrusted_client_estimate_cannot_reduce_reservation() {
+        let mut headers = HeaderMap::new();
+        headers.insert(OUTPUT_TOKEN_ESTIMATE_HEADER, "1".parse().unwrap());
+        assert_eq!(output_token_estimate(&headers, &ledger(false)), 256);
+    }
+
+    #[test]
+    fn trusted_proxy_estimate_is_honored() {
+        let mut headers = HeaderMap::new();
+        headers.insert(OUTPUT_TOKEN_ESTIMATE_HEADER, "128".parse().unwrap());
+        assert_eq!(output_token_estimate(&headers, &ledger(true)), 128);
     }
 }

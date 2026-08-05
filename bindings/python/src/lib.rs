@@ -415,6 +415,7 @@ struct Router {
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     trust_tenant_header: bool,
+    prefer_trusted_tenant_header: bool,
     tenant_header_name: String,
     storage_context_headers: HashMap<String, String>,
     pd_disaggregation: bool,
@@ -861,6 +862,7 @@ impl Router {
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
+            .prefer_trusted_tenant_header(self.prefer_trusted_tenant_header)
             .tenant_header_name(&self.tenant_header_name)
             .maybe_storage_context_headers(
                 (!self.storage_context_headers.is_empty())
@@ -956,6 +958,7 @@ impl Router {
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
         trust_tenant_header = false,
+        prefer_trusted_tenant_header = false,
         tenant_header_name = String::from("x-smg-tenant-id"),
         storage_context_headers = HashMap::new(),
         pd_disaggregation = false,
@@ -1106,6 +1109,7 @@ impl Router {
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         trust_tenant_header: bool,
+        prefer_trusted_tenant_header: bool,
         tenant_header_name: String,
         storage_context_headers: HashMap<String, String>,
         pd_disaggregation: bool,
@@ -1272,6 +1276,7 @@ impl Router {
             shutdown_grace_period_secs,
             request_id_headers,
             trust_tenant_header,
+            prefer_trusted_tenant_header,
             tenant_header_name,
             storage_context_headers,
             pd_disaggregation,

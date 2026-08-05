@@ -25,6 +25,12 @@ const CLAMP_TOTAL: &str = "smg_scheduler_clamp_total";
 const UNKNOWN_PRIORITY_TOTAL: &str = "smg_scheduler_unknown_priority_value_total";
 const STARVATION_PROMOTION_TOTAL: &str = "smg_scheduler_starvation_promotion_total";
 const PARTITION_ADMIT_TOTAL: &str = "smg_scheduler_partition_admit_total";
+const FAIR_SHARE_CHARGED_OUTPUT_TOKENS_TOTAL: &str = "smg_fair_share_charged_output_tokens_total";
+const FAIR_SHARE_VIRTUAL_FINISH: &str = "smg_fair_share_virtual_finish";
+const FAIR_SHARE_RESERVED_OUTPUT_TOKENS: &str = "smg_fair_share_reserved_output_tokens";
+const FAIR_SHARE_QUEUE_WAIT_SECONDS: &str = "smg_fair_share_queue_wait_seconds";
+const FAIR_SHARE_FALLBACK_TOTAL: &str = "smg_fair_share_fallback_total";
+const FAIR_SHARE_UNKNOWN_TENANT_TOTAL: &str = "smg_fair_share_unknown_tenant_total";
 
 // Capacity / autoscaling gauges, refreshed by the sampler task.
 const INFLIGHT: &str = "smg_scheduler_inflight";
@@ -83,6 +89,30 @@ pub fn describe() {
     describe_counter!(
         PARTITION_ADMIT_TOTAL,
         "Priority-scheduler admission outcomes by partition, class, and outcome"
+    );
+    describe_counter!(
+        FAIR_SHARE_CHARGED_OUTPUT_TOKENS_TOTAL,
+        "Output tokens charged to the global fair-share ledger by tenant"
+    );
+    describe_gauge!(
+        FAIR_SHARE_VIRTUAL_FINISH,
+        "Process-global active-set normalized virtual finish used for weighted dispatch"
+    );
+    describe_gauge!(
+        FAIR_SHARE_RESERVED_OUTPUT_TOKENS,
+        "Provisional output-token charges for active requests by tenant"
+    );
+    describe_histogram!(
+        FAIR_SHARE_QUEUE_WAIT_SECONDS,
+        "Fair-share queue wait by tenant and priority class"
+    );
+    describe_counter!(
+        FAIR_SHARE_FALLBACK_TOTAL,
+        "Fair-share settlements that used an estimate instead of terminal usage"
+    );
+    describe_counter!(
+        FAIR_SHARE_UNKNOWN_TENANT_TOTAL,
+        "Requests whose resolved tenant has no explicit fair-share weight"
     );
     describe_gauge!(INFLIGHT, "Current in-flight request count per class");
     describe_gauge!(QUEUE_DEPTH, "Current queued waiter count per class");
@@ -181,6 +211,47 @@ pub fn record_unknown_priority(tenant: &str) {
 /// Record a starvation-override promotion.
 pub fn record_starvation_promotion(class: Class) {
     counter!(STARVATION_PROMOTION_TOTAL, "class" => class.as_str()).increment(1);
+}
+
+pub fn record_fair_share_charged_output_tokens(tenant: &str, tokens: u32) {
+    counter!(
+        FAIR_SHARE_CHARGED_OUTPUT_TOKENS_TOTAL,
+        "tenant" => intern_string(tenant)
+    )
+    .increment(u64::from(tokens));
+}
+
+pub fn set_fair_share_virtual_finish(tenant: &str, virtual_finish: f64) {
+    gauge!(FAIR_SHARE_VIRTUAL_FINISH, "tenant" => intern_string(tenant)).set(virtual_finish);
+}
+
+pub fn set_fair_share_reserved_output_tokens(tenant: &str, tokens: u64) {
+    gauge!(
+        FAIR_SHARE_RESERVED_OUTPUT_TOKENS,
+        "tenant" => intern_string(tenant)
+    )
+    .set(tokens as f64);
+}
+
+pub fn record_fair_share_queue_wait(tenant: &str, class: Class, wait: Duration) {
+    histogram!(
+        FAIR_SHARE_QUEUE_WAIT_SECONDS,
+        "tenant" => intern_string(tenant),
+        "class" => class.as_str()
+    )
+    .record(wait.as_secs_f64());
+}
+
+pub fn record_fair_share_fallback(reason: &'static str) {
+    counter!(FAIR_SHARE_FALLBACK_TOTAL, "reason" => reason).increment(1);
+}
+
+pub fn record_fair_share_unknown_tenant(tenant: &str) {
+    counter!(
+        FAIR_SHARE_UNKNOWN_TENANT_TOTAL,
+        "tenant" => intern_string(tenant)
+    )
+    .increment(1);
 }
 
 /// Set the in-flight gauge for a class (sampler).

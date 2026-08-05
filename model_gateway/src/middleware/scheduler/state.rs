@@ -12,7 +12,8 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use super::{
-    Class, PriorityScheduler, SchedulerSettings, StaticTenantPolicyResolver, TenantPolicyResolver,
+    Class, GlobalFairShare, PriorityScheduler, SchedulerSettings, StaticTenantPolicyResolver,
+    TenantPolicyResolver,
 };
 use crate::{
     config::types::RouterConfig,
@@ -159,6 +160,7 @@ impl AdmissionMode {
         if yaml.is_none() {
             settings = settings.with_global_queue_budget(rc.queue_size);
         }
+        let fair_share = GlobalFairShare::from_settings(&settings).map(Arc::new);
 
         let resolver: Arc<dyn TenantPolicyResolver> =
             Arc::new(StaticTenantPolicyResolver::from_settings(&settings));
@@ -177,8 +179,12 @@ impl AdmissionMode {
             // The atomic value covers any update that won the race before the
             // receiver subscribed; subsequent updates remain queued for the
             // dispatcher through `capacity_watch`.
-            let scheduler = PriorityScheduler::new(&settings, worker_capacity.current())
-                .map_err(|e| e.to_string())?;
+            let scheduler = PriorityScheduler::new_with_fair_share(
+                &settings,
+                worker_capacity.current(),
+                fair_share,
+            )
+            .map_err(|e| e.to_string())?;
             scheduler.spawn_dispatcher_retaining_capacity(capacity_watch, worker_capacity);
             scheduler.spawn_sampler(SAMPLER_INTERVAL);
             return Ok(Self::Priority(Arc::new(SchedulerState {
@@ -235,8 +241,12 @@ impl AdmissionMode {
                 name,
                 initial_replicas.get(name).copied().unwrap_or(0),
             );
-            let scheduler = PriorityScheduler::new(&partition_settings, capacity)
-                .map_err(|e| format!("partition {name}: {e}"))?;
+            let scheduler = PriorityScheduler::new_with_fair_share(
+                &partition_settings,
+                capacity,
+                fair_share.clone(),
+            )
+            .map_err(|e| format!("partition {name}: {e}"))?;
             let (capacity_tx, capacity_rx) = watch::channel(capacity);
             scheduler.spawn_dispatcher(capacity_rx);
             capacity_senders.push((name.clone(), capacity_tx));

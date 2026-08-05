@@ -19,6 +19,7 @@ use crate::{
 #[derive(Clone)]
 pub struct TenantResolutionState {
     trust_tenant_header: bool,
+    prefer_trusted_tenant_header: bool,
     trusted_tenant_header_name: HeaderName,
 }
 
@@ -32,12 +33,18 @@ impl TenantResolutionState {
 
         Ok(Self {
             trust_tenant_header: config.trust_tenant_header,
+            prefer_trusted_tenant_header: config.prefer_trusted_tenant_header,
             trusted_tenant_header_name,
         })
     }
 }
 
 fn resolve_raw_tenant_key(state: &TenantResolutionState, request: &Request<Body>) -> TenantKey {
+    if state.trust_tenant_header && state.prefer_trusted_tenant_header {
+        if let Some(tenant_id) = extract_trusted_tenant_id(state, request.headers()) {
+            return canonical_tenant_key(TenantIdentity::Header(Arc::from(tenant_id)));
+        }
+    }
     if let Some(caller) = request.extensions().get::<DataPlaneCaller>() {
         return caller.tenant_key().clone();
     }
@@ -140,6 +147,86 @@ mod tests {
 
         let request_meta = resolve_route_request_meta(&state, &request);
         assert_eq!(request_meta.tenant_key().as_str(), "auth:b3c2");
+    }
+
+    #[tokio::test]
+    async fn trusted_header_does_not_override_auth_without_preference() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.tenant_resolution.trust_tenant_header = true;
+        let state = TenantResolutionState::new(&config).unwrap();
+        let mut request = Request::builder()
+            .uri("/")
+            .header(DEFAULT_TENANT_HEADER_NAME, "alice")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(DataPlaneCaller::new(TenantKey::from("auth:proxy")));
+
+        let request_meta = resolve_route_request_meta(&state, &request);
+        assert_eq!(request_meta.tenant_key().as_str(), "auth:proxy");
+    }
+
+    #[tokio::test]
+    async fn preferred_trusted_header_distinguishes_users_behind_shared_proxy_auth() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.tenant_resolution.trust_tenant_header = true;
+        config.tenant_resolution.prefer_trusted_tenant_header = true;
+        let state = TenantResolutionState::new(&config).unwrap();
+        for user in ["alice", "bob"] {
+            let mut request = Request::builder()
+                .uri("/")
+                .header(DEFAULT_TENANT_HEADER_NAME, user)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(DataPlaneCaller::new(TenantKey::from("auth:proxy")));
+
+            let request_meta = resolve_route_request_meta(&state, &request);
+            assert_eq!(request_meta.tenant_key().as_str(), format!("header:{user}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_preferred_header_falls_back_to_auth() {
+        for value in [
+            None,
+            Some(HeaderValue::from_static("   ")),
+            Some(HeaderValue::from_bytes(b"\x80").unwrap()),
+        ] {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker1:8000".to_string()],
+                },
+                PolicyConfig::Random,
+            );
+            config.tenant_resolution.trust_tenant_header = true;
+            config.tenant_resolution.prefer_trusted_tenant_header = true;
+            let state = TenantResolutionState::new(&config).unwrap();
+            let mut request = Request::builder().uri("/").body(Body::empty()).unwrap();
+            if let Some(value) = value {
+                request
+                    .headers_mut()
+                    .insert(DEFAULT_TENANT_HEADER_NAME, value);
+            }
+            request
+                .extensions_mut()
+                .insert(DataPlaneCaller::new(TenantKey::from("auth:proxy")));
+
+            let request_meta = resolve_route_request_meta(&state, &request);
+            assert_eq!(request_meta.tenant_key().as_str(), "auth:proxy");
+        }
     }
 
     #[tokio::test]
