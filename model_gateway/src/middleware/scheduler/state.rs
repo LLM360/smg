@@ -406,10 +406,10 @@ fn validate_partitions(
             config.max_concurrent_requests,
             config.max_concurrent_requests_per_healthy_replica,
         ) {
-            (true, None, Some(per_replica)) if per_replica > 0 => {}
+            (true, None, None) | (true, None, Some(1..)) => {}
             (true, _, _) => {
                 return Err(format!(
-                    "partition {name}: replica-aware capacity must omit max_concurrent_requests and set max_concurrent_requests_per_healthy_replica > 0"
+                    "partition {name}: replica-aware capacity must omit max_concurrent_requests; max_concurrent_requests_per_healthy_replica, when set, must be > 0"
                 ));
             }
             (false, Some(limit), None) if limit > 0 => {
@@ -478,17 +478,21 @@ fn allocate_weighted_capacities(weights: &[(String, u64)], target: u16) -> HashM
         .collect()
 }
 
-/// Count each healthy worker once. An explicit control-plane label moves the
-/// worker to that partition; otherwise its primary model id is used. Unknown
-/// labels/models land in the configured default partition.
-fn healthy_replica_counts(
+#[derive(Debug, Clone, Copy, Default)]
+struct PartitionWorkerCapacity {
+    replicas: u16,
+    reported_replicas: u16,
+    reported_capacity: u64,
+}
+
+fn healthy_partition_worker_capacities(
     partition_names: &HashSet<String>,
     default_partition: &str,
     registry: &WorkerRegistry,
-) -> HashMap<String, u16> {
-    let mut counts: HashMap<String, u16> = partition_names
+) -> HashMap<String, PartitionWorkerCapacity> {
+    let mut capacities: HashMap<String, PartitionWorkerCapacity> = partition_names
         .iter()
-        .map(|name| (name.clone(), 0))
+        .map(|name| (name.clone(), PartitionWorkerCapacity::default()))
         .collect();
     for worker in registry.get_all().into_iter().filter(|w| w.is_healthy()) {
         let requested = worker
@@ -504,12 +508,16 @@ fn healthy_replica_counts(
         } else {
             default_partition
         };
-        counts
-            .entry(partition.to_string())
-            .and_modify(|count| *count = count.saturating_add(1))
-            .or_insert(1);
+        let aggregate = capacities.entry(partition.to_string()).or_default();
+        aggregate.replicas = aggregate.replicas.saturating_add(1);
+        if let Some(reported) = worker.max_running_requests() {
+            aggregate.reported_replicas = aggregate.reported_replicas.saturating_add(1);
+            aggregate.reported_capacity = aggregate
+                .reported_capacity
+                .saturating_add(u64::from(reported));
+        }
     }
-    counts
+    capacities
 }
 
 /// Static mode preserves the original configured-cap behavior. Replica-aware
@@ -546,23 +554,41 @@ fn allocate_partition_capacities(
     }
 
     let names: HashSet<_> = configs.iter().map(|(name, _)| name.clone()).collect();
-    let counts = healthy_replica_counts(&names, default_partition, registry);
+    let worker_capacities =
+        healthy_partition_worker_capacities(&names, default_partition, registry);
+    let counts: HashMap<String, u16> = worker_capacities
+        .iter()
+        .map(|(name, capacity)| (name.clone(), capacity.replicas))
+        .collect();
+    let total_replicas: u64 = worker_capacities
+        .values()
+        .map(|capacity| u64::from(capacity.replicas))
+        .sum();
     let Some(weights): Option<Vec<_>> = configs
         .iter()
         .map(|(name, config)| {
-            let replicas = counts.get(name).copied().unwrap_or(0);
-            config
-                .max_concurrent_requests_per_healthy_replica
-                .map(|per_replica| {
-                    (
-                        name.clone(),
-                        u64::from(replicas).saturating_mul(u64::from(per_replica)),
-                    )
-                })
+            let capacity = worker_capacities.get(name).copied().unwrap_or_default();
+            let weight =
+                if let Some(per_replica) = config.max_concurrent_requests_per_healthy_replica {
+                    u64::from(capacity.replicas).saturating_mul(u64::from(per_replica))
+                } else if capacity.reported_replicas > 0 {
+                    // Scale the observed per-replica mean across any healthy
+                    // workers whose metadata discovery is still catching up.
+                    capacity
+                        .reported_capacity
+                        .saturating_mul(u64::from(capacity.replicas))
+                        / u64::from(capacity.reported_replicas)
+                } else if total_replicas > 0 {
+                    u64::from(global_capacity).saturating_mul(u64::from(capacity.replicas))
+                        / total_replicas
+                } else {
+                    0
+                };
+            Some((name.clone(), weight))
         })
         .collect()
     else {
-        error!("validated replica-aware admission partition is missing its per-replica capacity");
+        error!("validated replica-aware admission partition is missing its capacity source");
         return (HashMap::new(), counts);
     };
     let desired: u64 = weights.iter().map(|(_, weight)| *weight).sum();
@@ -834,6 +860,47 @@ mod tests {
         assert_eq!(allocation["private"], 100);
         assert_eq!(allocation["dsv4"], 100);
         assert_eq!(allocation.values().copied().sum::<u16>(), 500);
+    }
+
+    #[test]
+    fn replica_aware_allocation_uses_worker_reported_limits_without_override() {
+        let registry = WorkerRegistry::new();
+        let ready = openai_protocol::worker::WorkerStatus::Ready;
+        for (url, model, limit) in [
+            ("http://k3-a:8000", "kimi-k3", "64"),
+            ("http://k3-b:8000", "kimi-k3", "64"),
+            ("http://dsv4:8000", "dsv4", "256"),
+        ] {
+            let mut labels = HashMap::new();
+            labels.insert("max_running_requests".to_string(), limit.to_string());
+            let worker = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(openai_protocol::model_card::ModelCard::new(model))
+                    .labels(labels)
+                    .status(ready)
+                    .build(),
+            );
+            registry.register(worker).unwrap();
+        }
+
+        let dynamic = |queue_size| super::super::AdmissionPartitionConfig {
+            max_concurrent_requests: None,
+            capacity_from_healthy_replicas: true,
+            max_concurrent_requests_per_healthy_replica: None,
+            queue_size,
+        };
+        let configs = vec![
+            ("default".to_string(), dynamic(1)),
+            ("dsv4".to_string(), dynamic(1)),
+            ("kimi-k3".to_string(), dynamic(1)),
+        ];
+        let (allocation, counts) =
+            allocate_partition_capacities(&configs, "default", 384, &registry);
+        assert_eq!(counts["kimi-k3"], 2);
+        assert_eq!(counts["dsv4"], 1);
+        assert_eq!(allocation["kimi-k3"], 128);
+        assert_eq!(allocation["dsv4"], 256);
+        assert_eq!(allocation["default"], 0);
     }
 
     #[test]

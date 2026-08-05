@@ -124,8 +124,9 @@ pub struct TenantPolicyConfig {
 /// A deployment chooses one capacity mode for every configured partition:
 ///
 /// - static: set `max_concurrent_requests` (the original behavior), or
-/// - replica-aware: set `capacity_from_healthy_replicas: true`, configure
-///   `max_concurrent_requests_per_healthy_replica`, and omit the static maximum.
+/// - replica-aware: set `capacity_from_healthy_replicas: true`, omit the static
+///   maximum, and either derive each worker's ceiling from its reported
+///   `max_running_requests` or explicitly configure a per-replica override.
 ///
 /// Replica-aware partitions divide the live global scheduler capacity in
 /// proportion to the number of healthy workers assigned to each partition.
@@ -141,8 +142,9 @@ pub struct AdmissionPartitionConfig {
     /// Derive this partition's share from its healthy replica count.
     #[serde(default)]
     pub capacity_from_healthy_replicas: bool,
-    /// Admission slots contributed by each healthy replica in replica-aware
-    /// mode. Omitted in static mode.
+    /// Optional admission slots contributed by each healthy replica in
+    /// replica-aware mode. When omitted, use worker-reported
+    /// `max_running_requests`. Omitted in static mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests_per_healthy_replica: Option<u16>,
     /// Work-conserving queue budget shared by the priority classes inside
