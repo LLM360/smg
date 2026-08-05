@@ -1108,7 +1108,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use super::*;
-    use crate::middleware::scheduler::{ClassConfig, PrioritySchedulerYaml};
+    use crate::middleware::scheduler::{ClassConfig, FairShareConfig, PrioritySchedulerYaml};
 
     fn default_settings() -> SchedulerSettings {
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, None).unwrap()
@@ -2054,7 +2054,7 @@ mod tests {
         }
         let yaml = PrioritySchedulerYaml {
             classes,
-            fair_share: Some(crate::middleware::scheduler::FairShareConfig {
+            fair_share: Some(FairShareConfig {
                 default_weight: 1.0,
                 default_output_tokens: 10,
                 trust_output_token_estimate_header: false,

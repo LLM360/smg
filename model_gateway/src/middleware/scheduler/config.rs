@@ -557,13 +557,15 @@ fair_share:
     #[test]
     fn test_invalid_fair_share_weights_are_rejected() {
         for weight in [0.0, -1.0, f64::INFINITY, f64::NAN] {
-            let mut yaml = PrioritySchedulerYaml::default();
-            yaml.fair_share = Some(FairShareConfig {
-                default_weight: 1.0,
-                default_output_tokens: 128,
-                trust_output_token_estimate_header: false,
-                tenant_weights: HashMap::from([("header:alice".to_string(), weight)]),
-            });
+            let yaml = PrioritySchedulerYaml {
+                fair_share: Some(FairShareConfig {
+                    default_weight: 1.0,
+                    default_output_tokens: 128,
+                    trust_output_token_estimate_header: false,
+                    tenant_weights: HashMap::from([("header:alice".to_string(), weight)]),
+                }),
+                ..Default::default()
+            };
             assert!(matches!(
                 SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)),
                 Err(SettingsValidationError::InvalidFairShareTenantWeight { .. })
