@@ -772,6 +772,26 @@ impl ConfigValidator {
                 reason: "Must be > 0".to_string(),
             });
         }
+        if !adaptive.feedback_max_token_usage.is_finite()
+            || adaptive.feedback_max_token_usage <= 0.0
+            || adaptive.feedback_max_token_usage > 1.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.feedback_max_token_usage".to_string(),
+                value: adaptive.feedback_max_token_usage.to_string(),
+                reason: "Must be finite and in (0, 1]".to_string(),
+            });
+        }
+        if !adaptive.feedback_throughput_improvement_ratio.is_finite()
+            || adaptive.feedback_throughput_improvement_ratio < 0.0
+            || adaptive.feedback_throughput_improvement_ratio > 1.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "adaptive_admission.feedback_throughput_improvement_ratio".to_string(),
+                value: adaptive.feedback_throughput_improvement_ratio.to_string(),
+                reason: "Must be finite and in [0, 1]".to_string(),
+            });
+        }
 
         Ok(())
     }

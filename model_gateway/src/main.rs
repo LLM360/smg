@@ -6,10 +6,11 @@ use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         validate_mesh_server_name, AdaptiveAdmissionConfig, AdaptiveAdmissionMode,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        AdaptiveAdmissionStrategy, CircuitBreakerConfig, ConfigError, ConfigResult,
+        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
+        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -121,6 +122,31 @@ impl From<AdaptiveAdmissionCliMode> for AdaptiveAdmissionMode {
             AdaptiveAdmissionCliMode::Off => Self::Off,
             AdaptiveAdmissionCliMode::Shadow => Self::Shadow,
             AdaptiveAdmissionCliMode::Enforce => Self::Enforce,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum AdaptiveAdmissionCliStrategy {
+    #[default]
+    PredictedWork,
+    EngineFeedback,
+}
+
+impl std::fmt::Display for AdaptiveAdmissionCliStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PredictedWork => "predicted_work",
+            Self::EngineFeedback => "engine_feedback",
+        })
+    }
+}
+
+impl From<AdaptiveAdmissionCliStrategy> for AdaptiveAdmissionStrategy {
+    fn from(value: AdaptiveAdmissionCliStrategy) -> Self {
+        match value {
+            AdaptiveAdmissionCliStrategy::PredictedWork => Self::PredictedWork,
+            AdaptiveAdmissionCliStrategy::EngineFeedback => Self::EngineFeedback,
         }
     }
 }
@@ -527,6 +553,16 @@ struct CliArgs {
     )]
     adaptive_admission_mode: AdaptiveAdmissionCliMode,
 
+    /// Signal used for admission: predicted output work or direct engine
+    /// throughput, waiting-queue, and token-pressure feedback.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AdaptiveAdmissionCliStrategy::PredictedWork,
+        help_heading = "Adaptive Admission"
+    )]
+    adaptive_admission_strategy: AdaptiveAdmissionCliStrategy,
+
     /// Maximum predicted outstanding decode-work horizon in seconds.
     #[arg(long, default_value_t = 30.0, help_heading = "Adaptive Admission")]
     adaptive_admission_work_horizon_secs: f64,
@@ -551,6 +587,22 @@ struct CliArgs {
     /// Cold-start output-token prediction before a model has observations.
     #[arg(long, default_value_t = 4096, help_heading = "Adaptive Admission")]
     adaptive_admission_cold_start_output_tokens: u32,
+
+    /// Per-replica exploration margin above the learned throughput knee.
+    #[arg(long, default_value_t = 2, help_heading = "Adaptive Admission")]
+    adaptive_admission_feedback_probe_requests_per_healthy_replica: u32,
+
+    /// Per-replica engine waiting queue that closes feedback admission.
+    #[arg(long, default_value_t = 2, help_heading = "Adaptive Admission")]
+    adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: u32,
+
+    /// Engine token/KV usage ratio that closes feedback admission.
+    #[arg(long, default_value_t = 0.9, help_heading = "Adaptive Admission")]
+    adaptive_admission_feedback_max_token_usage: f64,
+
+    /// Relative generation-throughput gain required to raise the learned knee.
+    #[arg(long, default_value_t = 0.02, help_heading = "Adaptive Admission")]
+    adaptive_admission_feedback_throughput_improvement_ratio: f64,
 
     // ==================== Tenant Rate Limit ====================
     /// Enable per-tenant LLM token/request rate limiting. When unset
@@ -1556,12 +1608,20 @@ impl CliArgs {
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
             .adaptive_admission(AdaptiveAdmissionConfig {
                 mode: self.adaptive_admission_mode.into(),
+                strategy: self.adaptive_admission_strategy.into(),
                 work_horizon_secs: self.adaptive_admission_work_horizon_secs,
                 estimator_half_life_secs: self.adaptive_admission_estimator_half_life_secs,
                 prior_observations: self.adaptive_admission_prior_observations,
                 max_segments: self.adaptive_admission_max_segments,
                 min_load_coverage: self.adaptive_admission_min_load_coverage,
                 cold_start_output_tokens: self.adaptive_admission_cold_start_output_tokens,
+                feedback_probe_requests_per_healthy_replica: self
+                    .adaptive_admission_feedback_probe_requests_per_healthy_replica,
+                feedback_max_waiting_requests_per_healthy_replica: self
+                    .adaptive_admission_feedback_max_waiting_requests_per_healthy_replica,
+                feedback_max_token_usage: self.adaptive_admission_feedback_max_token_usage,
+                feedback_throughput_improvement_ratio: self
+                    .adaptive_admission_feedback_throughput_improvement_ratio,
             })
             .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
@@ -1928,6 +1988,36 @@ mod tests {
             server_config.router_config.engine_metrics,
             "engine_metrics must survive into ServerConfig via to_server_config"
         );
+    }
+
+    #[test]
+    fn engine_feedback_admission_options_flow_into_router_config() {
+        let cli = cli_args_from(&[
+            "--adaptive-admission-mode",
+            "shadow",
+            "--adaptive-admission-strategy",
+            "engine-feedback",
+            "--adaptive-admission-feedback-probe-requests-per-healthy-replica",
+            "3",
+            "--adaptive-admission-feedback-max-waiting-requests-per-healthy-replica",
+            "4",
+            "--adaptive-admission-feedback-max-token-usage",
+            "0.85",
+            "--adaptive-admission-feedback-throughput-improvement-ratio",
+            "0.03",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        let adaptive = router_config.adaptive_admission;
+        assert_eq!(adaptive.mode, AdaptiveAdmissionMode::Shadow);
+        assert_eq!(adaptive.strategy, AdaptiveAdmissionStrategy::EngineFeedback);
+        assert_eq!(adaptive.feedback_probe_requests_per_healthy_replica, 3);
+        assert_eq!(
+            adaptive.feedback_max_waiting_requests_per_healthy_replica,
+            4
+        );
+        assert_eq!(adaptive.feedback_max_token_usage, 0.85);
+        assert_eq!(adaptive.feedback_throughput_improvement_ratio, 0.03);
     }
 
     /// The multimodal transport flags must reach both `RouterConfig` and the

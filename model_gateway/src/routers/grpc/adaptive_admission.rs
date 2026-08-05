@@ -1,10 +1,11 @@
-//! Adaptive, token-work admission shared by the gRPC and HTTP serving paths.
+//! Adaptive admission shared by the gRPC and HTTP serving paths.
 //!
 //! The existing priority scheduler remains the infrastructure safety layer.
-//! This controller estimates request work after tokenization, learns output
-//! length online, and compares predicted outstanding decode work with fresh
-//! aggregate engine throughput. Shadow mode exercises the complete state
-//! machine without delaying or rejecting traffic.
+//! The original strategy predicts output-token work. The engine-feedback
+//! strategy instead learns each partition's useful running-concurrency knee
+//! from live throughput, probes just above it, and backs off on engine queue or
+//! KV pressure. Shadow mode exercises either state machine without delaying or
+//! rejecting traffic.
 
 use std::{
     collections::HashMap,
@@ -21,7 +22,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use crate::{
-    config::{AdaptiveAdmissionConfig, AdaptiveAdmissionMode},
+    config::{AdaptiveAdmissionConfig, AdaptiveAdmissionMode, AdaptiveAdmissionStrategy},
     observability::metrics::intern_string,
     worker::WorkerRegistry,
 };
@@ -45,6 +46,11 @@ const ENGINE_RUNNING: &str = "smg_adaptive_admission_engine_running_requests";
 const ENGINE_WAITING: &str = "smg_adaptive_admission_engine_waiting_requests";
 const ENGINE_WAITING_TOKENS: &str = "smg_adaptive_admission_engine_waiting_uncached_tokens";
 const ENGINE_TOKEN_USAGE: &str = "smg_adaptive_admission_engine_max_token_usage";
+const ENGINE_MEAN_TOKEN_USAGE: &str = "smg_adaptive_admission_engine_mean_token_usage";
+const ENGINE_MAX_RUNNING: &str = "smg_adaptive_admission_engine_max_running_requests";
+const ROUTER_OUTSTANDING_REQUESTS: &str = "smg_adaptive_admission_router_outstanding_requests";
+const FEEDBACK_RUNNING_LIMIT: &str = "smg_adaptive_admission_feedback_running_limit";
+const FEEDBACK_KNEE_PER_REPLICA: &str = "smg_adaptive_admission_feedback_knee_requests_per_replica";
 const SEGMENTS: &str = "smg_adaptive_admission_estimator_segments";
 
 pub(crate) const FLAG_MULTIPLE_COMPLETIONS: u16 = 1 << 0;
@@ -121,6 +127,26 @@ pub(crate) fn describe_metrics() {
     describe_gauge!(
         ENGINE_TOKEN_USAGE,
         "Maximum engine-reported token usage in an admission partition"
+    );
+    describe_gauge!(
+        ENGINE_MEAN_TOKEN_USAGE,
+        "Mean engine-reported token usage in an admission partition"
+    );
+    describe_gauge!(
+        ENGINE_MAX_RUNNING,
+        "Sum of engine-reported maximum running requests in an admission partition"
+    );
+    describe_gauge!(
+        ROUTER_OUTSTANDING_REQUESTS,
+        "Requests currently tracked by this router process"
+    );
+    describe_gauge!(
+        FEEDBACK_RUNNING_LIMIT,
+        "Dynamic request limit selected by engine-feedback admission"
+    );
+    describe_gauge!(
+        FEEDBACK_KNEE_PER_REPLICA,
+        "Learned running requests per replica at the throughput knee"
     );
     describe_gauge!(
         SEGMENTS,
@@ -393,6 +419,8 @@ struct PartitionLoad {
     waiting_requests: i64,
     waiting_uncached_tokens: i64,
     max_token_usage: f64,
+    token_usage_sum: f64,
+    max_running_requests: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +443,44 @@ impl CapacityEstimate {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FeedbackEstimate {
+    peak_tokens_per_second_per_replica: f64,
+    running_requests_per_replica_at_peak: f64,
+    last_update: Instant,
+}
+
+impl FeedbackEstimate {
+    fn effective_peak(&self, now: Instant, half_life_secs: f64) -> f64 {
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f64();
+        self.peak_tokens_per_second_per_replica * 2.0_f64.powf(-elapsed / half_life_secs)
+    }
+
+    fn observe(
+        &mut self,
+        throughput_per_replica: f64,
+        running_per_replica: f64,
+        now: Instant,
+        half_life_secs: f64,
+        improvement_ratio: f64,
+    ) {
+        let effective_peak = self.effective_peak(now, half_life_secs);
+        let raises_peak =
+            throughput_per_replica > effective_peak * (1.0 + improvement_ratio.max(0.0));
+        let same_plateau =
+            throughput_per_replica >= effective_peak * (1.0 - improvement_ratio.clamp(0.0, 1.0));
+        if raises_peak || same_plateau {
+            self.peak_tokens_per_second_per_replica = effective_peak.max(throughput_per_replica);
+            if raises_peak || running_per_replica < self.running_requests_per_replica_at_peak {
+                self.running_requests_per_replica_at_peak = running_per_replica;
+            }
+            self.last_update = now;
+        }
+    }
+}
+
 impl PartitionLoad {
     fn coverage(&self) -> f64 {
         if self.healthy_replicas == 0 {
@@ -423,13 +489,23 @@ impl PartitionLoad {
             f64::from(self.observed_replicas) / f64::from(self.healthy_replicas)
         }
     }
+
+    fn mean_token_usage(&self) -> f64 {
+        if self.observed_replicas == 0 {
+            0.0
+        } else {
+            self.token_usage_sum / f64::from(self.observed_replicas)
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct WorkState {
     outstanding_tokens: HashMap<String, u64>,
+    outstanding_requests: HashMap<String, u64>,
     loads: HashMap<String, PartitionLoad>,
     capacities: HashMap<String, CapacityEstimate>,
+    feedback_estimates: HashMap<String, FeedbackEstimate>,
 }
 
 #[derive(Debug)]
@@ -552,14 +628,26 @@ impl AdaptiveAdmissionController {
                 .map(|rank| i64::from(rank.num_waiting_reqs.max(0)))
                 .sum::<i64>();
             aggregate.waiting_uncached_tokens += load.total_waiting_uncached_tokens().max(0);
-            aggregate.max_token_usage = aggregate
-                .max_token_usage
-                .max(load.effective_token_usage().clamp(0.0, 1.0));
+            let token_usage = load.effective_token_usage().clamp(0.0, 1.0);
+            aggregate.token_usage_sum += token_usage;
+            aggregate.max_token_usage = aggregate.max_token_usage.max(token_usage);
+            let reported_max_running = load
+                .loads
+                .iter()
+                .map(|rank| i64::from(rank.max_running_requests.max(0)))
+                .sum::<i64>();
+            aggregate.max_running_requests += if reported_max_running > 0 {
+                reported_max_running
+            } else {
+                worker.max_running_requests().map_or(0, i64::from)
+            };
         }
 
         let now = Instant::now();
         let mut work = self.work.lock();
         work.capacities
+            .retain(|partition, _| partitions.contains_key(partition));
+        work.feedback_estimates
             .retain(|partition, _| partitions.contains_key(partition));
         for (partition, load) in &mut partitions {
             if load.observed_replicas > 0 && load.generation_tokens_per_second > 0.0 {
@@ -574,6 +662,26 @@ impl AdaptiveAdmissionController {
                         per_replica_tokens_per_second: per_replica,
                         last_update: now,
                     });
+                if load.running_requests > 0 {
+                    let running_per_replica =
+                        load.running_requests as f64 / f64::from(load.observed_replicas);
+                    work.feedback_estimates
+                        .entry(partition.clone())
+                        .and_modify(|estimate| {
+                            estimate.observe(
+                                per_replica,
+                                running_per_replica,
+                                now,
+                                self.config.estimator_half_life_secs,
+                                self.config.feedback_throughput_improvement_ratio,
+                            );
+                        })
+                        .or_insert(FeedbackEstimate {
+                            peak_tokens_per_second_per_replica: per_replica,
+                            running_requests_per_replica_at_peak: running_per_replica,
+                            last_update: now,
+                        });
+                }
             }
             if let Some(capacity) = work.capacities.get(partition) {
                 load.learned_capacity_tokens_per_second = capacity
@@ -595,7 +703,19 @@ impl AdaptiveAdmissionController {
                 .set(load.waiting_requests as f64);
             gauge!(ENGINE_WAITING_TOKENS, "partition" => Arc::clone(&partition_label))
                 .set(load.waiting_uncached_tokens as f64);
-            gauge!(ENGINE_TOKEN_USAGE, "partition" => partition_label).set(load.max_token_usage);
+            gauge!(ENGINE_TOKEN_USAGE, "partition" => Arc::clone(&partition_label))
+                .set(load.max_token_usage);
+            gauge!(ENGINE_MEAN_TOKEN_USAGE, "partition" => Arc::clone(&partition_label))
+                .set(load.mean_token_usage());
+            gauge!(ENGINE_MAX_RUNNING, "partition" => Arc::clone(&partition_label))
+                .set(load.max_running_requests as f64);
+            gauge!(FEEDBACK_KNEE_PER_REPLICA, "partition" => partition_label).set(
+                work.feedback_estimates
+                    .get(partition)
+                    .map_or(0.0, |estimate| {
+                        estimate.running_requests_per_replica_at_peak
+                    }),
+            );
         }
     }
 
@@ -617,72 +737,171 @@ impl AdaptiveAdmissionController {
             }
         };
         let now = Instant::now();
-        let prediction = self.predictor.lock().predict_at(&features, now);
-        let model_label = intern_string(&features.model);
-        counter!(
-            PREDICTIONS_TOTAL,
-            "model" => Arc::clone(&model_label),
-            "source" => prediction.source.as_str()
-        )
-        .increment(1);
-        histogram!(PREDICTED_OUTPUT_TOKENS, "model" => model_label)
-            .record(f64::from(prediction.output_tokens));
+        let prediction = if self.config.strategy == AdaptiveAdmissionStrategy::PredictedWork {
+            let prediction = self.predictor.lock().predict_at(&features, now);
+            let model_label = intern_string(&features.model);
+            counter!(
+                PREDICTIONS_TOTAL,
+                "model" => Arc::clone(&model_label),
+                "source" => prediction.source.as_str()
+            )
+            .increment(1);
+            histogram!(PREDICTED_OUTPUT_TOKENS, "model" => model_label)
+                .record(f64::from(prediction.output_tokens));
+            prediction
+        } else {
+            // Engine feedback does not predict completion length. Retain a
+            // zero reservation only so both strategies share the same tracker
+            // lifecycle without adding predictor lock contention.
+            Prediction {
+                output_tokens: 0,
+                model_output_tokens: 0,
+                source: PredictionSource::ColdStart,
+            }
+        };
 
         let decision = {
             let mut work = self.work.lock();
             let load = work.loads.get(&partition).cloned().unwrap_or_default();
+            let feedback_estimate = work.feedback_estimates.get(&partition).cloned();
             let outstanding = work
                 .outstanding_tokens
                 .entry(partition.clone())
                 .or_default();
             let prior_outstanding = *outstanding;
             *outstanding = outstanding.saturating_add(u64::from(prediction.output_tokens));
-            let coverage = load.coverage();
-            let telemetry_usable = coverage >= self.config.min_load_coverage
-                && load.learned_capacity_tokens_per_second.is_finite()
-                && load.learned_capacity_tokens_per_second > 0.0;
-            let budget = if telemetry_usable {
-                load.learned_capacity_tokens_per_second * self.config.work_horizon_secs
-            } else {
-                f64::INFINITY
-            };
             let router_outstanding = *outstanding as f64;
+            let outstanding_requests = work
+                .outstanding_requests
+                .entry(partition.clone())
+                .or_default();
+            *outstanding_requests = outstanding_requests.saturating_add(1);
+            let router_outstanding_requests = *outstanding_requests as f64;
+            let coverage = load.coverage();
             let engine_request_count = load
                 .running_requests
                 .saturating_add(load.waiting_requests)
                 .max(0) as f64;
-            let engine_estimated = engine_request_count * f64::from(prediction.model_output_tokens);
-            // `max` avoids counting work both in the router reservation table
-            // and in a later engine poll. The incoming request is not yet in
-            // the engine snapshot, so include it in the engine-side bound.
-            let projected =
-                router_outstanding.max(engine_estimated + f64::from(prediction.output_tokens));
-            let drain_seconds = if telemetry_usable {
-                projected / load.learned_capacity_tokens_per_second
-            } else {
-                0.0
-            };
-            let would_admit = !telemetry_usable || projected <= budget || prior_outstanding == 0;
-
             let partition_label = intern_string(&partition);
-            gauge!(OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label)).set(projected);
-            gauge!(ROUTER_OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
-                .set(router_outstanding);
-            gauge!(ENGINE_ESTIMATED_TOKENS, "partition" => Arc::clone(&partition_label))
-                .set(engine_estimated);
-            gauge!(WORK_BUDGET_TOKENS, "partition" => Arc::clone(&partition_label))
-                .set(if budget.is_finite() { budget } else { 0.0 });
-            gauge!(DRAIN_SECONDS, "partition" => partition_label).set(drain_seconds);
-            AdmissionDecision {
-                would_admit,
-                telemetry_usable,
-                retry_after_secs: if would_admit || !telemetry_usable {
-                    0
-                } else {
-                    ((projected - budget) / load.learned_capacity_tokens_per_second)
+            gauge!(ROUTER_OUTSTANDING_REQUESTS, "partition" => Arc::clone(&partition_label))
+                .set(router_outstanding_requests);
+
+            match self.config.strategy {
+                AdaptiveAdmissionStrategy::PredictedWork => {
+                    let telemetry_usable = coverage >= self.config.min_load_coverage
+                        && load.learned_capacity_tokens_per_second.is_finite()
+                        && load.learned_capacity_tokens_per_second > 0.0;
+                    let budget = if telemetry_usable {
+                        load.learned_capacity_tokens_per_second * self.config.work_horizon_secs
+                    } else {
+                        f64::INFINITY
+                    };
+                    let engine_estimated =
+                        engine_request_count * f64::from(prediction.model_output_tokens);
+                    // `max` avoids counting work both in router reservations
+                    // and in a later engine poll. Include the incoming request
+                    // because it is not in the engine snapshot yet.
+                    let projected = router_outstanding
+                        .max(engine_estimated + f64::from(prediction.output_tokens));
+                    let drain_seconds = if telemetry_usable {
+                        projected / load.learned_capacity_tokens_per_second
+                    } else {
+                        0.0
+                    };
+                    let would_admit =
+                        !telemetry_usable || projected <= budget || prior_outstanding == 0;
+                    gauge!(OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(projected);
+                    gauge!(ROUTER_OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(router_outstanding);
+                    gauge!(ENGINE_ESTIMATED_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(engine_estimated);
+                    gauge!(WORK_BUDGET_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(if budget.is_finite() { budget } else { 0.0 });
+                    gauge!(DRAIN_SECONDS, "partition" => Arc::clone(&partition_label))
+                        .set(drain_seconds);
+                    gauge!(FEEDBACK_RUNNING_LIMIT, "partition" => partition_label).set(0.0);
+                    AdmissionDecision {
+                        would_admit,
+                        telemetry_usable,
+                        reason: if !telemetry_usable {
+                            "telemetry_fallback"
+                        } else if would_admit {
+                            "within_work_budget"
+                        } else {
+                            "work_budget"
+                        },
+                        retry_after_secs: if would_admit || !telemetry_usable {
+                            0
+                        } else {
+                            ((projected - budget) / load.learned_capacity_tokens_per_second)
+                                .ceil()
+                                .clamp(1.0, f64::from(u32::MAX)) as u32
+                        },
+                    }
+                }
+                AdaptiveAdmissionStrategy::EngineFeedback => {
+                    let telemetry_usable = coverage >= self.config.min_load_coverage
+                        && load.observed_replicas > 0
+                        && load.max_running_requests > 0;
+                    let engine_limit = if telemetry_usable {
+                        (load.max_running_requests as f64 * f64::from(load.healthy_replicas)
+                            / f64::from(load.observed_replicas))
+                        .floor()
+                    } else {
+                        0.0
+                    };
+                    let learned_limit = feedback_estimate.as_ref().map(|estimate| {
+                        (estimate.running_requests_per_replica_at_peak
+                            * f64::from(load.healthy_replicas))
                         .ceil()
-                        .clamp(1.0, f64::from(u32::MAX)) as u32
-                },
+                            + f64::from(
+                                self.config
+                                    .feedback_probe_requests_per_healthy_replica
+                                    .saturating_mul(load.healthy_replicas),
+                            )
+                    });
+                    // Before a busy sample exists, the engine's own hard
+                    // running limit is the bounded cold-start ceiling.
+                    let running_limit = learned_limit
+                        .map_or(engine_limit, |learned| learned.max(1.0).min(engine_limit));
+                    let projected_requests =
+                        router_outstanding_requests.max(engine_request_count + 1.0);
+                    let waiting_limit = i64::from(
+                        self.config
+                            .feedback_max_waiting_requests_per_healthy_replica,
+                    ) * i64::from(load.observed_replicas);
+                    let reason = if !telemetry_usable {
+                        "telemetry_fallback"
+                    } else if load.mean_token_usage() >= self.config.feedback_max_token_usage {
+                        "token_pressure"
+                    } else if load.waiting_requests > waiting_limit {
+                        "engine_waiting"
+                    } else if projected_requests > running_limit {
+                        "running_limit"
+                    } else {
+                        "within_feedback_limit"
+                    };
+                    let would_admit =
+                        matches!(reason, "telemetry_fallback" | "within_feedback_limit");
+                    gauge!(FEEDBACK_RUNNING_LIMIT, "partition" => Arc::clone(&partition_label))
+                        .set(running_limit);
+                    gauge!(OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(router_outstanding);
+                    gauge!(ROUTER_OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(router_outstanding);
+                    gauge!(ENGINE_ESTIMATED_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(0.0);
+                    gauge!(WORK_BUDGET_TOKENS, "partition" => Arc::clone(&partition_label))
+                        .set(0.0);
+                    gauge!(DRAIN_SECONDS, "partition" => partition_label).set(0.0);
+                    AdmissionDecision {
+                        would_admit,
+                        telemetry_usable,
+                        reason,
+                        retry_after_secs: u32::from(!would_admit),
+                    }
+                }
             }
         };
 
@@ -701,6 +920,11 @@ impl AdaptiveAdmissionController {
                 AdaptiveAdmissionMode::Shadow => "shadow",
                 AdaptiveAdmissionMode::Enforce => "enforce",
             },
+            "strategy" => match self.config.strategy {
+                AdaptiveAdmissionStrategy::PredictedWork => "predicted_work",
+                AdaptiveAdmissionStrategy::EngineFeedback => "engine_feedback",
+            },
+            "reason" => decision.reason,
             "outcome" => outcome
         )
         .increment(1);
@@ -727,10 +951,20 @@ impl AdaptiveAdmissionController {
             *outstanding = outstanding.saturating_sub(u64::from(inner.prediction.output_tokens));
             gauge!(OUTSTANDING_TOKENS, "partition" => intern_string(&inner.partition))
                 .set(*outstanding as f64);
+            let outstanding_requests = work
+                .outstanding_requests
+                .entry(inner.partition.clone())
+                .or_default();
+            *outstanding_requests = outstanding_requests.saturating_sub(1);
+            gauge!(ROUTER_OUTSTANDING_REQUESTS, "partition" => intern_string(&inner.partition))
+                .set(*outstanding_requests as f64);
         }
         let Some(observed) = observed_output_tokens else {
             return;
         };
+        if self.config.strategy == AdaptiveAdmissionStrategy::EngineFeedback {
+            return;
+        }
         self.predictor
             .lock()
             .observe_at(&inner.features, observed, Instant::now());
@@ -764,6 +998,7 @@ impl AdaptiveAdmissionController {
 struct AdmissionDecision {
     would_admit: bool,
     telemetry_usable: bool,
+    reason: &'static str,
     retry_after_secs: u32,
 }
 
@@ -777,8 +1012,9 @@ struct TrackerInner {
 }
 
 /// Per-request adaptive-admission state. Dropping an unfinished tracker
-/// releases its predicted work without teaching the estimator from a partial
-/// or failed response.
+/// releases its request reservation. Predicted-work mode also releases its
+/// token reservation without teaching the estimator from a partial or failed
+/// response.
 pub(crate) struct AdaptiveRequestTracker {
     inner: Option<TrackerInner>,
 }
@@ -833,12 +1069,17 @@ mod tests {
     fn config() -> AdaptiveAdmissionConfig {
         AdaptiveAdmissionConfig {
             mode: AdaptiveAdmissionMode::Shadow,
+            strategy: AdaptiveAdmissionStrategy::PredictedWork,
             work_horizon_secs: 10.0,
             estimator_half_life_secs: 60.0,
             prior_observations: 2.0,
             max_segments: 20,
             min_load_coverage: 0.8,
             cold_start_output_tokens: 100,
+            feedback_probe_requests_per_healthy_replica: 2,
+            feedback_max_waiting_requests_per_healthy_replica: 2,
+            feedback_max_token_usage: 0.9,
+            feedback_throughput_improvement_ratio: 0.02,
         }
     }
 
@@ -1037,5 +1278,116 @@ mod tests {
         assert!(!starvation_probe.should_reject());
         let next = controller.begin("model".to_string(), features("b", 10, None));
         assert!(next.should_reject());
+    }
+
+    #[test]
+    fn engine_feedback_uses_learned_knee_plus_probe_margin() {
+        let mut settings = config();
+        settings.mode = AdaptiveAdmissionMode::Enforce;
+        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        let controller =
+            AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
+        let now = Instant::now();
+        let mut work = controller.work.lock();
+        work.loads.insert(
+            "model".to_string(),
+            PartitionLoad {
+                healthy_replicas: 1,
+                observed_replicas: 1,
+                generation_tokens_per_second: 100.0,
+                running_requests: 10,
+                max_running_requests: 64,
+                max_token_usage: 0.5,
+                ..PartitionLoad::default()
+            },
+        );
+        work.feedback_estimates.insert(
+            "model".to_string(),
+            FeedbackEstimate {
+                peak_tokens_per_second_per_replica: 100.0,
+                running_requests_per_replica_at_peak: 10.0,
+                last_update: now,
+            },
+        );
+        drop(work);
+
+        let trackers: Vec<_> = (0..12)
+            .map(|i| controller.begin("model".to_string(), features(&format!("u-{i}"), 10, None)))
+            .collect();
+        assert!(trackers.iter().all(|tracker| !tracker.should_reject()));
+        let excess = controller.begin("model".to_string(), features("excess", 10, None));
+        assert!(excess.should_reject());
+        assert_eq!(excess.retry_after_secs(), 1);
+    }
+
+    #[test]
+    fn engine_feedback_backs_off_on_waiting_or_token_pressure() {
+        for (waiting_requests, token_usage, expected_reason) in
+            [(3, 0.5, "engine_waiting"), (0, 0.91, "token_pressure")]
+        {
+            let mut settings = config();
+            settings.mode = AdaptiveAdmissionMode::Enforce;
+            settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+            let controller =
+                AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
+            controller.work.lock().loads.insert(
+                "model".to_string(),
+                PartitionLoad {
+                    healthy_replicas: 1,
+                    observed_replicas: 1,
+                    generation_tokens_per_second: 100.0,
+                    running_requests: 1,
+                    waiting_requests,
+                    max_running_requests: 64,
+                    max_token_usage: token_usage,
+                    token_usage_sum: token_usage,
+                    ..PartitionLoad::default()
+                },
+            );
+
+            let tracker = controller.begin("model".to_string(), features("u", 10, None));
+            assert!(tracker.should_reject());
+            assert_eq!(
+                tracker.inner.as_ref().unwrap().decision.reason,
+                expected_reason
+            );
+        }
+    }
+
+    #[test]
+    fn engine_feedback_cold_start_is_bounded_by_engine_limit() {
+        let mut settings = config();
+        settings.mode = AdaptiveAdmissionMode::Enforce;
+        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        let controller =
+            AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
+        controller.work.lock().loads.insert(
+            "model".to_string(),
+            PartitionLoad {
+                healthy_replicas: 1,
+                observed_replicas: 1,
+                max_running_requests: 2,
+                ..PartitionLoad::default()
+            },
+        );
+
+        let first = controller.begin("model".to_string(), features("a", 10, None));
+        let second = controller.begin("model".to_string(), features("b", 10, None));
+        let third = controller.begin("model".to_string(), features("c", 10, None));
+        assert!(!first.should_reject());
+        assert!(!second.should_reject());
+        assert!(third.should_reject());
+    }
+
+    #[test]
+    fn feedback_knee_moves_down_on_same_throughput_plateau() {
+        let start = Instant::now();
+        let mut estimate = FeedbackEstimate {
+            peak_tokens_per_second_per_replica: 100.0,
+            running_requests_per_replica_at_peak: 20.0,
+            last_update: start,
+        };
+        estimate.observe(99.0, 12.0, start + Duration::from_secs(1), 60.0, 0.02);
+        assert_eq!(estimate.running_requests_per_replica_at_peak, 12.0);
     }
 }

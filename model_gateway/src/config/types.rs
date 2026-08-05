@@ -26,6 +26,34 @@ pub enum AdaptiveAdmissionMode {
     Enforce,
 }
 
+/// Signal used to make adaptive admission decisions.
+///
+/// `predicted_work` preserves the original output-token predictor. The
+/// `engine_feedback` strategy instead learns the running-concurrency knee from
+/// live engine throughput and backs off when the engines report queue or KV
+/// pressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAdmissionStrategy {
+    #[default]
+    PredictedWork,
+    EngineFeedback,
+}
+
+impl std::str::FromStr for AdaptiveAdmissionStrategy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "predicted_work" => Ok(Self::PredictedWork),
+            "engine_feedback" => Ok(Self::EngineFeedback),
+            _ => Err(format!(
+                "adaptive admission strategy must be one of predicted_work, engine_feedback; got {value:?}"
+            )),
+        }
+    }
+}
+
 impl std::str::FromStr for AdaptiveAdmissionMode {
     type Err = String;
 
@@ -65,6 +93,22 @@ fn default_adaptive_cold_start_output_tokens() -> u32 {
     4096
 }
 
+fn default_feedback_probe_requests_per_healthy_replica() -> u32 {
+    2
+}
+
+fn default_feedback_max_waiting_requests_per_healthy_replica() -> u32 {
+    2
+}
+
+fn default_feedback_max_token_usage() -> f64 {
+    0.9
+}
+
+fn default_feedback_throughput_improvement_ratio() -> f64 {
+    0.02
+}
+
 /// Predictive token-work admission settings.
 ///
 /// The work horizon is an operator-facing latency objective rather than a
@@ -77,6 +121,8 @@ fn default_adaptive_cold_start_output_tokens() -> u32 {
 pub struct AdaptiveAdmissionConfig {
     #[serde(default)]
     pub mode: AdaptiveAdmissionMode,
+    #[serde(default)]
+    pub strategy: AdaptiveAdmissionStrategy,
     #[serde(default = "default_adaptive_work_horizon_secs")]
     pub work_horizon_secs: f64,
     #[serde(default = "default_adaptive_estimator_half_life_secs")]
@@ -89,18 +135,40 @@ pub struct AdaptiveAdmissionConfig {
     pub min_load_coverage: f64,
     #[serde(default = "default_adaptive_cold_start_output_tokens")]
     pub cold_start_output_tokens: u32,
+    /// Additional per-replica requests allowed above the learned
+    /// running-concurrency knee so the controller can discover more capacity.
+    #[serde(default = "default_feedback_probe_requests_per_healthy_replica")]
+    pub feedback_probe_requests_per_healthy_replica: u32,
+    /// Engine waiting-queue threshold that closes admission until pressure
+    /// falls. This is evaluated against workers with fresh load telemetry.
+    #[serde(default = "default_feedback_max_waiting_requests_per_healthy_replica")]
+    pub feedback_max_waiting_requests_per_healthy_replica: u32,
+    /// Maximum engine token/KV usage before feedback admission closes.
+    #[serde(default = "default_feedback_max_token_usage")]
+    pub feedback_max_token_usage: f64,
+    /// Minimum relative throughput gain required to move the learned
+    /// concurrency knee upward. Near-equal throughput may move it downward.
+    #[serde(default = "default_feedback_throughput_improvement_ratio")]
+    pub feedback_throughput_improvement_ratio: f64,
 }
 
 impl Default for AdaptiveAdmissionConfig {
     fn default() -> Self {
         Self {
             mode: AdaptiveAdmissionMode::Off,
+            strategy: AdaptiveAdmissionStrategy::PredictedWork,
             work_horizon_secs: default_adaptive_work_horizon_secs(),
             estimator_half_life_secs: default_adaptive_estimator_half_life_secs(),
             prior_observations: default_adaptive_prior_observations(),
             max_segments: default_adaptive_max_segments(),
             min_load_coverage: default_adaptive_min_load_coverage(),
             cold_start_output_tokens: default_adaptive_cold_start_output_tokens(),
+            feedback_probe_requests_per_healthy_replica:
+                default_feedback_probe_requests_per_healthy_replica(),
+            feedback_max_waiting_requests_per_healthy_replica:
+                default_feedback_max_waiting_requests_per_healthy_replica(),
+            feedback_max_token_usage: default_feedback_max_token_usage(),
+            feedback_throughput_improvement_ratio: default_feedback_throughput_improvement_ratio(),
         }
     }
 }
