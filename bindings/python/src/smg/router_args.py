@@ -124,12 +124,17 @@ class RouterArgs:
     # Engine telemetry and predictive token-work admission.
     engine_metrics: bool = False
     adaptive_admission_mode: str = "off"
+    adaptive_admission_strategy: str = "predicted_work"
     adaptive_admission_work_horizon_secs: float = 30.0
     adaptive_admission_estimator_half_life_secs: float = 900.0
     adaptive_admission_prior_observations: float = 20.0
     adaptive_admission_max_segments: int = 50_000
     adaptive_admission_min_load_coverage: float = 0.8
     adaptive_admission_cold_start_output_tokens: int = 4096
+    adaptive_admission_feedback_probe_requests_per_healthy_replica: int = 2
+    adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: int = 2
+    adaptive_admission_feedback_max_token_usage: float = 0.9
+    adaptive_admission_feedback_throughput_improvement_ratio: float = 0.02
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: int | None = None
     # Cluster-wide requests-per-second ceiling. Requires mesh and the same value on every gateway.
@@ -892,6 +897,12 @@ class RouterArgs:
             help="Predictive token-work admission mode",
         )
         adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-strategy",
+            choices=["predicted_work", "engine_feedback"],
+            default=RouterArgs.adaptive_admission_strategy,
+            help="Admission signal: output-work prediction or direct engine feedback",
+        )
+        adaptive_admission_group.add_argument(
             f"--{prefix}adaptive-admission-work-horizon-secs",
             type=float,
             default=RouterArgs.adaptive_admission_work_horizon_secs,
@@ -926,6 +937,32 @@ class RouterArgs:
             type=int,
             default=RouterArgs.adaptive_admission_cold_start_output_tokens,
             help="Cold-start output-token prediction before observations",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-feedback-probe-requests-per-healthy-replica",
+            type=int,
+            default=RouterArgs.adaptive_admission_feedback_probe_requests_per_healthy_replica,
+            help="Per-replica exploration margin above the learned throughput knee",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-feedback-max-waiting-requests-per-healthy-replica",
+            type=int,
+            default=(
+                RouterArgs.adaptive_admission_feedback_max_waiting_requests_per_healthy_replica
+            ),
+            help="Per-replica engine waiting queue that closes feedback admission",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-feedback-max-token-usage",
+            type=float,
+            default=RouterArgs.adaptive_admission_feedback_max_token_usage,
+            help="Engine token/KV usage ratio that closes feedback admission",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-feedback-throughput-improvement-ratio",
+            type=float,
+            default=RouterArgs.adaptive_admission_feedback_throughput_improvement_ratio,
+            help="Relative throughput gain required to raise the learned concurrency knee",
         )
 
         # Retry configuration
@@ -1517,13 +1554,9 @@ class RouterArgs:
     def _validate_router_args(self):
         if self.global_rate_limit_requests_per_second is not None:
             if self.global_rate_limit_requests_per_second <= 0:
-                raise ValueError(
-                    "global_rate_limit_requests_per_second must be greater than zero"
-                )
+                raise ValueError("global_rate_limit_requests_per_second must be greater than zero")
             if not self.enable_mesh:
-                raise ValueError(
-                    "global_rate_limit_requests_per_second requires enable_mesh=True"
-                )
+                raise ValueError("global_rate_limit_requests_per_second requires enable_mesh=True")
 
         # Validate configuration based on mode
         if self.epd_disaggregation:
