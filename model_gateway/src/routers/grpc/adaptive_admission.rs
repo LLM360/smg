@@ -23,7 +23,6 @@ use tokio::sync::watch;
 
 use crate::{
     config::{AdaptiveAdmissionConfig, AdaptiveAdmissionMode, AdaptiveAdmissionStrategy},
-    middleware::scheduler::AdaptiveCapacityProvider,
     observability::metrics::intern_string,
     worker::WorkerRegistry,
 };
@@ -540,56 +539,6 @@ struct WorkState {
     feedback_estimates: HashMap<String, FeedbackEstimate>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct EngineFeedbackConstraints {
-    telemetry_usable: bool,
-    running_limit: Option<f64>,
-    pressure_reason: Option<&'static str>,
-}
-
-fn engine_feedback_constraints(
-    config: &AdaptiveAdmissionConfig,
-    load: &PartitionLoad,
-    feedback_estimate: Option<&FeedbackEstimate>,
-) -> EngineFeedbackConstraints {
-    let telemetry_usable = load.coverage() >= config.min_load_coverage;
-    let engine_limit = if load.max_running_coverage() >= config.min_load_coverage {
-        Some(load.scaled_max_running_requests())
-    } else {
-        None
-    };
-    let learned_limit = feedback_estimate
-        .filter(|estimate| engine_limit.is_some() || estimate.pressure_observed)
-        .map(|estimate| {
-            (estimate.running_requests_per_replica_at_peak * f64::from(load.healthy_replicas))
-                .ceil()
-                + f64::from(
-                    config
-                        .feedback_probe_requests_per_healthy_replica
-                        .saturating_mul(load.healthy_replicas),
-                )
-        });
-    let running_limit = match (learned_limit, engine_limit) {
-        (Some(learned), Some(engine)) => Some(learned.max(1.0).min(engine)),
-        (Some(learned), None) => Some(learned.max(1.0)),
-        (None, engine) => engine,
-    };
-    let waiting_limit = i64::from(config.feedback_max_waiting_requests_per_healthy_replica)
-        * i64::from(load.observed_replicas);
-    let pressure_reason = if load.mean_token_usage() >= config.feedback_max_token_usage {
-        Some("token_pressure")
-    } else if load.waiting_requests > waiting_limit {
-        Some("engine_waiting")
-    } else {
-        None
-    };
-    EngineFeedbackConstraints {
-        telemetry_usable,
-        running_limit,
-        pressure_reason,
-    }
-}
-
 #[derive(Debug)]
 struct PredictionSampleState {
     skip_per_model: u64,
@@ -635,19 +584,16 @@ pub(crate) struct AdaptiveAdmissionController {
     work: Mutex<WorkState>,
     prediction_samples: Option<Mutex<PredictionSampleState>>,
     registry: Arc<WorkerRegistry>,
-    capacity_revision: watch::Sender<u64>,
 }
 
 impl AdaptiveAdmissionController {
     pub(crate) fn new(config: AdaptiveAdmissionConfig, registry: Arc<WorkerRegistry>) -> Arc<Self> {
-        let (capacity_revision, _) = watch::channel(0_u64);
         Arc::new(Self {
             predictor: Mutex::new(HierarchicalPredictor::new(&config)),
             config,
             work: Mutex::new(WorkState::default()),
             prediction_samples: PredictionSampleState::from_env().map(Mutex::new),
             registry,
-            capacity_revision,
         })
     }
 
@@ -818,9 +764,6 @@ impl AdaptiveAdmissionController {
                     }),
             );
         }
-        drop(work);
-        self.capacity_revision
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     pub(crate) fn begin(
@@ -945,19 +888,47 @@ impl AdaptiveAdmissionController {
                     }
                 }
                 AdaptiveAdmissionStrategy::EngineFeedback => {
-                    let constraints = engine_feedback_constraints(
-                        &self.config,
-                        &load,
-                        feedback_estimate.as_ref(),
-                    );
+                    let telemetry_usable = coverage >= self.config.min_load_coverage;
+                    let engine_limit =
+                        if load.max_running_coverage() >= self.config.min_load_coverage {
+                            Some(load.scaled_max_running_requests())
+                        } else {
+                            None
+                        };
+                    let learned_limit = feedback_estimate
+                        .as_ref()
+                        .filter(|estimate| engine_limit.is_some() || estimate.pressure_observed)
+                        .map(|estimate| {
+                            (estimate.running_requests_per_replica_at_peak
+                                * f64::from(load.healthy_replicas))
+                            .ceil()
+                                + f64::from(
+                                    self.config
+                                        .feedback_probe_requests_per_healthy_replica
+                                        .saturating_mul(load.healthy_replicas),
+                                )
+                        });
+                    // A reported engine maximum remains the cold-start hard
+                    // ceiling. Without one, live token/queue pressure explores
+                    // safely until a busy sample makes the learned knee usable.
+                    let running_limit = match (learned_limit, engine_limit) {
+                        (Some(learned), Some(engine)) => Some(learned.max(1.0).min(engine)),
+                        (Some(learned), None) => Some(learned.max(1.0)),
+                        (None, engine) => engine,
+                    };
                     let projected_requests =
                         router_outstanding_requests.max(engine_request_count + 1.0);
-                    let reason = if !constraints.telemetry_usable {
+                    let waiting_limit = i64::from(
+                        self.config
+                            .feedback_max_waiting_requests_per_healthy_replica,
+                    ) * i64::from(load.observed_replicas);
+                    let reason = if !telemetry_usable {
                         "telemetry_fallback"
-                    } else if let Some(reason) = constraints.pressure_reason {
-                        reason
-                    } else if constraints
-                        .running_limit
+                    } else if load.mean_token_usage() >= self.config.feedback_max_token_usage {
+                        "token_pressure"
+                    } else if load.waiting_requests > waiting_limit {
+                        "engine_waiting"
+                    } else if running_limit
                         .is_some_and(|running_limit| projected_requests > running_limit)
                     {
                         "running_limit"
@@ -967,7 +938,7 @@ impl AdaptiveAdmissionController {
                     let would_admit =
                         matches!(reason, "telemetry_fallback" | "within_feedback_limit");
                     gauge!(FEEDBACK_RUNNING_LIMIT, "partition" => Arc::clone(&partition_label))
-                        .set(constraints.running_limit.unwrap_or(0.0));
+                        .set(running_limit.unwrap_or(0.0));
                     gauge!(OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
                         .set(router_outstanding);
                     gauge!(ROUTER_OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
@@ -979,7 +950,7 @@ impl AdaptiveAdmissionController {
                     gauge!(DRAIN_SECONDS, "partition" => partition_label).set(0.0);
                     AdmissionDecision {
                         would_admit,
-                        telemetry_usable: constraints.telemetry_usable,
+                        telemetry_usable,
                         reason,
                         retry_after_secs: u32::from(!would_admit),
                     }
@@ -1073,41 +1044,6 @@ impl AdaptiveAdmissionController {
                 "adaptive admission prediction sample"
             );
         }
-    }
-}
-
-impl AdaptiveCapacityProvider for AdaptiveAdmissionController {
-    fn effective_capacity(&self, partition: &str, static_capacity: u16) -> u16 {
-        if self.config.mode != AdaptiveAdmissionMode::Enforce
-            || self.config.strategy != AdaptiveAdmissionStrategy::EngineFeedback
-        {
-            return static_capacity;
-        }
-        let work = self.work.lock();
-        let load = work.loads.get(partition).cloned().unwrap_or_default();
-        let constraints = engine_feedback_constraints(
-            &self.config,
-            &load,
-            work.feedback_estimates.get(partition),
-        );
-        if !constraints.telemetry_usable {
-            return static_capacity;
-        }
-        if constraints.pressure_reason.is_some() {
-            return 0;
-        }
-        let Some(running_limit) = constraints.running_limit else {
-            return static_capacity;
-        };
-        // This is a total fleet ceiling, not a remaining-credit count.
-        // SlotPool's packed in-flight counters are the single authoritative
-        // usage source. Subtracting controller or engine request counts here
-        // would double-account work and underutilize the partition.
-        (running_limit.floor().clamp(0.0, f64::from(u16::MAX)) as u16).min(static_capacity)
-    }
-
-    fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
-        self.capacity_revision.subscribe()
     }
 }
 
@@ -1656,73 +1592,6 @@ mod tests {
         assert_eq!(
             excess.inner.as_ref().unwrap().decision.reason,
             "running_limit"
-        );
-    }
-
-    #[test]
-    fn capacity_provider_reports_total_ceiling_without_request_double_accounting() {
-        let mut settings = config();
-        settings.mode = AdaptiveAdmissionMode::Enforce;
-        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
-        let controller =
-            AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
-        let mut work = controller.work.lock();
-        work.loads.insert(
-            "model".to_string(),
-            PartitionLoad {
-                healthy_replicas: 1,
-                observed_replicas: 1,
-                running_requests: 63,
-                max_running_requests: 64,
-                max_running_observed_replicas: 1,
-                token_usage_sum: 0.5,
-                max_token_usage: 0.5,
-                ..PartitionLoad::default()
-            },
-        );
-        work.outstanding_requests.insert("model".to_string(), 63);
-        drop(work);
-
-        assert_eq!(
-            controller.effective_capacity("model", 100),
-            64,
-            "provider returns a total ceiling; SlotPool subtracts in-flight usage"
-        );
-
-        controller
-            .work
-            .lock()
-            .loads
-            .get_mut("model")
-            .unwrap()
-            .token_usage_sum = 0.95;
-        assert_eq!(
-            controller.effective_capacity("model", 100),
-            0,
-            "live pressure can close the scheduler gate"
-        );
-    }
-
-    #[test]
-    fn capacity_revision_changes_on_load_samples_not_per_request() {
-        let controller =
-            AdaptiveAdmissionController::new(config(), Arc::new(WorkerRegistry::new()));
-        let revision = controller.subscribe_capacity_changes();
-        let tracker = controller.begin("model".to_string(), features("a", 10, None));
-        assert!(
-            !revision.has_changed().unwrap(),
-            "request admission must not wake every partition coordinator"
-        );
-        drop(tracker);
-        assert!(
-            !revision.has_changed().unwrap(),
-            "request completion must not wake every partition coordinator"
-        );
-
-        controller.update_loads(&HashMap::new());
-        assert!(
-            revision.has_changed().unwrap(),
-            "a real telemetry sample publishes a capacity revision"
         );
     }
 

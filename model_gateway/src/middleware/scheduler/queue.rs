@@ -2,7 +2,7 @@
 //! candidates while their class is at capacity.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -31,59 +31,6 @@ use crate::tenant::TenantKey;
 pub struct QueueBudget {
     used: AtomicUsize,
     capacity: usize,
-}
-
-/// Per-tenant occupancy ceiling shared by every priority class in one
-/// scheduler partition.
-///
-/// The global [`QueueBudget`] remains the partition-wide safety limit. This
-/// second budget prevents one tenant from consuming every queued position and
-/// ensures another tenant can become present for fair-share selection.
-#[derive(Debug)]
-pub struct TenantQueueBudget {
-    used: Mutex<HashMap<TenantKey, usize>>,
-    capacity: usize,
-}
-
-impl TenantQueueBudget {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            used: Mutex::new(HashMap::new()),
-            capacity,
-        }
-    }
-
-    fn try_acquire(&self, tenant: &TenantKey) -> bool {
-        let mut used = self.used.lock();
-        let count = used.entry(tenant.clone()).or_default();
-        if *count >= self.capacity {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    fn release(&self, tenant: &TenantKey) {
-        let mut used = self.used.lock();
-        let remove = match used.get_mut(tenant) {
-            Some(count) if *count > 0 => {
-                *count -= 1;
-                *count == 0
-            }
-            _ => {
-                debug_assert!(false, "tenant queue budget released below zero");
-                false
-            }
-        };
-        if remove {
-            used.remove(tenant);
-        }
-    }
-
-    #[cfg(test)]
-    fn depth(&self, tenant: &TenantKey) -> usize {
-        self.used.lock().get(tenant).copied().unwrap_or(0)
-    }
 }
 
 impl QueueBudget {
@@ -205,9 +152,9 @@ impl Waiter {
 /// and admission, so it uses `parking_lot::Mutex` rather than an async
 /// mutex.
 pub trait ClassQueue: Send + Sync {
-    /// Append a waiter. Returns `Err(waiter)` when an occupancy budget is
-    /// exhausted so the caller can convert the rejection into a saturation
-    /// response.
+    /// Append a waiter. Returns `Err(waiter)` when the shared global queue
+    /// budget is exhausted so the caller can convert the rejection into a
+    /// saturation response.
     fn try_enqueue(&self, waiter: Waiter) -> Result<(), Waiter>;
 
     /// Pop the next waiter, or `None` when empty.
@@ -223,9 +170,10 @@ pub trait ClassQueue: Send + Sync {
     /// Configured soft share of the global queue budget, for metrics.
     fn capacity(&self) -> usize;
 
-    /// Drain leading waiters whose cancel token has fired (clients that walked
-    /// away while queued). Fair queues inspect the leading run of every tenant
-    /// subqueue so a cancelled tenant cannot retain occupancy indefinitely.
+    /// Drain any leading run of waiters whose cancel token has fired
+    /// (clients that walked away while queued). One call removes every
+    /// consecutive cancelled head in a single lock acquisition; the
+    /// first non-cancelled or empty position stops the scan.
     fn drop_cancelled_head(&self);
 }
 
@@ -297,24 +245,15 @@ impl ClassQueue for FifoClassQueue {
 /// Only waiters in this concrete queue are candidates, so debt in another
 /// non-fungible model pool can never idle local capacity.
 pub struct FairClassQueue {
-    waiters: Mutex<FairQueueState>,
+    waiters: Mutex<VecDeque<Waiter>>,
     soft_limit: usize,
     budget: Arc<QueueBudget>,
-    tenant_budget: Arc<TenantQueueBudget>,
     ledger: Arc<GlobalFairShare>,
     scope_id: u64,
     class: Class,
 }
 
-#[derive(Default)]
-struct FairQueueState {
-    profiles: HashMap<FairShareProfile, HashMap<TenantKey, VecDeque<Waiter>>>,
-    depth: usize,
-}
-
 impl FairClassQueue {
-    /// Compatibility constructor with no tenant-specific ceiling beyond the
-    /// existing global queue budget.
     pub fn with_shared_budget(
         class: Class,
         soft_limit: usize,
@@ -322,55 +261,13 @@ impl FairClassQueue {
         ledger: Arc<GlobalFairShare>,
         scope_id: u64,
     ) -> Self {
-        let tenant_budget = Arc::new(TenantQueueBudget::new(budget.capacity()));
-        Self::with_shared_budgets(class, soft_limit, budget, tenant_budget, ledger, scope_id)
-    }
-
-    pub(crate) fn with_shared_budgets(
-        class: Class,
-        soft_limit: usize,
-        budget: Arc<QueueBudget>,
-        tenant_budget: Arc<TenantQueueBudget>,
-        ledger: Arc<GlobalFairShare>,
-        scope_id: u64,
-    ) -> Self {
         Self {
-            waiters: Mutex::new(FairQueueState::default()),
+            waiters: Mutex::new(VecDeque::with_capacity(soft_limit.min(64))),
             soft_limit,
             budget,
-            tenant_budget,
             ledger,
             scope_id,
             class,
-        }
-    }
-
-    fn drop_cancelled_locked(&self, state: &mut FairQueueState) {
-        let mut removed = Vec::new();
-        for (profile, tenants) in &mut state.profiles {
-            for (tenant, queue) in tenants {
-                while queue
-                    .front()
-                    .is_some_and(|waiter| waiter.cancel.is_cancelled())
-                {
-                    queue.pop_front();
-                    removed.push((profile.clone(), tenant.clone()));
-                }
-            }
-        }
-        if removed.is_empty() {
-            return;
-        }
-        state.depth = state.depth.saturating_sub(removed.len());
-        state.profiles.retain(|_, tenants| {
-            tenants.retain(|_, queue| !queue.is_empty());
-            !tenants.is_empty()
-        });
-        for (profile, tenant) in removed {
-            self.budget.release();
-            self.tenant_budget.release(&tenant);
-            self.ledger
-                .remove_waiter_in_profile(self.scope_id, &profile, &tenant, self.class);
         }
     }
 }
@@ -378,16 +275,9 @@ impl FairClassQueue {
 impl ClassQueue for FairClassQueue {
     fn try_enqueue(&self, waiter: Waiter) -> Result<(), Waiter> {
         let Some(tenant) = waiter.tenant.as_ref() else {
-            super::metrics::record_fair_share_queue_rejection("missing_tenant");
             return Err(waiter);
         };
-        if !self.tenant_budget.try_acquire(tenant) {
-            super::metrics::record_fair_share_queue_rejection("tenant_limit");
-            return Err(waiter);
-        }
         if !self.budget.try_acquire() {
-            self.tenant_budget.release(tenant);
-            super::metrics::record_fair_share_queue_rejection("global_limit");
             return Err(waiter);
         }
         let mut guard = self.waiters.lock();
@@ -397,53 +287,30 @@ impl ClassQueue for FairClassQueue {
             tenant,
             self.class,
         );
-        guard
-            .profiles
-            .entry(waiter.fair_share_profile.clone())
-            .or_default()
-            .entry(tenant.clone())
-            .or_default()
-            .push_back(waiter);
-        guard.depth += 1;
+        guard.push_back(waiter);
         Ok(())
     }
 
     fn pop_eligible(&self) -> Option<Waiter> {
         let mut guard = self.waiters.lock();
-        self.drop_cancelled_locked(&mut guard);
         let profile = guard
-            .profiles
             .iter()
-            .filter_map(|(profile, tenants)| {
-                tenants
-                    .values()
-                    .filter_map(VecDeque::front)
-                    .min_by_key(|waiter| waiter.queued_at)
-                    .map(|waiter| (profile.clone(), waiter.queued_at))
-            })
-            .min_by_key(|(_, queued_at)| *queued_at)
-            .map(|(profile, _)| profile)?;
-        let candidate_data: Vec<_> = guard
-            .profiles
-            .get(&profile)?
-            .iter()
-            .filter_map(|(tenant, queue)| {
-                queue
-                    .front()
-                    .map(|waiter| (tenant.clone(), waiter.estimated_output_tokens))
-            })
-            .collect();
+            .filter(|waiter| !waiter.cancel.is_cancelled())
+            .min_by_key(|waiter| waiter.queued_at)
+            .map(|waiter| waiter.fair_share_profile.clone())?;
         let selection = {
-            let candidates: Vec<_> = candidate_data
+            let candidates: Vec<_> = guard
                 .iter()
                 .enumerate()
-                .map(
-                    |(index, (tenant, estimated_output_tokens))| FairShareCandidate {
+                .filter(|(_, waiter)| !waiter.cancel.is_cancelled())
+                .filter(|(_, waiter)| waiter.fair_share_profile == profile)
+                .filter_map(|(index, waiter)| {
+                    waiter.tenant.as_ref().map(|tenant| FairShareCandidate {
                         index,
                         tenant,
-                        estimated_output_tokens: *estimated_output_tokens,
-                    },
-                )
+                        estimated_output_tokens: waiter.estimated_output_tokens,
+                    })
+                })
                 .collect();
             self.ledger.reserve_local_candidate_in_profile(
                 self.scope_id,
@@ -452,30 +319,11 @@ impl ClassQueue for FairClassQueue {
                 &candidates,
             )
         }?;
-        let Some((tenant, _)) = candidate_data.get(selection.index) else {
+        let Some(mut waiter) = guard.remove(selection.index) else {
             selection.reservation.cancel();
             return None;
         };
-        let tenant = tenant.clone();
-        let mut remove_profile = false;
-        let Some(mut waiter) = guard.profiles.get_mut(&profile).and_then(|tenants| {
-            let queue = tenants.get_mut(&tenant)?;
-            let waiter = queue.pop_front();
-            if queue.is_empty() {
-                tenants.remove(&tenant);
-            }
-            remove_profile = tenants.is_empty();
-            waiter
-        }) else {
-            selection.reservation.cancel();
-            return None;
-        };
-        if remove_profile {
-            guard.profiles.remove(&profile);
-        }
-        guard.depth = guard.depth.saturating_sub(1);
         self.budget.release();
-        self.tenant_budget.release(&tenant);
         if let Some(tenant) = waiter.tenant.as_ref() {
             self.ledger.record_queue_wait(
                 &waiter.fair_share_profile,
@@ -491,17 +339,13 @@ impl ClassQueue for FairClassQueue {
     fn head_age(&self) -> Option<Duration> {
         self.waiters
             .lock()
-            .profiles
-            .values()
-            .flat_map(HashMap::values)
-            .flat_map(VecDeque::iter)
-            .filter(|waiter| !waiter.cancel.is_cancelled())
+            .iter()
             .map(|waiter| waiter.queued_at.elapsed())
             .max()
     }
 
     fn depth(&self) -> usize {
-        self.waiters.lock().depth
+        self.waiters.lock().len()
     }
 
     fn capacity(&self) -> usize {
@@ -510,7 +354,25 @@ impl ClassQueue for FairClassQueue {
 
     fn drop_cancelled_head(&self) {
         let mut guard = self.waiters.lock();
-        self.drop_cancelled_locked(&mut guard);
+        let mut index = 0;
+        while index < guard.len() {
+            if !guard[index].cancel.is_cancelled() {
+                index += 1;
+                continue;
+            }
+            let Some(waiter) = guard.remove(index) else {
+                break;
+            };
+            self.budget.release();
+            if let Some(tenant) = waiter.tenant.as_ref() {
+                self.ledger.remove_waiter_in_profile(
+                    self.scope_id,
+                    &waiter.fair_share_profile,
+                    tenant,
+                    self.class,
+                );
+            }
+        }
     }
 }
 
@@ -537,7 +399,6 @@ mod tests {
         Arc::new(GlobalFairShare::from_config(&FairShareConfig {
             default_weight: 1.0,
             default_output_tokens: 10,
-            max_queued_requests_per_tenant: Some(64),
             trust_output_token_estimate_header: false,
             trust_request_model_header: true,
             tenant_weights: HashMap::new(),
@@ -570,23 +431,6 @@ mod tests {
             TenantKey::new(tenant),
             profile,
             10,
-        )
-    }
-
-    fn fair_queue(
-        class: Class,
-        global_budget: Arc<QueueBudget>,
-        tenant_budget: Arc<TenantQueueBudget>,
-        ledger: Arc<GlobalFairShare>,
-        scope_id: u64,
-    ) -> FairClassQueue {
-        FairClassQueue::with_shared_budgets(
-            class,
-            8,
-            global_budget,
-            tenant_budget,
-            ledger,
-            scope_id,
         )
     }
 
@@ -665,11 +509,10 @@ mod tests {
     fn oldest_model_group_wins_before_model_local_virtual_service() {
         let ledger = model_ledger();
         let scope_id = ledger.new_scope();
-        let queue = FairClassQueue::with_shared_budgets(
+        let queue = FairClassQueue::with_shared_budget(
             Class::Default,
             8,
             Arc::new(QueueBudget::new(8)),
-            Arc::new(TenantQueueBudget::new(8)),
             Arc::clone(&ledger),
             scope_id,
         );
@@ -701,172 +544,6 @@ mod tests {
             .take()
             .expect("model waiter has reservation")
             .cancel();
-    }
-
-    #[test]
-    fn noisy_tenant_cannot_fill_shared_queue_and_underserved_tenant_is_present() {
-        let ledger = model_ledger();
-        let scope_id = ledger.new_scope();
-        let global_budget = Arc::new(QueueBudget::new(3));
-        let tenant_budget = Arc::new(TenantQueueBudget::new(2));
-        let queue = fair_queue(
-            Class::Default,
-            global_budget,
-            Arc::clone(&tenant_budget),
-            Arc::clone(&ledger),
-            scope_id,
-        );
-        let profile = FairShareProfile::Global;
-        queue
-            .try_enqueue(model_waiter("a-1", "header:a", profile.clone()))
-            .unwrap();
-        queue
-            .try_enqueue(model_waiter("a-2", "header:a", profile.clone()))
-            .unwrap();
-        assert!(
-            queue
-                .try_enqueue(model_waiter("a-3", "header:a", profile.clone()))
-                .is_err(),
-            "the tenant ceiling rejects only the noisy tenant"
-        );
-        queue
-            .try_enqueue(model_waiter("b-1", "header:b", profile.clone()))
-            .expect("another tenant retains a queue position");
-        assert_eq!(queue.depth(), 3);
-        assert_eq!(tenant_budget.depth(&TenantKey::new("header:a")), 2);
-        assert_eq!(tenant_budget.depth(&TenantKey::new("header:b")), 1);
-
-        // Charge A in another scheduler scope while A and B are already
-        // backlogged here. The shared ledger must then select B from the
-        // locally present tenant heads.
-        let debt_scope = ledger.new_scope();
-        let a = TenantKey::new("header:a");
-        ledger.register_waiter(debt_scope, &a, Class::Default);
-        ledger
-            .reserve_local_candidate(
-                debt_scope,
-                Class::Default,
-                &[FairShareCandidate {
-                    index: 0,
-                    tenant: &a,
-                    estimated_output_tokens: 100,
-                }],
-            )
-            .expect("A receives contended service")
-            .reservation
-            .settle(Some(100), super::super::SettlementKind::Observed);
-
-        let mut selected = queue.pop_eligible().expect("a waiter dispatches");
-        assert_eq!(selected.request_id.0, "b-1");
-        selected
-            .fair_share_reservation
-            .take()
-            .expect("fair waiter has a reservation")
-            .cancel();
-    }
-
-    #[test]
-    fn global_budget_failure_rolls_back_tenant_occupancy() {
-        let ledger = model_ledger();
-        let scope_id = ledger.new_scope();
-        let global_budget = Arc::new(QueueBudget::new(1));
-        let tenant_budget = Arc::new(TenantQueueBudget::new(1));
-        let default = fair_queue(
-            Class::Default,
-            Arc::clone(&global_budget),
-            Arc::clone(&tenant_budget),
-            Arc::clone(&ledger),
-            scope_id,
-        );
-        let bulk = fair_queue(
-            Class::Bulk,
-            global_budget,
-            Arc::clone(&tenant_budget),
-            Arc::clone(&ledger),
-            scope_id,
-        );
-        default
-            .try_enqueue(model_waiter("b-held", "header:b", FairShareProfile::Global))
-            .unwrap();
-        assert!(bulk
-            .try_enqueue(model_waiter(
-                "a-global-full",
-                "header:a",
-                FairShareProfile::Global,
-            ))
-            .is_err());
-        let a = TenantKey::new("header:a");
-        assert_eq!(
-            tenant_budget.depth(&a),
-            0,
-            "failed global acquisition cannot leak a tenant claim"
-        );
-
-        let mut released = default.pop_eligible().unwrap();
-        released.fair_share_reservation.take().unwrap().cancel();
-        bulk.try_enqueue(model_waiter(
-            "a-after-release",
-            "header:a",
-            FairShareProfile::Global,
-        ))
-        .expect("A can enqueue after the global slot is released");
-        assert_eq!(tenant_budget.depth(&a), 1);
-    }
-
-    #[test]
-    fn cancellation_releases_tenant_budget_across_priority_classes() {
-        let ledger = model_ledger();
-        let scope_id = ledger.new_scope();
-        let global_budget = Arc::new(QueueBudget::new(2));
-        let tenant_budget = Arc::new(TenantQueueBudget::new(1));
-        let default = fair_queue(
-            Class::Default,
-            Arc::clone(&global_budget),
-            Arc::clone(&tenant_budget),
-            Arc::clone(&ledger),
-            scope_id,
-        );
-        let interactive = fair_queue(
-            Class::Interactive,
-            global_budget,
-            Arc::clone(&tenant_budget),
-            ledger,
-            scope_id,
-        );
-        let cancelled = CancellationToken::new();
-        let (tx, _rx) = oneshot::channel();
-        default
-            .try_enqueue(Waiter::new_fair(
-                Class::Default,
-                cancelled.clone(),
-                RequestId("a-cancelled".into()),
-                tx,
-                TenantKey::new("header:a"),
-                FairShareProfile::Global,
-                10,
-            ))
-            .unwrap();
-        assert!(
-            interactive
-                .try_enqueue(model_waiter(
-                    "a-interactive-blocked",
-                    "header:a",
-                    FairShareProfile::Global,
-                ))
-                .is_err(),
-            "the tenant budget is shared across priority classes"
-        );
-        cancelled.cancel();
-        default.drop_cancelled_head();
-        let a = TenantKey::new("header:a");
-        assert_eq!(tenant_budget.depth(&a), 0);
-        interactive
-            .try_enqueue(model_waiter(
-                "a-interactive",
-                "header:a",
-                FairShareProfile::Global,
-            ))
-            .expect("cancellation releases the cross-class tenant claim");
     }
 
     #[test]

@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use super::{
     fair_share::{FairShareProfile, FairShareReservation, GlobalFairShare, SettlementKind},
     inflight::InflightHandle,
-    queue::{ClassQueue, FairClassQueue, FifoClassQueue, QueueBudget, TenantQueueBudget, Waiter},
+    queue::{ClassQueue, FairClassQueue, FifoClassQueue, QueueBudget, Waiter},
     slots::SlotPool,
     Class, ClassRuntimeConfig, SchedulerSettings,
 };
@@ -191,21 +191,12 @@ impl PriorityScheduler {
             .fold(0_usize, usize::saturating_add);
         let queue_budget = Arc::new(QueueBudget::new(total_queue_capacity));
         let fair_share_scope = fair_share.as_ref().map(|ledger| ledger.new_scope());
-        let tenant_queue_budget = fair_share.as_ref().map(|_| {
-            let per_tenant_capacity = settings
-                .fair_share_config()
-                .and_then(|config| config.max_queued_requests_per_tenant)
-                .map_or(total_queue_capacity, |capacity| capacity as usize);
-            Arc::new(TenantQueueBudget::new(per_tenant_capacity))
-        });
         let class_queues: [Arc<dyn ClassQueue>; 4] = Class::ALL.map(|c| {
             queue_for(
                 settings,
                 c,
                 Arc::clone(&queue_budget),
-                fair_share.as_ref(),
-                fair_share_scope,
-                tenant_queue_budget.as_ref(),
+                fair_share.as_ref().zip(fair_share_scope),
             )
         });
         let class_config: [ClassRuntimeConfig; 4] =
@@ -1041,23 +1032,18 @@ fn queue_for(
     settings: &SchedulerSettings,
     class: Class,
     queue_budget: Arc<QueueBudget>,
-    fair_share: Option<&Arc<GlobalFairShare>>,
-    fair_share_scope: Option<u64>,
-    tenant_queue_budget: Option<&Arc<TenantQueueBudget>>,
+    fair_share: Option<(&Arc<GlobalFairShare>, u64)>,
 ) -> Arc<dyn ClassQueue> {
     let soft_limit = settings.class_config(class).queue_size as usize;
-    match (fair_share, fair_share_scope, tenant_queue_budget) {
-        (Some(ledger), Some(scope_id), Some(tenant_queue_budget)) => {
-            Arc::new(FairClassQueue::with_shared_budgets(
-                class,
-                soft_limit,
-                queue_budget,
-                Arc::clone(tenant_queue_budget),
-                Arc::clone(ledger),
-                scope_id,
-            ))
-        }
-        _ => Arc::new(FifoClassQueue::with_shared_budget(soft_limit, queue_budget)),
+    match fair_share {
+        Some((ledger, scope_id)) => Arc::new(FairClassQueue::with_shared_budget(
+            class,
+            soft_limit,
+            queue_budget,
+            Arc::clone(ledger),
+            scope_id,
+        )),
+        None => Arc::new(FifoClassQueue::with_shared_budget(soft_limit, queue_budget)),
     }
 }
 
@@ -1112,7 +1098,7 @@ impl SchedulerPermit {
         }
     }
 
-    pub(crate) fn cancel_fair_share_reservation(&mut self) {
+    fn cancel_fair_share_reservation(&mut self) {
         if let Some(reservation) = self.fair_share_reservation.take() {
             reservation.cancel();
         }
@@ -1859,60 +1845,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_zero_provider_capacity_blocks_dispatch_then_real_growth_admits_one() {
-        // Model a provider lowering the total fleet ceiling below current
-        // in-flight usage. SlotPool owns the authoritative counters: releases
-        // below a zero ceiling cannot dispatch, and a later 0 -> 1 change
-        // admits exactly one queued request.
-        let s = settings_with(Class::Default, 8, 60);
-        let scheduler = PriorityScheduler::new(&s, 2).unwrap();
-        let (tx, rx) = watch::channel(2_u16);
-        scheduler.spawn_dispatcher(rx);
-        let held_a = scheduler
-            .acquire_inflight(Class::Default, rid("held-a"))
-            .unwrap();
-        let held_b = scheduler
-            .acquire_inflight(Class::Default, rid("held-b"))
-            .unwrap();
-        let mut first_rx = enqueue_waiter(&scheduler, Class::Default);
-        let mut second_rx = enqueue_waiter(&scheduler, Class::Default);
-
-        tx.send(0).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while scheduler.slot_pool.capacity() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("provider zero reaches the scheduler");
-        assert_eq!(scheduler.inflight_for_test(Class::Default), 2);
-
-        drop(held_a);
-        drop(held_b);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(matches!(
-            first_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            second_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-
-        tx.send(1).unwrap();
-        let permit = tokio::time::timeout(Duration::from_secs(1), &mut first_rx)
-            .await
-            .expect("real capacity increase wakes the dispatcher")
-            .expect("first queued request receives a permit");
-        assert_eq!(scheduler.inflight_for_test(Class::Default), 1);
-        assert!(matches!(
-            second_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        drop(permit);
-    }
-
-    #[tokio::test]
     async fn test_permit_keeps_scheduler_alive_via_arc() {
         let s = default_settings();
         let scheduler = PriorityScheduler::new(&s, 256).unwrap();
@@ -2147,7 +2079,6 @@ mod tests {
             fair_share: Some(FairShareConfig {
                 default_weight: 1.0,
                 default_output_tokens: 10,
-                max_queued_requests_per_tenant: Some(64),
                 trust_output_token_estimate_header: false,
                 trust_request_model_header: false,
                 tenant_weights: HashMap::from([
@@ -2159,67 +2090,6 @@ mod tests {
             ..Default::default()
         };
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
-    }
-
-    #[test]
-    fn omitted_tenant_queue_cap_uses_full_shared_partition_budget() {
-        let mut classes = HashMap::new();
-        for class in Class::ALL {
-            let mut config = ClassConfig::default_for(class);
-            config.reserved_floor = 0;
-            config.reserved_per_slot = 0.0;
-            config.queue_size = 1;
-            classes.insert(class, config);
-        }
-        let yaml = PrioritySchedulerYaml {
-            classes,
-            fair_share: Some(FairShareConfig {
-                default_weight: 1.0,
-                default_output_tokens: 10,
-                max_queued_requests_per_tenant: None,
-                trust_output_token_estimate_header: false,
-                trust_request_model_header: false,
-                tenant_weights: HashMap::new(),
-                model_profiles: HashMap::new(),
-            }),
-            ..Default::default()
-        };
-        let settings =
-            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
-        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
-        let scheduler = PriorityScheduler::new_with_fair_share(&settings, 1, Some(ledger)).unwrap();
-        let tenant = TenantKey::new("header:a");
-
-        for index in 0..4 {
-            let (tx, _rx) = oneshot::channel();
-            scheduler.class_queues[Class::Default as usize]
-                .try_enqueue(Waiter::new_fair(
-                    Class::Default,
-                    CancellationToken::new(),
-                    rid(&format!("a-{index}")),
-                    tx,
-                    tenant.clone(),
-                    FairShareProfile::Global,
-                    10,
-                ))
-                .expect("omitted tenant cap must allow the shared partition budget");
-        }
-
-        let (tx, _rx) = oneshot::channel();
-        assert!(
-            scheduler.class_queues[Class::Default as usize]
-                .try_enqueue(Waiter::new_fair(
-                    Class::Default,
-                    CancellationToken::new(),
-                    rid("a-over-global-limit"),
-                    tx,
-                    tenant,
-                    FairShareProfile::Global,
-                    10,
-                ))
-                .is_err(),
-            "the existing shared partition budget remains the only default ceiling"
-        );
     }
 
     #[tokio::test]
