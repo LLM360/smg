@@ -127,10 +127,6 @@ fn default_fair_share_output_tokens() -> u32 {
     256
 }
 
-fn default_fair_share_max_queued_requests_per_tenant() -> u32 {
-    64
-}
-
 /// One model's hierarchical weighted-sharing policy.
 ///
 /// Explicit tenants and the aggregate `other` bucket contend at the outer
@@ -160,11 +156,12 @@ pub struct FairShareConfig {
     /// invalid. Terminal response usage replaces this estimate.
     #[serde(default = "default_fair_share_output_tokens")]
     pub default_output_tokens: u32,
-    /// Maximum queued requests from one tenant inside a scheduler partition,
-    /// shared across all priority classes. This prevents one noisy tenant
-    /// from consuming the partition's entire work-conserving queue budget.
-    #[serde(default = "default_fair_share_max_queued_requests_per_tenant")]
-    pub max_queued_requests_per_tenant: u32,
+    /// Optional maximum queued requests from one tenant inside a scheduler
+    /// partition, shared across all priority classes. When omitted, the
+    /// partition's shared queue capacity is used, preserving the original
+    /// work-conserving occupancy behavior.
+    #[serde(default)]
+    pub max_queued_requests_per_tenant: Option<u32>,
     /// Honor `x-smg-output-token-estimate`. Keep false unless a trusted proxy
     /// strips client copies and injects a validated value.
     #[serde(default)]
@@ -430,7 +427,7 @@ impl SchedulerSettings {
             if config.default_output_tokens == 0 {
                 return Err(SettingsValidationError::ZeroFairShareDefaultOutputTokens);
             }
-            if config.max_queued_requests_per_tenant == 0 {
+            if config.max_queued_requests_per_tenant == Some(0) {
                 return Err(SettingsValidationError::ZeroFairShareMaxQueuedRequestsPerTenant);
             }
             for (tenant, weight) in &config.tenant_weights {
@@ -617,7 +614,7 @@ fair_share:
         let fair_share = parsed.fair_share.as_ref().unwrap();
         assert_eq!(fair_share.default_weight, 0.5);
         assert_eq!(fair_share.default_output_tokens, 128);
-        assert_eq!(fair_share.max_queued_requests_per_tenant, 64);
+        assert_eq!(fair_share.max_queued_requests_per_tenant, None);
         assert!(fair_share.trust_output_token_estimate_header);
         assert_eq!(fair_share.tenant_weights["header:alice"], 10.0);
         assert_eq!(fair_share.tenant_weights["header:bob"], 5.0);
@@ -628,13 +625,30 @@ fair_share:
     }
 
     #[test]
+    fn test_yaml_explicit_fair_share_tenant_queue_limit_round_trip() {
+        let yaml = r#"
+fair_share:
+  max_queued_requests_per_tenant: 128
+"#;
+        let parsed: PrioritySchedulerYaml = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            parsed
+                .fair_share
+                .as_ref()
+                .unwrap()
+                .max_queued_requests_per_tenant,
+            Some(128)
+        );
+    }
+
+    #[test]
     fn test_invalid_fair_share_weights_are_rejected() {
         for weight in [0.0, -1.0, f64::INFINITY, f64::NAN] {
             let yaml = PrioritySchedulerYaml {
                 fair_share: Some(FairShareConfig {
                     default_weight: 1.0,
                     default_output_tokens: 128,
-                    max_queued_requests_per_tenant: 64,
+                    max_queued_requests_per_tenant: Some(64),
                     trust_output_token_estimate_header: false,
                     trust_request_model_header: false,
                     tenant_weights: HashMap::from([("header:alice".to_string(), weight)]),
@@ -655,7 +669,7 @@ fair_share:
             fair_share: Some(FairShareConfig {
                 default_weight: 1.0,
                 default_output_tokens: 128,
-                max_queued_requests_per_tenant: 0,
+                max_queued_requests_per_tenant: Some(0),
                 trust_output_token_estimate_header: false,
                 trust_request_model_header: false,
                 tenant_weights: HashMap::new(),
@@ -675,7 +689,7 @@ fair_share:
             fair_share: Some(FairShareConfig {
                 default_weight: 1.0,
                 default_output_tokens: 128,
-                max_queued_requests_per_tenant: 64,
+                max_queued_requests_per_tenant: Some(64),
                 trust_output_token_estimate_header: false,
                 trust_request_model_header: false,
                 tenant_weights: HashMap::new(),

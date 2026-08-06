@@ -194,9 +194,8 @@ impl PriorityScheduler {
         let tenant_queue_budget = fair_share.as_ref().map(|_| {
             let per_tenant_capacity = settings
                 .fair_share_config()
-                .map_or(total_queue_capacity, |config| {
-                    config.max_queued_requests_per_tenant as usize
-                });
+                .and_then(|config| config.max_queued_requests_per_tenant)
+                .map_or(total_queue_capacity, |capacity| capacity as usize);
             Arc::new(TenantQueueBudget::new(per_tenant_capacity))
         });
         let class_queues: [Arc<dyn ClassQueue>; 4] = Class::ALL.map(|c| {
@@ -2148,7 +2147,7 @@ mod tests {
             fair_share: Some(FairShareConfig {
                 default_weight: 1.0,
                 default_output_tokens: 10,
-                max_queued_requests_per_tenant: 64,
+                max_queued_requests_per_tenant: Some(64),
                 trust_output_token_estimate_header: false,
                 trust_request_model_header: false,
                 tenant_weights: HashMap::from([
@@ -2160,6 +2159,67 @@ mod tests {
             ..Default::default()
         };
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
+    }
+
+    #[test]
+    fn omitted_tenant_queue_cap_uses_full_shared_partition_budget() {
+        let mut classes = HashMap::new();
+        for class in Class::ALL {
+            let mut config = ClassConfig::default_for(class);
+            config.reserved_floor = 0;
+            config.reserved_per_slot = 0.0;
+            config.queue_size = 1;
+            classes.insert(class, config);
+        }
+        let yaml = PrioritySchedulerYaml {
+            classes,
+            fair_share: Some(FairShareConfig {
+                default_weight: 1.0,
+                default_output_tokens: 10,
+                max_queued_requests_per_tenant: None,
+                trust_output_token_estimate_header: false,
+                trust_request_model_header: false,
+                tenant_weights: HashMap::new(),
+                model_profiles: HashMap::new(),
+            }),
+            ..Default::default()
+        };
+        let settings =
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scheduler = PriorityScheduler::new_with_fair_share(&settings, 1, Some(ledger)).unwrap();
+        let tenant = TenantKey::new("header:a");
+
+        for index in 0..4 {
+            let (tx, _rx) = oneshot::channel();
+            scheduler.class_queues[Class::Default as usize]
+                .try_enqueue(Waiter::new_fair(
+                    Class::Default,
+                    CancellationToken::new(),
+                    rid(&format!("a-{index}")),
+                    tx,
+                    tenant.clone(),
+                    FairShareProfile::Global,
+                    10,
+                ))
+                .expect("omitted tenant cap must allow the shared partition budget");
+        }
+
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            scheduler.class_queues[Class::Default as usize]
+                .try_enqueue(Waiter::new_fair(
+                    Class::Default,
+                    CancellationToken::new(),
+                    rid("a-over-global-limit"),
+                    tx,
+                    tenant,
+                    FairShareProfile::Global,
+                    10,
+                ))
+                .is_err(),
+            "the existing shared partition budget remains the only default ceiling"
+        );
     }
 
     #[tokio::test]

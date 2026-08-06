@@ -283,7 +283,7 @@ mod tests {
         GlobalFairShare::from_config(&FairShareConfig {
             default_weight: 1.0,
             default_output_tokens: 256,
-            max_queued_requests_per_tenant: 64,
+            max_queued_requests_per_tenant: Some(64),
             trust_output_token_estimate_header: trust_header,
             trust_request_model_header: false,
             tenant_weights: HashMap::new(),
@@ -320,7 +320,7 @@ mod tests {
             fair_share: Some(FairShareConfig {
                 default_weight: 1.0,
                 default_output_tokens: 256,
-                max_queued_requests_per_tenant: 8,
+                max_queued_requests_per_tenant: Some(8),
                 trust_output_token_estimate_header: false,
                 trust_request_model_header: false,
                 tenant_weights: HashMap::from([("header:alice".to_string(), 1.0)]),

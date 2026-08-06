@@ -113,6 +113,7 @@ tenant_policies:
 fair_share:
   default_weight: 1
   default_output_tokens: 256
+  # Optional. Omit to use the partition's full shared queue capacity.
   max_queued_requests_per_tenant: 64
   trust_output_token_estimate_header: false
   trust_request_model_header: false
@@ -155,7 +156,7 @@ At startup the scheduler validates:
 
 - `queue_timeout_secs > 0` for every class (else startup fails for that class).
 - `starvation_threshold_secs > 0` for every class.
-- `fair_share.max_queued_requests_per_tenant > 0` when fair sharing is configured.
+- `fair_share.max_queued_requests_per_tenant > 0` when an explicit tenant queue cap is configured.
 - The sum of all `reserved` values must not exceed the live backend capacity. On a capacity *shrink* that would otherwise break this invariant, the scheduler scales reservations down proportionally rather than locking itself out.
 
 Any validation failure triggers the [fail-safe fallback to legacy admission](#enabling-the-scheduler).
@@ -174,7 +175,7 @@ Priority class selection remains the outer policy.
 |-------|---------|---------|
 | `default_weight` | `1.0` | Weight assigned to a resolved tenant absent from `tenant_weights`. Must be finite and greater than zero. |
 | `default_output_tokens` | `256` | Provisional output-token charge used when no trusted estimate is available. Must be greater than zero. |
-| `max_queued_requests_per_tenant` | `64` | Maximum queued requests from one canonical tenant inside one scheduler partition, shared across all four priority classes. Must be greater than zero. |
+| `max_queued_requests_per_tenant` | omitted | Optional maximum queued requests from one canonical tenant inside one scheduler partition, shared across all four priority classes. When omitted, the partition's full shared queue capacity is used. An explicit value must be greater than zero. |
 | `trust_output_token_estimate_header` | `false` | Honor `x-smg-output-token-estimate`. Enable only behind a proxy that strips client copies and injects a validated estimate. |
 | `trust_request_model_header` | `false` | Honor `x-smg-request-model` for per-model profile selection. Model profiles require this setting. Enable only behind a proxy that strips client copies and injects the parsed request model. |
 | `tenant_weights` | `{}` | Relative weights keyed by canonical tenant key. Every value must be finite and greater than zero. |
