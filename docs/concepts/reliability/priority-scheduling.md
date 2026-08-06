@@ -63,15 +63,10 @@ This is why `system` and `interactive` ship with reservations by default while `
 
 ## Per-class queues
 
-When no slot is immediately available, a request does not fail right away. It joins its class lane. The configured class sizes add up to one work-conserving partition-wide queue budget, while each class retains its own wait timeout:
+When no slot is immediately available, a request does not fail right away — it joins a **per-class FIFO queue**. Each class has its own queue with its own depth limit and its own wait timeout:
 
-- If the shared partition queue budget is exhausted, the request is rejected immediately (**429**).
+- If the queue is already at its configured depth, the request is rejected immediately (**429**).
 - If the request waits longer than the class's timeout, it is rejected (**408**).
-
-With fair sharing enabled, each class lane is further divided into FIFO tenant
-subqueues. One tenant's occupancy ceiling is shared across all four classes in
-the partition. This keeps a noisy tenant from filling the shared queue before
-another tenant can become present for weighted selection.
 
 A client that disconnects *while queued* is not currently detected — its place is held until that timeout fires, because the cancel signal isn't yet wired to client disconnect at this stage. (The **499** code exists for this case but isn't emitted today.)
 

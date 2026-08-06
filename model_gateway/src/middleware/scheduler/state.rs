@@ -17,7 +17,7 @@ use super::{
     TenantPolicyResolver,
 };
 use crate::{
-    config::{types::RouterConfig, AdaptiveAdmissionMode, AdaptiveAdmissionStrategy},
+    config::types::RouterConfig,
     middleware::token_bucket::TokenBucket,
     observability::metrics::Metrics,
     worker::{event::WorkerEvent, CapacityTrackerSettings, WorkerCapacity, WorkerRegistry},
@@ -34,18 +34,6 @@ pub const ADMISSION_PARTITION_HEADER: &str = "x-smg-admission-partition";
 /// Worker metadata label used by trusted control planes to assign a healthy
 /// replica to a partition other than its primary model id.
 pub const ADMISSION_PARTITION_LABEL: &str = "admission_partition";
-
-/// Optional live capacity ceiling supplied by adaptive admission.
-///
-/// The priority scheduler remains the queue owner. A provider only reports
-/// how many requests the fleet can accept right now; queued priority and
-/// fair-share policy still decide which locally eligible request receives the
-/// next slot.
-pub(crate) trait AdaptiveCapacityProvider: Send + Sync {
-    fn effective_capacity(&self, partition: &str, static_capacity: u16) -> u16;
-
-    fn subscribe_capacity_changes(&self) -> watch::Receiver<u64>;
-}
 
 #[derive(Clone)]
 pub struct SchedulerPartition {
@@ -148,19 +136,10 @@ impl AdmissionMode {
         registry: Arc<WorkerRegistry>,
         rate_limiter: Option<Arc<TokenBucket>>,
     ) -> Self {
-        Self::from_config_with_adaptive(rc, registry, rate_limiter, None)
-    }
-
-    pub(crate) fn from_config_with_adaptive(
-        rc: &RouterConfig,
-        registry: Arc<WorkerRegistry>,
-        rate_limiter: Option<Arc<TokenBucket>>,
-        adaptive_capacity_provider: Option<Arc<dyn AdaptiveCapacityProvider>>,
-    ) -> Self {
         if !rc.priority_scheduler_enabled {
             return Self::Legacy;
         }
-        match Self::try_build_priority(rc, registry, rate_limiter, adaptive_capacity_provider) {
+        match Self::try_build_priority(rc, registry, rate_limiter) {
             Ok(mode) => {
                 info!("priority scheduler enabled");
                 mode
@@ -179,7 +158,6 @@ impl AdmissionMode {
         rc: &RouterConfig,
         registry: Arc<WorkerRegistry>,
         rate_limiter: Option<Arc<TokenBucket>>,
-        adaptive_capacity_provider: Option<Arc<dyn AdaptiveCapacityProvider>>,
     ) -> Result<Self, String> {
         // The configured concurrency value is one global ceiling across the
         // entire healthy worker fleet. Worker-reported capacity may lower the
@@ -216,17 +194,6 @@ impl AdmissionMode {
             settings = settings.with_global_queue_budget(rc.queue_size);
         }
         let fair_share = GlobalFairShare::from_settings(&settings).map(Arc::new);
-        let adaptive_capacity_provider = if fair_share.is_some()
-            && rc.adaptive_admission.mode == AdaptiveAdmissionMode::Enforce
-            && rc.adaptive_admission.strategy == AdaptiveAdmissionStrategy::EngineFeedback
-        {
-            Some(adaptive_capacity_provider.ok_or_else(|| {
-                "fair share with enforced engine-feedback admission requires the adaptive capacity provider"
-                    .to_string()
-            })?)
-        } else {
-            None
-        };
         let model_registry = Arc::clone(&registry);
 
         let resolver: Arc<dyn TenantPolicyResolver> =
@@ -304,16 +271,7 @@ impl AdmissionMode {
                 configured_max,
                 config.queue_size as usize,
             );
-            let static_capacity = initial.get(name).copied().unwrap_or(0);
-            let capacity = effective_partition_capacity(
-                adaptive_capacity_provider.as_deref(),
-                name,
-                static_capacity,
-            );
-            super::metrics::set_partition_static_capacity(name, static_capacity);
-            if adaptive_capacity_provider.is_some() {
-                super::metrics::set_partition_adaptive_capacity(name, capacity);
-            }
+            let capacity = initial.get(name).copied().unwrap_or(0);
             super::metrics::set_partition_healthy_replicas(
                 name,
                 initial_replicas.get(name).copied().unwrap_or(0),
@@ -361,12 +319,9 @@ impl AdmissionMode {
             worker_capacity,
             registry,
             worker_events,
-            PartitionCapacityCoordinatorInputs {
-                configs: partition_configs,
-                default_partition: default_partition_name.clone(),
-                capacity_senders,
-                adaptive_capacity_provider,
-            },
+            partition_configs,
+            default_partition_name.clone(),
+            capacity_senders,
         );
         spawn_partition_metrics_sampler(partitions.values().cloned().collect());
 
@@ -379,16 +334,6 @@ impl AdmissionMode {
             rate_limiter,
         })))
     }
-}
-
-fn effective_partition_capacity(
-    provider: Option<&dyn AdaptiveCapacityProvider>,
-    partition: &str,
-    static_capacity: u16,
-) -> u16 {
-    provider.map_or(static_capacity, |provider| {
-        provider.effective_capacity(partition, static_capacity)
-    })
 }
 
 fn spawn_partition_metrics_sampler(partitions: Vec<SchedulerPartition>) {
@@ -697,19 +642,14 @@ fn allocate_partition_capacities(
     (allocate_weighted_capacities(&weights, target), counts)
 }
 
-struct PartitionCapacityCoordinatorInputs {
-    configs: Vec<(String, super::AdmissionPartitionConfig)>,
-    default_partition: String,
-    capacity_senders: Vec<(String, watch::Sender<u16>)>,
-    adaptive_capacity_provider: Option<Arc<dyn AdaptiveCapacityProvider>>,
-}
-
 fn spawn_partition_capacity_coordinator(
     mut capacity_watch: watch::Receiver<u16>,
     worker_capacity: Arc<WorkerCapacity>,
     registry: Arc<WorkerRegistry>,
     mut worker_events: broadcast::Receiver<WorkerEvent>,
-    inputs: PartitionCapacityCoordinatorInputs,
+    configs: Vec<(String, super::AdmissionPartitionConfig)>,
+    default_partition: String,
+    capacity_senders: Vec<(String, watch::Sender<u16>)>,
 ) {
     #[expect(
         clippy::disallowed_methods,
@@ -717,20 +657,6 @@ fn spawn_partition_capacity_coordinator(
     )]
     tokio::spawn(async move {
         let _worker_capacity = worker_capacity;
-        let PartitionCapacityCoordinatorInputs {
-            configs,
-            default_partition,
-            capacity_senders,
-            adaptive_capacity_provider,
-        } = inputs;
-        // Keep a never-changing receiver when coupling is disabled so the
-        // select loop has one simple shape without a closed-channel busy loop.
-        let (disabled_tx, disabled_rx) = watch::channel(0_u64);
-        let _disabled_tx = disabled_tx;
-        let mut adaptive_capacity_watch = adaptive_capacity_provider
-            .as_ref()
-            .map(|provider| provider.subscribe_capacity_changes())
-            .unwrap_or(disabled_rx);
         loop {
             tokio::select! {
                 changed = capacity_watch.changed() => {
@@ -744,11 +670,6 @@ fn spawn_partition_capacity_coordinator(
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                changed = adaptive_capacity_watch.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
             }
             let (allocations, replica_counts) = allocate_partition_capacities(
                 &configs,
@@ -757,23 +678,8 @@ fn spawn_partition_capacity_coordinator(
                 &registry,
             );
             for (name, sender) in &capacity_senders {
-                if let Some(static_capacity) = allocations.get(name) {
-                    let effective_capacity = effective_partition_capacity(
-                        adaptive_capacity_provider.as_deref(),
-                        name,
-                        *static_capacity,
-                    );
-                    super::metrics::set_partition_static_capacity(name, *static_capacity);
-                    if adaptive_capacity_provider.is_some() {
-                        super::metrics::set_partition_adaptive_capacity(name, effective_capacity);
-                    }
-                    sender.send_if_modified(|current| {
-                        if *current == effective_capacity {
-                            return false;
-                        }
-                        *current = effective_capacity;
-                        true
-                    });
+                if let Some(capacity) = allocations.get(name) {
+                    sender.send_replace(*capacity);
                 }
                 super::metrics::set_partition_healthy_replicas(
                     name,
@@ -824,7 +730,6 @@ mod tests {
         let fair_config = FairShareConfig {
             default_weight: 1.0,
             default_output_tokens: 10,
-            max_queued_requests_per_tenant: Some(64),
             trust_output_token_estimate_header: false,
             trust_request_model_header: true,
             tenant_weights: HashMap::new(),
@@ -872,7 +777,7 @@ mod tests {
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None, None).unwrap()
+            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None).unwrap()
         else {
             panic!("priority scheduler should start");
         };
@@ -936,7 +841,7 @@ mod tests {
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, registry, None, None).unwrap()
+            AdmissionMode::try_build_priority(&config, registry, None).unwrap()
         else {
             panic!("priority scheduler should start");
         };
@@ -1163,7 +1068,7 @@ default_admission_partition: default
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None, None).unwrap()
+            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None).unwrap()
         else {
             panic!("priority scheduler should start");
         };
@@ -1301,7 +1206,7 @@ default_admission_partition: default
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, Arc::new(WorkerRegistry::new()), None, None)
+            AdmissionMode::try_build_priority(&config, Arc::new(WorkerRegistry::new()), None)
                 .unwrap()
         else {
             panic!("priority scheduler should start");

@@ -45,7 +45,7 @@ The scheduler surfaces admission and preemption outcomes as HTTP status codes. E
 | Status | Condition | `X-SMG-Error-Code` | Extra headers |
 |--------|-----------|--------------------|---------------|
 | **503** Service Unavailable | **Preempted** — admitted, then cancelled before its first byte to make room for a higher-priority request | `scheduler_preempted` | `X-SMG-Preempted: true`, `Retry-After: 1` |
-| **429** Too Many Requests | **Queue full**: the partition-wide queue budget is exhausted, or fair sharing is enabled and this tenant reached its queue ceiling | `scheduler_queue_full` | None |
+| **429** Too Many Requests | **Queue full** — the request's per-class queue is at its configured depth | `scheduler_queue_full` | — |
 | **408** Request Timeout | **Queue timeout** — the request waited longer than its class's `queue_timeout` | `scheduler_queue_timeout` | — |
 | **499** Client Closed Request | **Client gone** — the client disconnected before admission completed (nginx convention; never actually read) | `scheduler_client_cancelled` | — |
 
@@ -113,8 +113,6 @@ tenant_policies:
 fair_share:
   default_weight: 1
   default_output_tokens: 256
-  # Optional. Omit to use the partition's full shared queue capacity.
-  max_queued_requests_per_tenant: 64
   trust_output_token_estimate_header: false
   trust_request_model_header: false
   tenant_weights:
@@ -132,7 +130,7 @@ Each entry under `classes` accepts the following fields. All are per-class.
 |-------|------|---------|
 | `reserved_floor` | integer (slots) | Minimum slots reserved for this class — the value the effective reservation never drops below. A higher class's *unused* reservation is held back from lower classes; a class's own reservation never reduces its own headroom. |
 | `reserved_per_slot` | float (0.0–1.0+) | Share of live capacity reserved for this class, on top of the floor: `effective = max(reserved_floor, ceil(reserved_per_slot × capacity))`, recomputed as capacity changes so the reservation tracks the fleet. `0.0` (the default) means purely absolute (just the floor). Must be finite and ≥ 0. At startup, if the floors + shares exceed capacity the scheduler fails safe to legacy admission; at runtime a capacity dip is absorbed by clamping the lowest classes first. |
-| `queue_size` | integer | Soft per-class share of the work-conserving partition queue. The four values are summed into one partition-wide occupancy budget, so an active class may borrow an idle class's share. A request arriving when the shared budget is full is rejected with **429**. |
+| `queue_size` | integer | Per-class queue depth limit. A request that arrives when the queue is full is rejected with **429**. |
 | `queue_timeout_secs` | integer (seconds) | How long a queued request waits before it is rejected with **408**. Must be `> 0`. |
 | `starvation_threshold_secs` | integer (seconds) | Head-of-queue age past which the dispatcher promotes a waiter out of normal priority order (and lets it use a reserved-but-unused slot) to avoid starvation. Must be `> 0`. |
 | `can_preempt` | boolean | Whether admissions in this class may preempt a lower-class in-flight request that has not yet emitted its first byte. |
@@ -156,7 +154,6 @@ At startup the scheduler validates:
 
 - `queue_timeout_secs > 0` for every class (else startup fails for that class).
 - `starvation_threshold_secs > 0` for every class.
-- `fair_share.max_queued_requests_per_tenant > 0` when an explicit tenant queue cap is configured.
 - The sum of all `reserved` values must not exceed the live backend capacity. On a capacity *shrink* that would otherwise break this invariant, the scheduler scales reservations down proportionally rather than locking itself out.
 
 Any validation failure triggers the [fail-safe fallback to legacy admission](#enabling-the-scheduler).
@@ -175,7 +172,6 @@ Priority class selection remains the outer policy.
 |-------|---------|---------|
 | `default_weight` | `1.0` | Weight assigned to a resolved tenant absent from `tenant_weights`. Must be finite and greater than zero. |
 | `default_output_tokens` | `256` | Provisional output-token charge used when no trusted estimate is available. Must be greater than zero. |
-| `max_queued_requests_per_tenant` | omitted | Optional maximum queued requests from one canonical tenant inside one scheduler partition, shared across all four priority classes. When omitted, the partition's full shared queue capacity is used. An explicit value must be greater than zero. |
 | `trust_output_token_estimate_header` | `false` | Honor `x-smg-output-token-estimate`. Enable only behind a proxy that strips client copies and injects a validated estimate. |
 | `trust_request_model_header` | `false` | Honor `x-smg-request-model` for per-model profile selection. Model profiles require this setting. Enable only behind a proxy that strips client copies and injects the parsed request model. |
 | `tenant_weights` | `{}` | Relative weights keyed by canonical tenant key. Every value must be finite and greater than zero. |
@@ -204,13 +200,6 @@ fair_share:
       other_weight: 20
 ```
 
-Fair-share queues retain one FIFO subqueue per real tenant. The per-tenant
-ceiling is acquired before the partition-wide queue budget, so one noisy
-tenant cannot consume every waiting position and prevent another tenant from
-becoming eligible for weighted selection. Cancellation, timeout, and dequeue
-release both occupancy claims. Priority class remains the outer dispatch
-policy.
-
 The percentages apply while the corresponding buckets are simultaneously
 backlogged for that model. Idle shares are borrowed, so a free model slot is
 never held empty. Requests for models without a configured profile continue to
@@ -221,16 +210,6 @@ terminal usage record replaces that estimate with actual output tokens. If a
 client disconnects, the backend fails, or terminal usage is missing or
 truncated, the provisional charge remains. This prevents cancellation from
 evading fair-share accounting.
-
-When fair sharing runs with enforced `engine_feedback` adaptive admission, the
-adaptive controller publishes a total fleet capacity ceiling to the scheduler.
-The scheduler's own in-flight counters remain authoritative for used capacity,
-and only telemetry revisions wake the capacity coordinator. A local adaptive
-429 safety recheck cancels the provisional fair-share reservation because no
-backend work began.
-This coupling requires explicit admission partitions; the unpartitioned
-scheduler retains its worker-capacity ceiling because one global adaptive cap
-cannot safely combine pressure from non-fungible model pools.
 
 Fairness credit accrues only during active contention. When a new or returning
 tenant becomes active, its virtual finish is rebased to the current active-set
@@ -314,16 +293,12 @@ The scheduler exposes these Prometheus metrics (see the [Metrics Reference](metr
 | `smg_scheduler_utilization` | Gauge | — | Total in-flight divided by backend capacity. |
 | `smg_scheduler_class_capacity_pressure` | Gauge | `class` | Normalized 0.0–1.0 pressure (worse of queue and slot pressure). |
 | `smg_fair_share_charged_output_tokens_total` | Counter | `tenant` | Actual or conservative fallback output tokens charged across the process-local ledger. |
-| `smg_fair_share_model_charged_output_tokens_total` | Counter | `model`, `bucket`, `tenant` | Charged output tokens within configured model profiles. `bucket` is bounded to `explicit` or `other`. |
 | `smg_fair_share_virtual_finish` | Gauge | `model`, `tenant` | Active-set normalized tenant virtual finish. Flat mode uses `model="global"`. |
 | `smg_fair_share_other_bucket_virtual_finish` | Gauge | `model` | Outer virtual finish of a model profile's aggregate `other` bucket. |
 | `smg_fair_share_reserved_output_tokens` | Gauge | `tenant` | Provisional output-token charges held by active requests. |
 | `smg_fair_share_queue_wait_seconds` | Histogram | `model`, `tenant`, `class` | Fair-share queue wait by model profile, tenant, and priority class. |
 | `smg_fair_share_fallback_total` | Counter | `reason` | Settlement or estimate paths that used a configured fallback. |
 | `smg_fair_share_unknown_tenant_total` | Counter | `tenant` | Requests whose canonical tenant has no explicit configured weight. |
-| `smg_fair_share_queue_rejections_total` | Counter | `reason` | Fair-share queue rejections. `reason` is bounded to `tenant_limit`, `global_limit`, or `missing_tenant`. |
-| `smg_scheduler_partition_static_capacity` | Gauge | `partition` | Worker-derived partition safety ceiling before adaptive admission. |
-| `smg_scheduler_partition_adaptive_capacity` | Gauge | `partition` | Effective engine-feedback scheduler capacity after the adaptive ceiling. |
 
 ---
 
