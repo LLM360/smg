@@ -501,8 +501,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_cached_owners_per_prefix,
             help=(
-                "Soft maximum number of healthy cached owners per prefix. New"
-                " owners are held back while suitable owners remain. Zero disables."
+                "Replication ceiling for healthy cached owners per prefix. Existing"
+                " owners remain sticky below the ceiling; a new owner is created only"
+                " when every matching owner is pressured. Zero disables."
             ),
         )
         routing_group.add_argument(
@@ -510,8 +511,8 @@ class RouterArgs:
             type=int,
             default=RouterArgs.cache_owner_spill_cooldown_secs,
             help=(
-                "Minimum interval between adding owners to one cached prefix."
-                " Hard overload and no-suitable-owner safety paths bypass it."
+                "Minimum interval between pressure-driven owner additions to one"
+                " cached prefix. Concurrent requests join the provisional owner."
             ),
         )
         routing_group.add_argument(

@@ -275,11 +275,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
-    /// Soft maximum number of healthy cached owners per prefix. Zero disables.
+    /// Replication ceiling for healthy cached owners per prefix. Zero disables.
     #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
     max_cached_owners_per_prefix: usize,
 
-    /// Minimum seconds between adding cached owners to one prefix. Zero disables.
+    /// Minimum seconds between pressure-driven owner additions. Zero disables.
     #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
     cache_owner_spill_cooldown_secs: u64,
 

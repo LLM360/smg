@@ -1,8 +1,9 @@
 /*
     Cache-Aware Load Balancing Router
 
-    When load is balanced, uses cache-aware routing. When imbalanced, uses
-    shortest-queue. A system is imbalanced when both:
+    Uses cache-aware routing whenever a suitable longest-prefix owner exists.
+    When no owner exists, or every owner is pressured, uses size-aware P2C.
+    The legacy count-based imbalance signal fires when both:
         (max - min) > abs_threshold  AND  max > rel_threshold * min
 
     Three types of cache-aware routing (mutually exclusive, selected by
@@ -29,15 +30,17 @@
 
     Load Balancing (Size-Aware Power-of-Two)
     -------------------------------------------
-    Cache misses, stale owners, and imbalanced pools use size-aware
-    power-of-two. The selected fallback becomes another prefix owner.
+    Cache misses and stale owners use size-aware power-of-two. A pressured
+    owner set may add one bounded replica. The selected fallback becomes
+    another prefix owner.
 
     Engine Pressure Guard (Optional)
     -------------------------------------------
-    Restricts cache-aware candidates to workers within 10 percentage points of
-    the least-pressured engine and below 90% pressure. Pressure is the larger of
-    KV token usage and utilization; waiting requests break ties. Missing or
-    stale telemetry falls back to the existing request-count behavior.
+    Restricts cached-owner candidates to workers within 10 percentage points of
+    the least-pressured owner and below 90% pressure. Non-owner candidates use
+    the equivalent fleet-scoped guard for cold fallback. Pressure is the larger
+    of KV token usage and utilization; waiting requests break ties. Missing or
+    stale telemetry fails open to existing owners.
 
     Configuration Parameters:
     ------------------------
@@ -49,9 +52,9 @@
     block_size:              Backend KV cache block size for event-driven routing
     engine_load:             Enable the engine pressure guard
     max_cached_owners_per_prefix:
-                             Soft replication target (0 disables)
+                             Replication ceiling for one prefix (0 disables)
     cache_owner_spill_cooldown_secs:
-                             Minimum interval between new prefix owners
+                             Minimum interval between pressure-driven owners
 */
 
 use std::{
@@ -408,6 +411,50 @@ impl CacheAwarePolicy {
             best_index,
             pressure_by_index,
         })
+    }
+
+    /// Return cached owners that are safe to receive another request.
+    ///
+    /// Pressure is evaluated only within the owner set. A cooler unrelated
+    /// worker must not invalidate a usable cached owner and turn a fleet-wide
+    /// KV spread into prefix churn. Missing or stale telemetry fails open to
+    /// the known owners, preserving cache affinity until comparable snapshots
+    /// return.
+    fn suitable_cached_owners(
+        workers: &[Arc<dyn Worker>],
+        owner_indices: &[usize],
+        pressure_plan: Option<&EnginePressurePlan>,
+    ) -> Vec<usize> {
+        let Some(plan) = pressure_plan else {
+            return owner_indices.to_vec();
+        };
+        let Some(best_pressure) = owner_indices
+            .iter()
+            .filter_map(|idx| plan.pressure_by_index.get(idx).map(|load| load.pressure))
+            .min_by(f64::total_cmp)
+        else {
+            return owner_indices.to_vec();
+        };
+        if best_pressure > ENGINE_PRESSURE_HIGH_WATERMARK {
+            return Vec::new();
+        }
+
+        let pressure_limit =
+            (best_pressure + ENGINE_PRESSURE_SLACK).min(ENGINE_PRESSURE_HIGH_WATERMARK);
+        let mut suitable: Vec<usize> = owner_indices
+            .iter()
+            .copied()
+            .filter(|idx| plan.pressure_by_index[idx].pressure <= pressure_limit)
+            .collect();
+        suitable.sort_by(|&left_idx, &right_idx| {
+            let left = plan.pressure_by_index[&left_idx];
+            let right = plan.pressure_by_index[&right_idx];
+            left.pressure
+                .total_cmp(&right.pressure)
+                .then_with(|| left.waiting_requests.cmp(&right.waiting_requests))
+                .then_with(|| workers[left_idx].load().cmp(&workers[right_idx].load()))
+        });
+        suitable
     }
 
     /// Enable request-hot-path `hash_index` population. Called by mesh
@@ -999,7 +1046,33 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
+        // The router pre-filters workers by model, so any healthy worker gives
+        // us the model key before engine pressure narrows the candidate set.
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
         let pressure_plan = self.engine_pressure_plan(workers, &healthy_indices);
+
+        // Prefix ownership is evaluated before fleet-wide imbalance. This is
+        // the critical locality invariant: a hot unrelated worker cannot make
+        // a usable cached owner disappear. Only pressure on every matching
+        // owner may create one controlled additional owner.
+        if let Some(selected_idx) = self.select_cached_owner_or_pressure_spill(
+            workers,
+            info,
+            &healthy_indices,
+            model_id,
+            pressure_plan.as_ref(),
+        ) {
+            let result = if pressure_plan.is_some() {
+                "cached_owner_scoped"
+            } else {
+                "telemetry_fallback"
+            };
+            if self.config.engine_load {
+                Metrics::record_cache_aware_engine_decision(result);
+            }
+            return Some(selected_idx);
+        }
+
         let selection_indices = match pressure_plan.as_ref() {
             Some(plan) => &plan.allowed_indices,
             _ => &healthy_indices,
@@ -1029,9 +1102,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         } else {
             (min_load, max_load)
         };
-
-        // Determine the model for this set of workers (router pre-filters by model).
-        let model_id = normalize_model_key(workers[selection_indices[0]].model_id());
 
         // Apply upstream's imbalance and cache-affinity behavior only within
         // the candidates admitted by the engine-pressure guard.
@@ -1308,6 +1378,148 @@ impl CacheAwarePolicy {
         }
     }
 
+    fn owners_with_provisional(
+        &self,
+        ownership: &PrefixOwnership,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> Vec<usize> {
+        let mut owners = ownership.owners.clone();
+        if let Some(idx) = self.recent_provisional_owner(ownership.key, workers, healthy_indices) {
+            if !owners.contains(&idx) {
+                owners.push(idx);
+            }
+        }
+        owners
+    }
+
+    fn select_from_cached_owners(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        owner_indices: &[usize],
+        model_id: &str,
+    ) -> Option<usize> {
+        if let Some(tokens) = info.tokens {
+            if self.has_event_indexer(model_id) {
+                self.select_worker_event_driven(workers, tokens, owner_indices, info, model_id)
+            } else {
+                self.select_worker_with_tokens(workers, tokens, owner_indices, info, model_id)
+            }
+        } else {
+            self.select_worker_with_text(
+                workers,
+                info.request_text.unwrap_or(""),
+                owner_indices,
+                info,
+                model_id,
+            )
+        }
+    }
+
+    /// Prefer the longest-prefix owners before applying fleet-wide imbalance.
+    ///
+    /// Existing owners are balanced by owner-local pressure and atomic reserved
+    /// work. A new owner is created only when every eligible owner is above the
+    /// pressure high-water mark and the configured replication ceiling has not
+    /// been reached. Concurrent spill requests coalesce on one provisional
+    /// destination until backend cache events catch up.
+    fn select_cached_owner_or_pressure_spill(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        model_id: &str,
+        pressure_plan: Option<&EnginePressurePlan>,
+    ) -> Option<usize> {
+        if self.config.max_cached_owners_per_prefix == 0 {
+            return None;
+        }
+
+        let ownership = self.prefix_ownership(workers, info, healthy_indices, model_id);
+        let known_owners = self.owners_with_provisional(&ownership, workers, healthy_indices);
+        let owner_count = known_owners.len();
+        if owner_count == 0 {
+            return None;
+        }
+
+        let eligible_owners =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &known_owners);
+        if eligible_owners.is_empty() {
+            return None;
+        }
+
+        let suitable_owners =
+            Self::suitable_cached_owners(workers, &eligible_owners, pressure_plan);
+        if !suitable_owners.is_empty() {
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "cached_owner_hold",
+                owner_count,
+            );
+            return self.select_from_cached_owners(workers, info, &suitable_owners, model_id);
+        }
+
+        let Some(plan) = pressure_plan else {
+            // `suitable_cached_owners` only returns empty with a complete,
+            // fresh pressure plan, but keep this fail-open guard explicit.
+            return self.select_from_cached_owners(workers, info, &eligible_owners, model_id);
+        };
+
+        if owner_count < self.config.max_cached_owners_per_prefix {
+            let spill_candidates: Vec<usize> = plan
+                .allowed_indices
+                .iter()
+                .copied()
+                .filter(|idx| {
+                    plan.pressure_by_index[idx].pressure <= ENGINE_PRESSURE_HIGH_WATERMARK
+                        && !known_owners.contains(idx)
+                })
+                .collect();
+            let spill_candidates =
+                SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &spill_candidates);
+            if !spill_candidates.is_empty() {
+                let (selected, claimed_new_owner) = self.select_or_join_replication_spill(
+                    ownership.key,
+                    workers,
+                    info,
+                    &spill_candidates,
+                    model_id,
+                )?;
+                let result = if claimed_new_owner {
+                    "owner_pressure_spill"
+                } else {
+                    "spill_cooldown_hold"
+                };
+                Metrics::record_cache_aware_replication_decision(model_id, result, owner_count);
+                return Some(selected);
+            }
+        }
+
+        // At the owner ceiling, or when the whole fleet is above the pressure
+        // high-water mark, preserve affinity on the least-pressured owner. The
+        // admission controller remains responsible for stopping new dispatch
+        // when there is no safe capacity anywhere in the model pool.
+        let best_pressure = eligible_owners
+            .iter()
+            .map(|idx| plan.pressure_by_index[idx].pressure)
+            .min_by(f64::total_cmp)?;
+        let least_pressured: Vec<usize> = eligible_owners
+            .iter()
+            .copied()
+            .filter(|idx| {
+                plan.pressure_by_index[idx].pressure <= best_pressure + f64::from(f32::EPSILON)
+            })
+            .collect();
+        let result = if owner_count >= self.config.max_cached_owners_per_prefix {
+            "owner_ceiling_hold"
+        } else {
+            "no_safe_spill_hold"
+        };
+        Metrics::record_cache_aware_replication_decision(model_id, result, owner_count);
+        self.select_from_cached_owners(workers, info, &least_pressured, model_id)
+    }
+
     fn recent_provisional_owner(
         &self,
         key: PrefixBudgetKey,
@@ -1326,19 +1538,6 @@ impl CacheAwarePolicy {
             .iter()
             .copied()
             .find(|&idx| workers[idx].url() == state.provisional_owner)
-    }
-
-    fn record_replication_spill(&self, key: PrefixBudgetKey, worker_url: &str) {
-        if self.config.cache_owner_spill_cooldown_secs == 0 {
-            return;
-        }
-        self.replication_state.insert(
-            key,
-            PrefixReplicationState {
-                last_spill: Instant::now(),
-                provisional_owner: worker_url.to_string(),
-            },
-        );
     }
 
     /// Atomically claim the next replication slot for a prefix. The first
@@ -1414,7 +1613,7 @@ impl CacheAwarePolicy {
         healthy_indices: &[usize],
         candidate_indices: &[usize],
         model_id: &str,
-        reason: ImbalanceReason,
+        _reason: ImbalanceReason,
     ) -> Option<usize> {
         if self.config.max_cached_owners_per_prefix == 0 {
             return self.select_worker_fallback(workers, info, candidate_indices, model_id);
@@ -1447,53 +1646,30 @@ impl CacheAwarePolicy {
             }
         }
         let owner_count = healthy_owners.len();
-        let hard_overload = reason == ImbalanceReason::BackendOverload;
-        let cooldown_active = provisional_owner.is_some();
-        let at_target = owner_count >= self.config.max_cached_owners_per_prefix;
-
-        if !owner_candidates.is_empty() && !hard_overload && (at_target || cooldown_active) {
-            let result = if at_target {
-                "owner_target_hold"
-            } else {
-                "spill_cooldown_hold"
-            };
-            Metrics::record_cache_aware_replication_decision(model_id, result, owner_count);
+        if !owner_candidates.is_empty() {
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "cached_owner_hold",
+                owner_count,
+            );
             return self.fallback.select_least_loaded_from_candidates(
                 workers,
                 info,
                 &owner_candidates,
             );
         }
-
-        let had_suitable_owner = !owner_candidates.is_empty();
-        let (selected, claimed_new_owner) = if hard_overload {
-            let selected =
-                self.select_worker_fallback(workers, info, candidate_indices, model_id)?;
-            let creates_owner = !ownership.owners.contains(&selected);
-            if creates_owner {
-                self.record_replication_spill(ownership.key, workers[selected].url());
-            }
-            (selected, creates_owner)
-        } else {
-            self.select_or_join_replication_spill(
-                ownership.key,
-                workers,
-                info,
-                &eligible_indices,
-                model_id,
-            )?
-        };
+        let (selected, claimed_new_owner) = self.select_or_join_replication_spill(
+            ownership.key,
+            workers,
+            info,
+            &eligible_indices,
+            model_id,
+        )?;
         let creates_owner = !ownership.owners.contains(&selected) && claimed_new_owner;
-        let result = if hard_overload && creates_owner {
-            "hard_overload_spill"
-        } else if hard_overload {
-            "hard_overload_existing_owner"
-        } else if !claimed_new_owner {
+        let result = if !claimed_new_owner {
             "spill_cooldown_hold"
-        } else if !had_suitable_owner {
-            "no_suitable_owner_spill"
         } else if creates_owner {
-            "budgeted_spill"
+            "no_suitable_owner_spill"
         } else {
             "fallback_existing_owner"
         };
@@ -2183,13 +2359,22 @@ mod tests {
     }
 
     #[test]
-    fn replication_budget_cooldown_allows_only_one_new_owner() {
-        let policy = replication_budget_policy(8, 60);
+    fn owner_pressure_spill_allows_only_one_new_owner() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            engine_load: true,
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         prime_worker_one_affinity(&policy, &workers, "hot prefix");
-        for _ in 0..20 {
-            workers[0].increment_load();
-        }
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.95, 0.95, 4)),
+            ("http://w2:8000".to_string(), engine_load(0.20, 0.20, 0)),
+            ("http://w3:8000".to_string(), engine_load(0.20, 0.20, 0)),
+        ]));
         let info = SelectWorkerInfo {
             request_text: Some("hot prefix"),
             ..Default::default()
@@ -2210,9 +2395,10 @@ mod tests {
     }
 
     #[test]
-    fn replication_budget_hard_overload_bypasses_owner_target() {
+    fn replication_ceiling_holds_even_when_cached_owner_is_hot() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.0,
+            engine_load: true,
             balance_abs_threshold: usize::MAX,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 0.9,
@@ -2223,10 +2409,10 @@ mod tests {
         });
         let workers = two_workers();
         prime_worker_one_affinity(&policy, &workers, "hot prefix");
-        for _ in 0..20 {
-            workers[0].increment_load();
-        }
-        let _tx = inject_kv(&policy, &workers, &[0.95, 0.20]);
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.95, 0.95, 4)),
+            ("http://w2:8000".to_string(), engine_load(0.20, 0.20, 0)),
+        ]));
 
         let selected = policy
             .select_worker(
@@ -2238,14 +2424,48 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(selected, 1);
+        assert_eq!(selected, 0);
         let model_id = normalize_model_key(workers[0].model_id());
         let matched = policy
             .string_trees
             .get(model_id)
             .unwrap()
             .match_prefix_with_counts("hot prefix");
-        assert_eq!(matched.tenants.len(), 2);
+        assert_eq!(matched.tenants.len(), 1);
+    }
+
+    #[test]
+    fn sequential_prefix_extensions_stay_on_one_owner() {
+        let policy = replication_budget_policy(8, 5);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        prime_worker_one_affinity(&policy, &workers, "shared turn one");
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+
+        for text in [
+            "shared turn one turn two",
+            "shared turn one turn two turn three",
+        ] {
+            let selected = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(selected, 0);
+        }
+
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("shared turn one turn two turn three");
+        assert_eq!(matched.tenants.len(), 1);
     }
 
     #[test]
@@ -3261,6 +3481,86 @@ mod tests {
             selected, 1,
             "the event index must expose both owners and avoid uncached worker 3"
         );
+    }
+
+    #[test]
+    fn event_driven_unrelated_hot_worker_does_not_break_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            engine_load: true,
+            balance_token_usage_threshold: 0.30,
+            overload_token_usage_threshold: 0.90,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.84, 0.84, 1)),
+            ("http://w2:8000".to_string(), engine_load(0.34, 0.34, 0)),
+            ("http://w3:8000".to_string(), engine_load(0.95, 0.95, 8)),
+        ]));
+        let _tx = inject_kv(&policy, &workers, &[0.84, 0.34, 0.95]);
+
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert(
+            "unknown".to_string(),
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4]], 4),
+        );
+        policy.set_kv_event_monitor(Some(monitor));
+
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[1, 2, 3, 4]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn event_driven_owner_pressure_spill_reuses_provisional_owner() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            engine_load: true,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.95, 0.95, 8)),
+            ("http://w2:8000".to_string(), engine_load(0.20, 0.20, 0)),
+            ("http://w3:8000".to_string(), engine_load(0.20, 0.20, 0)),
+        ]));
+
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert(
+            "unknown".to_string(),
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4]], 4),
+        );
+        policy.set_kv_event_monitor(Some(monitor));
+        let info = SelectWorkerInfo {
+            tokens: Some(&[1, 2, 3, 4]),
+            ..Default::default()
+        };
+
+        let first = policy.select_worker(&workers, &info).unwrap();
+        let second = policy.select_worker(&workers, &info).unwrap();
+
+        assert_ne!(first, 0);
+        assert_eq!(second, first);
+        assert_eq!(policy.replication_state.len(), 1);
     }
 
     #[test]
