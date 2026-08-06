@@ -27,7 +27,8 @@ use tracing::trace;
 use super::{
     fair_share::FairShareProfile, metrics as sched_metrics, state::SchedulerState, AdmitOutcome,
     Class, GlobalFairShare, RejectionReason, SchedulerError, SchedulerGuardBody,
-    HEADER_X_SMG_PREEMPTED, OUTPUT_TOKEN_ESTIMATE_HEADER, PRIORITY_HEADER,
+    HEADER_X_SMG_LOCAL_ADAPTIVE_REJECTED, HEADER_X_SMG_PREEMPTED, OUTPUT_TOKEN_ESTIMATE_HEADER,
+    PRIORITY_HEADER,
 };
 use crate::{
     middleware::{
@@ -47,6 +48,20 @@ static NEXT_ADMISSION_ID: AtomicU64 = AtomicU64::new(0);
 fn next_registry_id() -> RequestId {
     let n = NEXT_ADMISSION_ID.fetch_add(1, Ordering::Relaxed);
     RequestId(format!("sched-{n}"))
+}
+
+fn consume_local_adaptive_rejection_marker(
+    response: &mut Response,
+    permit: &mut super::SchedulerPermit,
+) -> bool {
+    let rejected = response
+        .headers_mut()
+        .remove(HEADER_X_SMG_LOCAL_ADAPTIVE_REJECTED)
+        .is_some();
+    if rejected {
+        permit.cancel_fair_share_reservation();
+    }
+    rejected
 }
 
 /// The class a request resolves to, plus what it asked for.
@@ -187,13 +202,17 @@ pub async fn priority_admission_middleware(
         )
         .await
     {
-        AdmitOutcome::Admitted(permit) => {
+        AdmitOutcome::Admitted(mut permit) => {
             pending_guard.resolve();
             Metrics::record_http_admission_admitted();
             let active_guard = AdmissionActiveGuard::new();
             // Hand the handler the cancel token (for preemption select!).
             req.extensions_mut().insert(permit.cancel_token());
-            let response = next.run(req).await;
+            let mut response = next.run(req).await;
+            // The local adaptive controller rejected before backend work
+            // began. Return the scheduler slot normally, but erase the
+            // provisional token charge so retries do not accumulate debt.
+            consume_local_adaptive_rejection_marker(&mut response, &mut permit);
             // Best-effort: the handler's PreemptionGuard tags a *pre-response*
             // preemption (a 503 carrying this header), which we count as
             // `preempted`. A preemption that fires after the handler produced
@@ -253,13 +272,18 @@ pub async fn priority_admission_middleware(
 mod tests {
     use std::collections::HashMap;
 
+    use axum::http::StatusCode;
+
     use super::*;
-    use crate::middleware::scheduler::FairShareConfig;
+    use crate::middleware::scheduler::{
+        ClassConfig, FairShareConfig, PriorityScheduler, PrioritySchedulerYaml, SchedulerSettings,
+    };
 
     fn ledger(trust_header: bool) -> GlobalFairShare {
         GlobalFairShare::from_config(&FairShareConfig {
             default_weight: 1.0,
             default_output_tokens: 256,
+            max_queued_requests_per_tenant: 64,
             trust_output_token_estimate_header: trust_header,
             trust_request_model_header: false,
             tenant_weights: HashMap::new(),
@@ -279,5 +303,73 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(OUTPUT_TOKEN_ESTIMATE_HEADER, "128".parse().unwrap());
         assert_eq!(output_token_estimate(&headers, &ledger(true)), 128);
+    }
+
+    #[tokio::test]
+    async fn local_adaptive_rejection_cancels_provisional_fair_share_charge() {
+        let mut classes = HashMap::new();
+        for class in Class::ALL {
+            let mut config = ClassConfig::default_for(class);
+            config.reserved_floor = 0;
+            config.reserved_per_slot = 0.0;
+            config.queue_size = 8;
+            classes.insert(class, config);
+        }
+        let yaml = PrioritySchedulerYaml {
+            classes,
+            fair_share: Some(FairShareConfig {
+                default_weight: 1.0,
+                default_output_tokens: 256,
+                max_queued_requests_per_tenant: 8,
+                trust_output_token_estimate_header: false,
+                trust_request_model_header: false,
+                tenant_weights: HashMap::from([("header:alice".to_string(), 1.0)]),
+                model_profiles: HashMap::new(),
+            }),
+            ..Default::default()
+        };
+        let settings =
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scheduler =
+            PriorityScheduler::new_with_fair_share(&settings, 1, Some(Arc::clone(&ledger)))
+                .unwrap();
+        let tenant = TenantKey::new("header:alice");
+        let scope_id = scheduler.fair_share_scope_for_test().unwrap();
+        let AdmitOutcome::Admitted(mut permit) = scheduler
+            .admit_for_tenant(
+                Class::Default,
+                RequestId("adaptive-rejected".into()),
+                CancellationToken::new(),
+                tenant.clone(),
+                256,
+            )
+            .await
+        else {
+            panic!("fair-share request should be provisionally admitted");
+        };
+        assert_eq!(ledger.snapshot(scope_id, &tenant).1, 256);
+
+        let mut response = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(HEADER_X_SMG_LOCAL_ADAPTIVE_REJECTED, "true")
+            .body(Body::empty())
+            .unwrap();
+        assert!(consume_local_adaptive_rejection_marker(
+            &mut response,
+            &mut permit
+        ));
+        assert!(response
+            .headers()
+            .get(HEADER_X_SMG_LOCAL_ADAPTIVE_REJECTED)
+            .is_none());
+        assert_eq!(ledger.snapshot(scope_id, &tenant), (0, 0, 0, [0; 4]));
+
+        drop(permit);
+        assert_eq!(
+            ledger.snapshot(scope_id, &tenant),
+            (0, 0, 0, [0; 4]),
+            "permit drop remains idempotent after cancellation"
+        );
     }
 }

@@ -33,4 +33,11 @@ pub use fair_share::{
     GlobalFairShare, SettlementKind, OUTPUT_TOKEN_ESTIMATE_HEADER, REQUEST_MODEL_HEADER,
 };
 pub use policy::{StaticTenantPolicyResolver, TenantPolicy, TenantPolicyResolver};
+pub(crate) use state::AdaptiveCapacityProvider;
 pub use state::{AdmissionMode, SchedulerState, ADMISSION_PARTITION_HEADER};
+
+/// Internal response marker set only by SMG's local adaptive-admission stage.
+/// The scheduler middleware removes it before returning the response and uses
+/// it to cancel a provisional fair-share charge for work that never ran.
+pub(crate) const HEADER_X_SMG_LOCAL_ADAPTIVE_REJECTED: &str =
+    "x-smg-local-adaptive-admission-rejected";
