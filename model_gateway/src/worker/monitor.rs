@@ -56,6 +56,7 @@ use openai_protocol::worker::{
     RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse, WorkerStatus,
 };
 use parking_lot::{Mutex, RwLock};
+use serde::Deserialize;
 use tokio::{
     sync::{broadcast, watch},
     task::JoinHandle,
@@ -77,6 +78,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// summary buckets are simply never queried by name.
 struct PromScrape {
     samples: HashMap<String, Vec<f64>>,
+}
+
+/// Standard SGLang HTTP `/get_load` response item.
+///
+/// Unlike the richer SMG `/v1/loads` extension, upstream SGLang returns a
+/// bare array with scheduler counts and token totals. Prometheus supplies the
+/// ratio and throughput fields needed by load-aware routing.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SglangHttpLoadSnapshot {
+    dp_rank: i32,
+    /// Total scheduler requests, including `num_waiting_reqs`.
+    num_reqs: i32,
+    num_waiting_reqs: i32,
+    num_tokens: i32,
+    num_pending_tokens: i32,
+    max_running_requests: i32,
 }
 
 impl PromScrape {
@@ -538,8 +556,16 @@ impl WorkerMonitor {
     }
 
     /// SGLang HTTP: try the custom `/v1/loads` endpoint first (some builds
-    /// serve it), then fall back to the Prometheus `/metrics` gauges. The
-    /// KV-usage ratio (0.0–1.0) is `<prefix>token_usage`, where SGLang used
+    /// serve it), then combine upstream SGLang's `/get_load` scheduler counts
+    /// with its Prometheus `/metrics` gauges. If `/get_load` is unavailable,
+    /// retain the ratio-only Prometheus fallback.
+    ///
+    /// The standard endpoint matters for tensor-parallel engines: SGLang
+    /// repeats scheduler gauges for every TP rank, so summing Prometheus
+    /// samples overcounts running and waiting requests. `/get_load` reports
+    /// one entry per DP rank and therefore supplies the canonical counts.
+    ///
+    /// The KV-usage ratio (0.0–1.0) is `<prefix>token_usage`, where SGLang used
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
     async fn fetch_http_load_sglang(
@@ -550,6 +576,7 @@ impl WorkerMonitor {
             return Some(resp);
         }
 
+        let standard_loads = Self::fetch_http_load_sglang_standard(client, worker).await;
         let url = format!("{}/metrics", worker.url());
         let body = Self::authed_get(client, worker, &url)
             .await?
@@ -565,6 +592,10 @@ impl WorkerMonitor {
             .into_iter()
             .find(|p| m.has(&format!("{p}token_usage")))?;
 
+        if let Some(loads) = standard_loads {
+            return Self::combine_sglang_standard_loads(loads, &m, prefix);
+        }
+
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
             num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
@@ -574,6 +605,69 @@ impl WorkerMonitor {
             utilization: m.mean(&format!("{prefix}utilization")),
             ..Default::default()
         }))
+    }
+
+    /// Fetch upstream SGLang's standard per-DP-rank scheduler snapshot.
+    async fn fetch_http_load_sglang_standard(
+        client: &reqwest::Client,
+        worker: &Arc<dyn Worker>,
+    ) -> Option<Vec<SglangHttpLoadSnapshot>> {
+        let url = format!("{}/get_load", worker.url());
+        let resp = Self::authed_get(client, worker, &url).await?;
+        let loads: Vec<SglangHttpLoadSnapshot> = resp.json().await.ok()?;
+        (!loads.is_empty()).then_some(loads)
+    }
+
+    /// Enrich canonical `/get_load` counts with ratio and throughput gauges.
+    ///
+    /// Prometheus values are averaged across emitted samples. Assigning the
+    /// average to every DP snapshot preserves the aggregate throughput when
+    /// metrics are per-DP, while avoiding multiplication when a TP-only
+    /// engine repeats the same sample on every tensor rank.
+    fn combine_sglang_standard_loads(
+        loads: Vec<SglangHttpLoadSnapshot>,
+        metrics: &PromScrape,
+        prefix: &str,
+    ) -> Option<WorkerLoadResponse> {
+        if loads.is_empty() {
+            return None;
+        }
+        let token_usage_name = format!("{prefix}token_usage");
+        if !metrics.has(&token_usage_name) {
+            return None;
+        }
+
+        let token_usage = metrics.mean(&token_usage_name);
+        let gen_throughput = metrics.mean(&format!("{prefix}gen_throughput"));
+        let cache_hit_rate = metrics.mean(&format!("{prefix}cache_hit_rate"));
+        let utilization = metrics.mean(&format!("{prefix}utilization"));
+        let dp_rank_count = i32::try_from(loads.len()).unwrap_or(i32::MAX);
+        let loads = loads
+            .into_iter()
+            .map(|load| {
+                let total_requests = load.num_reqs.max(0);
+                let waiting_requests = load.num_waiting_reqs.max(0).min(total_requests);
+                SchedulerLoadSnapshot {
+                    dp_rank: load.dp_rank,
+                    num_running_reqs: total_requests.saturating_sub(waiting_requests),
+                    num_waiting_reqs: waiting_requests,
+                    num_waiting_uncached_tokens: load.num_pending_tokens.max(0),
+                    num_total_reqs: total_requests,
+                    num_used_tokens: load.num_tokens.max(0),
+                    token_usage,
+                    gen_throughput,
+                    cache_hit_rate,
+                    utilization,
+                    max_running_requests: load.max_running_requests.max(0),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Some(WorkerLoadResponse {
+            dp_rank_count,
+            loads,
+            ..Default::default()
+        })
     }
 
     /// Shared authenticated GET with the standard timeout. Returns `None` on
@@ -1254,6 +1348,41 @@ sglang:token_usage{model="llama"} 0.42
 sglang:utilization{model="llama"} 0.9
 "#;
 
+    const SGLANG_TP_METRICS: &str = r#"
+sglang:num_running_reqs{model_name="glm",tp_rank="0"} 22
+sglang:num_running_reqs{model_name="glm",tp_rank="1"} 22
+sglang:num_running_reqs{model_name="glm",tp_rank="2"} 22
+sglang:num_running_reqs{model_name="glm",tp_rank="3"} 22
+sglang:num_running_reqs{model_name="glm",tp_rank="4"} 22
+sglang:num_running_reqs{model_name="glm",tp_rank="5"} 22
+sglang:num_running_reqs{model_name="glm",tp_rank="6"} 22
+sglang:num_running_reqs{model_name="glm",tp_rank="7"} 22
+sglang:num_queue_reqs{model_name="glm",tp_rank="0"} 4
+sglang:num_queue_reqs{model_name="glm",tp_rank="1"} 4
+sglang:num_queue_reqs{model_name="glm",tp_rank="2"} 4
+sglang:num_queue_reqs{model_name="glm",tp_rank="3"} 4
+sglang:num_queue_reqs{model_name="glm",tp_rank="4"} 4
+sglang:num_queue_reqs{model_name="glm",tp_rank="5"} 4
+sglang:num_queue_reqs{model_name="glm",tp_rank="6"} 4
+sglang:num_queue_reqs{model_name="glm",tp_rank="7"} 4
+sglang:token_usage{model_name="glm",tp_rank="0"} 0.98
+sglang:token_usage{model_name="glm",tp_rank="1"} 0.98
+sglang:token_usage{model_name="glm",tp_rank="2"} 0.98
+sglang:token_usage{model_name="glm",tp_rank="3"} 0.98
+sglang:token_usage{model_name="glm",tp_rank="4"} 0.98
+sglang:token_usage{model_name="glm",tp_rank="5"} 0.98
+sglang:token_usage{model_name="glm",tp_rank="6"} 0.98
+sglang:token_usage{model_name="glm",tp_rank="7"} 0.98
+sglang:gen_throughput{model_name="glm",tp_rank="0"} 1147
+sglang:gen_throughput{model_name="glm",tp_rank="1"} 1147
+sglang:gen_throughput{model_name="glm",tp_rank="2"} 1147
+sglang:gen_throughput{model_name="glm",tp_rank="3"} 1147
+sglang:gen_throughput{model_name="glm",tp_rank="4"} 1147
+sglang:gen_throughput{model_name="glm",tp_rank="5"} 1147
+sglang:gen_throughput{model_name="glm",tp_rank="6"} 1147
+sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
+"#;
+
     #[test]
     fn parses_gauges_ignoring_comments_and_labels() {
         let m = PromScrape::parse(VLLM_METRICS);
@@ -1297,6 +1426,72 @@ sglang:utilization{model="llama"} 0.9
         assert_eq!(m.mean("sglang:token_usage"), 0.42);
         assert_eq!(m.sum("sglang:num_running_reqs"), 2.0);
         assert_eq!(m.sum("sglang:num_queue_reqs"), 4.0);
+    }
+
+    #[test]
+    fn sglang_standard_load_avoids_tensor_parallel_metric_duplication() {
+        let standard: Vec<SglangHttpLoadSnapshot> = serde_json::from_str(
+            r#"[{"dp_rank":0,"num_reqs":34,"num_waiting_reqs":6,"num_tokens":1420277,"num_pending_tokens":151477}]"#,
+        )
+        .unwrap();
+        let metrics = PromScrape::parse(SGLANG_TP_METRICS);
+        assert_eq!(metrics.sum("sglang:num_running_reqs"), 176.0);
+        assert_eq!(metrics.sum("sglang:num_queue_reqs"), 32.0);
+
+        let response =
+            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:").unwrap();
+        assert_eq!(response.dp_rank_count, 1);
+        assert_eq!(response.loads[0].num_running_reqs, 28);
+        assert_eq!(response.loads[0].num_waiting_reqs, 6);
+        assert_eq!(response.loads[0].num_total_reqs, 34);
+        assert_eq!(response.loads[0].num_waiting_uncached_tokens, 151477);
+        assert_eq!(response.loads[0].num_used_tokens, 1420277);
+        assert!((response.effective_token_usage() - 0.98).abs() < 1e-12);
+        assert_eq!(response.total_gen_throughput(), 1147.0);
+    }
+
+    #[test]
+    fn sglang_standard_load_preserves_data_parallel_aggregation() {
+        let standard: Vec<SglangHttpLoadSnapshot> = serde_json::from_str(
+            r#"[{"dp_rank":0,"num_reqs":3,"num_waiting_reqs":1},{"dp_rank":1,"num_reqs":4,"num_waiting_reqs":2}]"#,
+        )
+        .unwrap();
+        let metrics = PromScrape::parse(
+            "sglang:token_usage{dp_rank=\"0\"} 0.2\n\
+             sglang:token_usage{dp_rank=\"1\"} 0.4\n\
+             sglang:gen_throughput{dp_rank=\"0\"} 10\n\
+             sglang:gen_throughput{dp_rank=\"1\"} 20\n",
+        );
+
+        let response =
+            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:").unwrap();
+        assert_eq!(response.dp_rank_count, 2);
+        assert_eq!(
+            response
+                .loads
+                .iter()
+                .map(|load| load.num_running_reqs)
+                .sum::<i32>(),
+            4
+        );
+        assert_eq!(
+            response
+                .loads
+                .iter()
+                .map(|load| load.num_waiting_reqs)
+                .sum::<i32>(),
+            3
+        );
+        assert_eq!(
+            response
+                .loads
+                .iter()
+                .map(|load| load.num_total_reqs)
+                .sum::<i32>(),
+            7
+        );
+        assert!((response.effective_token_usage() - 0.3).abs() < f64::EPSILON);
+        assert!((response.total_gen_throughput() - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]

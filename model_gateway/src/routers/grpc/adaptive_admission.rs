@@ -454,6 +454,10 @@ impl CapacityEstimate {
 struct FeedbackEstimate {
     peak_tokens_per_second_per_replica: f64,
     running_requests_per_replica_at_peak: f64,
+    /// True after the partition has crossed a live pressure boundary. This
+    /// keeps a tiny idle-throughput sample from becoming a restrictive learned
+    /// cap when the engine does not publish `max_running_requests`.
+    pressure_observed: bool,
     last_update: Instant,
 }
 
@@ -472,7 +476,9 @@ impl FeedbackEstimate {
         now: Instant,
         half_life_secs: f64,
         improvement_ratio: f64,
+        under_pressure: bool,
     ) {
+        self.pressure_observed |= under_pressure;
         let effective_peak = self.effective_peak(now, half_life_secs);
         let raises_peak =
             throughput_per_replica > effective_peak * (1.0 + improvement_ratio.max(0.0));
@@ -695,6 +701,13 @@ impl AdaptiveAdmissionController {
                 if load.running_requests > 0 {
                     let running_per_replica =
                         load.running_requests as f64 / f64::from(load.observed_replicas);
+                    let waiting_limit = i64::from(
+                        self.config
+                            .feedback_max_waiting_requests_per_healthy_replica,
+                    ) * i64::from(load.observed_replicas);
+                    let under_pressure = load.mean_token_usage()
+                        >= self.config.feedback_max_token_usage
+                        || load.waiting_requests > waiting_limit;
                     work.feedback_estimates
                         .entry(partition.clone())
                         .and_modify(|estimate| {
@@ -704,11 +717,13 @@ impl AdaptiveAdmissionController {
                                 now,
                                 self.config.estimator_half_life_secs,
                                 self.config.feedback_throughput_improvement_ratio,
+                                under_pressure,
                             );
                         })
                         .or_insert(FeedbackEstimate {
                             peak_tokens_per_second_per_replica: per_replica,
                             running_requests_per_replica_at_peak: running_per_replica,
+                            pressure_observed: under_pressure,
                             last_update: now,
                         });
                 }
@@ -873,27 +888,34 @@ impl AdaptiveAdmissionController {
                     }
                 }
                 AdaptiveAdmissionStrategy::EngineFeedback => {
-                    let telemetry_usable = coverage >= self.config.min_load_coverage
-                        && load.max_running_coverage() >= self.config.min_load_coverage;
-                    let engine_limit = if telemetry_usable {
-                        load.scaled_max_running_requests()
-                    } else {
-                        0.0
+                    let telemetry_usable = coverage >= self.config.min_load_coverage;
+                    let engine_limit =
+                        if load.max_running_coverage() >= self.config.min_load_coverage {
+                            Some(load.scaled_max_running_requests())
+                        } else {
+                            None
+                        };
+                    let learned_limit = feedback_estimate
+                        .as_ref()
+                        .filter(|estimate| engine_limit.is_some() || estimate.pressure_observed)
+                        .map(|estimate| {
+                            (estimate.running_requests_per_replica_at_peak
+                                * f64::from(load.healthy_replicas))
+                            .ceil()
+                                + f64::from(
+                                    self.config
+                                        .feedback_probe_requests_per_healthy_replica
+                                        .saturating_mul(load.healthy_replicas),
+                                )
+                        });
+                    // A reported engine maximum remains the cold-start hard
+                    // ceiling. Without one, live token/queue pressure explores
+                    // safely until a busy sample makes the learned knee usable.
+                    let running_limit = match (learned_limit, engine_limit) {
+                        (Some(learned), Some(engine)) => Some(learned.max(1.0).min(engine)),
+                        (Some(learned), None) => Some(learned.max(1.0)),
+                        (None, engine) => engine,
                     };
-                    let learned_limit = feedback_estimate.as_ref().map(|estimate| {
-                        (estimate.running_requests_per_replica_at_peak
-                            * f64::from(load.healthy_replicas))
-                        .ceil()
-                            + f64::from(
-                                self.config
-                                    .feedback_probe_requests_per_healthy_replica
-                                    .saturating_mul(load.healthy_replicas),
-                            )
-                    });
-                    // Before a busy sample exists, the engine's own hard
-                    // running limit is the bounded cold-start ceiling.
-                    let running_limit = learned_limit
-                        .map_or(engine_limit, |learned| learned.max(1.0).min(engine_limit));
                     let projected_requests =
                         router_outstanding_requests.max(engine_request_count + 1.0);
                     let waiting_limit = i64::from(
@@ -906,7 +928,9 @@ impl AdaptiveAdmissionController {
                         "token_pressure"
                     } else if load.waiting_requests > waiting_limit {
                         "engine_waiting"
-                    } else if projected_requests > running_limit {
+                    } else if running_limit
+                        .is_some_and(|running_limit| projected_requests > running_limit)
+                    {
                         "running_limit"
                     } else {
                         "within_feedback_limit"
@@ -914,7 +938,7 @@ impl AdaptiveAdmissionController {
                     let would_admit =
                         matches!(reason, "telemetry_fallback" | "within_feedback_limit");
                     gauge!(FEEDBACK_RUNNING_LIMIT, "partition" => Arc::clone(&partition_label))
-                        .set(running_limit);
+                        .set(running_limit.unwrap_or(0.0));
                     gauge!(OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
                         .set(router_outstanding);
                     gauge!(ROUTER_OUTSTANDING_TOKENS, "partition" => Arc::clone(&partition_label))
@@ -1336,6 +1360,7 @@ mod tests {
             FeedbackEstimate {
                 peak_tokens_per_second_per_replica: 100.0,
                 running_requests_per_replica_at_peak: 10.0,
+                pressure_observed: false,
                 last_update: now,
             },
         );
@@ -1436,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_feedback_fails_open_when_max_running_coverage_is_incomplete() {
+    fn engine_feedback_uses_load_when_max_running_coverage_is_incomplete() {
         let mut settings = config();
         settings.mode = AdaptiveAdmissionMode::Enforce;
         settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
@@ -1455,10 +1480,118 @@ mod tests {
 
         let tracker = controller.begin("model".to_string(), features("u", 10, None));
         assert!(!tracker.should_reject());
-        assert!(!tracker.inner.as_ref().unwrap().decision.telemetry_usable);
+        assert!(tracker.inner.as_ref().unwrap().decision.telemetry_usable);
         assert_eq!(
             tracker.inner.as_ref().unwrap().decision.reason,
-            "telemetry_fallback"
+            "within_feedback_limit"
+        );
+    }
+
+    #[test]
+    fn engine_feedback_enforces_pressure_without_max_running_limit() {
+        for (waiting_requests, token_usage, expected_reason) in
+            [(3, 0.5, "engine_waiting"), (0, 0.91, "token_pressure")]
+        {
+            let mut settings = config();
+            settings.mode = AdaptiveAdmissionMode::Enforce;
+            settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+            let controller =
+                AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
+            controller.work.lock().loads.insert(
+                "model".to_string(),
+                PartitionLoad {
+                    healthy_replicas: 1,
+                    observed_replicas: 1,
+                    running_requests: 10,
+                    waiting_requests,
+                    max_token_usage: token_usage,
+                    token_usage_sum: token_usage,
+                    ..PartitionLoad::default()
+                },
+            );
+
+            let tracker = controller.begin("model".to_string(), features("u", 10, None));
+            assert!(tracker.should_reject());
+            assert!(tracker.inner.as_ref().unwrap().decision.telemetry_usable);
+            assert_eq!(
+                tracker.inner.as_ref().unwrap().decision.reason,
+                expected_reason
+            );
+        }
+    }
+
+    #[test]
+    fn engine_feedback_ignores_idle_knee_without_max_running_limit() {
+        let mut settings = config();
+        settings.mode = AdaptiveAdmissionMode::Enforce;
+        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        let controller =
+            AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
+        let now = Instant::now();
+        let mut work = controller.work.lock();
+        work.loads.insert(
+            "model".to_string(),
+            PartitionLoad {
+                healthy_replicas: 4,
+                observed_replicas: 4,
+                ..PartitionLoad::default()
+            },
+        );
+        work.feedback_estimates.insert(
+            "model".to_string(),
+            FeedbackEstimate {
+                peak_tokens_per_second_per_replica: 0.001,
+                running_requests_per_replica_at_peak: 0.25,
+                pressure_observed: false,
+                last_update: now,
+            },
+        );
+        drop(work);
+
+        let trackers: Vec<_> = (0..20)
+            .map(|i| controller.begin("model".to_string(), features(&format!("u-{i}"), 10, None)))
+            .collect();
+        assert!(trackers.iter().all(|tracker| !tracker.should_reject()));
+    }
+
+    #[test]
+    fn engine_feedback_uses_busy_knee_without_max_running_limit() {
+        let mut settings = config();
+        settings.mode = AdaptiveAdmissionMode::Enforce;
+        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        let controller =
+            AdaptiveAdmissionController::new(settings, Arc::new(WorkerRegistry::new()));
+        let now = Instant::now();
+        let mut work = controller.work.lock();
+        work.loads.insert(
+            "model".to_string(),
+            PartitionLoad {
+                healthy_replicas: 1,
+                observed_replicas: 1,
+                running_requests: 10,
+                ..PartitionLoad::default()
+            },
+        );
+        work.feedback_estimates.insert(
+            "model".to_string(),
+            FeedbackEstimate {
+                peak_tokens_per_second_per_replica: 100.0,
+                running_requests_per_replica_at_peak: 10.0,
+                pressure_observed: true,
+                last_update: now,
+            },
+        );
+        drop(work);
+
+        let trackers: Vec<_> = (0..12)
+            .map(|i| controller.begin("model".to_string(), features(&format!("u-{i}"), 10, None)))
+            .collect();
+        assert!(trackers.iter().all(|tracker| !tracker.should_reject()));
+        let excess = controller.begin("model".to_string(), features("excess", 10, None));
+        assert!(excess.should_reject());
+        assert_eq!(
+            excess.inner.as_ref().unwrap().decision.reason,
+            "running_limit"
         );
     }
 
@@ -1468,9 +1601,11 @@ mod tests {
         let mut estimate = FeedbackEstimate {
             peak_tokens_per_second_per_replica: 100.0,
             running_requests_per_replica_at_peak: 20.0,
+            pressure_observed: false,
             last_update: start,
         };
-        estimate.observe(99.0, 12.0, start + Duration::from_secs(1), 60.0, 0.02);
+        estimate.observe(99.0, 12.0, start + Duration::from_secs(1), 60.0, 0.02, true);
         assert_eq!(estimate.running_requests_per_replica_at_peak, 12.0);
+        assert!(estimate.pressure_observed);
     }
 }
