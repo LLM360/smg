@@ -24,7 +24,35 @@ pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
         400 => metrics_labels::ERROR_VALIDATION,
         404 => metrics_labels::ERROR_NO_WORKERS,
         408 | 504 => metrics_labels::ERROR_TIMEOUT,
+        429 => metrics_labels::ERROR_ADMISSION_REJECTED,
         500..=599 => metrics_labels::ERROR_BACKEND,
         _ => metrics_labels::ERROR_INTERNAL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_admission_rejection_is_not_an_internal_error() {
+        assert_eq!(
+            error_type_from_status(StatusCode::TOO_MANY_REQUESTS),
+            metrics_labels::ERROR_ADMISSION_REJECTED
+        );
+    }
+
+    #[test]
+    fn representative_router_error_mappings_remain_stable() {
+        for (status, expected) in [
+            (StatusCode::BAD_REQUEST, metrics_labels::ERROR_VALIDATION),
+            (StatusCode::NOT_FOUND, metrics_labels::ERROR_NO_WORKERS),
+            (StatusCode::REQUEST_TIMEOUT, metrics_labels::ERROR_TIMEOUT),
+            (StatusCode::GATEWAY_TIMEOUT, metrics_labels::ERROR_TIMEOUT),
+            (StatusCode::BAD_GATEWAY, metrics_labels::ERROR_BACKEND),
+            (StatusCode::FORBIDDEN, metrics_labels::ERROR_INTERNAL),
+        ] {
+            assert_eq!(error_type_from_status(status), expected);
+        }
     }
 }

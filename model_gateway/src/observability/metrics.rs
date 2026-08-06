@@ -640,6 +640,7 @@ pub mod metrics_labels {
     pub const ERROR_TIMEOUT: &str = "timeout";
     pub const ERROR_BACKEND: &str = "backend_error";
     pub const ERROR_VALIDATION: &str = "validation_error";
+    pub const ERROR_ADMISSION_REJECTED: &str = "admission_rejected";
     pub const ERROR_INTERNAL: &str = "internal_error";
 }
 
