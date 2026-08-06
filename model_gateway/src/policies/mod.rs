@@ -162,13 +162,15 @@ pub struct CacheAwareConfig {
     /// shedding load off a critically-saturated engine. A safety valve, best set
     /// high (e.g. 0.9). Requires `token_usage`; `>= 1.0` disables it (default).
     pub overload_token_usage_threshold: f32,
-    /// Soft cap on the number of healthy workers allowed to own one prefix
-    /// before cache-aware routing holds new requests on existing owners.
-    /// `0` disables the replication budget for backward compatibility.
+    /// Maximum number of healthy workers intentionally allowed to own one
+    /// prefix. Existing owners remain sticky below this ceiling; a new owner is
+    /// created only when every matching owner is pressured. Authoritative event
+    /// state is never pruned to enforce the ceiling. `0` disables the
+    /// replication budget for backward compatibility.
     pub max_cached_owners_per_prefix: usize,
-    /// Minimum interval between creating additional owners for one prefix.
-    /// Hard overload and the absence of any suitable cached owner bypass the
-    /// cooldown. `0` disables the cooldown.
+    /// Minimum interval between pressure-driven owner additions for one prefix.
+    /// Concurrent requests join the same provisional owner while the cooldown
+    /// is active. `0` disables the cooldown.
     pub cache_owner_spill_cooldown_secs: u64,
 }
 
