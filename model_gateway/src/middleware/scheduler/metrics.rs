@@ -26,12 +26,15 @@ const UNKNOWN_PRIORITY_TOTAL: &str = "smg_scheduler_unknown_priority_value_total
 const STARVATION_PROMOTION_TOTAL: &str = "smg_scheduler_starvation_promotion_total";
 const PARTITION_ADMIT_TOTAL: &str = "smg_scheduler_partition_admit_total";
 const FAIR_SHARE_CHARGED_OUTPUT_TOKENS_TOTAL: &str = "smg_fair_share_charged_output_tokens_total";
+const FAIR_SHARE_MODEL_CHARGED_OUTPUT_TOKENS_TOTAL: &str =
+    "smg_fair_share_model_charged_output_tokens_total";
 const FAIR_SHARE_VIRTUAL_FINISH: &str = "smg_fair_share_virtual_finish";
 const FAIR_SHARE_OTHER_BUCKET_VIRTUAL_FINISH: &str = "smg_fair_share_other_bucket_virtual_finish";
 const FAIR_SHARE_RESERVED_OUTPUT_TOKENS: &str = "smg_fair_share_reserved_output_tokens";
 const FAIR_SHARE_QUEUE_WAIT_SECONDS: &str = "smg_fair_share_queue_wait_seconds";
 const FAIR_SHARE_FALLBACK_TOTAL: &str = "smg_fair_share_fallback_total";
 const FAIR_SHARE_UNKNOWN_TENANT_TOTAL: &str = "smg_fair_share_unknown_tenant_total";
+const FAIR_SHARE_QUEUE_REJECTIONS_TOTAL: &str = "smg_fair_share_queue_rejections_total";
 
 // Capacity / autoscaling gauges, refreshed by the sampler task.
 const INFLIGHT: &str = "smg_scheduler_inflight";
@@ -41,6 +44,8 @@ const QUEUE_SIZE_LIMIT: &str = "smg_scheduler_queue_size_limit";
 const RETRY_AFTER_SECONDS: &str = "smg_scheduler_retry_after_seconds";
 const CLASS_CAPACITY_PRESSURE: &str = "smg_scheduler_class_capacity_pressure";
 const PARTITION_CAPACITY: &str = "smg_scheduler_partition_capacity";
+const PARTITION_STATIC_CAPACITY: &str = "smg_scheduler_partition_static_capacity";
+const PARTITION_ADAPTIVE_CAPACITY: &str = "smg_scheduler_partition_adaptive_capacity";
 const PARTITION_HEALTHY_REPLICAS: &str = "smg_scheduler_partition_healthy_replicas";
 const PARTITION_INFLIGHT: &str = "smg_scheduler_partition_inflight";
 const PARTITION_QUEUE_DEPTH: &str = "smg_scheduler_partition_queue_depth";
@@ -95,6 +100,10 @@ pub fn describe() {
         FAIR_SHARE_CHARGED_OUTPUT_TOKENS_TOTAL,
         "Output tokens charged to the global fair-share ledger by tenant"
     );
+    describe_counter!(
+        FAIR_SHARE_MODEL_CHARGED_OUTPUT_TOKENS_TOTAL,
+        "Output tokens charged within a configured model fair-share profile by bucket and tenant"
+    );
     describe_gauge!(
         FAIR_SHARE_VIRTUAL_FINISH,
         "Active-set normalized tenant virtual finish by model profile"
@@ -119,6 +128,10 @@ pub fn describe() {
         FAIR_SHARE_UNKNOWN_TENANT_TOTAL,
         "Requests whose resolved tenant has no explicit fair-share weight"
     );
+    describe_counter!(
+        FAIR_SHARE_QUEUE_REJECTIONS_TOTAL,
+        "Fair-share queue rejections by bounded capacity reason"
+    );
     describe_gauge!(INFLIGHT, "Current in-flight request count per class");
     describe_gauge!(QUEUE_DEPTH, "Current queued waiter count per class");
     describe_gauge!(
@@ -140,6 +153,14 @@ pub fn describe() {
     describe_gauge!(
         PARTITION_CAPACITY,
         "Current hard admission capacity by partition"
+    );
+    describe_gauge!(
+        PARTITION_STATIC_CAPACITY,
+        "Worker-derived safety capacity before adaptive admission by partition"
+    );
+    describe_gauge!(
+        PARTITION_ADAPTIVE_CAPACITY,
+        "Effective engine-feedback scheduler capacity by partition"
     );
     describe_gauge!(
         PARTITION_HEALTHY_REPLICAS,
@@ -226,6 +247,21 @@ pub fn record_fair_share_charged_output_tokens(tenant: &str, tokens: u32) {
     .increment(u64::from(tokens));
 }
 
+pub fn record_fair_share_model_charged_output_tokens(
+    model: &str,
+    bucket: &'static str,
+    tenant: &str,
+    tokens: u32,
+) {
+    counter!(
+        FAIR_SHARE_MODEL_CHARGED_OUTPUT_TOKENS_TOTAL,
+        "model" => intern_string(model),
+        "bucket" => bucket,
+        "tenant" => intern_string(tenant)
+    )
+    .increment(u64::from(tokens));
+}
+
 pub fn set_fair_share_virtual_finish(model: &str, tenant: &str, virtual_finish: f64) {
     gauge!(
         FAIR_SHARE_VIRTUAL_FINISH,
@@ -273,6 +309,10 @@ pub fn record_fair_share_unknown_tenant(tenant: &str) {
     .increment(1);
 }
 
+pub fn record_fair_share_queue_rejection(reason: &'static str) {
+    counter!(FAIR_SHARE_QUEUE_REJECTIONS_TOTAL, "reason" => reason).increment(1);
+}
+
 /// Set the in-flight gauge for a class (sampler).
 pub fn set_inflight(class: Class, count: u16) {
     gauge!(INFLIGHT, "class" => class.as_str()).set(f64::from(count));
@@ -305,6 +345,22 @@ pub fn set_class_capacity_pressure(class: Class, pressure: f64) {
 
 pub fn set_partition_capacity(partition: &str, capacity: u16) {
     gauge!(PARTITION_CAPACITY, "partition" => intern_string(partition)).set(f64::from(capacity));
+}
+
+pub fn set_partition_static_capacity(partition: &str, capacity: u16) {
+    gauge!(
+        PARTITION_STATIC_CAPACITY,
+        "partition" => intern_string(partition)
+    )
+    .set(f64::from(capacity));
+}
+
+pub fn set_partition_adaptive_capacity(partition: &str, capacity: u16) {
+    gauge!(
+        PARTITION_ADAPTIVE_CAPACITY,
+        "partition" => intern_string(partition)
+    )
+    .set(f64::from(capacity));
 }
 
 pub fn set_partition_healthy_replicas(partition: &str, replicas: u16) {

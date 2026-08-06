@@ -1081,6 +1081,12 @@ impl GlobalFairShare {
 
         let metric_tenant = self.metric_tenant(tenant);
         super::metrics::record_fair_share_charged_output_tokens(metric_tenant, charged);
+        super::metrics::record_fair_share_model_charged_output_tokens(
+            model,
+            if is_other { "other" } else { "explicit" },
+            metric_tenant,
+            charged,
+        );
         super::metrics::set_fair_share_virtual_finish(
             model,
             metric_tenant,
@@ -1259,6 +1265,7 @@ mod tests {
         FairShareConfig {
             default_weight: 1.0,
             default_output_tokens: 10,
+            max_queued_requests_per_tenant: 64,
             trust_output_token_estimate_header: false,
             trust_request_model_header: false,
             tenant_weights: weights

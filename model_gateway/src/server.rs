@@ -788,10 +788,17 @@ pub fn build_app(
 
     // Choose the admission path once at startup: priority scheduler when
     // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
-    let admission_mode = middleware::scheduler::AdmissionMode::from_config(
+    let admission_mode = middleware::scheduler::AdmissionMode::from_config_with_adaptive(
         &app_state.context.router_config,
         app_state.context.worker_registry.clone(),
         app_state.context.rate_limiter.clone(),
+        app_state
+            .context
+            .adaptive_admission
+            .as_ref()
+            .map(|controller| {
+                Arc::clone(controller) as Arc<dyn middleware::scheduler::AdaptiveCapacityProvider>
+            }),
     );
 
     let protected_routes = with_admission_layer(

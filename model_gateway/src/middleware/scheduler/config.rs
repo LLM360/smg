@@ -127,6 +127,10 @@ fn default_fair_share_output_tokens() -> u32 {
     256
 }
 
+fn default_fair_share_max_queued_requests_per_tenant() -> u32 {
+    64
+}
+
 /// One model's hierarchical weighted-sharing policy.
 ///
 /// Explicit tenants and the aggregate `other` bucket contend at the outer
@@ -156,6 +160,11 @@ pub struct FairShareConfig {
     /// invalid. Terminal response usage replaces this estimate.
     #[serde(default = "default_fair_share_output_tokens")]
     pub default_output_tokens: u32,
+    /// Maximum queued requests from one tenant inside a scheduler partition,
+    /// shared across all priority classes. This prevents one noisy tenant
+    /// from consuming the partition's entire work-conserving queue budget.
+    #[serde(default = "default_fair_share_max_queued_requests_per_tenant")]
+    pub max_queued_requests_per_tenant: u32,
     /// Honor `x-smg-output-token-estimate`. Keep false unless a trusted proxy
     /// strips client copies and injects a validated value.
     #[serde(default)]
@@ -267,6 +276,8 @@ pub enum SettingsValidationError {
     InvalidFairShareDefaultWeight,
     #[error("fair_share.default_output_tokens must be > 0")]
     ZeroFairShareDefaultOutputTokens,
+    #[error("fair_share.max_queued_requests_per_tenant must be > 0")]
+    ZeroFairShareMaxQueuedRequestsPerTenant,
     #[error("fair_share.tenant_weights[{tenant:?}] must be finite and > 0")]
     InvalidFairShareTenantWeight { tenant: String },
     #[error("fair_share.model_profiles require trust_request_model_header=true")]
@@ -418,6 +429,9 @@ impl SchedulerSettings {
             }
             if config.default_output_tokens == 0 {
                 return Err(SettingsValidationError::ZeroFairShareDefaultOutputTokens);
+            }
+            if config.max_queued_requests_per_tenant == 0 {
+                return Err(SettingsValidationError::ZeroFairShareMaxQueuedRequestsPerTenant);
             }
             for (tenant, weight) in &config.tenant_weights {
                 if !weight.is_finite() || *weight <= 0.0 {
@@ -603,6 +617,7 @@ fair_share:
         let fair_share = parsed.fair_share.as_ref().unwrap();
         assert_eq!(fair_share.default_weight, 0.5);
         assert_eq!(fair_share.default_output_tokens, 128);
+        assert_eq!(fair_share.max_queued_requests_per_tenant, 64);
         assert!(fair_share.trust_output_token_estimate_header);
         assert_eq!(fair_share.tenant_weights["header:alice"], 10.0);
         assert_eq!(fair_share.tenant_weights["header:bob"], 5.0);
@@ -619,6 +634,7 @@ fair_share:
                 fair_share: Some(FairShareConfig {
                     default_weight: 1.0,
                     default_output_tokens: 128,
+                    max_queued_requests_per_tenant: 64,
                     trust_output_token_estimate_header: false,
                     trust_request_model_header: false,
                     tenant_weights: HashMap::from([("header:alice".to_string(), weight)]),
@@ -634,11 +650,32 @@ fair_share:
     }
 
     #[test]
+    fn test_zero_fair_share_tenant_queue_limit_is_rejected() {
+        let yaml = PrioritySchedulerYaml {
+            fair_share: Some(FairShareConfig {
+                default_weight: 1.0,
+                default_output_tokens: 128,
+                max_queued_requests_per_tenant: 0,
+                trust_output_token_estimate_header: false,
+                trust_request_model_header: false,
+                tenant_weights: HashMap::new(),
+                model_profiles: HashMap::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)),
+            Err(SettingsValidationError::ZeroFairShareMaxQueuedRequestsPerTenant)
+        ));
+    }
+
+    #[test]
     fn test_model_profiles_require_the_trusted_request_model_header() {
         let yaml = PrioritySchedulerYaml {
             fair_share: Some(FairShareConfig {
                 default_weight: 1.0,
                 default_output_tokens: 128,
+                max_queued_requests_per_tenant: 64,
                 trust_output_token_estimate_header: false,
                 trust_request_model_header: false,
                 tenant_weights: HashMap::new(),
