@@ -537,7 +537,7 @@ mod tests {
         Arc::new(GlobalFairShare::from_config(&FairShareConfig {
             default_weight: 1.0,
             default_output_tokens: 10,
-            max_queued_requests_per_tenant: 64,
+            max_queued_requests_per_tenant: Some(64),
             trust_output_token_estimate_header: false,
             trust_request_model_header: true,
             tenant_weights: HashMap::new(),
