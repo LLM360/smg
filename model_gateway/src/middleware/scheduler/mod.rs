@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod body;
+pub mod capacity_credit;
 pub mod class;
 pub mod config;
 pub mod engine;
