@@ -593,7 +593,12 @@ impl WorkerMonitor {
             .find(|p| m.has(&format!("{p}token_usage")))?;
 
         if let Some(loads) = standard_loads {
-            return Self::combine_sglang_standard_loads(loads, &m, prefix);
+            return Self::combine_sglang_standard_loads(
+                loads,
+                &m,
+                prefix,
+                worker.max_running_requests().map_or(0, i32::from),
+            );
         }
 
         Some(Self::single_rank(SchedulerLoadSnapshot {
@@ -623,11 +628,18 @@ impl WorkerMonitor {
     /// Prometheus values are averaged across emitted samples. Assigning the
     /// average to every DP snapshot preserves the aggregate throughput when
     /// metrics are per-DP, while avoiding multiplication when a TP-only
-    /// engine repeats the same sample on every tensor rank.
+    /// engine repeats the same sample on every tensor rank. Older SGLang
+    /// versions omit `max_running_requests` from this canonical endpoint, so
+    /// divide the instance-wide capacity discovered from `/server_info` across
+    /// a complete set of missing per-DP caps. Mixed reported/missing caps stay
+    /// incomplete so scheduler-pressure routing fails open. The Prometheus-only
+    /// fallback remains unchanged and does not receive this capacity, because
+    /// its request gauges may be repeated by TP rank.
     fn combine_sglang_standard_loads(
         loads: Vec<SglangHttpLoadSnapshot>,
         metrics: &PromScrape,
         prefix: &str,
+        fallback_max_running_requests: i32,
     ) -> Option<WorkerLoadResponse> {
         if loads.is_empty() {
             return None;
@@ -642,6 +654,15 @@ impl WorkerMonitor {
         let cache_hit_rate = metrics.mean(&format!("{prefix}cache_hit_rate"));
         let utilization = metrics.mean(&format!("{prefix}utilization"));
         let dp_rank_count = i32::try_from(loads.len()).unwrap_or(i32::MAX);
+        let all_caps_missing = loads.iter().all(|load| load.max_running_requests <= 0);
+        let fallback_per_dp = if all_caps_missing {
+            fallback_max_running_requests
+                .max(0)
+                .checked_div(dp_rank_count)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let loads = loads
             .into_iter()
             .map(|load| {
@@ -658,7 +679,11 @@ impl WorkerMonitor {
                     gen_throughput,
                     cache_hit_rate,
                     utilization,
-                    max_running_requests: load.max_running_requests.max(0),
+                    max_running_requests: if load.max_running_requests > 0 {
+                        load.max_running_requests
+                    } else {
+                        fallback_per_dp
+                    },
                     ..Default::default()
                 }
             })
@@ -1439,13 +1464,15 @@ sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
         assert_eq!(metrics.sum("sglang:num_queue_reqs"), 32.0);
 
         let response =
-            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:").unwrap();
+            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:", 37)
+                .unwrap();
         assert_eq!(response.dp_rank_count, 1);
         assert_eq!(response.loads[0].num_running_reqs, 28);
         assert_eq!(response.loads[0].num_waiting_reqs, 6);
         assert_eq!(response.loads[0].num_total_reqs, 34);
         assert_eq!(response.loads[0].num_waiting_uncached_tokens, 151477);
         assert_eq!(response.loads[0].num_used_tokens, 1420277);
+        assert_eq!(response.loads[0].max_running_requests, 37);
         assert!((response.effective_token_usage() - 0.98).abs() < 1e-12);
         assert_eq!(response.total_gen_throughput(), 1147.0);
     }
@@ -1464,7 +1491,8 @@ sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
         );
 
         let response =
-            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:").unwrap();
+            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:", 37)
+                .unwrap();
         assert_eq!(response.dp_rank_count, 2);
         assert_eq!(
             response
@@ -1490,8 +1518,49 @@ sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
                 .sum::<i32>(),
             7
         );
+        assert!(response
+            .loads
+            .iter()
+            .all(|load| load.max_running_requests == 18));
+        assert_eq!(
+            response
+                .loads
+                .iter()
+                .map(|load| load.max_running_requests)
+                .sum::<i32>(),
+            36
+        );
         assert!((response.effective_token_usage() - 0.3).abs() < f64::EPSILON);
         assert!((response.total_gen_throughput() - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sglang_standard_load_prefers_reported_capacity_over_metadata_fallback() {
+        let standard: Vec<SglangHttpLoadSnapshot> = serde_json::from_str(
+            r#"[{"dp_rank":0,"num_reqs":34,"num_waiting_reqs":6,"max_running_requests":45}]"#,
+        )
+        .unwrap();
+        let metrics = PromScrape::parse("sglang:token_usage 0.5\n");
+
+        let response =
+            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:", 37)
+                .unwrap();
+        assert_eq!(response.loads[0].max_running_requests, 45);
+    }
+
+    #[test]
+    fn sglang_standard_load_keeps_partial_rank_capacity_incomplete() {
+        let standard: Vec<SglangHttpLoadSnapshot> = serde_json::from_str(
+            r#"[{"dp_rank":0,"num_reqs":34,"max_running_requests":45},{"dp_rank":1,"num_reqs":7}]"#,
+        )
+        .unwrap();
+        let metrics = PromScrape::parse("sglang:token_usage 0.5\n");
+
+        let response =
+            WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:", 90)
+                .unwrap();
+        assert_eq!(response.loads[0].max_running_requests, 45);
+        assert_eq!(response.loads[1].max_running_requests, 0);
     }
 
     #[test]
