@@ -3421,6 +3421,9 @@ mod tests {
         cache_policy: Arc<dyn LoadBalancingPolicy>,
         workers: Vec<Arc<dyn Worker>>,
         partition_headers: HeaderMap,
+        // Keep adaptive load telemetry alive across sequential requests.
+        _loads_tx: watch::Sender<HashMap<String, WorkerLoadResponse>>,
+        _observed_loads_tx: watch::Sender<HashMap<String, ObservedWorkerLoad>>,
     }
 
     fn cold_bootstrap_test_fixture(worker_url: String) -> ColdBootstrapTestFixture {
@@ -3511,6 +3514,8 @@ mod tests {
             cache_policy,
             workers,
             partition_headers,
+            _loads_tx,
+            _observed_loads_tx,
         }
     }
 
@@ -3700,6 +3705,7 @@ mod tests {
         );
 
         server.await.unwrap();
+        drop((_loads_tx, _observed_loads_tx));
     }
 
     #[tokio::test]
@@ -3709,6 +3715,8 @@ mod tests {
             cache_policy,
             workers,
             partition_headers,
+            _loads_tx,
+            _observed_loads_tx,
         } = cold_bootstrap_test_fixture("http://127.0.0.1:9".to_string());
         let tenant_meta = TenantRequestMeta::new(TenantKey::new("tenant-a"));
 
@@ -3777,6 +3785,8 @@ mod tests {
             cache_policy,
             workers,
             partition_headers,
+            _loads_tx,
+            _observed_loads_tx,
         } = cold_bootstrap_test_fixture(worker_url);
         let response = router
             .route_typed_request(
@@ -3834,6 +3844,8 @@ mod tests {
             cache_policy,
             workers,
             partition_headers,
+            _loads_tx,
+            _observed_loads_tx,
         } = cold_bootstrap_test_fixture(worker_url);
         let typed_req = TestGenerationRequest {
             stream: true,
@@ -4104,7 +4116,8 @@ mod tests {
             workers,
             partition_headers,
             request_text,
-            ..
+            _loads_tx,
+            _observed_loads_tx,
         } = distribution_test_fixture("http://127.0.0.1:9".to_string());
 
         for (request_id, include_usage) in
@@ -4178,7 +4191,8 @@ mod tests {
             workers,
             partition_headers,
             request_text,
-            ..
+            _loads_tx,
+            _observed_loads_tx,
         } = distribution_test_fixture(idle_url);
         let meta = distribution_test_meta("request-with-usage");
         let response = router
@@ -4253,7 +4267,8 @@ mod tests {
             workers,
             partition_headers,
             request_text,
-            ..
+            _loads_tx,
+            _observed_loads_tx,
         } = distribution_test_fixture(idle_url);
         let idle = Arc::clone(&workers[1]);
         let typed_req = TestGenerationRequest {
