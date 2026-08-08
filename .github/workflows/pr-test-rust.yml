@@ -15,6 +15,12 @@ on:
       - "mkdocs.yml"
       - "*.md"
   workflow_dispatch:
+    inputs:
+      cpu_only:
+        description: "Run only compile, lint, and unit-test jobs"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -333,6 +339,7 @@ jobs:
   # --- Benchmarks (standalone) ---
 
   benchmarks:
+    if: github.event_name != 'workflow_dispatch' || inputs.cpu_only != true
     needs: build-wheel
     runs-on: 4-gpu-h100
     timeout-minutes: 36
@@ -505,6 +512,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -551,6 +559,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -579,6 +588,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -607,6 +617,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -628,6 +639,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -661,6 +673,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -683,6 +696,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -714,6 +728,7 @@ jobs:
   e2e-4gpu-chat:
     name: e2e-4gpu-chat (${{ matrix.engine }})
     needs: [e2e-1gpu-chat]
+    if: github.event_name != 'workflow_dispatch' || inputs.cpu_only != true
     strategy:
       fail-fast: false
       matrix:
@@ -736,6 +751,7 @@ jobs:
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
     needs: [e2e-1gpu-gateway]
+    if: github.event_name != 'workflow_dispatch' || inputs.cpu_only != true
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -749,6 +765,7 @@ jobs:
   e2e-4gpu-epd:
     name: e2e-4gpu-epd (tokenspeed)
     needs: [e2e-1gpu-chat]
+    if: github.event_name != 'workflow_dispatch' || inputs.cpu_only != true
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: tokenspeed
@@ -768,6 +785,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -914,6 +932,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && (github.event_name != 'workflow_dispatch' || inputs.cpu_only != true)
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
