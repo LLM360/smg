@@ -631,6 +631,18 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.02, help_heading = "Adaptive Admission")]
     adaptive_admission_feedback_throughput_improvement_ratio: f64,
 
+    /// Exact partition allowed to use bounded distribution headroom. Repeat
+    /// for multiple partitions. Empty by default, so the path is inert.
+    #[arg(long, help_heading = "Adaptive Admission")]
+    adaptive_admission_distribution_headroom_partition: Vec<String>,
+
+    /// Process-local cap on concurrent distribution-headroom routes per
+    /// enabled partition. Zero disables the path; the experimental isolated
+    /// singleton-canary implementation requires exactly one. This is unsafe
+    /// across blue/green or other multi-router overlap.
+    #[arg(long, default_value_t = 0, help_heading = "Adaptive Admission")]
+    adaptive_admission_distribution_headroom_max_inflight: u16,
+
     // ==================== Tenant Rate Limit ====================
     /// Enable per-tenant LLM token/request rate limiting. When unset
     /// (default), no rate limiter is constructed.
@@ -1654,6 +1666,11 @@ impl CliArgs {
                 feedback_max_token_usage: self.adaptive_admission_feedback_max_token_usage,
                 feedback_throughput_improvement_ratio: self
                     .adaptive_admission_feedback_throughput_improvement_ratio,
+                distribution_headroom_partitions: self
+                    .adaptive_admission_distribution_headroom_partition
+                    .clone(),
+                distribution_headroom_max_inflight: self
+                    .adaptive_admission_distribution_headroom_max_inflight,
             })
             .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
@@ -1807,6 +1824,17 @@ impl CliArgs {
         };
 
         // ==================== Mesh Server ====================
+        if self.enable_mesh
+            && !router_config
+                .adaptive_admission
+                .distribution_headroom_partitions
+                .is_empty()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "experimental adaptive distribution headroom requires mesh-disabled singleton routing"
+                    .to_string(),
+            });
+        }
         let mesh_server_config = self.build_mesh_server_config()?;
 
         Ok(ServerConfig {
@@ -2051,6 +2079,59 @@ mod tests {
         );
         assert_eq!(adaptive.feedback_max_token_usage, 0.85);
         assert_eq!(adaptive.feedback_throughput_improvement_ratio, 0.03);
+        assert!(adaptive.distribution_headroom_partitions.is_empty());
+        assert_eq!(adaptive.distribution_headroom_max_inflight, 0);
+    }
+
+    #[test]
+    fn distribution_headroom_options_flow_into_a_valid_router_config() {
+        let mut cli = cli_args_from(&[
+            "--worker-urls",
+            "http://worker1:8000",
+            "http://worker2:8000",
+            "--cache-aware-engine-load",
+            "--max-cached-owners-per-prefix",
+            "2",
+            "--cache-owner-spill-cooldown-secs",
+            "5",
+            "--eviction-interval",
+            "0",
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-adaptive-capacity",
+            "--capacity-credit-generation",
+            "canary-1",
+            "--capacity-credit-required",
+            "--api-key",
+            "service-key",
+            "--trust-tenant-header",
+            "--prefer-trusted-tenant-header",
+            "--adaptive-admission-mode",
+            "enforce",
+            "--adaptive-admission-strategy",
+            "engine-feedback",
+            "--adaptive-admission-distribution-headroom-partition",
+            "k3",
+            "--adaptive-admission-distribution-headroom-max-inflight",
+            "1",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config
+                .adaptive_admission
+                .distribution_headroom_partitions,
+            ["k3"]
+        );
+        assert_eq!(
+            router_config
+                .adaptive_admission
+                .distribution_headroom_max_inflight,
+            1
+        );
+        router_config.validate().unwrap();
+
+        cli.enable_mesh = true;
+        assert!(cli.to_server_config(router_config).is_err());
     }
 
     /// The multimodal transport flags must reach both `RouterConfig` and the

@@ -33,9 +33,9 @@ use super::{
     fair_share::FairShareProfile,
     metrics as sched_metrics,
     state::SchedulerState,
-    AdmitOutcome, Class, GlobalFairShare, LocalAdaptiveRejection, RejectionReason, SchedulerError,
-    SchedulerGuardBody, SchedulerPermit, HEADER_X_SMG_PREEMPTED, OUTPUT_TOKEN_ESTIMATE_HEADER,
-    PRIORITY_HEADER,
+    AdmitOutcome, Class, GlobalFairShare, LocalAdaptiveRejection,
+    RedeemedCapacityCreditAuthorization, RejectionReason, SchedulerError, SchedulerGuardBody,
+    SchedulerPermit, HEADER_X_SMG_PREEMPTED, OUTPUT_TOKEN_ESTIMATE_HEADER, PRIORITY_HEADER,
 };
 use crate::{
     middleware::{
@@ -191,7 +191,7 @@ async fn run_admitted_request(
 
 pub async fn priority_admission_middleware(
     State(state): State<Arc<SchedulerState>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     Metrics::record_http_admission_received();
@@ -213,7 +213,7 @@ pub async fn priority_admission_middleware(
                 return capacity_credit_error_response(CapacityCreditError::Unknown, None);
             };
             match registry.redeem(&presented.token, &presented.binding) {
-                Ok(redeemed) => Some((redeemed.payload, presented.partition)),
+                Ok(redeemed) => Some((redeemed.payload, redeemed.binding, presented.partition)),
                 Err(error) => {
                     Metrics::record_http_admission_rejected();
                     pending_guard.resolve();
@@ -249,7 +249,11 @@ pub async fn priority_admission_middleware(
         }
     }
 
-    if let Some((held_permit, partition)) = held_credit {
+    if let Some((held_permit, binding, partition)) = held_credit {
+        if let Some(meta) = req.extensions().get::<RouteRequestMeta>().cloned() {
+            req.extensions_mut()
+                .insert(meta.with_extension(RedeemedCapacityCreditAuthorization::new(binding)));
+        }
         pending_guard.resolve();
         return run_admitted_request(
             req,

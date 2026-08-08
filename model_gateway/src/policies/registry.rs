@@ -4,6 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use http::HeaderMap;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
@@ -19,10 +20,105 @@ use super::{
 };
 use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-    policies::cache_aware::LoadReceiver,
+    policies::cache_aware::{CacheDistributionLease, LoadReceiver},
     routers::common::header_utils::extract_routing_key,
-    worker::{KvEventMonitor, Worker},
+    worker::{KvEventMonitor, Worker, WorkerLoadGuard},
 };
+
+#[derive(Debug)]
+struct CacheDistributionWorkReservation {
+    policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    worker_url: String,
+    cost: u64,
+}
+
+impl CacheDistributionWorkReservation {
+    fn into_load_guard(
+        mut self,
+        worker: Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<WorkerLoadGuard> {
+        if worker.url() != self.worker_url {
+            return None;
+        }
+        let policy = self.policy.take()?;
+        Some(WorkerLoadGuard::with_policy_reservation(
+            worker, headers, policy, self.cost,
+        ))
+    }
+}
+
+impl Drop for CacheDistributionWorkReservation {
+    fn drop(&mut self) {
+        if let Some(policy) = self.policy.take() {
+            policy.release_reservation(&self.worker_url, self.cost);
+        }
+    }
+}
+
+/// An exact cache-distribution target plus its non-cloneable policy lease.
+///
+/// Callers compose `worker()` with their normal `WorkerLoadGuard`, validate
+/// immediately before the one backend attempt, and commit only after success.
+#[derive(Debug)]
+pub(crate) struct CacheDistributionRoute {
+    worker: Arc<dyn Worker>,
+    lease: CacheDistributionLease,
+    work_reservation: Option<CacheDistributionWorkReservation>,
+}
+
+impl CacheDistributionRoute {
+    pub(crate) fn worker(&self) -> Arc<dyn Worker> {
+        Arc::clone(&self.worker)
+    }
+
+    pub(crate) fn target_url(&self) -> &str {
+        self.lease.target_url()
+    }
+
+    pub(crate) fn target_revision(&self) -> u64 {
+        self.lease.target_revision()
+    }
+
+    pub(crate) fn target_generation_id(&self) -> u64 {
+        self.lease.target_generation_id()
+    }
+
+    pub(crate) fn partition(&self) -> &str {
+        self.lease.partition()
+    }
+
+    /// Transfer the already-recorded exact-target work reservation into the
+    /// ordinary worker guard. The route retains only the cache lease.
+    pub(crate) fn create_load_guard(
+        &mut self,
+        headers: Option<&HeaderMap>,
+    ) -> Option<WorkerLoadGuard> {
+        self.work_reservation
+            .take()?
+            .into_load_guard(Arc::clone(&self.worker), headers)
+    }
+
+    pub(crate) fn validate_before_dispatch(
+        &self,
+        registry: &PolicyRegistry,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> bool {
+        registry.validate_cache_distribution_route(model_id, workers, info, self)
+    }
+
+    pub(crate) fn commit_after_success(
+        &mut self,
+        registry: &PolicyRegistry,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        request_text: &str,
+    ) -> bool {
+        registry.commit_cache_distribution_route(model_id, workers, request_text, self)
+    }
+}
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -121,11 +217,13 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        if let Some(sticky) = self.routing_key_sticky.as_ref() {
-            if Self::routing_key_override_applies(policy.name())
-                && extract_routing_key(info.headers).is_some()
-            {
-                return sticky.select_worker(workers, info);
+        if !info.forbid_unleased_cache_owner_expansion {
+            if let Some(sticky) = self.routing_key_sticky.as_ref() {
+                if Self::routing_key_override_applies(policy.name())
+                    && extract_routing_key(info.headers).is_some()
+                {
+                    return sticky.select_worker(workers, info);
+                }
             }
         }
         policy.select_worker(workers, info)
@@ -142,16 +240,95 @@ impl PolicyRegistry {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<(usize, Option<u64>)> {
-        if let Some(sticky) = self.routing_key_sticky.as_ref() {
-            if Self::routing_key_override_applies(policy.name())
-                && extract_routing_key(info.headers).is_some()
-            {
-                return sticky.select_worker(workers, info).map(|idx| (idx, None));
+        if !info.forbid_unleased_cache_owner_expansion {
+            if let Some(sticky) = self.routing_key_sticky.as_ref() {
+                if Self::routing_key_override_applies(policy.name())
+                    && extract_routing_key(info.headers).is_some()
+                {
+                    return sticky.select_worker(workers, info).map(|idx| (idx, None));
+                }
             }
         }
 
         let idx = policy.select_worker(workers, info)?;
         Some((idx, policy.reservation_cost(info)))
+    }
+
+    /// Begin a default-off exact cache-distribution route through a
+    /// cache-aware policy. Non-cache policies, incomplete engine telemetry,
+    /// disabled replication settings, and inexact candidates return `None`.
+    pub(crate) fn begin_cache_distribution_route(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        partition: &str,
+        allowed_targets: &[(String, u64, u64)],
+    ) -> Option<CacheDistributionRoute> {
+        let policy = self.get_policy_or_default(model_id);
+        let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>()?;
+        let (target_idx, lease) = cache_aware.begin_distribution_lease(
+            model_id,
+            workers,
+            info,
+            partition,
+            allowed_targets,
+        )?;
+        let worker = Arc::clone(&workers[target_idx]);
+        let cost = cache_aware.reserve_distribution_target_work(worker.as_ref(), info);
+        Some(CacheDistributionRoute {
+            worker: Arc::clone(&worker),
+            lease,
+            work_reservation: Some(CacheDistributionWorkReservation {
+                policy: Some(policy),
+                worker_url: worker.url().to_string(),
+                cost,
+            }),
+        })
+    }
+
+    fn validate_cache_distribution_route(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        route: &CacheDistributionRoute,
+    ) -> bool {
+        let policy = self.get_policy_or_default(model_id);
+        policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .is_some_and(|cache_aware| {
+                cache_aware.validate_distribution_lease(
+                    model_id,
+                    workers,
+                    info,
+                    &route.worker,
+                    &route.lease,
+                )
+            })
+    }
+
+    fn commit_cache_distribution_route(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        request_text: &str,
+        route: &mut CacheDistributionRoute,
+    ) -> bool {
+        let policy = self.get_policy_or_default(model_id);
+        policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .is_some_and(|cache_aware| {
+                cache_aware.commit_distribution_success(
+                    model_id,
+                    workers,
+                    request_text,
+                    &route.worker,
+                    &mut route.lease,
+                )
+            })
     }
 
     /// Policies that already honor `X-SMG-Routing-Key` keep their own handling; all
@@ -703,8 +880,8 @@ mod tests {
         }))
     }
 
-    fn headers_with_key(key: &str) -> http::HeaderMap {
-        let mut h = http::HeaderMap::new();
+    fn headers_with_key(key: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
         h.insert("x-smg-routing-key", key.parse().unwrap());
         h
     }
@@ -720,6 +897,30 @@ mod tests {
         assert!(!PolicyRegistry::routing_key_override_applies(
             "consistent_hashing"
         ));
+    }
+
+    #[test]
+    fn exact_cache_distribution_api_is_downcast_only() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let workers = vec![worker("http://w1", WorkerType::Regular)];
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            ..Default::default()
+        };
+
+        assert!(registry
+            .begin_cache_distribution_route(
+                crate::worker::UNKNOWN_MODEL_ID,
+                &workers,
+                &info,
+                "model",
+                &[(
+                    workers[0].url().to_string(),
+                    workers[0].generation_id(),
+                    workers[0].revision(),
+                )],
+            )
+            .is_none());
     }
 
     #[test]
@@ -746,6 +947,35 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
         }
+    }
+
+    #[test]
+    fn distribution_guard_bypasses_routing_key_override() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let headers = headers_with_key("session-A");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+
+        let first = reg.select_worker(&policy, &workers, &info).unwrap();
+        let second = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_ne!(
+            first, second,
+            "the keyed sticky override must not bypass a guarded policy"
+        );
     }
 
     #[test]

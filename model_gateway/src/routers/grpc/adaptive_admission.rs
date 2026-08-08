@@ -8,12 +8,12 @@
 //! rejecting traffic.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Weak,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -22,13 +22,14 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use crate::{
-    config::{AdaptiveAdmissionConfig, AdaptiveAdmissionMode, AdaptiveAdmissionStrategy},
-    middleware::scheduler::state::AdaptiveCapacityProvider,
+    config::{
+        AdaptiveAdmissionConfig, AdaptiveAdmissionMode, AdaptiveAdmissionStrategy,
+        DISTRIBUTION_HEADROOM_MAX_AGE_SECS,
+    },
+    middleware::scheduler::{state::AdaptiveCapacityProvider, ADMISSION_PARTITION_LABEL},
     observability::metrics::intern_string,
-    worker::WorkerRegistry,
+    worker::{monitor::ObservedWorkerLoad, ConnectionMode, WorkerRegistry, WorkerType},
 };
-
-const ADMISSION_PARTITION_LABEL: &str = "admission_partition";
 
 const PREDICTIONS_TOTAL: &str = "smg_adaptive_admission_predictions_total";
 const PREDICTED_OUTPUT_TOKENS: &str = "smg_adaptive_admission_predicted_output_tokens";
@@ -51,10 +52,18 @@ const ENGINE_MEAN_TOKEN_USAGE: &str = "smg_adaptive_admission_engine_mean_token_
 const ENGINE_MAX_RUNNING: &str = "smg_adaptive_admission_engine_max_running_requests";
 const ENGINE_MAX_RUNNING_COVERAGE: &str =
     "smg_adaptive_admission_engine_max_running_requests_coverage";
+const DISTRIBUTION_HEADROOM: &str = "smg_adaptive_admission_distribution_headroom_requests";
+const DISTRIBUTION_HEADROOM_COVERAGE: &str =
+    "smg_adaptive_admission_distribution_headroom_coverage";
+const DISTRIBUTION_HEADROOM_ACTIVE: &str =
+    "smg_adaptive_admission_distribution_headroom_active_requests";
+const DISTRIBUTION_OVERRIDES_TOTAL: &str = "smg_adaptive_admission_distribution_overrides_total";
 const ROUTER_OUTSTANDING_REQUESTS: &str = "smg_adaptive_admission_router_outstanding_requests";
 const FEEDBACK_RUNNING_LIMIT: &str = "smg_adaptive_admission_feedback_running_limit";
 const FEEDBACK_KNEE_PER_REPLICA: &str = "smg_adaptive_admission_feedback_knee_requests_per_replica";
 const SEGMENTS: &str = "smg_adaptive_admission_estimator_segments";
+const DISTRIBUTION_HEADROOM_MAX_AGE: Duration =
+    Duration::from_secs(DISTRIBUTION_HEADROOM_MAX_AGE_SECS);
 
 pub(crate) const FLAG_MULTIPLE_COMPLETIONS: u16 = 1 << 0;
 pub(crate) const FLAG_TOOLS: u16 = 1 << 1;
@@ -142,6 +151,22 @@ pub(crate) fn describe_metrics() {
     describe_gauge!(
         ENGINE_MAX_RUNNING_COVERAGE,
         "Fraction of healthy replicas contributing a maximum-running-requests ceiling"
+    );
+    describe_gauge!(
+        DISTRIBUTION_HEADROOM,
+        "Safe cache-policy-agnostic request headroom across fully observed workers"
+    );
+    describe_gauge!(
+        DISTRIBUTION_HEADROOM_COVERAGE,
+        "Fraction of healthy replicas contributing strict per-worker headroom"
+    );
+    describe_gauge!(
+        DISTRIBUTION_HEADROOM_ACTIVE,
+        "Pre-dispatch distribution-headroom permits active in this gateway"
+    );
+    describe_counter!(
+        DISTRIBUTION_OVERRIDES_TOTAL,
+        "Rejected adaptive admissions explicitly authorized for an exact distribution route"
     );
     describe_gauge!(
         ROUTER_OUTSTANDING_REQUESTS,
@@ -418,6 +443,7 @@ impl HierarchicalPredictor {
 
 #[derive(Debug, Clone, Default)]
 struct PartitionLoad {
+    model_ids: HashSet<String>,
     healthy_replicas: u32,
     observed_replicas: u32,
     generation_tokens_per_second: f64,
@@ -429,6 +455,88 @@ struct PartitionLoad {
     token_usage_sum: f64,
     max_running_requests: i64,
     max_running_observed_replicas: u32,
+    strict_max_running_requests: i64,
+    strict_effective_occupancy: i64,
+    headroom_healthy_replicas: u32,
+    headroom_observed_replicas: u32,
+    issuable_headroom_requests: i64,
+    worker_headroom_requests: HashMap<String, WorkerHeadroom>,
+    worker_router_load_observations: HashMap<(String, u64, u64), usize>,
+    headroom_epoch: u64,
+    observed_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerHeadroom {
+    requests: i64,
+    generation_id: u64,
+    revision: u64,
+    router_load_at_observation: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StrictWorkerCapacity {
+    running_requests: i64,
+    waiting_requests: i64,
+    max_running_requests: i64,
+    max_pressure: f64,
+}
+
+fn strict_worker_capacity(
+    load: &WorkerLoadResponse,
+    registered_max_running_requests: Option<u16>,
+) -> Option<StrictWorkerCapacity> {
+    let rank_count = usize::try_from(load.dp_rank_count).ok()?;
+    if rank_count == 0 || rank_count != load.loads.len() {
+        return None;
+    }
+    let mut ranks = HashSet::with_capacity(rank_count);
+    let mut capacity = StrictWorkerCapacity {
+        running_requests: 0,
+        waiting_requests: 0,
+        max_running_requests: 0,
+        max_pressure: 0.0,
+    };
+    for rank in &load.loads {
+        if rank.max_running_requests < 0 {
+            return None;
+        }
+        let max_running_requests = if rank.max_running_requests > 0 {
+            rank.max_running_requests
+        } else if rank_count == 1 {
+            // Older SGLang HTTP `/get_load` payloads omit this field even
+            // though worker discovery publishes the exact engine-wide cap.
+            // The metadata fallback is unambiguous only for a single DP rank;
+            // multi-rank workers remain fail closed unless every rank reports
+            // its own capacity.
+            i32::from(registered_max_running_requests?)
+        } else {
+            return None;
+        };
+        if !ranks.insert(rank.dp_rank)
+            || rank.num_running_reqs < 0
+            || rank.num_waiting_reqs < 0
+            || !rank.token_usage.is_finite()
+            || !rank.utilization.is_finite()
+            || !(0.0..=1.0).contains(&rank.token_usage)
+            || !(0.0..=1.0).contains(&rank.utilization)
+        {
+            return None;
+        }
+        capacity.running_requests = capacity
+            .running_requests
+            .saturating_add(i64::from(rank.num_running_reqs));
+        capacity.waiting_requests = capacity
+            .waiting_requests
+            .saturating_add(i64::from(rank.num_waiting_reqs));
+        capacity.max_running_requests = capacity
+            .max_running_requests
+            .saturating_add(i64::from(max_running_requests));
+        capacity.max_pressure = capacity
+            .max_pressure
+            .max(rank.token_usage.max(rank.utilization));
+    }
+    Some(capacity)
 }
 
 #[derive(Debug, Clone)]
@@ -529,6 +637,25 @@ impl PartitionLoad {
             .floor()
         }
     }
+
+    fn headroom_coverage(&self) -> f64 {
+        if self.headroom_healthy_replicas == 0 {
+            0.0
+        } else {
+            f64::from(self.headroom_observed_replicas) / f64::from(self.headroom_healthy_replicas)
+        }
+    }
+
+    fn headroom_is_fresh(&self) -> bool {
+        self.observed_at
+            .is_some_and(|observed_at| observed_at.elapsed() <= DISTRIBUTION_HEADROOM_MAX_AGE)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActiveDistributionHeadroom {
+    total: u32,
+    by_worker: HashMap<(String, u64, u64), u32>,
 }
 
 #[derive(Debug, Default)]
@@ -538,6 +665,8 @@ struct WorkState {
     loads: HashMap<String, PartitionLoad>,
     capacities: HashMap<String, CapacityEstimate>,
     feedback_estimates: HashMap<String, FeedbackEstimate>,
+    active_distribution_headroom: HashMap<String, ActiveDistributionHeadroom>,
+    headroom_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -545,6 +674,10 @@ struct EngineFeedbackConstraints {
     telemetry_usable: bool,
     running_limit: Option<f64>,
     pressure_reason: Option<&'static str>,
+}
+
+fn distribution_challenge_reason(reason: &str) -> bool {
+    matches!(reason, "engine_waiting" | "running_limit")
 }
 
 fn engine_feedback_constraints(
@@ -638,6 +771,116 @@ pub(crate) struct AdaptiveAdmissionController {
     capacity_revision: watch::Sender<u64>,
 }
 
+/// Pre-dispatch permit for one adaptive distribution route. It is scoped to
+/// one gateway process and transferred to the ordinary worker-load guard at
+/// dispatch, so it remains disabled unless an explicit partition allowlist
+/// enables the higher-level routing feature.
+#[derive(Debug)]
+pub(crate) struct DistributionHeadroomPermit {
+    controller: Weak<AdaptiveAdmissionController>,
+    partition: String,
+    telemetry_epoch: u64,
+    target: Option<(String, u64, u64)>,
+    active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DistributionHeadroomCandidate {
+    pub(crate) worker_url: String,
+    pub(crate) worker_generation_id: u64,
+    pub(crate) worker_revision: u64,
+}
+
+impl DistributionHeadroomPermit {
+    /// Bind the already-reserved aggregate slot to the exact route selected by
+    /// the cache policy. A telemetry or worker-generation change fails closed.
+    pub(crate) fn bind_target(
+        &mut self,
+        target_url: &str,
+        target_generation_id: u64,
+        target_revision: u64,
+    ) -> bool {
+        if self.target.is_some() {
+            return false;
+        }
+        let Some(controller) = self.controller.upgrade() else {
+            return false;
+        };
+        if controller.bind_distribution_target(
+            &self.partition,
+            self.telemetry_epoch,
+            target_url,
+            target_generation_id,
+            target_revision,
+        ) {
+            self.target = Some((
+                target_url.to_string(),
+                target_generation_id,
+                target_revision,
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn validate_for_dispatch(&self) -> bool {
+        let Some((target_url, target_generation_id, target_revision)) = self.target.as_ref() else {
+            return false;
+        };
+        self.controller.upgrade().is_some_and(|controller| {
+            controller.validate_distribution_target(
+                &self.partition,
+                self.telemetry_epoch,
+                target_url,
+                *target_generation_id,
+                *target_revision,
+            )
+        })
+    }
+
+    /// Atomically transfer this adaptive reservation to the exact target's
+    /// already-created ordinary `WorkerLoadGuard`. The controller discounts
+    /// exactly that one new router-local load, revalidates the telemetry epoch
+    /// and target generation, and decrements this permit while holding one work
+    /// lock. On failure, consuming `self` leaves the permit active so `Drop`
+    /// performs the normal fail-closed release.
+    pub(crate) fn try_transfer_after_worker_load_reserved(mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+        let Some((target_url, target_generation_id, target_revision)) = self.target.clone() else {
+            return false;
+        };
+        let Some(controller) = self.controller.upgrade() else {
+            return false;
+        };
+        if !controller.try_transfer_distribution_headroom(
+            &self.partition,
+            self.telemetry_epoch,
+            &target_url,
+            target_generation_id,
+            target_revision,
+        ) {
+            return false;
+        }
+        self.active = false;
+        true
+    }
+}
+
+impl Drop for DistributionHeadroomPermit {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(controller) = self.controller.upgrade() else {
+            return;
+        };
+        controller.release_distribution_headroom(&self.partition, self.target.as_ref());
+    }
+}
+
 impl AdaptiveAdmissionController {
     pub(crate) fn new(config: AdaptiveAdmissionConfig, registry: Arc<WorkerRegistry>) -> Arc<Self> {
         let (capacity_revision, _) = watch::channel(0_u64);
@@ -655,36 +898,544 @@ impl AdaptiveAdmissionController {
         self.config.mode
     }
 
+    pub(crate) fn distribution_headroom_enabled(&self, partition: &str) -> bool {
+        self.config.distribution_headroom_max_inflight > 0
+            && self
+                .config
+                .distribution_headroom_partitions
+                .iter()
+                .any(|allowed| allowed == partition)
+    }
+
+    fn current_router_loads(&self) -> HashMap<(String, u64, u64), usize> {
+        self.registry
+            .get_all()
+            .into_iter()
+            .filter(|worker| {
+                worker.is_healthy()
+                    && worker.generation_id() != 0
+                    && *worker.worker_type() == WorkerType::Regular
+                    && *worker.connection_mode() == ConnectionMode::Http
+            })
+            .map(|worker| {
+                (
+                    (
+                        worker.url().to_string(),
+                        worker.generation_id(),
+                        worker.revision(),
+                    ),
+                    worker.load(),
+                )
+            })
+            .collect()
+    }
+
+    fn adjusted_distribution_headroom(
+        load: &PartitionLoad,
+        current: &HashMap<(String, u64, u64), usize>,
+    ) -> Option<(i64, i64)> {
+        if load.worker_router_load_observations.len()
+            != usize::try_from(load.headroom_healthy_replicas).ok()?
+        {
+            return None;
+        }
+        let router_delta = load.worker_router_load_observations.iter().try_fold(
+            0_i64,
+            |total, (identity, observed)| {
+                let current = *current.get(identity)?;
+                let delta = i64::try_from(current.saturating_sub(*observed)).ok()?;
+                Some(total.saturating_add(delta))
+            },
+        )?;
+        let aggregate_gap = load
+            .strict_max_running_requests
+            .saturating_sub(load.strict_effective_occupancy)
+            .saturating_sub(router_delta)
+            .max(0);
+        let eligible_worker_gap =
+            load.worker_headroom_requests
+                .iter()
+                .try_fold(0_i64, |total, (url, headroom)| {
+                    let current =
+                        *current.get(&(url.clone(), headroom.generation_id, headroom.revision))?;
+                    let delta =
+                        i64::try_from(current.saturating_sub(headroom.router_load_at_observation))
+                            .ok()?;
+                    Some(total.saturating_add(headroom.requests.saturating_sub(delta).max(0)))
+                })?;
+        Some((router_delta, aggregate_gap.min(eligible_worker_gap)))
+    }
+
+    /// Atomically reserve aggregate distribution headroom and return the exact
+    /// worker generations eligible at that telemetry epoch. Cache ownership is
+    /// applied later by the routing policy.
+    pub(crate) fn try_acquire_distribution_headroom(
+        self: &Arc<Self>,
+        partition: &str,
+        model: &str,
+    ) -> Option<(
+        DistributionHeadroomPermit,
+        Vec<DistributionHeadroomCandidate>,
+    )> {
+        if partition != model || !self.distribution_headroom_enabled(partition) {
+            return None;
+        }
+        let max_inflight = self.config.distribution_headroom_max_inflight;
+        let current_router_loads = self.current_router_loads();
+        let mut work = self.work.lock();
+        let load = work.loads.get(partition)?.clone();
+        if !load.headroom_is_fresh()
+            || load.coverage() < 1.0
+            || load.headroom_coverage() < 1.0
+            || load.model_ids.len() != 1
+            || !load.model_ids.contains(model)
+        {
+            return None;
+        }
+        let telemetry_epoch = load.headroom_epoch;
+        let headroom = load.worker_headroom_requests.clone();
+        let active = work
+            .active_distribution_headroom
+            .entry(partition.to_string())
+            .or_default();
+        let (_, adjusted_headroom) =
+            Self::adjusted_distribution_headroom(&load, &current_router_loads)?;
+        let available = u32::try_from(adjusted_headroom.max(0))
+            .unwrap_or(u32::MAX)
+            .min(u32::from(max_inflight));
+        if available <= active.total {
+            return None;
+        }
+        let candidates: Vec<_> = headroom
+            .iter()
+            .filter(|(url, headroom)| {
+                let identity = (url.to_string(), headroom.generation_id, headroom.revision);
+                let active_for_worker = active.by_worker.get(&identity).copied().unwrap_or(0);
+                let current = current_router_loads
+                    .get(&identity)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                let post_observation =
+                    i64::try_from(current.saturating_sub(headroom.router_load_at_observation))
+                        .unwrap_or(i64::MAX);
+                let adjusted_headroom = headroom.requests.saturating_sub(post_observation).max(0);
+                u32::try_from(adjusted_headroom).unwrap_or(u32::MAX) > active_for_worker
+            })
+            .map(|(url, headroom)| DistributionHeadroomCandidate {
+                worker_url: url.clone(),
+                worker_generation_id: headroom.generation_id,
+                worker_revision: headroom.revision,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        active.total = active.total.saturating_add(1);
+        gauge!(DISTRIBUTION_HEADROOM_ACTIVE, "partition" => intern_string(partition))
+            .set(f64::from(active.total));
+        Some((
+            DistributionHeadroomPermit {
+                controller: Arc::downgrade(self),
+                partition: partition.to_string(),
+                telemetry_epoch,
+                target: None,
+                active: true,
+            },
+            candidates,
+        ))
+    }
+
+    fn bind_distribution_target(
+        &self,
+        partition: &str,
+        telemetry_epoch: u64,
+        target_url: &str,
+        target_generation_id: u64,
+        target_revision: u64,
+    ) -> bool {
+        let Some(worker) = self.registry.get_by_url(target_url) else {
+            return false;
+        };
+        if target_generation_id == 0
+            || worker.generation_id() != target_generation_id
+            || worker.revision() != target_revision
+            || !worker.is_available()
+        {
+            return false;
+        }
+        let current_router_loads = self.current_router_loads();
+        let mut work = self.work.lock();
+        let Some(load) = work.loads.get(partition) else {
+            return false;
+        };
+        let Some((_, adjusted_headroom)) =
+            Self::adjusted_distribution_headroom(load, &current_router_loads)
+        else {
+            return false;
+        };
+        let aggregate_limit = u32::try_from(adjusted_headroom.max(0))
+            .unwrap_or(u32::MAX)
+            .min(u32::from(self.config.distribution_headroom_max_inflight));
+        if load.headroom_epoch != telemetry_epoch
+            || !load.headroom_is_fresh()
+            || load.coverage() < 1.0
+            || load.headroom_coverage() < 1.0
+            || load.model_ids.len() != 1
+            || aggregate_limit == 0
+        {
+            return false;
+        }
+        let Some(headroom) = load.worker_headroom_requests.get(target_url) else {
+            return false;
+        };
+        if headroom.generation_id != target_generation_id || headroom.revision != target_revision {
+            return false;
+        }
+        if worker.generation_id() != target_generation_id
+            || worker.revision() != target_revision
+            || !worker.is_available()
+        {
+            return false;
+        }
+        let current_target_load = current_router_loads
+            .get(&(
+                target_url.to_string(),
+                target_generation_id,
+                target_revision,
+            ))
+            .copied()
+            .unwrap_or(usize::MAX);
+        let post_observation =
+            i64::try_from(current_target_load.saturating_sub(headroom.router_load_at_observation))
+                .unwrap_or(i64::MAX);
+        let worker_limit = u32::try_from(headroom.requests.saturating_sub(post_observation).max(0))
+            .unwrap_or(u32::MAX);
+        let Some(active) = work.active_distribution_headroom.get_mut(partition) else {
+            return false;
+        };
+        if active.total > aggregate_limit {
+            return false;
+        }
+        let worker_active = active
+            .by_worker
+            .entry((
+                target_url.to_string(),
+                target_generation_id,
+                target_revision,
+            ))
+            .or_default();
+        if *worker_active >= worker_limit {
+            return false;
+        }
+        *worker_active = worker_active.saturating_add(1);
+        true
+    }
+
+    fn validate_distribution_target(
+        &self,
+        partition: &str,
+        telemetry_epoch: u64,
+        target_url: &str,
+        target_generation_id: u64,
+        target_revision: u64,
+    ) -> bool {
+        let current_router_loads = self.current_router_loads();
+        self.validate_distribution_target_with_loads(
+            partition,
+            telemetry_epoch,
+            target_url,
+            target_generation_id,
+            target_revision,
+            &current_router_loads,
+        )
+    }
+
+    fn validate_distribution_target_with_loads(
+        &self,
+        partition: &str,
+        telemetry_epoch: u64,
+        target_url: &str,
+        target_generation_id: u64,
+        target_revision: u64,
+        current_router_loads: &HashMap<(String, u64, u64), usize>,
+    ) -> bool {
+        let work = self.work.lock();
+        self.validate_distribution_target_locked(
+            &work,
+            partition,
+            telemetry_epoch,
+            (target_url, target_generation_id, target_revision),
+            current_router_loads,
+        )
+    }
+
+    fn validate_distribution_target_locked(
+        &self,
+        work: &WorkState,
+        partition: &str,
+        telemetry_epoch: u64,
+        target: (&str, u64, u64),
+        current_router_loads: &HashMap<(String, u64, u64), usize>,
+    ) -> bool {
+        let (target_url, target_generation_id, target_revision) = target;
+        let Some(worker) = self.registry.get_by_url(target_url) else {
+            return false;
+        };
+        if target_generation_id == 0
+            || worker.generation_id() != target_generation_id
+            || worker.revision() != target_revision
+            || !worker.is_available()
+        {
+            return false;
+        }
+        let Some(load) = work.loads.get(partition) else {
+            return false;
+        };
+        let Some((_, adjusted_headroom)) =
+            Self::adjusted_distribution_headroom(load, current_router_loads)
+        else {
+            return false;
+        };
+        let aggregate_limit = u32::try_from(adjusted_headroom.max(0))
+            .unwrap_or(u32::MAX)
+            .min(u32::from(self.config.distribution_headroom_max_inflight));
+        if load.headroom_epoch != telemetry_epoch
+            || !load.headroom_is_fresh()
+            || load.coverage() < 1.0
+            || load.headroom_coverage() < 1.0
+            || load.model_ids.len() != 1
+            || aggregate_limit == 0
+        {
+            return false;
+        }
+        if work
+            .active_distribution_headroom
+            .get(partition)
+            .is_none_or(|active| active.total > aggregate_limit)
+        {
+            return false;
+        }
+        let Some(headroom) = load.worker_headroom_requests.get(target_url) else {
+            return false;
+        };
+        if headroom.generation_id != target_generation_id || headroom.revision != target_revision {
+            return false;
+        }
+        let current_target_load = current_router_loads
+            .get(&(
+                target_url.to_string(),
+                target_generation_id,
+                target_revision,
+            ))
+            .copied()
+            .unwrap_or(usize::MAX);
+        let post_observation =
+            i64::try_from(current_target_load.saturating_sub(headroom.router_load_at_observation))
+                .unwrap_or(i64::MAX);
+        let worker_limit = u32::try_from(headroom.requests.saturating_sub(post_observation).max(0))
+            .unwrap_or(u32::MAX);
+        let key = (
+            target_url.to_string(),
+            target_generation_id,
+            target_revision,
+        );
+        if work
+            .active_distribution_headroom
+            .get(partition)
+            .and_then(|active| active.by_worker.get(&key))
+            .is_none_or(|active| *active > worker_limit)
+        {
+            return false;
+        }
+        self.registry.get_by_url(target_url).is_some_and(|current| {
+            current.generation_id() == target_generation_id
+                && current.revision() == target_revision
+                && current.is_available()
+        })
+    }
+
+    fn try_transfer_distribution_headroom(
+        &self,
+        partition: &str,
+        telemetry_epoch: u64,
+        target_url: &str,
+        target_generation_id: u64,
+        target_revision: u64,
+    ) -> bool {
+        let mut work = self.work.lock();
+        let mut current_router_loads = self.current_router_loads();
+        let Some(target_load) = current_router_loads.get_mut(&(
+            target_url.to_string(),
+            target_generation_id,
+            target_revision,
+        )) else {
+            return false;
+        };
+        let Some(discounted) = target_load.checked_sub(1) else {
+            return false;
+        };
+        *target_load = discounted;
+        if !self.validate_distribution_target_locked(
+            &work,
+            partition,
+            telemetry_epoch,
+            (target_url, target_generation_id, target_revision),
+            &current_router_loads,
+        ) {
+            return false;
+        }
+        let Some(remaining) = Self::transfer_distribution_headroom_locked(
+            &mut work,
+            partition,
+            target_url,
+            target_generation_id,
+            target_revision,
+        ) else {
+            return false;
+        };
+        gauge!(DISTRIBUTION_HEADROOM_ACTIVE, "partition" => intern_string(partition))
+            .set(f64::from(remaining));
+        true
+    }
+
+    fn transfer_distribution_headroom_locked(
+        work: &mut WorkState,
+        partition: &str,
+        target_url: &str,
+        target_generation_id: u64,
+        target_revision: u64,
+    ) -> Option<u32> {
+        let remaining = {
+            let active = work.active_distribution_headroom.get_mut(partition)?;
+            if active.total == 0 {
+                return None;
+            }
+            let key = (
+                target_url.to_string(),
+                target_generation_id,
+                target_revision,
+            );
+            let worker_active = active.by_worker.get_mut(&key)?;
+            if *worker_active == 0 {
+                return None;
+            }
+            *worker_active -= 1;
+            if *worker_active == 0 {
+                active.by_worker.remove(&key);
+            }
+            active.total -= 1;
+            active.total
+        };
+        if remaining == 0 {
+            work.active_distribution_headroom.remove(partition);
+        }
+        Some(remaining)
+    }
+
+    fn release_distribution_headroom(&self, partition: &str, target: Option<&(String, u64, u64)>) {
+        let mut work = self.work.lock();
+        let Some(active) = work.active_distribution_headroom.get_mut(partition) else {
+            return;
+        };
+        active.total = active.total.saturating_sub(1);
+        if let Some((target_url, target_generation_id, target_revision)) = target {
+            let key = (target_url.clone(), *target_generation_id, *target_revision);
+            if let Some(worker_active) = active.by_worker.get_mut(&key) {
+                *worker_active = worker_active.saturating_sub(1);
+                if *worker_active == 0 {
+                    active.by_worker.remove(&key);
+                }
+            }
+        }
+        let remaining = active.total;
+        if remaining == 0 {
+            work.active_distribution_headroom.remove(partition);
+        }
+        gauge!(DISTRIBUTION_HEADROOM_ACTIVE, "partition" => intern_string(partition))
+            .set(f64::from(remaining));
+    }
+
     pub(crate) fn start_load_updates(
         self: &Arc<Self>,
         mut loads: watch::Receiver<HashMap<String, WorkerLoadResponse>>,
+        mut observed_loads: watch::Receiver<HashMap<String, ObservedWorkerLoad>>,
     ) {
-        self.update_loads(&loads.borrow());
+        self.update_loads(&loads.borrow(), &observed_loads.borrow());
         let controller = Arc::downgrade(self);
         #[expect(
             clippy::disallowed_methods,
             reason = "controller task holds only a weak reference and exits with the gateway"
         )]
         tokio::spawn(async move {
+            let mut expiry = tokio::time::interval(Duration::from_secs(1));
             loop {
-                if loads.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    changed = loads.changed() => {
+                        let Some(controller) = controller.upgrade() else {
+                            break;
+                        };
+                        if changed.is_err() {
+                            controller.update_loads(&HashMap::new(), &HashMap::new());
+                            break;
+                        }
+                        controller.update_loads(&loads.borrow(), &observed_loads.borrow());
+                    }
+                    changed = observed_loads.changed() => {
+                        let Some(controller) = controller.upgrade() else {
+                            break;
+                        };
+                        if changed.is_err() {
+                            controller.update_loads(&loads.borrow(), &HashMap::new());
+                            break;
+                        }
+                        controller.update_loads(&loads.borrow(), &observed_loads.borrow());
+                    }
+                    _ = expiry.tick() => {
+                        let Some(controller) = controller.upgrade() else {
+                            break;
+                        };
+                        controller.expire_distribution_headroom();
+                    }
                 }
-                let Some(controller) = controller.upgrade() else {
-                    break;
-                };
-                controller.update_loads(&loads.borrow());
             }
         });
     }
 
-    fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+    fn expire_distribution_headroom(&self) {
+        let mut changed = false;
+        let mut work = self.work.lock();
+        work.headroom_epoch = work.headroom_epoch.wrapping_add(1);
+        let next_epoch = work.headroom_epoch;
+        for load in work.loads.values_mut() {
+            if !load.headroom_is_fresh()
+                && (load.issuable_headroom_requests != 0
+                    || !load.worker_headroom_requests.is_empty())
+            {
+                load.issuable_headroom_requests = 0;
+                load.worker_headroom_requests.clear();
+                load.headroom_epoch = next_epoch;
+                changed = true;
+            }
+        }
+        drop(work);
+        if changed {
+            self.capacity_revision
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
+    fn update_loads(
+        &self,
+        loads: &HashMap<String, WorkerLoadResponse>,
+        observed_loads: &HashMap<String, ObservedWorkerLoad>,
+    ) {
+        let now = Instant::now();
         let mut partitions: HashMap<String, PartitionLoad> = HashMap::new();
         for worker in self
             .registry
             .get_all()
             .into_iter()
-            .filter(|w| w.is_healthy())
+            .filter(|worker| worker.is_healthy())
         {
             let partition = worker
                 .metadata()
@@ -702,16 +1453,18 @@ impl AdaptiveAdmissionController {
             };
             aggregate.observed_replicas = aggregate.observed_replicas.saturating_add(1);
             aggregate.generation_tokens_per_second += load.total_gen_throughput().max(0.0);
-            aggregate.running_requests += load
+            let running_requests = load
                 .loads
                 .iter()
                 .map(|rank| i64::from(rank.num_running_reqs.max(0)))
                 .sum::<i64>();
-            aggregate.waiting_requests += load
+            let waiting_requests = load
                 .loads
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs.max(0)))
                 .sum::<i64>();
+            aggregate.running_requests += running_requests;
+            aggregate.waiting_requests += waiting_requests;
             aggregate.waiting_uncached_tokens += load.total_waiting_uncached_tokens().max(0);
             let token_usage = load.effective_token_usage().clamp(0.0, 1.0);
             aggregate.token_usage_sum += token_usage;
@@ -733,8 +1486,122 @@ impl AdaptiveAdmissionController {
             }
         }
 
-        let now = Instant::now();
+        // Build the stricter distribution-headroom view separately so the
+        // default-off feature does not change ordinary adaptive admission.
+        for worker in self.registry.get_all().into_iter().filter(|worker| {
+            worker.is_healthy()
+                && *worker.worker_type() == WorkerType::Regular
+                && *worker.connection_mode() == ConnectionMode::Http
+        }) {
+            let partition = worker
+                .metadata()
+                .spec
+                .labels
+                .get(ADMISSION_PARTITION_LABEL)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| worker.model_id())
+                .to_string();
+            let aggregate = partitions.entry(partition).or_default();
+            aggregate.headroom_healthy_replicas =
+                aggregate.headroom_healthy_replicas.saturating_add(1);
+            aggregate.model_ids.insert(worker.model_id().to_string());
+            let Some(observed) = observed_loads.get(worker.url()) else {
+                continue;
+            };
+            if !observed.authorizes_distribution_headroom() {
+                continue;
+            }
+            let worker_generation_id = worker.generation_id();
+            if worker_generation_id == 0
+                || observed.worker_generation_id != worker_generation_id
+                || observed.worker_revision != worker.revision()
+                || observed.observed_at.elapsed() > DISTRIBUTION_HEADROOM_MAX_AGE
+            {
+                continue;
+            }
+            aggregate.observed_at = Some(
+                aggregate
+                    .observed_at
+                    .map_or(observed.observed_at, |oldest| {
+                        oldest.min(observed.observed_at)
+                    }),
+            );
+            let Some(strict) =
+                strict_worker_capacity(&observed.response, worker.max_running_requests())
+            else {
+                continue;
+            };
+            aggregate.headroom_observed_replicas =
+                aggregate.headroom_observed_replicas.saturating_add(1);
+            aggregate.strict_max_running_requests = aggregate
+                .strict_max_running_requests
+                .saturating_add(strict.max_running_requests);
+            let occupancy = strict
+                .running_requests
+                .saturating_add(strict.waiting_requests);
+            let effective_occupancy = occupancy
+                .max(i64::try_from(observed.router_load_at_observation).unwrap_or(i64::MAX));
+            aggregate.strict_effective_occupancy = aggregate
+                .strict_effective_occupancy
+                .saturating_add(effective_occupancy);
+            aggregate.worker_router_load_observations.insert(
+                (
+                    worker.url().to_string(),
+                    observed.worker_generation_id,
+                    observed.worker_revision,
+                ),
+                observed.router_load_at_observation,
+            );
+            let worker_headroom = strict
+                .max_running_requests
+                .saturating_sub(effective_occupancy)
+                .max(0);
+            let waiting_limit = i64::from(
+                self.config
+                    .feedback_max_waiting_requests_per_healthy_replica,
+            );
+            if worker_headroom > 0
+                && worker.is_available()
+                && strict.waiting_requests <= waiting_limit
+                && strict.max_pressure < self.config.feedback_max_token_usage
+            {
+                aggregate.worker_headroom_requests.insert(
+                    worker.url().to_string(),
+                    WorkerHeadroom {
+                        requests: worker_headroom,
+                        generation_id: observed.worker_generation_id,
+                        revision: observed.worker_revision,
+                        router_load_at_observation: observed.router_load_at_observation,
+                    },
+                );
+            }
+        }
+
+        for load in partitions.values_mut() {
+            let full_coverage = load.headroom_observed_replicas == load.headroom_healthy_replicas
+                && load.headroom_healthy_replicas > 0
+                && load.model_ids.len() == 1;
+            if full_coverage {
+                let aggregate_gap = load
+                    .strict_max_running_requests
+                    .saturating_sub(load.strict_effective_occupancy)
+                    .max(0);
+                let eligible_worker_gap = load
+                    .worker_headroom_requests
+                    .values()
+                    .map(|headroom| headroom.requests)
+                    .fold(0_i64, i64::saturating_add);
+                load.issuable_headroom_requests = aggregate_gap.min(eligible_worker_gap);
+            }
+        }
+
         let mut work = self.work.lock();
+        work.headroom_epoch = work.headroom_epoch.wrapping_add(1);
+        let headroom_epoch = work.headroom_epoch;
+        for load in partitions.values_mut() {
+            load.headroom_epoch = headroom_epoch;
+        }
         work.capacities
             .retain(|partition, _| partitions.contains_key(partition));
         work.feedback_estimates
@@ -810,6 +1677,15 @@ impl AdaptiveAdmissionController {
                 .set(load.max_running_requests as f64);
             gauge!(ENGINE_MAX_RUNNING_COVERAGE, "partition" => Arc::clone(&partition_label))
                 .set(load.max_running_coverage());
+            gauge!(DISTRIBUTION_HEADROOM, "partition" => Arc::clone(&partition_label))
+                .set(load.issuable_headroom_requests as f64);
+            gauge!(DISTRIBUTION_HEADROOM_COVERAGE, "partition" => Arc::clone(&partition_label))
+                .set(load.headroom_coverage());
+            gauge!(DISTRIBUTION_HEADROOM_ACTIVE, "partition" => Arc::clone(&partition_label)).set(
+                work.active_distribution_headroom
+                    .get(partition)
+                    .map_or(0.0, |active| f64::from(active.total)),
+            );
             gauge!(FEEDBACK_KNEE_PER_REPLICA, "partition" => partition_label).set(
                 work.feedback_estimates
                     .get(partition)
@@ -832,14 +1708,18 @@ impl AdaptiveAdmissionController {
         // can send arbitrary headers. Only retain a selector already known
         // from fresh worker telemetry; otherwise fall back to the request's
         // model. This keeps state and metric cardinality bounded.
+        let requested_partition = partition;
         let partition = {
             let work = self.work.lock();
-            if partition == features.model || work.loads.contains_key(&partition) {
-                partition
+            if requested_partition == features.model
+                || work.loads.contains_key(&requested_partition)
+            {
+                requested_partition.clone()
             } else {
                 features.model.clone()
             }
         };
+        let requested_partition_exact = requested_partition == partition;
         let now = Instant::now();
         let prediction = if self.config.strategy == AdaptiveAdmissionStrategy::PredictedWork {
             let prediction = self.predictor.lock().predict_at(&features, now);
@@ -1018,6 +1898,8 @@ impl AdaptiveAdmissionController {
                 features,
                 prediction,
                 decision,
+                requested_partition_exact,
+                distribution_authorized: AtomicBool::new(false),
                 resolved: AtomicBool::new(false),
             }),
         }
@@ -1083,6 +1965,8 @@ impl AdaptiveCapacityProvider for AdaptiveAdmissionController {
         {
             return static_capacity;
         }
+        let distribution_enabled = self.distribution_headroom_enabled(partition);
+        let current_router_loads = distribution_enabled.then(|| self.current_router_loads());
         let work = self.work.lock();
         let load = work.loads.get(partition).cloned().unwrap_or_default();
         let constraints = engine_feedback_constraints(
@@ -1091,15 +1975,72 @@ impl AdaptiveCapacityProvider for AdaptiveAdmissionController {
             work.feedback_estimates.get(partition),
         );
         if !constraints.telemetry_usable {
-            return static_capacity;
+            return if distribution_enabled {
+                0
+            } else {
+                static_capacity
+            };
         }
-        if constraints.pressure_reason.is_some() {
-            return 0;
-        }
-        let Some(running_limit) = constraints.running_limit else {
-            return static_capacity;
+        let ordinary_capacity = if constraints.pressure_reason.is_some() {
+            0
+        } else if let Some(running_limit) = constraints.running_limit {
+            (running_limit.floor().clamp(0.0, f64::from(u16::MAX)) as u16).min(static_capacity)
+        } else {
+            static_capacity
         };
-        (running_limit.floor().clamp(0.0, f64::from(u16::MAX)) as u16).min(static_capacity)
+        let distribution_can_raise_capacity = distribution_enabled
+            && (constraints.pressure_reason == Some("engine_waiting")
+                || (constraints.pressure_reason.is_none() && constraints.running_limit.is_some()));
+        if distribution_can_raise_capacity {
+            let Some(current_router_loads) = current_router_loads.as_ref() else {
+                return ordinary_capacity;
+            };
+            if !load.headroom_is_fresh()
+                || load.coverage() < 1.0
+                || load.headroom_coverage() < 1.0
+                || load.model_ids.len() != 1
+                || !load.model_ids.contains(partition)
+            {
+                return ordinary_capacity;
+            }
+            let Some((router_delta, adjusted_headroom)) =
+                Self::adjusted_distribution_headroom(&load, current_router_loads)
+            else {
+                return ordinary_capacity;
+            };
+            // The scheduler capacity is an absolute ceiling, not a count of
+            // newly issuable credits. Expose at most the configured number of
+            // distribution transitions above the strict observed occupancy.
+            // Otherwise a single idle replica with a large gap could let the
+            // allocator mint that entire gap while the routing layer can hold
+            // only `distribution_headroom_max_inflight` permits, turning the
+            // remainder into local 429/refund churn.
+            let route_limit =
+                adjusted_headroom.min(i64::from(self.config.distribution_headroom_max_inflight));
+            let active = i64::from(
+                work.active_distribution_headroom
+                    .get(partition)
+                    .map_or(0, |active| active.total),
+            );
+            if route_limit == 0 || active > route_limit {
+                return ordinary_capacity;
+            }
+            let remaining = route_limit.saturating_sub(active);
+            let bounded_headroom = active.saturating_add(remaining);
+            let safe_total = load
+                .strict_effective_occupancy
+                .saturating_add(router_delta)
+                .saturating_add(bounded_headroom)
+                .clamp(0, i64::from(u16::MAX)) as u16;
+            let distribution_capacity = safe_total
+                .min(
+                    load.strict_max_running_requests
+                        .clamp(0, i64::from(u16::MAX)) as u16,
+                )
+                .min(static_capacity);
+            return ordinary_capacity.max(distribution_capacity);
+        }
+        ordinary_capacity
     }
 
     fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
@@ -1121,6 +2062,8 @@ struct TrackerInner {
     features: PredictionFeatures,
     prediction: Prediction,
     decision: AdmissionDecision,
+    requested_partition_exact: bool,
+    distribution_authorized: AtomicBool,
     resolved: AtomicBool,
 }
 
@@ -1133,6 +2076,47 @@ pub(crate) struct AdaptiveRequestTracker {
 }
 
 impl AdaptiveRequestTracker {
+    /// Return the exact configured partition only for an enforced
+    /// engine-feedback rejection that the distribution path is allowed to
+    /// challenge. Unknown trusted selectors never fall back into this path.
+    pub(crate) fn distribution_headroom_partition(&self) -> Option<&str> {
+        let inner = self.inner.as_ref()?;
+        let controller = inner.controller.upgrade()?;
+        (controller.mode() == AdaptiveAdmissionMode::Enforce
+            && controller.config.strategy == AdaptiveAdmissionStrategy::EngineFeedback
+            && inner.requested_partition_exact
+            && inner.partition == inner.features.model
+            && inner.decision.telemetry_usable
+            && !inner.decision.would_admit
+            && distribution_challenge_reason(inner.decision.reason)
+            && controller.distribution_headroom_enabled(&inner.partition))
+        .then_some(inner.partition.as_str())
+    }
+
+    /// Authorize the already-proved exact route exactly once. This only
+    /// changes the local adaptive decision; it does not create scheduler or
+    /// worker capacity and must be called after those independent proofs.
+    pub(crate) fn authorize_distribution_headroom(&self) -> bool {
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        if self.distribution_headroom_partition().is_none()
+            || inner
+                .distribution_authorized
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        counter!(
+            DISTRIBUTION_OVERRIDES_TOTAL,
+            "partition" => intern_string(&inner.partition),
+            "reason" => inner.decision.reason,
+        )
+        .increment(1);
+        true
+    }
+
     pub(crate) fn should_reject(&self) -> bool {
         let Some(inner) = &self.inner else {
             return false;
@@ -1141,6 +2125,7 @@ impl AdaptiveRequestTracker {
             controller.mode() == AdaptiveAdmissionMode::Enforce
                 && inner.decision.telemetry_usable
                 && !inner.decision.would_admit
+                && !inner.distribution_authorized.load(Ordering::Acquire)
         })
     }
 
@@ -1175,9 +2160,15 @@ impl Drop for AdaptiveRequestTracker {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Barrier, time::Duration};
+
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, SchedulerLoadSnapshot},
+    };
 
     use super::*;
+    use crate::worker::{monitor::WorkerLoadSource, BasicWorkerBuilder, Worker, WorkerLoadGuard};
 
     fn config() -> AdaptiveAdmissionConfig {
         AdaptiveAdmissionConfig {
@@ -1193,6 +2184,8 @@ mod tests {
             feedback_max_waiting_requests_per_healthy_replica: 2,
             feedback_max_token_usage: 0.9,
             feedback_throughput_improvement_ratio: 0.02,
+            distribution_headroom_partitions: Vec::new(),
+            distribution_headroom_max_inflight: 0,
         }
     }
 
@@ -1206,6 +2199,133 @@ mod tests {
             max_output_tokens: maximum,
             generation_flags: 0,
         }
+    }
+
+    fn distribution_controller_with_max_inflight(
+        max_inflight: u16,
+    ) -> (
+        Arc<AdaptiveAdmissionController>,
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+    ) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let no_health_check = HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        };
+        for url in ["http://hot:8000", "http://idle:8000"] {
+            registry.register(Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("model"))
+                    .health_config(no_health_check.clone())
+                    .label(ADMISSION_PARTITION_LABEL, "model")
+                    .build(),
+            ));
+        }
+        let hot = registry.get_by_url("http://hot:8000").unwrap();
+        let idle = registry.get_by_url("http://idle:8000").unwrap();
+        let mut settings = config();
+        settings.mode = AdaptiveAdmissionMode::Enforce;
+        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        settings.distribution_headroom_partitions = vec!["model".to_string()];
+        settings.distribution_headroom_max_inflight = max_inflight;
+        let controller = AdaptiveAdmissionController::new(settings, registry);
+        controller.work.lock().loads.insert(
+            "model".to_string(),
+            PartitionLoad {
+                model_ids: HashSet::from(["model".to_string()]),
+                healthy_replicas: 2,
+                observed_replicas: 2,
+                running_requests: 38,
+                waiting_requests: 36,
+                token_usage_sum: 1.0,
+                max_token_usage: 0.5,
+                max_running_requests: 76,
+                max_running_observed_replicas: 2,
+                strict_max_running_requests: 76,
+                strict_effective_occupancy: 74,
+                headroom_healthy_replicas: 2,
+                headroom_observed_replicas: 2,
+                issuable_headroom_requests: 2,
+                worker_headroom_requests: HashMap::from([(
+                    idle.url().to_string(),
+                    WorkerHeadroom {
+                        requests: 2,
+                        generation_id: idle.generation_id(),
+                        revision: idle.revision(),
+                        router_load_at_observation: 0,
+                    },
+                )]),
+                worker_router_load_observations: HashMap::from([
+                    (
+                        (hot.url().to_string(), hot.generation_id(), hot.revision()),
+                        0,
+                    ),
+                    (
+                        (
+                            idle.url().to_string(),
+                            idle.generation_id(),
+                            idle.revision(),
+                        ),
+                        0,
+                    ),
+                ]),
+                headroom_epoch: 1,
+                observed_at: Some(Instant::now()),
+                ..PartitionLoad::default()
+            },
+        );
+        (controller, hot, idle)
+    }
+
+    fn provenance_controller() -> (
+        Arc<AdaptiveAdmissionController>,
+        Arc<dyn Worker>,
+        WorkerLoadResponse,
+    ) {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker:8000")
+                    .model(ModelCard::new("model"))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .label(ADMISSION_PARTITION_LABEL, "model")
+                    .build(),
+            ))
+            .unwrap();
+        let worker = registry.get_by_url("http://worker:8000").unwrap();
+        let mut settings = config();
+        settings.mode = AdaptiveAdmissionMode::Enforce;
+        settings.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        settings.distribution_headroom_partitions = vec!["model".to_string()];
+        settings.distribution_headroom_max_inflight = 1;
+        let response = WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                token_usage: 0.1,
+                utilization: 0.1,
+                max_running_requests: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        (
+            AdaptiveAdmissionController::new(settings, registry),
+            worker,
+            response,
+        )
+    }
+
+    fn distribution_controller() -> (
+        Arc<AdaptiveAdmissionController>,
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+    ) {
+        distribution_controller_with_max_inflight(8)
     }
 
     #[test]
@@ -1688,6 +2808,557 @@ mod tests {
     }
 
     #[test]
+    fn strict_distribution_math_exposes_exactly_two_of_seventy_six_slots() {
+        let (controller, _hot, idle) = distribution_controller();
+
+        assert_eq!(controller.effective_capacity("model", 100), 76);
+        let (mut first, first_candidates) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert_eq!(first_candidates.len(), 1);
+        assert_eq!(first_candidates[0].worker_url, idle.url());
+        assert!(first.bind_target(idle.url(), idle.generation_id(), idle.revision()));
+
+        let (mut second, second_candidates) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert_eq!(second_candidates.len(), 1);
+        assert!(second.bind_target(idle.url(), idle.generation_id(), idle.revision()));
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "model")
+            .is_none());
+
+        // Transfer each adaptive reservation to the ordinary worker load
+        // accounting before dispatch. At every step the next slot remains
+        // visible exactly once, never zero times or twice.
+        assert!(first.validate_for_dispatch());
+        let first_guard = WorkerLoadGuard::new(idle.clone(), None);
+        assert!(first.try_transfer_after_worker_load_reserved());
+        assert!(second.validate_for_dispatch());
+        let second_guard = WorkerLoadGuard::new(idle.clone(), None);
+        assert!(second.try_transfer_after_worker_load_reserved());
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "model")
+            .is_none());
+
+        drop(first_guard);
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "model")
+            .is_some());
+        drop(second_guard);
+    }
+
+    #[test]
+    fn distribution_capacity_never_advertises_more_than_transition_limit() {
+        let (controller, _hot, idle) = distribution_controller_with_max_inflight(1);
+
+        // Strict occupancy is 74 and clean-peer telemetry exposes two slots,
+        // but the scheduler may issue only one transition credit at a time.
+        assert_eq!(controller.effective_capacity("model", 100), 75);
+        let (permit, candidates) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worker_url, idle.url());
+        assert_eq!(
+            controller.effective_capacity("model", 100),
+            75,
+            "a held route permit is already inside the absolute scheduler ceiling"
+        );
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "model")
+            .is_none());
+
+        drop(permit);
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "model")
+            .is_some());
+    }
+
+    #[test]
+    fn distribution_capacity_never_bypasses_token_pressure() {
+        let (controller, _hot, _idle) = distribution_controller_with_max_inflight(1);
+        {
+            let mut work = controller.work.lock();
+            let load = work.loads.get_mut("model").unwrap();
+            load.token_usage_sum = 1.9;
+            load.max_token_usage = 0.95;
+        }
+
+        assert_eq!(controller.effective_capacity("model", 100), 0);
+        let tracker = controller.begin("model".to_string(), features("u", 10, None));
+        assert!(tracker.should_reject());
+        assert_eq!(
+            tracker.inner.as_ref().unwrap().decision.reason,
+            "token_pressure"
+        );
+        assert_eq!(tracker.distribution_headroom_partition(), None);
+    }
+
+    #[test]
+    fn distribution_capacity_never_raises_without_an_eligible_clean_peer() {
+        let (waiting, _hot, _idle) = distribution_controller_with_max_inflight(1);
+        waiting
+            .work
+            .lock()
+            .loads
+            .get_mut("model")
+            .unwrap()
+            .worker_headroom_requests
+            .clear();
+        assert_eq!(waiting.effective_capacity("model", 100), 0);
+
+        let (limited, _hot, _idle) = distribution_controller_with_max_inflight(1);
+        {
+            let mut work = limited.work.lock();
+            let load = work.loads.get_mut("model").unwrap();
+            load.running_requests = 40;
+            load.waiting_requests = 0;
+            load.strict_effective_occupancy = 74;
+            load.worker_headroom_requests.clear();
+            work.feedback_estimates.insert(
+                "model".to_string(),
+                FeedbackEstimate {
+                    peak_tokens_per_second_per_replica: 100.0,
+                    running_requests_per_replica_at_peak: 18.0,
+                    pressure_observed: true,
+                    last_update: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(limited.effective_capacity("model", 100), 40);
+    }
+
+    #[test]
+    fn distribution_capacity_raises_learned_limit_only_at_the_boundary() {
+        let (controller, _hot, _idle) = distribution_controller_with_max_inflight(1);
+        {
+            let mut work = controller.work.lock();
+            let load = work.loads.get_mut("model").unwrap();
+            load.running_requests = 40;
+            load.waiting_requests = 0;
+            load.strict_effective_occupancy = 40;
+            work.feedback_estimates.insert(
+                "model".to_string(),
+                FeedbackEstimate {
+                    peak_tokens_per_second_per_replica: 100.0,
+                    running_requests_per_replica_at_peak: 18.0,
+                    pressure_observed: true,
+                    last_update: Instant::now(),
+                },
+            );
+        }
+
+        // Learned ordinary limit is 18*2 + 2*2 = 40. At that exact
+        // boundary, one verified clean-peer transition raises it to 41 and
+        // the corresponding request is challengeable for `running_limit`.
+        assert_eq!(controller.effective_capacity("model", 100), 41);
+        let tracker = controller.begin("model".to_string(), features("u", 10, None));
+        assert!(tracker.should_reject());
+        assert_eq!(
+            tracker.inner.as_ref().unwrap().decision.reason,
+            "running_limit"
+        );
+        assert_eq!(tracker.distribution_headroom_partition(), Some("model"));
+
+        let (below, _hot, _idle) = distribution_controller_with_max_inflight(1);
+        {
+            let mut work = below.work.lock();
+            let load = work.loads.get_mut("model").unwrap();
+            load.running_requests = 20;
+            load.waiting_requests = 0;
+            load.strict_effective_occupancy = 20;
+            work.feedback_estimates.insert(
+                "model".to_string(),
+                FeedbackEstimate {
+                    peak_tokens_per_second_per_replica: 100.0,
+                    running_requests_per_replica_at_peak: 18.0,
+                    pressure_observed: true,
+                    last_update: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(below.effective_capacity("model", 100), 40);
+        let ordinary = below.begin("model".to_string(), features("u", 10, None));
+        assert!(!ordinary.should_reject());
+        assert_eq!(ordinary.distribution_headroom_partition(), None);
+    }
+
+    #[test]
+    fn distribution_permit_rejects_same_url_re_registration_aba() {
+        let (controller, _hot, idle) = distribution_controller();
+        let (mut permit, candidates) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        let candidate = candidates.first().unwrap();
+        let target_url = idle.url().to_string();
+        let old_generation_id = candidate.worker_generation_id;
+        let old_revision = candidate.worker_revision;
+        assert_eq!(old_generation_id, idle.generation_id());
+        assert_eq!(old_revision, idle.revision());
+
+        assert!(controller.registry.remove_by_url(&target_url).is_some());
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(&target_url)
+                .model(ModelCard::new("model"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .label(ADMISSION_PARTITION_LABEL, "model")
+                .build(),
+        );
+        assert_eq!(replacement.revision(), old_revision);
+        assert_ne!(replacement.generation_id(), old_generation_id);
+        assert!(controller.registry.register(replacement.clone()).is_some());
+
+        // URL and revision have both returned to their old values, but neither
+        // the stale generation nor the unobserved replacement may be bound.
+        assert!(!permit.bind_target(&target_url, old_generation_id, old_revision));
+        assert!(!permit.bind_target(
+            &target_url,
+            replacement.generation_id(),
+            replacement.revision(),
+        ));
+    }
+
+    #[test]
+    fn distribution_transfer_discounts_exactly_the_new_worker_guard() {
+        let (controller, _hot, idle) = distribution_controller();
+        let (mut first, _) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert!(first.bind_target(idle.url(), idle.generation_id(), idle.revision()));
+        let (mut second, _) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert!(second.bind_target(idle.url(), idle.generation_id(), idle.revision()));
+
+        // One unrelated ordinary request plus this caller's newly-created guard
+        // consume both observed slots. Discounting only the caller still leaves
+        // one unit of router-local load, so two adaptive permits cannot transfer.
+        let unrelated_guard = WorkerLoadGuard::new(idle.clone(), None);
+        let caller_guard = WorkerLoadGuard::new(idle.clone(), None);
+        assert!(!first.try_transfer_after_worker_load_reserved());
+        assert_eq!(
+            controller
+                .work
+                .lock()
+                .active_distribution_headroom
+                .get("model")
+                .unwrap()
+                .total,
+            1
+        );
+
+        drop(second);
+        drop(caller_guard);
+        drop(unrelated_guard);
+        assert!(!controller
+            .work
+            .lock()
+            .active_distribution_headroom
+            .contains_key("model"));
+    }
+
+    #[test]
+    fn distribution_transfer_fails_closed_when_telemetry_is_revoked_while_waiting() {
+        let (controller, _hot, idle) = distribution_controller();
+        let (mut permit, _) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert!(permit.bind_target(idle.url(), idle.generation_id(), idle.revision()));
+
+        let mut work = controller.work.lock();
+        let barrier = Arc::new(Barrier::new(2));
+        let thread_barrier = Arc::clone(&barrier);
+        let thread_idle = idle.clone();
+        let handle = std::thread::spawn(move || {
+            let guard = WorkerLoadGuard::new(thread_idle, None);
+            thread_barrier.wait();
+            let transferred = permit.try_transfer_after_worker_load_reserved();
+            drop(guard);
+            transferred
+        });
+        barrier.wait();
+        work.loads.get_mut("model").unwrap().headroom_epoch += 1;
+        drop(work);
+
+        assert!(!handle.join().unwrap());
+        assert!(!controller
+            .work
+            .lock()
+            .active_distribution_headroom
+            .contains_key("model"));
+    }
+
+    #[test]
+    fn distribution_transfer_fails_closed_when_target_is_revoked_while_waiting() {
+        let (controller, _hot, idle) = distribution_controller();
+        let (mut permit, _) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert!(permit.bind_target(idle.url(), idle.generation_id(), idle.revision()));
+
+        let work = controller.work.lock();
+        let barrier = Arc::new(Barrier::new(2));
+        let thread_barrier = Arc::clone(&barrier);
+        let thread_idle = idle.clone();
+        let handle = std::thread::spawn(move || {
+            let guard = WorkerLoadGuard::new(thread_idle, None);
+            thread_barrier.wait();
+            let transferred = permit.try_transfer_after_worker_load_reserved();
+            drop(guard);
+            transferred
+        });
+        barrier.wait();
+        for _ in 0..5 {
+            idle.record_outcome(503);
+        }
+        assert!(!idle.is_available());
+        drop(work);
+
+        assert!(!handle.join().unwrap());
+        assert!(!controller
+            .work
+            .lock()
+            .active_distribution_headroom
+            .contains_key("model"));
+    }
+
+    #[test]
+    fn concurrent_distribution_acquisition_has_exactly_two_winners() {
+        let (controller, _hot, _idle) = distribution_controller();
+        let barrier = Arc::new(Barrier::new(32));
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let controller = Arc::clone(&controller);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    controller
+                        .try_acquire_distribution_headroom("model", "model")
+                        .map(|(permit, _)| permit)
+                })
+            })
+            .collect();
+        let winners: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(winners.len(), 2);
+        drop(winners);
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "model")
+            .is_some());
+    }
+
+    #[test]
+    fn circuit_open_owner_still_contributes_occupancy_but_is_not_a_target() {
+        let (controller, hot, idle) = distribution_controller();
+        for _ in 0..5 {
+            hot.record_outcome(503);
+        }
+        assert!(hot.is_healthy());
+        assert!(!hot.is_available());
+        assert!(controller.current_router_loads().contains_key(&(
+            hot.url().to_string(),
+            hot.generation_id(),
+            hot.revision(),
+        )));
+
+        let (_permit, candidates) = controller
+            .try_acquire_distribution_headroom("model", "model")
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worker_url, idle.url());
+    }
+
+    #[test]
+    fn distribution_challenge_requires_exact_partition_and_one_shot_authorization() {
+        let (controller, _hot, _idle) = distribution_controller();
+        let tracker = controller.begin("model".to_string(), features("u", 10, None));
+        assert!(tracker.should_reject());
+        assert_eq!(tracker.distribution_headroom_partition(), Some("model"));
+        assert!(tracker.authorize_distribution_headroom());
+        assert!(!tracker.authorize_distribution_headroom());
+        assert!(!tracker.should_reject());
+
+        let fallback =
+            controller.begin("attacker-controlled".to_string(), features("u2", 10, None));
+        assert!(fallback.should_reject());
+        assert_eq!(fallback.distribution_headroom_partition(), None);
+
+        let mut mismatched_model = features("u3", 10, None);
+        mismatched_model.model = "other-model".to_string();
+        let mismatched = controller.begin("model".to_string(), mismatched_model);
+        assert!(mismatched.should_reject());
+        assert_eq!(mismatched.distribution_headroom_partition(), None);
+    }
+
+    #[test]
+    fn distribution_capacity_requires_partition_to_equal_sole_model() {
+        let (controller, _hot, _idle) = distribution_controller();
+        controller
+            .work
+            .lock()
+            .loads
+            .get_mut("model")
+            .unwrap()
+            .model_ids = HashSet::from(["other-model".to_string()]);
+
+        assert_eq!(controller.effective_capacity("model", 100), 0);
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "other-model")
+            .is_none());
+    }
+
+    #[test]
+    fn distribution_capacity_fails_closed_on_partial_or_stale_strict_view() {
+        let (controller, _hot, _idle) = distribution_controller();
+        {
+            let mut work = controller.work.lock();
+            work.loads
+                .get_mut("model")
+                .unwrap()
+                .headroom_observed_replicas = 1;
+        }
+        assert_eq!(controller.effective_capacity("model", 100), 0);
+
+        {
+            let mut work = controller.work.lock();
+            let load = work.loads.get_mut("model").unwrap();
+            load.headroom_observed_replicas = 2;
+            load.observed_at = Some(Instant::now() - Duration::from_secs(6));
+        }
+        assert_eq!(controller.effective_capacity("model", 100), 0);
+        assert!(controller
+            .try_acquire_distribution_headroom("model", "model")
+            .is_none());
+    }
+
+    #[test]
+    fn distribution_headroom_requires_canonical_scheduler_provenance() {
+        for (source, scheduler_counts_present) in [
+            (WorkerLoadSource::PrometheusOnly, false),
+            (WorkerLoadSource::PrometheusOnly, true),
+            (WorkerLoadSource::NativeLoads, false),
+            (WorkerLoadSource::GrpcGetLoads, true),
+        ] {
+            let (controller, worker, response) = provenance_controller();
+            controller.update_loads(
+                &HashMap::from([(worker.url().to_string(), response.clone())]),
+                &HashMap::from([(
+                    worker.url().to_string(),
+                    ObservedWorkerLoad {
+                        response: response.clone(),
+                        observed_at: Instant::now(),
+                        worker_generation_id: worker.generation_id(),
+                        worker_revision: worker.revision(),
+                        router_load_at_observation: 0,
+                        source,
+                        scheduler_counts_present,
+                    },
+                )]),
+            );
+
+            let work = controller.work.lock();
+            let load = work.loads.get("model").unwrap();
+            assert_eq!(load.observed_replicas, 1);
+            assert_eq!(load.max_running_requests, 2);
+            assert_eq!(load.headroom_observed_replicas, 0);
+            assert_eq!(load.issuable_headroom_requests, 0);
+            drop(work);
+            assert!(controller
+                .try_acquire_distribution_headroom("model", "model")
+                .is_none());
+        }
+
+        for source in [
+            WorkerLoadSource::NativeLoads,
+            WorkerLoadSource::SglangGetLoad,
+        ] {
+            let (controller, worker, response) = provenance_controller();
+            controller.update_loads(
+                &HashMap::from([(worker.url().to_string(), response.clone())]),
+                &HashMap::from([(
+                    worker.url().to_string(),
+                    ObservedWorkerLoad {
+                        response,
+                        observed_at: Instant::now(),
+                        worker_generation_id: worker.generation_id(),
+                        worker_revision: worker.revision(),
+                        router_load_at_observation: 0,
+                        source,
+                        scheduler_counts_present: true,
+                    },
+                )]),
+            );
+            assert!(controller
+                .try_acquire_distribution_headroom("model", "model")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn strict_worker_capacity_rejects_malformed_rank_telemetry() {
+        let valid = WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                token_usage: 0.5,
+                utilization: 0.5,
+                num_running_reqs: 1,
+                max_running_requests: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(strict_worker_capacity(&valid, None).is_some());
+
+        let mut negative = valid.clone();
+        negative.loads[0].num_waiting_reqs = -1;
+        assert!(strict_worker_capacity(&negative, None).is_none());
+        let mut negative_capacity = valid.clone();
+        negative_capacity.loads[0].max_running_requests = -1;
+        assert!(strict_worker_capacity(&negative_capacity, Some(38)).is_none());
+        let mut non_finite = valid.clone();
+        non_finite.loads[0].token_usage = f64::NAN;
+        assert!(strict_worker_capacity(&non_finite, None).is_none());
+        let mut duplicate_rank = valid;
+        duplicate_rank.dp_rank_count = 2;
+        duplicate_rank.loads.push(duplicate_rank.loads[0].clone());
+        assert!(strict_worker_capacity(&duplicate_rank, None).is_none());
+    }
+
+    #[test]
+    fn strict_worker_capacity_uses_registered_cap_only_for_single_dp_rank() {
+        let missing_cap = WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                token_usage: 0.5,
+                utilization: 0.5,
+                num_running_reqs: 1,
+                max_running_requests: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let capacity = strict_worker_capacity(&missing_cap, Some(38)).unwrap();
+        assert_eq!(capacity.max_running_requests, 38);
+        assert!(strict_worker_capacity(&missing_cap, None).is_none());
+
+        let mut ambiguous_multi_rank = missing_cap.clone();
+        ambiguous_multi_rank.dp_rank_count = 2;
+        ambiguous_multi_rank.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            ..ambiguous_multi_rank.loads[0].clone()
+        });
+        assert!(strict_worker_capacity(&ambiguous_multi_rank, Some(38)).is_none());
+    }
+
+    #[test]
     fn capacity_revision_changes_on_load_samples_not_per_request() {
         let controller =
             AdaptiveAdmissionController::new(config(), Arc::new(WorkerRegistry::new()));
@@ -1697,7 +3368,7 @@ mod tests {
         drop(tracker);
         assert!(!revision.has_changed().unwrap());
 
-        controller.update_loads(&HashMap::new());
+        controller.update_loads(&HashMap::new(), &HashMap::new());
         assert!(revision.has_changed().unwrap());
     }
 

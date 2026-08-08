@@ -143,6 +143,10 @@ class RouterArgs:
     adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: int = 2
     adaptive_admission_feedback_max_token_usage: float = 0.9
     adaptive_admission_feedback_throughput_improvement_ratio: float = 0.02
+    adaptive_admission_distribution_headroom_partition: list[str] = dataclasses.field(
+        default_factory=list
+    )
+    adaptive_admission_distribution_headroom_max_inflight: int = 0
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: int | None = None
     # Cluster-wide requests-per-second ceiling. Requires mesh and the same value on every gateway.
@@ -1021,6 +1025,22 @@ class RouterArgs:
             type=float,
             default=RouterArgs.adaptive_admission_feedback_throughput_improvement_ratio,
             help="Relative throughput gain required to raise the learned concurrency knee",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-distribution-headroom-partition",
+            action="append",
+            default=None,
+            help="Exact partition allowed to use bounded distribution headroom; repeatable",
+        )
+        adaptive_admission_group.add_argument(
+            f"--{prefix}adaptive-admission-distribution-headroom-max-inflight",
+            type=int,
+            default=RouterArgs.adaptive_admission_distribution_headroom_max_inflight,
+            help=(
+                "Process-local distribution-headroom cap per enabled partition; the "
+                "experimental isolated-singleton canary requires exactly 1 and is "
+                "unsafe across blue/green or other multi-router overlap"
+            ),
         )
 
         # Retry configuration

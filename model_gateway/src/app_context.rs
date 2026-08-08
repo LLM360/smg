@@ -342,19 +342,20 @@ impl AppContextBuilder {
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
         let worker_monitor = self.worker_monitor;
-        let adaptive_admission =
-            if router_config.adaptive_admission.mode == crate::config::AdaptiveAdmissionMode::Off {
-                None
-            } else {
-                let controller = AdaptiveAdmissionController::new(
-                    router_config.adaptive_admission.clone(),
-                    worker_registry.clone(),
-                );
-                if let Some(monitor) = &worker_monitor {
-                    controller.start_load_updates(monitor.subscribe());
-                }
-                Some(controller)
-            };
+        let adaptive_admission = if router_config.adaptive_admission.mode
+            == crate::config::AdaptiveAdmissionMode::Off
+        {
+            None
+        } else {
+            let controller = AdaptiveAdmissionController::new(
+                router_config.adaptive_admission.clone(),
+                worker_registry.clone(),
+            );
+            if let Some(monitor) = &worker_monitor {
+                controller.start_load_updates(monitor.subscribe(), monitor.subscribe_observed());
+            }
+            Some(controller)
+        };
 
         // Create WorkerService from the already-built components
         let worker_service = Arc::new(WorkerService::new(
@@ -463,6 +464,15 @@ impl AppContextBuilder {
         // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
         // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
         // backend to avoid unnecessary TLS initialization overhead.
+        self.client = Some(Self::build_worker_client(config, timeout_secs, false)?);
+        Ok(self)
+    }
+
+    pub(crate) fn build_worker_client(
+        config: &RouterConfig,
+        timeout_secs: u64,
+        disable_redirects: bool,
+    ) -> Result<Client, String> {
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
         let mut client_builder = Client::builder()
@@ -472,6 +482,9 @@ impl AppContextBuilder {
             .connect_timeout(Duration::from_secs(10))
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
+        if disable_redirects {
+            client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+        }
 
         // Force rustls backend when TLS is configured
         if has_tls_config {
@@ -500,12 +513,9 @@ impl AppContextBuilder {
             );
         }
 
-        let client = client_builder
+        client_builder
             .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-
-        self.client = Some(client);
-        Ok(self)
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))
     }
 
     /// Create rate limiter based on config

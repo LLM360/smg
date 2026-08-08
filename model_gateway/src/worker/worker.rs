@@ -46,6 +46,23 @@ pub const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 /// vLLM Mooncake KV connector name
 pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 
+/// Process-local identity for a worker runtime. A same-URL replacement adopts
+/// the existing runtime (and therefore its generation), while removing and
+/// re-registering that URL constructs a new runtime with a new generation.
+static NEXT_WORKER_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_worker_generation_id() -> u64 {
+    match NEXT_WORKER_GENERATION_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+    }) {
+        Ok(generation_id) => generation_id,
+        // Reusing an identity after wraparound would invalidate the ABA guard.
+        // This counter cannot realistically exhaust during one process lifetime,
+        // but fail-stop if it ever does instead of continuing unsafely.
+        Err(_) => std::process::abort(),
+    }
+}
+
 /// vLLM NIXL KV connector name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
 
@@ -215,6 +232,14 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Same-URL `replace()` increments the revision so stale probe outcomes
     /// can be discarded without mutating the newly installed worker object.
     fn revision(&self) -> u64 {
+        0
+    }
+
+    /// Get the immutable process-local identity of the shared worker runtime.
+    ///
+    /// Implementations that cannot provide a stable identity return zero;
+    /// strict telemetry consumers must treat zero as unavailable.
+    fn generation_id(&self) -> u64 {
         0
     }
 
@@ -817,6 +842,7 @@ pub struct RoutingState {
 /// Shared mutable worker state preserved across same-URL replacements.
 #[derive(Debug)]
 pub struct WorkerRuntime {
+    generation_id: u64,
     status: AtomicU8,
     consecutive_failures: AtomicUsize,
     consecutive_successes: AtomicUsize,
@@ -830,6 +856,7 @@ pub struct WorkerRuntime {
 impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
         Self {
+            generation_id: next_worker_generation_id(),
             status: AtomicU8::new(initial_status as u8),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_successes: AtomicUsize::new(0),
@@ -842,6 +869,10 @@ impl WorkerRuntime {
     }
 
     // ── Lifecycle status ────────────────────────────────────────────
+
+    pub fn generation_id(&self) -> u64 {
+        self.generation_id
+    }
 
     pub fn status(&self) -> WorkerStatus {
         WorkerStatus::from_u8(self.status.load(Ordering::Acquire))
@@ -971,6 +1002,7 @@ impl fmt::Debug for BasicWorker {
         let runtime = self.runtime.load();
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
+            .field("generation_id", &runtime.generation_id())
             .field("status", &runtime.status())
             .field("revision", &runtime.revision())
             .field("circuit_breaker_state", &self.circuit_breaker_state())
@@ -1032,6 +1064,10 @@ impl Worker for BasicWorker {
 
     fn revision(&self) -> u64 {
         self.runtime.load().revision()
+    }
+
+    fn generation_id(&self) -> u64 {
+        self.runtime.load().generation_id()
     }
 
     fn set_status(&self, status: WorkerStatus) {
@@ -1533,6 +1569,29 @@ mod tests {
         assert!(worker.is_healthy());
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.processed_requests(), 0);
+    }
+
+    #[test]
+    fn worker_runtime_generation_survives_replace_but_not_re_registration() {
+        let original = BasicWorkerBuilder::new("http://test:8080")
+            .health_config(no_health_check())
+            .build();
+        let replacement = BasicWorkerBuilder::new("http://test:8080")
+            .health_config(no_health_check())
+            .build();
+        let replacement_initial_generation = replacement.generation_id();
+
+        assert_ne!(original.generation_id(), replacement_initial_generation);
+        assert!(replacement.inherit_shared_state_from(&original));
+        assert_eq!(replacement.generation_id(), original.generation_id());
+        assert_ne!(replacement.generation_id(), replacement_initial_generation);
+        assert_eq!(replacement.revision(), 1);
+
+        let re_registered = BasicWorkerBuilder::new("http://test:8080")
+            .health_config(no_health_check())
+            .build();
+        assert_ne!(re_registered.generation_id(), replacement.generation_id());
+        assert_eq!(re_registered.revision(), 0);
     }
 
     #[test]

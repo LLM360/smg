@@ -268,6 +268,7 @@ impl WorkerSelectionStage {
             hash_ring,
             max_output_tokens: None,
             reserve_work: true,
+            forbid_unleased_cache_owner_expansion: false,
             leg: WorkerLeg::Single,
         };
 
@@ -395,6 +396,7 @@ impl WorkerSelectionStage {
             hash_ring,
             max_output_tokens: None,
             reserve_work: false,
+            forbid_unleased_cache_owner_expansion: false,
             leg: WorkerLeg::Prefill,
         };
         let prefill_idx = self
@@ -567,6 +569,7 @@ impl WorkerSelectionStage {
             hash_ring: hash_ring.clone(),
             max_output_tokens: None,
             reserve_work: false,
+            forbid_unleased_cache_owner_expansion: false,
             leg: WorkerLeg::Prefill,
         };
         let prefill_idx =
@@ -642,6 +645,7 @@ fn assign_encode_workers(
                 hash_ring: hash_ring.clone(),
                 max_output_tokens: None,
                 reserve_work: false,
+                forbid_unleased_cache_owner_expansion: false,
                 leg: WorkerLeg::Single,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;

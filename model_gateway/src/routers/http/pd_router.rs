@@ -935,6 +935,7 @@ impl PDRouter {
                     hash_ring,
                     max_output_tokens: None,
                     reserve_work: false,
+                    forbid_unleased_cache_owner_expansion: false,
                     leg,
                 },
             )

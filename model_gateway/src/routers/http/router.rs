@@ -29,17 +29,20 @@ use openai_protocol::{
 };
 use reqwest::{
     multipart::{Form, Part},
-    Client,
+    Client, Request as ReqwestRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
-    app_context::AppContext,
+    app_context::{AppContext, AppContextBuilder},
     config::types::RetryConfig,
     middleware::{
-        scheduler::{LocalAdaptiveRejection, ADMISSION_PARTITION_HEADER},
+        scheduler::{
+            LocalAdaptiveRejection, RedeemedCapacityCreditAuthorization,
+            ADMISSION_PARTITION_HEADER, ADMISSION_PARTITION_LABEL,
+        },
         TenantRequestMeta,
     },
     observability::{
@@ -56,6 +59,7 @@ use crate::{
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             retry::{is_retryable_status, RetryExecutor},
+            sse::{SseDecoder, SseFrame},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -79,11 +83,18 @@ const ADAPTIVE_RESPONSE_TAIL_LIMIT: usize = 256 * 1024;
 const COMET_USER_HEADER: &str = "x-comet-user";
 const COMET_WORKLOAD_TYPE_HEADER: &str = "x-comet-workload-type";
 
+/// Exact bytes already buffered by the non-streaming relay. Keeping a cheap
+/// clone in response extensions lets the distribution path prove completion
+/// without consuming or rewriting the client-visible body.
+#[derive(Clone)]
+struct BufferedResponseBytes(bytes::Bytes);
+
 /// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
+    no_redirect_client: Client,
     retry_config: RetryConfig,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -97,6 +108,18 @@ struct WorkerSelection {
     reservation_cost: Option<u64>,
 }
 
+enum WorkerSelectionResult {
+    Selected(WorkerSelection),
+    NoAvailable,
+    UnleasedOwnerExpansionBlocked,
+}
+
+struct HttpAdmission {
+    tracker: Option<AdaptiveRequestTracker>,
+    distribution_partition: Option<String>,
+    owner_expansion_guard_partition: Option<String>,
+}
+
 fn trusted_header(headers: Option<&HeaderMap>, name: &str) -> Option<String> {
     headers
         .and_then(|headers| headers.get(name))
@@ -104,6 +127,50 @@ fn trusted_header(headers: Option<&HeaderMap>, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn worker_admission_partition(worker: &dyn Worker) -> &str {
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get(ADMISSION_PARTITION_LABEL)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| worker.model_id())
+}
+
+fn workers_in_admission_partition(
+    workers: &[Arc<dyn Worker>],
+    partition: &str,
+) -> Vec<Arc<dyn Worker>> {
+    workers
+        .iter()
+        .filter(|worker| worker_admission_partition(worker.as_ref()) == partition)
+        .cloned()
+        .collect()
+}
+
+fn local_distribution_rejection(message: &'static str) -> Response {
+    let mut response = error::create_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "adaptive_distribution_unavailable",
+        message,
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response.extensions_mut().insert(LocalAdaptiveRejection);
+    response
+}
+
+fn should_retry_upstream_response(response: &Response, owner_expansion_guarded: bool) -> bool {
+    !owner_expansion_guarded
+        && is_retryable_status(response.status())
+        && response
+            .extensions()
+            .get::<LocalAdaptiveRejection>()
+            .is_none()
 }
 
 fn approximate_prompt_tokens(text: &str) -> u32 {
@@ -333,6 +400,229 @@ impl http_body::Body for AdaptiveTrackingBody {
     }
 }
 
+#[derive(Default)]
+struct CacheDistributionStreamProof {
+    decoder: SseDecoder,
+    saw_usage: bool,
+    saw_openai_finish: bool,
+    terminal_success: bool,
+    failed: bool,
+}
+
+impl CacheDistributionStreamProof {
+    fn observe(&mut self, data: &[u8]) {
+        if self.failed {
+            return;
+        }
+        if self.decoder.push(data).is_err() {
+            self.failed = true;
+            return;
+        }
+        while let Some(frame) = self.decoder.next_frame() {
+            match frame {
+                Ok(frame) => self.observe_frame(&frame),
+                Err(_) => self.failed = true,
+            }
+        }
+        self.decoder.compact();
+    }
+
+    fn observe_frame(&mut self, frame: &SseFrame<'_>) {
+        if frame.is_done() {
+            self.terminal_success |= self.saw_usage && self.saw_openai_finish;
+            return;
+        }
+
+        let Ok(value) = frame.decode_data::<serde_json::Value>() else {
+            self.failed = true;
+            return;
+        };
+        let event_type = frame
+            .event_type
+            .as_deref()
+            .or_else(|| value.get("type").and_then(serde_json::Value::as_str));
+        if stream_frame_is_error(event_type, &value) {
+            self.failed = true;
+            self.terminal_success = false;
+            return;
+        }
+
+        let frame_usage = stream_output_tokens_from_value(&value).is_some();
+        self.saw_usage |= frame_usage;
+        self.saw_openai_finish |= value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .is_some_and(|reason| !reason.is_null())
+                })
+            });
+
+        let responses_completed = event_type == Some("response.completed")
+            && value
+                .pointer("/response/status")
+                .and_then(serde_json::Value::as_str)
+                == Some("completed")
+            && frame_usage;
+        let anthropic_completed = event_type == Some("message_stop") && self.saw_usage;
+        let sglang_completed = value
+            .pointer("/meta_info/finish_reason")
+            .is_some_and(sglang_finish_reason_is_terminal)
+            && frame_usage;
+        self.terminal_success |= responses_completed || anthropic_completed || sglang_completed;
+    }
+
+    fn clean_terminal_success(&self) -> bool {
+        !self.failed && self.decoder.buffered_len() == 0 && self.terminal_success
+    }
+}
+
+fn stream_output_tokens_from_value(value: &serde_json::Value) -> Option<u32> {
+    output_tokens_from_value(value)
+        .or_else(|| value_u32(value.pointer("/response/usage/output_tokens")))
+}
+
+fn stream_frame_is_error(event_type: Option<&str>, value: &serde_json::Value) -> bool {
+    event_type.is_some_and(|event| {
+        event == "error" || event.ends_with(".error") || event.ends_with(".failed")
+    }) || value.get("error").is_some_and(|error| !error.is_null())
+        || matches!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("error" | "response.failed" | "response.incomplete")
+        )
+}
+
+fn sglang_finish_reason_is_terminal(reason: &serde_json::Value) -> bool {
+    let reason_type = reason
+        .as_str()
+        .or_else(|| reason.get("type").and_then(serde_json::Value::as_str));
+    matches!(reason_type, Some("stop" | "length"))
+}
+
+fn buffered_completion_has_proof(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    if stream_frame_is_error(None, &value) || stream_output_tokens_from_value(&value).is_none() {
+        return false;
+    }
+
+    let openai_completed = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|choices| {
+            !choices.is_empty()
+                && choices.iter().all(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .is_some_and(|reason| !reason.is_null())
+                })
+        });
+    let sglang_completed = ["/meta_info/finish_reason", "/finish_reason"]
+        .into_iter()
+        .any(|pointer| {
+            value
+                .pointer(pointer)
+                .is_some_and(sglang_finish_reason_is_terminal)
+        });
+    let event_type = value.get("type").and_then(serde_json::Value::as_str);
+    let responses_completed = if event_type == Some("response.completed") {
+        value
+            .pointer("/response/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("completed")
+    } else {
+        value.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+    };
+    let anthropic_completed = value.get("type").and_then(serde_json::Value::as_str)
+        == Some("message")
+        && value
+            .get("stop_reason")
+            .is_some_and(|reason| !reason.is_null());
+
+    openai_completed || sglang_completed || responses_completed || anthropic_completed
+}
+
+/// Holds the exact cache-distribution proof and worker accounting through a
+/// streaming response. Ownership is published only after a clean end-of-stream
+/// with protocol-level terminal success and observed output usage.
+struct CacheDistributionStreamingBody {
+    inner: Body,
+    commit: Box<dyn FnMut() + Send>,
+    _load_guard: WorkerLoadGuard,
+    proof: CacheDistributionStreamProof,
+    commit_attempted: bool,
+}
+
+impl CacheDistributionStreamingBody {
+    fn wrap_response(
+        response: Response,
+        load_guard: WorkerLoadGuard,
+        commit: impl FnMut() + Send + 'static,
+    ) -> Response {
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(Self {
+                inner: body,
+                commit: Box::new(commit),
+                _load_guard: load_guard,
+                proof: CacheDistributionStreamProof::default(),
+                commit_attempted: false,
+            }),
+        )
+    }
+
+    fn commit_if_complete(&mut self) {
+        if !self.commit_attempted && self.proof.clean_terminal_success() {
+            self.commit_attempted = true;
+            (self.commit)();
+        }
+    }
+}
+
+impl http_body::Body for CacheDistributionStreamingBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.proof.observe(data);
+                }
+                if this.inner.is_end_stream() {
+                    this.commit_if_complete();
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.proof.failed = true;
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.commit_if_complete();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
@@ -355,6 +645,11 @@ impl Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
+            no_redirect_client: AppContextBuilder::build_worker_client(
+                &ctx.router_config,
+                ctx.router_config.request_timeout_secs,
+                true,
+            )?,
             retry_config: ctx.router_config.effective_retry_config(),
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
@@ -423,7 +718,8 @@ impl Router {
         text: Option<&str>,
         headers: Option<&HeaderMap>,
         max_output_tokens: Option<u64>,
-    ) -> Option<WorkerSelection> {
+        owner_expansion_guard_partition: Option<&str>,
+    ) -> WorkerSelectionResult {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
             None
@@ -438,14 +734,22 @@ impl Router {
             false, // get all workers, we'll filter by is_available() next
         );
 
-        let available: Vec<Arc<dyn Worker>> = workers
+        let guarded_workers = owner_expansion_guard_partition
+            .map(|partition| workers_in_admission_partition(&workers, partition));
+        let observed_workers = guarded_workers.as_ref().unwrap_or(&workers);
+        let available: Vec<Arc<dyn Worker>> = observed_workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
             .collect();
         if available.is_empty() {
-            return None;
+            return if owner_expansion_guard_partition.is_some() {
+                WorkerSelectionResult::UnleasedOwnerExpansionBlocked
+            } else {
+                WorkerSelectionResult::NoAvailable
+            };
         }
+        let forbid_unleased_cache_owner_expansion = owner_expansion_guard_partition.is_some();
 
         // Get the appropriate policy for this model
         let policy = self.policy_registry.get_policy_or_default(model_id);
@@ -460,12 +764,29 @@ impl Router {
             hash_ring,
             max_output_tokens,
             reserve_work: true,
+            forbid_unleased_cache_owner_expansion,
             leg: crate::policies::WorkerLeg::Single,
         };
         let reservation_cost = policy.reservation_cost(&info);
-        let idx = self
+        // In guarded mode the policy must see healthy circuit-open workers so
+        // it can distinguish an unavailable recorded owner from a genuinely
+        // cold prefix. Its own routing-state filter still prevents selecting
+        // a worker that cannot execute.
+        let selection_workers = if forbid_unleased_cache_owner_expansion {
+            observed_workers
+        } else {
+            &available
+        };
+        let Some(idx) = self
             .policy_registry
-            .select_worker(&policy, &available, &info)?;
+            .select_worker(&policy, selection_workers, &info)
+        else {
+            return if forbid_unleased_cache_owner_expansion {
+                WorkerSelectionResult::UnleasedOwnerExpansionBlocked
+            } else {
+                WorkerSelectionResult::NoAvailable
+            };
+        };
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -475,8 +796,8 @@ impl Router {
             policy.name(),
         );
 
-        Some(WorkerSelection {
-            worker: available[idx].clone(),
+        WorkerSelectionResult::Selected(WorkerSelection {
+            worker: selection_workers[idx].clone(),
             policy,
             reservation_cost,
         })
@@ -511,20 +832,41 @@ impl Router {
         route: &'static str,
         model_id: &str,
         text: &str,
-    ) -> Result<Option<AdaptiveRequestTracker>, Box<Response>> {
+    ) -> Result<HttpAdmission, Box<Response>> {
         let Some(controller) = self.adaptive_admission.clone() else {
-            return Ok(None);
+            return Ok(HttpAdmission {
+                tracker: None,
+                distribution_partition: None,
+                owner_expansion_guard_partition: None,
+            });
         };
         if matches!(route, "/v1/embeddings" | "/v1/classify" | "/v1/rerank") {
-            return Ok(None);
+            return Ok(HttpAdmission {
+                tracker: None,
+                distribution_partition: None,
+                owner_expansion_guard_partition: None,
+            });
         }
         let partition = trusted_header(headers, ADMISSION_PARTITION_HEADER)
             .unwrap_or_else(|| model_id.to_string());
+        if model_id == crate::worker::UNKNOWN_MODEL_ID
+            && controller.distribution_headroom_enabled(&partition)
+        {
+            return Err(Box::new(local_distribution_rejection(
+                "distribution-enabled generation requests must name the model explicitly",
+            )));
+        }
         let tracker = controller.begin(
-            partition,
+            partition.clone(),
             http_prediction_features(typed_req, headers, route, model_id, text),
         );
-        if tracker.should_reject() {
+        let distribution_partition = tracker
+            .distribution_headroom_partition()
+            .map(str::to_string);
+        let owner_expansion_guard_partition = (partition == model_id
+            && controller.distribution_headroom_enabled(&partition))
+        .then(|| partition.clone());
+        if tracker.should_reject() && distribution_partition.is_none() {
             let mut response = error::create_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "adaptive_admission_saturated",
@@ -537,12 +879,17 @@ impl Router {
             response.extensions_mut().insert(LocalAdaptiveRejection);
             return Err(Box::new(response));
         }
-        Ok(Some(tracker))
+        Ok(HttpAdmission {
+            tracker: Some(tracker),
+            distribution_partition,
+            owner_expansion_guard_partition,
+        })
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
         typed_req: &T,
         route: &'static str,
         model_id: &str,
@@ -558,11 +905,16 @@ impl Router {
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
         let model = model_id;
         let endpoint = route_to_endpoint(route);
-        let adaptive_tracker =
-            match self.begin_http_admission(headers, typed_req, route, model_id, &text) {
-                Ok(tracker) => tracker,
-                Err(response) => return *response,
-            };
+        let admission = match self.begin_http_admission(headers, typed_req, route, model_id, &text)
+        {
+            Ok(admission) => admission,
+            Err(response) => return *response,
+        };
+        let HttpAdmission {
+            tracker: adaptive_tracker,
+            distribution_partition,
+            owner_expansion_guard_partition,
+        } = admission;
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -574,51 +926,76 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
-        // Use per-model retry config if set by a worker, otherwise fall back to router default.
-        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
-        let retry_config = per_model_retry_config
-            .as_ref()
-            .unwrap_or(&self.retry_config);
+        let mut response = if let Some(partition) = distribution_partition.as_deref() {
+            let Some(tracker) = adaptive_tracker.as_ref() else {
+                return local_distribution_rejection("adaptive request state was unavailable");
+            };
+            self.route_distribution_request_once(
+                headers,
+                tenant_meta,
+                tracker,
+                typed_req,
+                route,
+                model_id,
+                canonical_model.as_deref(),
+                is_stream,
+                &text,
+                partition,
+            )
+            .await
+        } else {
+            // Use per-model retry config if set by a worker, otherwise fall back to router default.
+            let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
+            let retry_config = per_model_retry_config
+                .as_ref()
+                .unwrap_or(&self.retry_config);
 
-        let mut response = RetryExecutor::execute_response_with_retry(
-            retry_config,
-            // operation per attempt
-            |_: u32| async {
-                let res = self
-                    .route_typed_request_once(
-                        headers,
-                        typed_req,
-                        route,
-                        model_id,
-                        canonical_model.as_deref(),
-                        is_stream,
-                        &text,
-                    )
-                    .await;
+            RetryExecutor::execute_response_with_retry(
+                retry_config,
+                // operation per attempt
+                |_: u32| async {
+                    let res = self
+                        .route_typed_request_once(
+                            headers,
+                            owner_expansion_guard_partition.as_deref(),
+                            typed_req,
+                            route,
+                            model_id,
+                            canonical_model.as_deref(),
+                            is_stream,
+                            &text,
+                        )
+                        .await;
 
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                Metrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
+                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                    Metrics::record_router_upstream_response(
+                        metrics_labels::ROUTER_HTTP,
+                        res.status().as_u16(),
+                        extract_error_code_from_response(&res),
+                    );
 
-                res
-            },
-            // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
-            // on_backoff hook
-            |delay, attempt| {
-                // Layer 3 worker metrics
-                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
-            },
-            // on_exhausted hook
-            || {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
-            },
-        )
-        .await;
+                    res
+                },
+                // should_retry predicate
+                |res, _attempt| {
+                    should_retry_upstream_response(res, owner_expansion_guard_partition.is_some())
+                },
+                // on_backoff hook
+                |delay, attempt| {
+                    // Layer 3 worker metrics
+                    Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                    Metrics::record_worker_retry_backoff(attempt, delay);
+                },
+                // on_exhausted hook
+                || {
+                    Metrics::record_worker_retries_exhausted(
+                        metrics_labels::WORKER_REGULAR,
+                        endpoint,
+                    );
+                },
+            )
+            .await
+        };
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -652,11 +1029,289 @@ impl Router {
 
     #[expect(
         clippy::too_many_arguments,
+        reason = "exact distribution route composes independent admission, cache, and HTTP proofs"
+    )]
+    async fn route_distribution_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        tracker: &AdaptiveRequestTracker,
+        typed_req: &T,
+        route: &'static str,
+        model_id: &str,
+        canonical_model: Option<&str>,
+        is_stream: bool,
+        text: &str,
+        partition: &str,
+    ) -> Response {
+        let Some(controller) = self.adaptive_admission.as_ref() else {
+            return local_distribution_rejection("adaptive controller was unavailable");
+        };
+        let Some(authorization) = tenant_meta.extension::<RedeemedCapacityCreditAuthorization>()
+        else {
+            return local_distribution_rejection("a scheduler capacity credit is required");
+        };
+        if !authorization.matches(partition, model_id) {
+            return local_distribution_rejection("capacity credit binding did not match the route");
+        }
+
+        let Some((mut headroom_permit, candidates)) =
+            controller.try_acquire_distribution_headroom(partition, model_id)
+        else {
+            return local_distribution_rejection("fresh worker headroom was unavailable");
+        };
+        let allowed_targets: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.worker_url,
+                    candidate.worker_generation_id,
+                    candidate.worker_revision,
+                )
+            })
+            .collect();
+
+        let model_filter = (model_id != crate::worker::UNKNOWN_MODEL_ID).then_some(model_id);
+        let workers: Vec<_> = self
+            .worker_registry
+            .get_workers_filtered(
+                model_filter,
+                Some(WorkerType::Regular),
+                Some(ConnectionMode::Http),
+                None,
+                false,
+            )
+            .into_iter()
+            // Keep Ready but circuit-open cached owners in the ownership and
+            // pressure proof. The policy separately requires the exact target
+            // candidate to be executable.
+            .filter(|worker| worker.is_healthy())
+            // The adaptive headroom proof is partition-scoped. A private
+            // reservation can share the model and cache prefix, but it must
+            // neither suppress nor become a target for a public seed.
+            .filter(|worker| worker_admission_partition(worker.as_ref()) == partition)
+            .collect();
+        if workers.is_empty() {
+            return local_distribution_rejection("no routeable HTTP workers were available");
+        }
+        let hash_ring = self.worker_registry.get_hash_ring(model_id);
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            tokens: None,
+            headers,
+            hash_ring,
+            max_output_tokens: typed_req.max_output_tokens_for_routing().map(u64::from),
+            reserve_work: false,
+            forbid_unleased_cache_owner_expansion: false,
+            leg: crate::policies::WorkerLeg::Single,
+        };
+        let Some(mut cache_route) = self.policy_registry.begin_cache_distribution_route(
+            model_id,
+            &workers,
+            &info,
+            partition,
+            &allowed_targets,
+        ) else {
+            return local_distribution_rejection("cache policy found no exact eligible route");
+        };
+        if cache_route.partition() != partition
+            || !headroom_permit.bind_target(
+                cache_route.target_url(),
+                cache_route.target_generation_id(),
+                cache_route.target_revision(),
+            )
+            || !cache_route.validate_before_dispatch(
+                &self.policy_registry,
+                model_id,
+                &workers,
+                &info,
+            )
+            || !headroom_permit.validate_for_dispatch()
+        {
+            return local_distribution_rejection("exact route validation changed before dispatch");
+        }
+
+        let worker = cache_route.worker();
+        if worker.url() != cache_route.target_url()
+            || worker.generation_id() != cache_route.target_generation_id()
+            || worker.revision() != cache_route.target_revision()
+        {
+            return local_distribution_rejection("selected worker generation did not match proof");
+        }
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let prepared_request = match self.prepare_typed_request(
+            Some(&headers_with_trace),
+            typed_req,
+            route,
+            canonical_model,
+            worker.as_ref(),
+        ) {
+            Ok(request) => request,
+            Err(mut response) => {
+                // Serialization, worker preparation, and request building are
+                // definite local pre-execution failures. Tell fair-share to
+                // refund the provisional credit without rewriting the useful
+                // client-facing error status.
+                response.extensions_mut().insert(LocalAdaptiveRejection);
+                return *response;
+            }
+        };
+        if !authorization.try_claim(partition, model_id) {
+            return local_distribution_rejection(
+                "capacity credit route claim was already consumed",
+            );
+        }
+        if !cache_route.validate_before_dispatch(&self.policy_registry, model_id, &workers, &info)
+            || !headroom_permit.validate_for_dispatch()
+        {
+            return local_distribution_rejection("exact route changed while claiming capacity");
+        }
+        let Some(load_guard) = cache_route.create_load_guard(headers) else {
+            return local_distribution_rejection("exact target work reservation was unavailable");
+        };
+        // Tuple field drop order is intentional: clear the pending cache lease
+        // before releasing exact work and worker load on every early return.
+        let mut route_lifetime = (cache_route, load_guard);
+        if worker.url() != route_lifetime.0.target_url()
+            || worker.generation_id() != route_lifetime.0.target_generation_id()
+            || worker.revision() != route_lifetime.0.target_revision()
+            || !route_lifetime.0.validate_before_dispatch(
+                &self.policy_registry,
+                model_id,
+                &workers,
+                &info,
+            )
+        {
+            return local_distribution_rejection(
+                "exact worker generation changed immediately before dispatch",
+            );
+        }
+        // Atomically revalidate and transfer the adaptive reservation into the
+        // ordinary worker load accounting. Acquirers see at least one of the
+        // two, and a telemetry epoch cannot change between proof and release.
+        if !headroom_permit.try_transfer_after_worker_load_reserved() {
+            return local_distribution_rejection(
+                "exact worker headroom changed immediately before dispatch",
+            );
+        }
+        if !tracker.authorize_distribution_headroom() {
+            return local_distribution_rejection("adaptive route authorization was not valid");
+        }
+
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id,
+            "cache_aware_distribution",
+        );
+        events::RequestSentEvent { url: worker.url() }.emit();
+        let mut response = self
+            .send_prepared_typed_request(
+                &self.no_redirect_client,
+                prepared_request,
+                route,
+                worker.as_ref(),
+                is_stream,
+                None,
+            )
+            .await;
+        events::RequestReceivedEvent {}.emit();
+
+        let status = response.status();
+        worker.record_outcome(status.as_u16());
+        Metrics::record_router_upstream_response(
+            metrics_labels::ROUTER_HTTP,
+            status.as_u16(),
+            extract_error_code_from_response(&response),
+        );
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+        }
+
+        if is_stream {
+            if status.is_success() {
+                let (mut cache_route, load_guard) = route_lifetime;
+                let policy_registry = Arc::clone(&self.policy_registry);
+                let commit_workers = workers;
+                let commit_model = model_id.to_string();
+                let commit_text = text.to_string();
+                let commit_partition = partition.to_string();
+                let commit_worker_url = worker.url().to_string();
+                response = CacheDistributionStreamingBody::wrap_response(
+                    response,
+                    load_guard,
+                    move || {
+                        if !cache_route.commit_after_success(
+                            &policy_registry,
+                            &commit_model,
+                            &commit_workers,
+                            &commit_text,
+                        ) {
+                            warn!(
+                                model_id = commit_model,
+                                partition = commit_partition,
+                                worker_url = commit_worker_url,
+                                "cache distribution route could not commit after terminal stream success"
+                            );
+                        }
+                    },
+                );
+            } else {
+                // The relay may remain live after response headers, even for a
+                // non-success status. Retain both guards until its body ends or
+                // the client disconnects, but never publish cache ownership.
+                response = AttachedBody::wrap_response(response, route_lifetime);
+            }
+            return response;
+        }
+
+        if status.is_success() {
+            let completion_proved = response
+                .extensions()
+                .get::<BufferedResponseBytes>()
+                .is_some_and(|body| buffered_completion_has_proof(&body.0));
+            if !completion_proved {
+                // The backend accepted work, so preserve its response and do
+                // not refund the consumed fair-share credit. The seed lease is
+                // dropped without publishing ownership.
+                warn!(
+                    model_id,
+                    partition,
+                    worker_url = worker.url(),
+                    "cache distribution route lacked non-streaming terminal usage proof"
+                );
+            } else if !route_lifetime.0.commit_after_success(
+                &self.policy_registry,
+                model_id,
+                &workers,
+                text,
+            ) {
+                warn!(
+                    model_id,
+                    partition,
+                    worker_url = worker.url(),
+                    "cache distribution route could not commit after proved backend completion"
+                );
+            }
+        }
+
+        drop(route_lifetime);
+        response
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
         reason = "per-attempt state threaded from route_typed_request; a struct would only move the arity"
     )]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
+        owner_expansion_guard_partition: Option<&str>,
         typed_req: &T,
         route: &'static str,
         model_id: &str,
@@ -669,9 +1324,15 @@ impl Router {
             Some(text),
             headers,
             typed_req.max_output_tokens_for_routing().map(u64::from),
+            owner_expansion_guard_partition,
         ) {
-            Some(selection) => selection,
-            None => {
+            WorkerSelectionResult::Selected(selection) => selection,
+            WorkerSelectionResult::UnleasedOwnerExpansionBlocked => {
+                return local_distribution_rejection(
+                    "ordinary routing cannot create an unleased cache owner",
+                );
+            }
+            WorkerSelectionResult::NoAvailable => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
                 let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
                     None
@@ -973,6 +1634,7 @@ impl Router {
                 hash_ring,
                 max_output_tokens: None,
                 reserve_work: false,
+                forbid_unleased_cache_owner_expansion: false,
                 leg: crate::policies::WorkerLeg::Single,
             },
         ) {
@@ -1252,32 +1914,51 @@ impl Router {
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
+        let request =
+            match self.prepare_typed_request(headers, typed_req, route, canonical_model, worker) {
+                Ok(request) => request,
+                Err(response) => return *response,
+            };
+
+        self.send_prepared_typed_request(
+            &self.client,
+            request,
+            route,
+            worker,
+            is_stream,
+            load_guard,
+        )
+        .await
+    }
+
+    fn prepare_typed_request<T: serde::Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        canonical_model: Option<&str>,
+        worker: &dyn Worker,
+    ) -> Result<ReqwestRequest, Box<Response>> {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
-        let mut json_val = match serde_json::to_value(typed_req) {
-            Ok(j) => j,
-            Err(e) => {
-                return error::bad_request(
-                    "serialization_failed",
-                    format!("Convert into serde_json::Value failed: {e}"),
-                );
-            }
-        };
+        let mut json_val = serde_json::to_value(typed_req).map_err(|error| {
+            Box::new(error::bad_request(
+                "serialization_failed",
+                format!("Convert into serde_json::Value failed: {error}"),
+            ))
+        })?;
 
         if let Some(canonical_model) = canonical_model {
             super::set_request_model(&mut json_val, canonical_model);
         }
 
-        let mut json_val = match worker.prepare_request(json_val) {
-            Ok(prepared) => prepared,
-            Err(e) => {
-                return error::bad_request(
-                    "request_preparation_failed",
-                    format!("Failed to prepare request: {e}"),
-                );
-            }
-        };
+        let mut json_val = worker.prepare_request(json_val).map_err(|error| {
+            Box::new(error::bad_request(
+                "request_preparation_failed",
+                format!("Failed to prepare request: {error}"),
+            ))
+        })?;
         strip_default_sglang_fields(&mut json_val);
 
         let mut request_builder = self.client.post(&endpoint_url).json(&json_val);
@@ -1298,7 +1979,21 @@ impl Router {
             }
         }
 
-        let res = match request_builder.send().await {
+        request_builder
+            .build()
+            .map_err(|error| Box::new(convert_reqwest_error(error)))
+    }
+
+    async fn send_prepared_typed_request(
+        &self,
+        client: &Client,
+        request: ReqwestRequest,
+        route: &'static str,
+        worker: &dyn Worker,
+        is_stream: bool,
+        load_guard: Option<WorkerLoadGuard>,
+    ) -> Response {
+        let res = match client.execute(request).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1365,9 +2060,12 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
-                    let mut response = Response::new(Body::from(body));
+                    let mut response = Response::new(Body::from(body.clone()));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
+                    response
+                        .extensions_mut()
+                        .insert(BufferedResponseBytes(body));
                     response
                 }
                 Err(e) => {
@@ -1540,55 +2238,55 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, tenant_meta, body, "/generate", model_id)
             .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_typed_request(headers, tenant_meta, body, "/v1/chat/completions", model_id)
             .await
     }
 
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/messages", model_id)
+        self.route_typed_request(headers, tenant_meta, body, "/v1/messages", model_id)
             .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, tenant_meta, body, "/v1/completions", model_id)
             .await
     }
 
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, tenant_meta, body, "/v1/responses", model_id)
             .await
     }
 
@@ -1600,22 +2298,22 @@ impl RouterTrait for Router {
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, tenant_meta, body, "/v1/embeddings", model_id)
             .await
     }
 
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
+        self.route_typed_request(headers, tenant_meta, body, "/v1/classify", model_id)
             .await
     }
 
@@ -1640,13 +2338,13 @@ impl RouterTrait for Router {
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: &RerankRequest,
         model_id: &str,
     ) -> Response {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, tenant_meta, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, canonical_model.as_deref(), response).await {
@@ -1811,13 +2509,38 @@ impl RouterTrait for Router {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Instant,
+    };
+
+    use http_body_util::BodyExt;
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse},
+    };
     use serde::Serialize;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::watch,
+    };
 
     use super::*;
-    use crate::{config::types::PolicyConfig, worker::BasicWorkerBuilder};
+    use crate::{
+        config::{
+            AdaptiveAdmissionConfig, AdaptiveAdmissionMode, AdaptiveAdmissionStrategy, PolicyConfig,
+        },
+        middleware::scheduler::capacity_credit::CapacityCreditBinding,
+        policies::{CacheAwarePolicy, SizeAwarePowerOfTwoPolicy},
+        tenant::TenantKey,
+        worker::{
+            monitor::{ObservedWorkerLoad, WorkerLoadSource},
+            BasicWorkerBuilder,
+        },
+    };
 
-    #[derive(Serialize)]
+    #[derive(Clone, Serialize)]
     struct TestGenerationRequest {
         stream: bool,
         n: u32,
@@ -1850,6 +2573,104 @@ mod tests {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn distribution_worker_scope_excludes_other_admission_partitions() {
+        let public: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://public:8080")
+                .model(ModelCard::new("test-model"))
+                .label(ADMISSION_PARTITION_LABEL, "test-model")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let private: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://private:8080")
+                .model(ModelCard::new("test-model"))
+                .label(ADMISSION_PARTITION_LABEL, "private")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let fallback: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://fallback:8080")
+                .model(ModelCard::new("test-model"))
+                .health_config(no_health_check())
+                .build(),
+        );
+
+        let scoped: Vec<_> =
+            workers_in_admission_partition(&[public, private, fallback], "test-model")
+                .into_iter()
+                .map(|worker| worker.url().to_string())
+                .collect();
+
+        assert_eq!(scoped, ["http://public:8080", "http://fallback:8080"]);
+    }
+
+    #[test]
+    fn guarded_selection_never_falls_through_to_private_partition() {
+        let public: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://public:8080")
+                .model(ModelCard::new("test-model"))
+                .label(ADMISSION_PARTITION_LABEL, "test-model")
+                .health_config(no_health_check())
+                .build(),
+        );
+        for _ in 0..5 {
+            public.record_outcome(503);
+        }
+        assert!(public.is_healthy());
+        assert!(!public.is_available());
+        let private: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://private:8080")
+                .model(ModelCard::new("test-model"))
+                .label(ADMISSION_PARTITION_LABEL, "private")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register_or_replace(public);
+        worker_registry.register_or_replace(private);
+        let router = Router {
+            worker_registry,
+            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            client: Client::new(),
+            no_redirect_client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            retry_config: RetryConfig::default(),
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+            adaptive_admission: None,
+        };
+
+        assert!(matches!(
+            router.select_worker_for_model(
+                "test-model",
+                Some("shared prefix"),
+                None,
+                Some(1_000),
+                Some("test-model"),
+            ),
+            WorkerSelectionResult::UnleasedOwnerExpansionBlocked
+        ));
+    }
+
+    #[test]
+    fn local_distribution_rejection_is_never_retried_internally() {
+        let local = local_distribution_rejection("blocked before dispatch");
+        assert_eq!(local.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!should_retry_upstream_response(&local, false));
+
+        let upstream = error::create_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "upstream_busy",
+            "retry another worker",
+        );
+        assert!(should_retry_upstream_response(&upstream, false));
+        assert!(!should_retry_upstream_response(&upstream, true));
     }
 
     #[test]
@@ -1921,6 +2742,712 @@ mod tests {
         assert_eq!(observed_output_tokens(tail), Some(29));
     }
 
+    #[test]
+    fn buffered_distribution_commit_requires_terminal_usage_proof() {
+        for body in [
+            br#"{"choices":[{"finish_reason":"stop"}],"usage":{"completion_tokens":7}}"#.as_slice(),
+            br#"{"text":"ok","meta_info":{"completion_tokens":7,"finish_reason":{"type":"stop"}}}"#
+                .as_slice(),
+            br#"{"status":"completed","usage":{"output_tokens":7}}"#.as_slice(),
+            br#"{"type":"message","stop_reason":"end_turn","usage":{"output_tokens":7}}"#
+                .as_slice(),
+        ] {
+            assert!(buffered_completion_has_proof(body));
+        }
+
+        for body in [
+            br#"{"choices":[{"finish_reason":null}],"usage":{"completion_tokens":7}}"#.as_slice(),
+            br#"{"choices":[{"finish_reason":"stop"}]}"#.as_slice(),
+            br#"{"text":"partial","meta_info":{"completion_tokens":7,"finish_reason":{"type":"abort"}}}"#
+                .as_slice(),
+            br#"{"type":"response.completed","response":{"status":"failed","usage":{"output_tokens":7}}}"#
+                .as_slice(),
+            br#"{"type":"response.completed","response":{"usage":{"output_tokens":7}}}"#
+                .as_slice(),
+            br#"{"error":{"message":"OOM"},"usage":{"completion_tokens":7}}"#.as_slice(),
+            br#"{"status":"incomplete","usage":{"output_tokens":7}}"#.as_slice(),
+            br#"not-json"#.as_slice(),
+            b"".as_slice(),
+        ] {
+            assert!(!buffered_completion_has_proof(body));
+        }
+    }
+
+    fn tracked_stream_response(
+        worker: &Arc<dyn Worker>,
+        body: Body,
+        commits: &Arc<AtomicUsize>,
+    ) -> Response {
+        let commits_for_body = Arc::clone(commits);
+        CacheDistributionStreamingBody::wrap_response(
+            Response::new(body),
+            WorkerLoadGuard::new(Arc::clone(worker), None),
+            move || {
+                commits_for_body.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+    }
+
+    fn test_stream_worker() -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_commits_only_after_clean_terminal_success() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let reservation_policy = Arc::new(SizeAwarePowerOfTwoPolicy::new(1_000));
+        let reservation_info = SelectWorkerInfo {
+            request_text: Some("x"),
+            max_output_tokens: Some(500),
+            ..Default::default()
+        };
+        let reservation_cost =
+            reservation_policy.reserve_exact_worker(worker.url(), &reservation_info);
+        let load_guard = WorkerLoadGuard::with_policy_reservation(
+            Arc::clone(&worker),
+            None,
+            reservation_policy.clone(),
+            reservation_cost,
+        );
+        let commits = Arc::new(AtomicUsize::new(0));
+        let commits_for_body = Arc::clone(&commits);
+        let backend_stream = stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":17}}\n\ndata: [DONE]\n\n",
+            )),
+        ]);
+        let response = CacheDistributionStreamingBody::wrap_response(
+            Response::new(Body::from_stream(backend_stream)),
+            load_guard,
+            move || {
+                commits_for_body.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(worker.load(), 1);
+        assert_eq!(
+            reservation_policy.reserved_for(worker.url()),
+            reservation_cost
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+
+        let mut body = response.into_body();
+        assert!(body.frame().await.expect("first frame").is_ok());
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert!(body.frame().await.expect("terminal frame").is_ok());
+        assert!(body.frame().await.is_none());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        drop(body);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(reservation_policy.reserved_for(worker.url()), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_rejects_2xx_in_band_error() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let response = tracked_stream_response(
+            &worker,
+            Body::from("data: {\"error\":{\"message\":\"OOM\"}}\n\n"),
+            &commits,
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty());
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_ignores_comment_heartbeat() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let response = tracked_stream_response(
+            &worker,
+            Body::from(": keep-alive\n\nevent: ping\n\n"),
+            &commits,
+        );
+        assert!(to_bytes(response.into_body(), usize::MAX).await.is_ok());
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_rejects_truncated_terminal_event() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let response = tracked_stream_response(
+            &worker,
+            Body::from(
+                "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                 data: {\"choices\":[],\"usage\":{\"completion_tokens\":17}}",
+            ),
+            &commits,
+        );
+        assert!(to_bytes(response.into_body(), usize::MAX).await.is_ok());
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_rejects_client_cancellation_after_terminal_frame() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let terminal = Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+            b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+              data: {\"choices\":[],\"usage\":{\"completion_tokens\":17}}\n\n\
+              data: [DONE]\n\n",
+        ));
+        let backend_stream = stream::iter([terminal])
+            .chain(stream::pending::<Result<bytes::Bytes, std::io::Error>>());
+        let response =
+            tracked_stream_response(&worker, Body::from_stream(backend_stream), &commits);
+        let mut body = response.into_body();
+        assert!(body.frame().await.expect("terminal data frame").is_ok());
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        drop(body);
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_accepts_sglang_terminal_usage() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let response = tracked_stream_response(
+            &worker,
+            Body::from(
+                "data: {\"text\":\"hello\",\"meta_info\":{\"completion_tokens\":5,\
+                 \"finish_reason\":{\"type\":\"stop\"}}}\n\ndata: [DONE]\n\n",
+            ),
+            &commits,
+        );
+        assert!(to_bytes(response.into_body(), usize::MAX).await.is_ok());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_accepts_responses_completed_usage() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let response = tracked_stream_response(
+            &worker,
+            Body::from(
+                "event: response.completed\n\
+                 data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\
+                 \"usage\":{\"output_tokens\":11}}}\n\n",
+            ),
+            &commits,
+        );
+        let mut body = response.into_body();
+
+        assert_eq!(worker.load(), 1);
+        assert!(body
+            .frame()
+            .await
+            .expect("responses terminal frame")
+            .is_ok());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert!(body.frame().await.is_none());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert!(body.frame().await.is_none());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        drop(body);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_accepts_anthropic_usage_then_message_stop() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let response = tracked_stream_response(
+            &worker,
+            Body::from(
+                "event: message_delta\n\
+                 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n\
+                 event: message_stop\n\
+                 data: {\"type\":\"message_stop\"}\n\n",
+            ),
+            &commits,
+        );
+        let mut body = response.into_body();
+
+        assert_eq!(worker.load(), 1);
+        assert!(body
+            .frame()
+            .await
+            .expect("anthropic terminal frames")
+            .is_ok());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert!(body.frame().await.is_none());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert!(body.frame().await.is_none());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        drop(body);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_distribution_stream_body_error_never_commits() {
+        let worker = test_stream_worker();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let error_stream = stream::iter([Err::<bytes::Bytes, std::io::Error>(
+            std::io::Error::other("backend stream failed"),
+        )]);
+        let response = tracked_stream_response(&worker, Body::from_stream(error_stream), &commits);
+        assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn non_success_stream_holds_attached_state_until_body_drop() {
+        struct DropSignal(Arc<AtomicUsize>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut response = Response::new(Body::from("unavailable"));
+        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        let response = AttachedBody::wrap_response(
+            response,
+            (
+                WorkerLoadGuard::new(Arc::clone(&worker), None),
+                DropSignal(Arc::clone(&dropped)),
+            ),
+        );
+
+        assert_eq!(worker.load(), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "unavailable"
+        );
+        assert_eq!(worker.load(), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_backend_request_never_follows_redirects() {
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_url = format!("http://{}", destination.local_addr().unwrap());
+        let redirect = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_url = format!("http://{}", redirect.local_addr().unwrap());
+        let location = format!("{destination_url}/generate");
+        let redirect_task = tokio::spawn(async move {
+            let (mut socket, _) = redirect.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let router = create_test_regular_router();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(redirect_url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let typed_req = TestGenerationRequest {
+            stream: false,
+            n: 1,
+            max_tokens: 1,
+            tools: Vec::new(),
+            response_format: serde_json::Value::Null,
+            reasoning_effort: String::new(),
+        };
+        let request = router
+            .prepare_typed_request(None, &typed_req, "/generate", None, worker.as_ref())
+            .unwrap();
+        let response = router
+            .send_prepared_typed_request(
+                &router.no_redirect_client,
+                request,
+                "/generate",
+                worker.as_ref(),
+                false,
+                None,
+            )
+            .await;
+
+        redirect_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), destination.accept())
+                .await
+                .is_err(),
+            "the exact-route client must not POST to a redirect destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_nonstream_response_preserves_terminal_proof_and_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let body =
+            br#"{"text":"ok","meta_info":{"completion_tokens":7,"finish_reason":{"type":"stop"}}}"#;
+        let response_bytes = body.to_vec();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_bytes.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(&response_bytes).await.unwrap();
+        });
+
+        let router = create_test_regular_router();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(worker_url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let typed_req = TestGenerationRequest {
+            stream: false,
+            n: 1,
+            max_tokens: 1,
+            tools: Vec::new(),
+            response_format: serde_json::Value::Null,
+            reasoning_effort: String::new(),
+        };
+        let request = router
+            .prepare_typed_request(None, &typed_req, "/generate", None, worker.as_ref())
+            .unwrap();
+        let response = router
+            .send_prepared_typed_request(
+                &router.no_redirect_client,
+                request,
+                "/generate",
+                worker.as_ref(),
+                false,
+                None,
+            )
+            .await;
+
+        server.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let proof = response
+            .extensions()
+            .get::<BufferedResponseBytes>()
+            .expect("exact non-stream response must retain buffered proof bytes");
+        assert!(buffered_completion_has_proof(&proof.0));
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            body.as_slice()
+        );
+    }
+
+    fn distribution_test_load(
+        running_requests: i32,
+        waiting_requests: i32,
+        max_running_requests: i32,
+    ) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                token_usage: 0.1,
+                utilization: 0.1,
+                num_running_reqs: running_requests,
+                num_waiting_reqs: waiting_requests,
+                max_running_requests,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn distribution_test_meta(request_id: &str) -> TenantRequestMeta {
+        let tenant = TenantKey::new("tenant-a");
+        let binding = CapacityCreditBinding::new(
+            "generation-1",
+            1,
+            "test-model",
+            "test-model",
+            tenant.clone(),
+            request_id,
+            1,
+        )
+        .unwrap();
+        TenantRequestMeta::new(tenant)
+            .with_extension(RedeemedCapacityCreditAuthorization::new(binding))
+    }
+
+    #[tokio::test]
+    async fn distribution_nonstream_commits_owner_only_after_terminal_usage_proof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let idle_url = format!("http://{}", listener.local_addr().unwrap());
+        let invalid_body =
+            br#"{"text":"ok","meta_info":{"finish_reason":{"type":"stop"}}}"#.to_vec();
+        let valid_body =
+            br#"{"text":"ok","meta_info":{"completion_tokens":7,"finish_reason":{"type":"stop"}}}"#
+                .to_vec();
+        let server_bodies = [invalid_body.clone(), valid_body.clone()];
+        let server = tokio::spawn(async move {
+            for response_bytes in server_bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_bytes.len()
+                );
+                socket.write_all(response_head.as_bytes()).await.unwrap();
+                socket.write_all(&response_bytes).await.unwrap();
+            }
+        });
+
+        let hot: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://127.0.0.1:1")
+                .model(ModelCard::new("test-model"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .label(ADMISSION_PARTITION_LABEL, "test-model")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let idle: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(idle_url)
+                .model(ModelCard::new("test-model"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .label(ADMISSION_PARTITION_LABEL, "test-model")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let workers = vec![Arc::clone(&hot), Arc::clone(&idle)];
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register(Arc::clone(&hot)).unwrap();
+        worker_registry.register(Arc::clone(&idle)).unwrap();
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+            fallback_output_token_estimate: 2_048,
+            block_size: 16,
+            engine_load: true,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 2,
+            cache_owner_spill_cooldown_secs: 60,
+        }));
+        let cache_policy = policy_registry.get_default_policy();
+        cache_policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .init_workers(&workers);
+
+        let mut partition_headers = HeaderMap::new();
+        partition_headers.insert(
+            ADMISSION_PARTITION_HEADER,
+            HeaderValue::from_static("test-model"),
+        );
+        let request_text = "abcdefgh";
+        let idle_guard = WorkerLoadGuard::new(Arc::clone(&idle), None);
+        assert_eq!(
+            cache_policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(request_text),
+                    headers: Some(&partition_headers),
+                    ..Default::default()
+                },
+            ),
+            Some(0),
+            "the setup must prime only the hot worker as prefix owner"
+        );
+        drop(idle_guard);
+        for _ in 0..5 {
+            hot.record_outcome(503);
+        }
+        assert!(hot.is_healthy());
+        assert!(!hot.is_available());
+
+        let hot_load = distribution_test_load(37, 1, 38);
+        let idle_load = distribution_test_load(0, 0, 38);
+        let loads = HashMap::from([
+            (hot.url().to_string(), hot_load.clone()),
+            (idle.url().to_string(), idle_load.clone()),
+        ]);
+        cache_policy.update_loads(&loads);
+        let observed_at = Instant::now();
+        let observed_loads = HashMap::from([
+            (
+                hot.url().to_string(),
+                ObservedWorkerLoad {
+                    response: hot_load,
+                    observed_at,
+                    worker_generation_id: hot.generation_id(),
+                    worker_revision: hot.revision(),
+                    router_load_at_observation: hot.load(),
+                    source: WorkerLoadSource::NativeLoads,
+                    scheduler_counts_present: true,
+                },
+            ),
+            (
+                idle.url().to_string(),
+                ObservedWorkerLoad {
+                    response: idle_load,
+                    observed_at,
+                    worker_generation_id: idle.generation_id(),
+                    worker_revision: idle.revision(),
+                    router_load_at_observation: idle.load(),
+                    source: WorkerLoadSource::NativeLoads,
+                    scheduler_counts_present: true,
+                },
+            ),
+        ]);
+        let (_loads_tx, loads_rx) = watch::channel(loads);
+        let (_observed_loads_tx, observed_loads_rx) = watch::channel(observed_loads);
+        let controller = AdaptiveAdmissionController::new(
+            AdaptiveAdmissionConfig {
+                mode: AdaptiveAdmissionMode::Enforce,
+                strategy: AdaptiveAdmissionStrategy::EngineFeedback,
+                min_load_coverage: 1.0,
+                feedback_max_waiting_requests_per_healthy_replica: 0,
+                distribution_headroom_partitions: vec!["test-model".to_string()],
+                distribution_headroom_max_inflight: 1,
+                ..Default::default()
+            },
+            Arc::clone(&worker_registry),
+        );
+        controller.start_load_updates(loads_rx, observed_loads_rx);
+
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            no_redirect_client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            retry_config: RetryConfig::default(),
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+            adaptive_admission: Some(controller),
+        };
+        let typed_req = TestGenerationRequest {
+            stream: false,
+            n: 1,
+            max_tokens: 1,
+            tools: Vec::new(),
+            response_format: serde_json::Value::Null,
+            reasoning_effort: String::new(),
+        };
+
+        let invalid_response = router
+            .route_typed_request(
+                Some(&partition_headers),
+                &distribution_test_meta("request-invalid"),
+                &typed_req,
+                "/generate",
+                "test-model",
+            )
+            .await;
+        assert_eq!(invalid_response.status(), StatusCode::OK);
+        assert!(invalid_response
+            .extensions()
+            .get::<LocalAdaptiveRejection>()
+            .is_none());
+        assert!(invalid_response
+            .extensions()
+            .get::<BufferedResponseBytes>()
+            .is_some_and(|body| !buffered_completion_has_proof(&body.0)));
+        assert_eq!(
+            to_bytes(invalid_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            invalid_body
+        );
+        assert_eq!(
+            cache_policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(request_text),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            ),
+            None,
+            "a 2xx response without terminal usage proof must not publish the idle owner"
+        );
+
+        let valid_response = router
+            .route_typed_request(
+                Some(&partition_headers),
+                &distribution_test_meta("request-valid"),
+                &typed_req,
+                "/generate",
+                "test-model",
+            )
+            .await;
+        assert_eq!(valid_response.status(), StatusCode::OK);
+        assert!(valid_response
+            .extensions()
+            .get::<LocalAdaptiveRejection>()
+            .is_none());
+        assert!(valid_response
+            .extensions()
+            .get::<BufferedResponseBytes>()
+            .is_some_and(|body| buffered_completion_has_proof(&body.0)));
+        assert_eq!(
+            to_bytes(valid_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            valid_body
+        );
+        let committed_idx = cache_policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(request_text),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            )
+            .expect("terminal usage proof must publish the idle owner");
+        assert_eq!(workers[committed_idx].url(), idle.url());
+
+        server.await.unwrap();
+    }
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1942,6 +3469,10 @@ mod tests {
             worker_registry,
             policy_registry,
             client: Client::new(),
+            no_redirect_client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             retry_config: RetryConfig::default(),
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

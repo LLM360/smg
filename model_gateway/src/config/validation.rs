@@ -78,7 +78,12 @@ pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
-        Self::validate_policy(&config.policy)?;
+        let distribution_headroom_partitions =
+            &config.adaptive_admission.distribution_headroom_partitions;
+        let default_policy_serves_distribution_headroom = distribution_headroom_partitions
+            .iter()
+            .any(|partition| !config.model_policies.contains_key(partition));
+        Self::validate_policy(&config.policy, default_policy_serves_distribution_headroom)?;
         for (model_id, policy) in &config.model_policies {
             if model_id.trim().is_empty() {
                 return Err(ConfigError::InvalidValue {
@@ -87,7 +92,12 @@ impl ConfigValidator {
                     reason: "Model ID must not be empty".to_string(),
                 });
             }
-            Self::validate_policy(policy)?;
+            Self::validate_policy(
+                policy,
+                distribution_headroom_partitions
+                    .iter()
+                    .any(|partition| partition == model_id),
+            )?;
         }
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
@@ -354,10 +364,10 @@ impl ConfigValidator {
                 }
 
                 if let Some(p_policy) = prefill_policy {
-                    Self::validate_policy(p_policy)?;
+                    Self::validate_policy(p_policy, false)?;
                 }
                 if let Some(d_policy) = decode_policy {
-                    Self::validate_policy(d_policy)?;
+                    Self::validate_policy(d_policy, false)?;
                 }
             }
             RoutingMode::EncodePrefillDecode {
@@ -390,14 +400,14 @@ impl ConfigValidator {
                     Self::validate_urls(decode_urls)?;
                 }
                 if let Some(policy) = encode_policy {
-                    Self::validate_policy(policy)?;
+                    Self::validate_policy(policy, false)?;
                     Self::validate_encode_policy(policy)?;
                 }
                 if let Some(policy) = prefill_policy {
-                    Self::validate_policy(policy)?;
+                    Self::validate_policy(policy, false)?;
                 }
                 if let Some(policy) = decode_policy {
-                    Self::validate_policy(policy)?;
+                    Self::validate_policy(policy, false)?;
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
@@ -424,7 +434,10 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
+    fn validate_policy(
+        policy: &PolicyConfig,
+        allow_disabled_cache_eviction: bool,
+    ) -> ConfigResult<()> {
         match policy {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
@@ -501,7 +514,7 @@ impl ConfigValidator {
                     });
                 }
 
-                if *eviction_interval_secs == 0 {
+                if *eviction_interval_secs == 0 && !allow_disabled_cache_eviction {
                     return Err(ConfigError::InvalidValue {
                         field: "eviction_interval_secs".to_string(),
                         value: eviction_interval_secs.to_string(),
@@ -773,6 +786,94 @@ impl ConfigValidator {
             });
         }
 
+        let headroom_partitions = &config.adaptive_admission.distribution_headroom_partitions;
+        let headroom_max_inflight = config.adaptive_admission.distribution_headroom_max_inflight;
+        if headroom_partitions.is_empty() != (headroom_max_inflight == 0) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "adaptive distribution headroom requires both a non-empty partition allowlist and max_inflight > 0"
+                    .to_string(),
+            });
+        }
+        if !headroom_partitions.is_empty() {
+            if headroom_max_inflight != 1 {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "experimental adaptive distribution headroom requires max_inflight=1 and an isolated singleton router; it is not a cross-process lease"
+                        .to_string(),
+                });
+            }
+            if headroom_partitions.len() != 1 {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "experimental adaptive distribution headroom supports exactly one partition per singleton router"
+                        .to_string(),
+                });
+            }
+            let mut unique = std::collections::HashSet::new();
+            if headroom_partitions.iter().any(|partition| {
+                partition.is_empty()
+                    || partition.trim() != partition
+                    || !unique.insert(partition.as_str())
+            }) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "adaptive distribution-headroom partitions must be non-empty, trimmed, and unique"
+                        .to_string(),
+                });
+            }
+            if config.adaptive_admission.mode != AdaptiveAdmissionMode::Enforce
+                || config.adaptive_admission.strategy != AdaptiveAdmissionStrategy::EngineFeedback
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "adaptive distribution headroom requires mode=enforce and strategy=engine_feedback"
+                        .to_string(),
+                });
+            }
+            if !config.priority_scheduler_enabled
+                || !config.priority_scheduler_adaptive_capacity
+                || config.capacity_credit_generation.is_none()
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "adaptive distribution headroom requires the priority scheduler, adaptive partition capacity, and an enabled capacity-credit generation"
+                        .to_string(),
+                });
+            }
+            if !matches!(config.mode, RoutingMode::Regular { .. })
+                || config.connection_mode != crate::worker::ConnectionMode::Http
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "adaptive distribution headroom currently supports regular HTTP routing only"
+                        .to_string(),
+                });
+            }
+            if config.routing_key_override.enabled {
+                return Err(ConfigError::ValidationFailed {
+                    reason:
+                        "adaptive distribution headroom is incompatible with routing-key override"
+                            .to_string(),
+                });
+            }
+            let max_poll_interval_secs = DISTRIBUTION_HEADROOM_MAX_AGE_SECS / 2;
+            if config.load_monitor_interval_secs > max_poll_interval_secs {
+                return Err(ConfigError::InvalidValue {
+                    field: "load_monitor_interval_secs".to_string(),
+                    value: config.load_monitor_interval_secs.to_string(),
+                    reason: format!(
+                        "Must be <= {max_poll_interval_secs} while experimental adaptive distribution headroom is enabled so worker evidence remains fresh"
+                    ),
+                });
+            }
+            if headroom_partitions.iter().any(|partition| {
+                let policy = config
+                    .model_policies
+                    .get(partition)
+                    .unwrap_or(&config.policy);
+                !Self::distribution_headroom_policy_is_compatible(policy)
+            }) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "each adaptive distribution-headroom partition must resolve through its exact-name model override or the default policy to cache_aware routing with engine_load, disabled tree eviction, at least two cached owners, and a nonzero spill cooldown"
+                        .to_string(),
+                });
+            }
+        }
+
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_timeout_secs".to_string(),
@@ -867,6 +968,20 @@ impl ConfigValidator {
         }
 
         Ok(())
+    }
+
+    fn distribution_headroom_policy_is_compatible(policy: &PolicyConfig) -> bool {
+        matches!(
+            policy,
+            PolicyConfig::CacheAware {
+                engine_load: true,
+                eviction_interval_secs: 0,
+                max_cached_owners_per_prefix,
+                cache_owner_spill_cooldown_secs,
+                ..
+            } if *max_cached_owners_per_prefix >= 2
+                && *cache_owner_spill_cooldown_secs > 0
+        )
     }
 
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
@@ -2037,6 +2152,209 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn distribution_headroom_policy(
+        engine_load: bool,
+        max_cached_owners_per_prefix: usize,
+        cache_owner_spill_cooldown_secs: u64,
+    ) -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            max_tree_size: 1024,
+            fallback_output_token_estimate: 4096,
+            block_size: 16,
+            engine_load,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix,
+            cache_owner_spill_cooldown_secs,
+        }
+    }
+
+    fn enabled_distribution_headroom_config() -> RouterConfig {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![
+                    "http://worker1:8000".to_string(),
+                    "http://worker2:8000".to_string(),
+                ],
+            },
+            distribution_headroom_policy(true, 2, 5),
+        );
+        config.priority_scheduler_enabled = true;
+        config.capacity_credit_generation = Some("canary-1".to_string());
+        config.capacity_credit_required = true;
+        config.priority_scheduler_adaptive_capacity = true;
+        config.api_key = Some("service-key".to_string());
+        config.tenant_resolution.trust_tenant_header = true;
+        config.tenant_resolution.prefer_trusted_tenant_header = true;
+        config.adaptive_admission.mode = AdaptiveAdmissionMode::Enforce;
+        config.adaptive_admission.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        config.adaptive_admission.distribution_headroom_partitions = vec!["k3".to_string()];
+        config.adaptive_admission.distribution_headroom_max_inflight = 1;
+        config.load_monitor_interval_secs = DISTRIBUTION_HEADROOM_MAX_AGE_SECS / 2;
+        config
+    }
+
+    #[test]
+    fn distribution_headroom_is_disabled_and_inert_by_default() {
+        let config = RouterConfig::default();
+
+        assert!(config
+            .adaptive_admission
+            .distribution_headroom_partitions
+            .is_empty());
+        assert_eq!(
+            config.adaptive_admission.distribution_headroom_max_inflight,
+            0
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn distribution_headroom_requires_allowlist_and_positive_cap_together() {
+        let mut allowlist_only = RouterConfig::default();
+        allowlist_only
+            .adaptive_admission
+            .distribution_headroom_partitions = vec!["k3".to_string()];
+        assert!(ConfigValidator::validate(&allowlist_only).is_err());
+
+        let mut cap_only = RouterConfig::default();
+        cap_only
+            .adaptive_admission
+            .distribution_headroom_max_inflight = 1;
+        assert!(ConfigValidator::validate(&cap_only).is_err());
+    }
+
+    #[test]
+    fn distribution_headroom_rejects_more_than_one_process_local_seed() {
+        let mut config = enabled_distribution_headroom_config();
+        config.adaptive_admission.distribution_headroom_max_inflight = 2;
+
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn enabled_distribution_headroom_accepts_only_the_safe_http_configuration() {
+        let config = enabled_distribution_headroom_config();
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        let mut invalid = config.clone();
+        invalid.adaptive_admission.mode = AdaptiveAdmissionMode::Shadow;
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.adaptive_admission.strategy = AdaptiveAdmissionStrategy::PredictedWork;
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut selectively_protected = config.clone();
+        selectively_protected.capacity_credit_required = false;
+        assert!(ConfigValidator::validate(&selectively_protected).is_ok());
+
+        let mut invalid = selectively_protected.clone();
+        invalid.capacity_credit_generation = None;
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = selectively_protected;
+        invalid.priority_scheduler_adaptive_capacity = false;
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.priority_scheduler_enabled = false;
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.mode = RoutingMode::OpenAI {
+            worker_urls: vec!["http://worker1:8000".to_string()],
+        };
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.connection_mode = ConnectionMode::Grpc;
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.routing_key_override.enabled = true;
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.load_monitor_interval_secs = DISTRIBUTION_HEADROOM_MAX_AGE_SECS / 2 + 1;
+        assert!(matches!(
+            ConfigValidator::validate(&invalid),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "load_monitor_interval_secs"
+        ));
+
+        let mut invalid = config.clone();
+        invalid.policy = distribution_headroom_policy(false, 2, 5);
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.policy = distribution_headroom_policy(true, 1, 5);
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        invalid.policy = distribution_headroom_policy(true, 2, 0);
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut invalid = config.clone();
+        if let PolicyConfig::CacheAware {
+            eviction_interval_secs,
+            ..
+        } = &mut invalid.policy
+        {
+            *eviction_interval_secs = 60;
+        }
+        assert!(ConfigValidator::validate(&invalid).is_err());
+
+        let mut unrelated_override = config.clone();
+        unrelated_override
+            .model_policies
+            .insert("other-model".to_string(), PolicyConfig::Random);
+        assert!(ConfigValidator::validate(&unrelated_override).is_ok());
+
+        let mut exact_override = config.clone();
+        exact_override.policy = PolicyConfig::Random;
+        exact_override
+            .model_policies
+            .insert("k3".to_string(), distribution_headroom_policy(true, 2, 5));
+        assert!(ConfigValidator::validate(&exact_override).is_ok());
+
+        let mut unrelated_compatible_override = config.clone();
+        unrelated_compatible_override.policy = PolicyConfig::Random;
+        unrelated_compatible_override.model_policies.insert(
+            "other-model".to_string(),
+            distribution_headroom_policy(true, 2, 5),
+        );
+        assert!(ConfigValidator::validate(&unrelated_compatible_override).is_err());
+
+        let mut incompatible_exact_override = config;
+        incompatible_exact_override
+            .model_policies
+            .insert("k3".to_string(), PolicyConfig::Random);
+        assert!(ConfigValidator::validate(&incompatible_exact_override).is_err());
+    }
+
+    #[test]
+    fn distribution_headroom_partition_allowlist_is_exact_and_canonical() {
+        for partitions in [
+            vec![String::new()],
+            vec![" k3".to_string()],
+            vec!["k3 ".to_string()],
+            vec!["k3".to_string(), "k3".to_string()],
+        ] {
+            let mut config = enabled_distribution_headroom_config();
+            config.adaptive_admission.distribution_headroom_partitions = partitions;
+            assert!(ConfigValidator::validate(&config).is_err());
+        }
+
+        let mut multiple = enabled_distribution_headroom_config();
+        multiple.adaptive_admission.distribution_headroom_partitions =
+            vec!["k3".to_string(), "k3-canary".to_string()];
+        assert!(ConfigValidator::validate(&multiple).is_err());
     }
 
     #[test]

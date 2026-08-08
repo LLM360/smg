@@ -150,6 +150,17 @@ pub struct AdaptiveAdmissionConfig {
     /// concurrency knee upward. Near-equal throughput may move it downward.
     #[serde(default = "default_feedback_throughput_improvement_ratio")]
     pub feedback_throughput_improvement_ratio: f64,
+    /// Exact admission partitions allowed to consume bounded per-worker
+    /// distribution headroom. Empty by default, so the feature is inert.
+    #[serde(default)]
+    pub distribution_headroom_partitions: Vec<String>,
+    /// Process-local safety ceiling for concurrent distribution-headroom
+    /// routes in each enabled partition. Zero disables the feature; the
+    /// experimental singleton-canary implementation requires exactly one.
+    /// This is not a cross-process lease and is unsafe during blue/green
+    /// overlap or when multiple routers share the same workers.
+    #[serde(default)]
+    pub distribution_headroom_max_inflight: u16,
 }
 
 impl Default for AdaptiveAdmissionConfig {
@@ -169,6 +180,8 @@ impl Default for AdaptiveAdmissionConfig {
                 default_feedback_max_waiting_requests_per_healthy_replica(),
             feedback_max_token_usage: default_feedback_max_token_usage(),
             feedback_throughput_improvement_ratio: default_feedback_throughput_improvement_ratio(),
+            distribution_headroom_partitions: Vec::new(),
+            distribution_headroom_max_inflight: 0,
         }
     }
 }
@@ -414,6 +427,11 @@ pub struct TokenizerCacheConfig {
 fn default_load_monitor_interval_secs() -> u64 {
     10
 }
+
+/// Maximum age accepted by the experimental distribution-headroom proof.
+/// Keep this in config so startup validation and the admission hot path share
+/// one freshness contract.
+pub(crate) const DISTRIBUTION_HEADROOM_MAX_AGE_SECS: u64 = 5;
 
 fn default_enable_l0() -> bool {
     false
@@ -1171,10 +1189,27 @@ mod tests {
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
         assert!(!config.tenant_resolution.trust_tenant_header);
+        assert!(config
+            .adaptive_admission
+            .distribution_headroom_partitions
+            .is_empty());
+        assert_eq!(
+            config.adaptive_admission.distribution_headroom_max_inflight,
+            0
+        );
         assert_eq!(
             config.tenant_resolution.tenant_header_name,
             DEFAULT_TENANT_HEADER_NAME
         );
+    }
+
+    #[test]
+    fn adaptive_admission_legacy_serde_defaults_distribution_headroom_off() {
+        let config: AdaptiveAdmissionConfig = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(config, AdaptiveAdmissionConfig::default());
+        assert!(config.distribution_headroom_partitions.is_empty());
+        assert_eq!(config.distribution_headroom_max_inflight, 0);
     }
 
     #[test]

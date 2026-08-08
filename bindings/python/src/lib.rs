@@ -511,6 +511,8 @@ struct Router {
     adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: u32,
     adaptive_admission_feedback_max_token_usage: f64,
     adaptive_admission_feedback_throughput_improvement_ratio: f64,
+    adaptive_admission_distribution_headroom_partition: Vec<String>,
+    adaptive_admission_distribution_headroom_max_inflight: u16,
     capacity_credit_generation: Option<String>,
     capacity_credit_ttl_ms: u64,
     capacity_credit_terminal_retention_secs: u64,
@@ -831,6 +833,11 @@ impl Router {
                 feedback_max_token_usage: self.adaptive_admission_feedback_max_token_usage,
                 feedback_throughput_improvement_ratio: self
                     .adaptive_admission_feedback_throughput_improvement_ratio,
+                distribution_headroom_partitions: self
+                    .adaptive_admission_distribution_headroom_partition
+                    .clone(),
+                distribution_headroom_max_inflight: self
+                    .adaptive_admission_distribution_headroom_max_inflight,
             })
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
@@ -1065,6 +1072,8 @@ impl Router {
         adaptive_admission_feedback_max_waiting_requests_per_healthy_replica = 2,
         adaptive_admission_feedback_max_token_usage = 0.9,
         adaptive_admission_feedback_throughput_improvement_ratio = 0.02,
+        adaptive_admission_distribution_headroom_partition = vec![],
+        adaptive_admission_distribution_headroom_max_inflight = 0,
         capacity_credit_generation = None,
         capacity_credit_ttl_ms = 30000,
         capacity_credit_terminal_retention_secs = 600,
@@ -1220,6 +1229,8 @@ impl Router {
         adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: u32,
         adaptive_admission_feedback_max_token_usage: f64,
         adaptive_admission_feedback_throughput_improvement_ratio: f64,
+        adaptive_admission_distribution_headroom_partition: Vec<String>,
+        adaptive_admission_distribution_headroom_max_inflight: u16,
         capacity_credit_generation: Option<String>,
         capacity_credit_ttl_ms: u64,
         capacity_credit_terminal_retention_secs: u64,
@@ -1389,6 +1400,8 @@ impl Router {
             adaptive_admission_feedback_max_waiting_requests_per_healthy_replica,
             adaptive_admission_feedback_max_token_usage,
             adaptive_admission_feedback_throughput_improvement_ratio,
+            adaptive_admission_distribution_headroom_partition,
+            adaptive_admission_distribution_headroom_max_inflight,
             capacity_credit_generation,
             capacity_credit_ttl_ms,
             capacity_credit_terminal_retention_secs,

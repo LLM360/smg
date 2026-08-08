@@ -38,9 +38,10 @@
     -------------------------------------------
     Restricts cached-owner candidates to workers within 10 percentage points of
     the least-pressured owner and below 90% pressure. Non-owner candidates use
-    the equivalent fleet-scoped guard for cold fallback. Pressure is the larger
-    of KV token usage and utilization; waiting requests break ties. Missing or
-    stale telemetry fails open to existing owners.
+    the equivalent fleet-scoped guard for cold fallback. Pressure is the largest
+    of KV token usage, utilization, and scheduler occupancy when every engine
+    reports a running-request cap for every DP rank. Missing, partial, or stale
+    telemetry fails open to existing owners.
 
     Configuration Parameters:
     ------------------------
@@ -60,7 +61,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -69,7 +70,7 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -87,6 +88,9 @@ use crate::{
 const ENGINE_LOAD_MAX_AGE: Duration = Duration::from_secs(30);
 const ENGINE_PRESSURE_SLACK: f64 = 0.10;
 const ENGINE_PRESSURE_HIGH_WATERMARK: f64 = 0.90;
+const ADMISSION_PARTITION_HEADER: &str = "x-smg-admission-partition";
+
+static NEXT_CACHE_POLICY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImbalanceReason {
@@ -115,10 +119,143 @@ struct PrefixReplicationState {
     provisional_owner: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingDistributionSeed {
+    lease_id: u64,
+    prefix_key: PrefixBudgetKey,
+    model_id: Arc<str>,
+    target_url: Arc<str>,
+    target_generation_id: u64,
+    target_revision: u64,
+    request_digest: blake3::Hash,
+    request_len: usize,
+    creates_owner: bool,
+}
+
+#[derive(Debug)]
+struct CacheDistributionState {
+    policy_instance_id: u64,
+    next_lease_id: AtomicU64,
+    pending_by_partition: DashMap<String, PendingDistributionSeed>,
+}
+
+impl CacheDistributionState {
+    fn new() -> Self {
+        // Pointer equality on `CacheDistributionState` is the authoritative
+        // instance binding. This monotonic label makes diagnostics and tests
+        // readable; wrapping after u64::MAX policy constructions is harmless.
+        let policy_instance_id = NEXT_CACHE_POLICY_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        Self {
+            policy_instance_id,
+            next_lease_id: AtomicU64::new(1),
+            pending_by_partition: DashMap::new(),
+        }
+    }
+
+    fn next_lease_id(&self) -> Option<u64> {
+        self.next_lease_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+    }
+
+    fn release_if_current(&self, partition: &str, lease_id: u64) -> bool {
+        self.pending_by_partition
+            .remove_if(partition, |_, pending| pending.lease_id == lease_id)
+            .is_some()
+    }
+}
+
+/// One exact, success-committed cache-distribution decision.
+///
+/// The lease deliberately does not implement `Clone`. Dropping it before a
+/// successful commit releases only its own pending partition entry. A stale
+/// lease ID can therefore never clear a newer decision for the same partition.
+#[derive(Debug)]
+pub(crate) struct CacheDistributionLease {
+    state: Arc<CacheDistributionState>,
+    policy_instance_id: u64,
+    lease_id: u64,
+    partition: Arc<str>,
+    prefix_key: PrefixBudgetKey,
+    model_id: Arc<str>,
+    target_url: Arc<str>,
+    target_generation_id: u64,
+    target_revision: u64,
+    request_digest: blake3::Hash,
+    request_len: usize,
+    creates_owner: bool,
+    finished: bool,
+}
+
+impl CacheDistributionLease {
+    pub(super) fn partition(&self) -> &str {
+        &self.partition
+    }
+
+    pub(super) fn target_url(&self) -> &str {
+        &self.target_url
+    }
+
+    pub(super) fn target_revision(&self) -> u64 {
+        self.target_revision
+    }
+
+    pub(super) fn target_generation_id(&self) -> u64 {
+        self.target_generation_id
+    }
+
+    fn request_matches(&self, text: &str) -> bool {
+        text.len() == self.request_len && blake3::hash(text.as_bytes()) == self.request_digest
+    }
+
+    fn pending_matches(&self) -> bool {
+        self.policy_instance_id == self.state.policy_instance_id
+            && self
+                .state
+                .pending_by_partition
+                .get(self.partition.as_ref())
+                .is_some_and(|pending| {
+                    pending.lease_id == self.lease_id
+                        && pending.prefix_key == self.prefix_key
+                        && pending.model_id == self.model_id
+                        && pending.target_url == self.target_url
+                        && pending.target_generation_id == self.target_generation_id
+                        && pending.target_revision == self.target_revision
+                        && pending.request_digest == self.request_digest
+                        && pending.request_len == self.request_len
+                        && pending.creates_owner == self.creates_owner
+                })
+    }
+
+    fn finish(&mut self) -> bool {
+        let removed = self
+            .state
+            .release_if_current(self.partition.as_ref(), self.lease_id);
+        if removed {
+            self.finished = true;
+        }
+        removed
+    }
+}
+
+impl Drop for CacheDistributionLease {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.state
+                .release_if_current(self.partition.as_ref(), self.lease_id);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PrefixOwnership {
     key: PrefixBudgetKey,
     owners: Vec<usize>,
+    /// Whether the authoritative/approximate index matched at least one owner,
+    /// including an owner that is currently not executable.
+    has_known_owner: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +341,15 @@ pub struct CacheAwarePolicy {
     /// reported by the backend event stream.
     replication_state: Arc<DashMap<PrefixBudgetKey, PrefixReplicationState>>,
     _replication_gc_task: Option<PeriodicTask>,
+    /// Exact, success-committed cache-distribution leases. This state is
+    /// separate from the ordinary replication cooldown because acquiring a
+    /// lease must not claim durable ownership before the backend succeeds.
+    distribution_state: Arc<CacheDistributionState>,
+    /// Serializes guarded ordinary selection with exact lease acquisition and
+    /// ownership commit. Routing is cheap relative to inference, and this
+    /// process-local fence closes the cold-bootstrap check/insert race without
+    /// widening the critical section to backend execution.
+    distribution_selection_lock: Mutex<()>,
 }
 
 /// Per-model inner container for [`CacheAwarePolicy::hash_index`].
@@ -228,6 +374,7 @@ impl CacheAwarePolicy {
         let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
         let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
         let replication_state = Arc::new(DashMap::<PrefixBudgetKey, PrefixReplicationState>::new());
+        let distribution_state = Arc::new(CacheDistributionState::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.eviction_interval_secs > 0 {
@@ -333,6 +480,8 @@ impl CacheAwarePolicy {
             engine_loads: RwLock::new(HashMap::new()),
             replication_state,
             _replication_gc_task: replication_gc_task,
+            distribution_state,
+            distribution_selection_lock: Mutex::new(()),
         }
     }
 
@@ -346,7 +495,14 @@ impl CacheAwarePolicy {
         }
 
         let loads = self.engine_loads.read();
-        let mut pressure_by_index = HashMap::with_capacity(healthy_indices.len());
+        struct RawWorkerPressure {
+            idx: usize,
+            backend_pressure: f64,
+            scheduler_pressure: Option<f64>,
+            waiting_requests: i64,
+        }
+
+        let mut raw_pressure = Vec::with_capacity(healthy_indices.len());
 
         // Degrade the whole decision to legacy request-count routing unless all
         // candidates have comparable, fresh engine telemetry.
@@ -357,27 +513,92 @@ impl CacheAwarePolicy {
                 return None;
             }
 
-            let pressure = load
+            let backend_pressure = load
                 .response
                 .loads
                 .iter()
                 .map(|rank| rank.token_usage.max(rank.utilization))
                 .fold(0.0_f64, f64::max);
-            if !pressure.is_finite() || pressure < 0.0 {
+            if !backend_pressure.is_finite() || backend_pressure < 0.0 {
                 return None;
             }
+            let running_requests: i64 = load
+                .response
+                .loads
+                .iter()
+                .map(|rank| i64::from(rank.num_running_reqs.max(0)))
+                .sum();
             let waiting_requests = load
                 .response
                 .loads
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs.max(0)))
                 .sum();
+            let reported_max_running = load.response.loads.iter().try_fold(0_i64, |total, rank| {
+                let rank_cap = i64::from(rank.max_running_requests);
+                (rank_cap > 0).then(|| total.saturating_add(rank_cap))
+            });
+            let registered_single_rank_cap =
+                if load.response.dp_rank_count == 1 && load.response.loads.len() == 1 {
+                    let rank = &load.response.loads[0];
+                    let running = rank.num_running_reqs;
+                    let waiting = rank.num_waiting_reqs;
+                    // Upstream SGLang `/get_load` reports one canonical DP
+                    // snapshot and `combine_sglang_standard_loads` preserves its
+                    // total request count. Older versions omit only the cap, which
+                    // discovery still reports exactly. The Prometheus fallback,
+                    // by contrast, leaves `num_total_reqs` at zero and can contain
+                    // TP-duplicated request gauges. Require the canonical count
+                    // identity so metadata never turns duplicated gauges into
+                    // scheduler occupancy. The all-zero idle case is unambiguous.
+                    if rank.max_running_requests == 0
+                        && running >= 0
+                        && waiting >= 0
+                        && rank.num_total_reqs == running.saturating_add(waiting)
+                    {
+                        worker.max_running_requests().map(i64::from)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            let max_running_requests = reported_max_running.or(registered_single_rank_cap);
+            let scheduler_pressure = max_running_requests.map(|max_running| {
+                (running_requests.saturating_add(waiting_requests) as f64 / max_running as f64)
+                    .clamp(0.0, 1.0)
+            });
+
+            raw_pressure.push(RawWorkerPressure {
+                idx,
+                backend_pressure,
+                scheduler_pressure,
+                waiting_requests,
+            });
+        }
+
+        // Scheduler counts and caps must be comparable across the entire
+        // candidate set. In particular, SGLang's Prometheus-only fallback can
+        // repeat request gauges for every TP rank while omitting the cap. A
+        // missing cap therefore disables scheduler occupancy for this decision
+        // instead of making that worker look artificially saturated.
+        let use_scheduler_pressure = raw_pressure
+            .iter()
+            .all(|load| load.scheduler_pressure.is_some());
+        let mut pressure_by_index = HashMap::with_capacity(raw_pressure.len());
+        for load in raw_pressure {
+            let pressure = if use_scheduler_pressure {
+                load.backend_pressure
+                    .max(load.scheduler_pressure.unwrap_or_default())
+            } else {
+                load.backend_pressure
+            };
 
             pressure_by_index.insert(
-                idx,
+                load.idx,
                 WorkerPressure {
                     pressure,
-                    waiting_requests,
+                    waiting_requests: load.waiting_requests,
                 },
             );
         }
@@ -479,6 +700,438 @@ impl CacheAwarePolicy {
     /// imbalance trigger can read fresh per-worker `token_usage`.
     pub fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
         *self.load_rx.write() = rx;
+    }
+
+    /// Disabled eviction is required for the singleton distribution proof so
+    /// an owner cannot disappear between selection and commit. Fail closed
+    /// once the configured per-tenant tree bound is crossed instead of letting
+    /// that canary-only mode grow without limit. One accepted request can
+    /// overshoot the bound by at most the router's payload limit; the next
+    /// guarded selection is rejected before another insertion.
+    fn distribution_index_within_bound(&self, model_id: &str) -> bool {
+        self.string_trees.get(model_id).is_none_or(|tree| {
+            tree.tenant_char_count
+                .iter()
+                .all(|entry| *entry.value() <= self.config.max_tree_size)
+        })
+    }
+
+    /// Begin one exact HTTP cache-distribution decision.
+    ///
+    /// This is intentionally not part of [`LoadBalancingPolicy`]. Callers must
+    /// opt in by downcasting a cache-aware policy and must provide an exact
+    /// URL-plus-generation-plus-revision allowlist produced by the admission layer. Acquiring a
+    /// lease is read-only with respect to the prefix trees, replication
+    /// cooldown, worker load, and fallback work reservations.
+    pub(crate) fn begin_distribution_lease(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        partition: &str,
+        allowed_targets: &[(String, u64, u64)],
+    ) -> Option<(usize, CacheDistributionLease)> {
+        let _selection_guard = self.distribution_selection_lock.lock();
+        if !self.config.engine_load
+            || self.config.max_cached_owners_per_prefix == 0
+            || self.config.cache_owner_spill_cooldown_secs == 0
+            || partition.is_empty()
+            || info.tokens.is_some()
+        {
+            return None;
+        }
+        let text = info.request_text?;
+        if let Some(value) = info
+            .headers
+            .and_then(|headers| headers.get(ADMISSION_PARTITION_HEADER))
+        {
+            if value.to_str().ok()?.trim() != partition {
+                return None;
+            }
+        }
+        // Ready-but-circuit-open workers still carry authoritative prefix and
+        // pressure evidence. Keep them in the observed set, while exact target
+        // filtering below independently requires `can_execute`.
+        let observed_indices = Self::distribution_observed_indices(workers);
+        let first_idx = *observed_indices.first()?;
+        let tree_model_id = normalize_model_key(workers[first_idx].model_id());
+        if normalize_model_key(model_id) != tree_model_id
+            || observed_indices
+                .iter()
+                .any(|&idx| normalize_model_key(workers[idx].model_id()) != tree_model_id)
+        {
+            return None;
+        }
+        if !self.distribution_index_within_bound(tree_model_id) {
+            Metrics::record_cache_aware_replication_decision(
+                tree_model_id,
+                "distribution_index_bound_exceeded",
+                0,
+            );
+            return None;
+        }
+
+        let exact_candidates =
+            Self::exact_distribution_candidates(workers, info, &observed_indices, allowed_targets)?;
+        if exact_candidates.is_empty() {
+            return None;
+        }
+        let pressure_plan = self.engine_pressure_plan(workers, &observed_indices)?;
+        let ownership = self.prefix_ownership(workers, info, &observed_indices, tree_model_id);
+        let known_owners = self.owners_with_provisional(&ownership, workers, &observed_indices);
+        if known_owners.is_empty() {
+            return None;
+        }
+
+        let routeable_owners = Self::routeable_distribution_owners(workers, &known_owners);
+        let suitable_owners =
+            Self::suitable_cached_owners(workers, &routeable_owners, Some(&pressure_plan));
+        let existing_candidates: Vec<usize> = exact_candidates
+            .iter()
+            .copied()
+            .filter(|idx| suitable_owners.contains(idx))
+            .collect();
+        let (target_idx, creates_owner) = if let Some(idx) =
+            Self::best_distribution_candidate(workers, &existing_candidates, &pressure_plan)
+        {
+            (idx, false)
+        } else {
+            if !suitable_owners.is_empty()
+                || known_owners.len() >= self.config.max_cached_owners_per_prefix
+            {
+                return None;
+            }
+            let new_owner_candidates: Vec<usize> = exact_candidates
+                .iter()
+                .copied()
+                .filter(|idx| {
+                    !known_owners.contains(idx)
+                        && pressure_plan.allowed_indices.contains(idx)
+                        && pressure_plan.pressure_by_index[idx].pressure
+                            <= ENGINE_PRESSURE_HIGH_WATERMARK
+                })
+                .collect();
+            (
+                Self::best_distribution_candidate(workers, &new_owner_candidates, &pressure_plan)?,
+                true,
+            )
+        };
+
+        let target_generation_id = workers[target_idx].generation_id();
+        let target_revision = workers[target_idx].revision();
+        if !allowed_targets
+            .iter()
+            .any(|(url, generation_id, revision)| {
+                url == workers[target_idx].url()
+                    && *generation_id == target_generation_id
+                    && *revision == target_revision
+            })
+        {
+            return None;
+        }
+        let lease = self.acquire_distribution_lease(
+            partition,
+            ownership.key,
+            tree_model_id,
+            workers[target_idx].as_ref(),
+            text,
+            creates_owner,
+        )?;
+        Some((target_idx, lease))
+    }
+
+    /// Record fallback work against an exact target selected by a valid
+    /// distribution lease, without rerunning worker selection.
+    pub(crate) fn reserve_distribution_target_work(
+        &self,
+        target: &dyn Worker,
+        info: &SelectWorkerInfo<'_>,
+    ) -> u64 {
+        let cost = self.fallback.reserve_exact_worker(target.url(), info);
+        target.increment_processed();
+        cost
+    }
+
+    /// Revalidate an exact lease immediately before dispatch.
+    ///
+    /// The current policy instance, pending lease record, request, target
+    /// object, target revision, routing constraints, prefix condition, and
+    /// engine pressure must all still match. This method does not mutate any
+    /// cache-policy or worker state.
+    pub(crate) fn validate_distribution_lease(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        expected_worker: &Arc<dyn Worker>,
+        lease: &CacheDistributionLease,
+    ) -> bool {
+        if !Arc::ptr_eq(&self.distribution_state, &lease.state)
+            || self.distribution_state.policy_instance_id != lease.policy_instance_id
+            || normalize_model_key(model_id) != lease.model_id.as_ref()
+            || info.tokens.is_some()
+            || !info
+                .request_text
+                .is_some_and(|text| lease.request_matches(text))
+            || !lease.pending_matches()
+        {
+            return false;
+        }
+        let Some(target_idx) = Self::exact_lease_target_index(workers, expected_worker, lease)
+        else {
+            return false;
+        };
+        let observed_indices = Self::distribution_observed_indices(workers);
+        if !observed_indices.contains(&target_idx)
+            || normalize_model_key(workers[target_idx].model_id()) != lease.model_id.as_ref()
+            || SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &[target_idx])
+                != [target_idx]
+        {
+            return false;
+        }
+        let Some(pressure_plan) = self.engine_pressure_plan(workers, &observed_indices) else {
+            return false;
+        };
+        let ownership = self.prefix_ownership(workers, info, &observed_indices, &lease.model_id);
+        if ownership.key != lease.prefix_key {
+            return false;
+        }
+        let known_owners = self.owners_with_provisional(&ownership, workers, &observed_indices);
+        if known_owners.is_empty() {
+            return false;
+        }
+        let routeable_owners = Self::routeable_distribution_owners(workers, &known_owners);
+        let suitable_owners =
+            Self::suitable_cached_owners(workers, &routeable_owners, Some(&pressure_plan));
+
+        if known_owners.contains(&target_idx) {
+            return suitable_owners.contains(&target_idx);
+        }
+        lease.creates_owner
+            && suitable_owners.is_empty()
+            && known_owners.len() < self.config.max_cached_owners_per_prefix
+            && pressure_plan.allowed_indices.contains(&target_idx)
+            && pressure_plan.pressure_by_index[&target_idx].pressure
+                <= ENGINE_PRESSURE_HIGH_WATERMARK
+    }
+
+    /// Commit durable HTTP prefix ownership after a successful backend call.
+    ///
+    /// Commit intentionally rechecks only immutable binding and current target
+    /// identity. The owner-pressure condition was checked immediately before
+    /// dispatch, while a successful response is itself evidence that this exact
+    /// target now owns the routed prefix.
+    pub(crate) fn commit_distribution_success(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        request_text: &str,
+        expected_worker: &Arc<dyn Worker>,
+        lease: &mut CacheDistributionLease,
+    ) -> bool {
+        let _selection_guard = self.distribution_selection_lock.lock();
+        if !Arc::ptr_eq(&self.distribution_state, &lease.state)
+            || self.distribution_state.policy_instance_id != lease.policy_instance_id
+            || normalize_model_key(model_id) != lease.model_id.as_ref()
+            || !lease.request_matches(request_text)
+            || !lease.pending_matches()
+            || Self::exact_lease_target_index(workers, expected_worker, lease).is_none()
+        {
+            return false;
+        }
+
+        let Some(tree) = self
+            .string_trees
+            .get(lease.model_id.as_ref())
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+        let result = tree.match_and_insert_with(request_text, |_| Some(lease.target_url.as_ref()));
+        if self.should_populate_hash_index() {
+            let matched_prefix: String = request_text
+                .chars()
+                .take(result.matched_char_count)
+                .collect();
+            self.hash_index
+                .entry(lease.model_id.to_string())
+                .or_default()
+                .string_tree
+                .insert(kv_index::hash_node_path(request_text), matched_prefix);
+        }
+        if lease.creates_owner {
+            self.replication_state.insert(
+                lease.prefix_key,
+                PrefixReplicationState {
+                    last_spill: Instant::now(),
+                    provisional_owner: lease.target_url.to_string(),
+                },
+            );
+        }
+        lease.finish()
+    }
+
+    fn acquire_distribution_lease(
+        &self,
+        partition: &str,
+        prefix_key: PrefixBudgetKey,
+        model_id: &str,
+        target: &dyn Worker,
+        request_text: &str,
+        creates_owner: bool,
+    ) -> Option<CacheDistributionLease> {
+        let lease_id = self.distribution_state.next_lease_id()?;
+        let model_id: Arc<str> = Arc::from(model_id);
+        let target_url: Arc<str> = Arc::from(target.url());
+        let target_generation_id = target.generation_id();
+        let target_revision = target.revision();
+        let partition: Arc<str> = Arc::from(partition);
+        let request_digest = blake3::hash(request_text.as_bytes());
+        let request_len = request_text.len();
+        let pending = PendingDistributionSeed {
+            lease_id,
+            prefix_key,
+            model_id: Arc::clone(&model_id),
+            target_url: Arc::clone(&target_url),
+            target_generation_id,
+            target_revision,
+            request_digest,
+            request_len,
+            creates_owner,
+        };
+        match self
+            .distribution_state
+            .pending_by_partition
+            .entry(partition.to_string())
+        {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(entry) => {
+                entry.insert(pending);
+                Some(CacheDistributionLease {
+                    state: Arc::clone(&self.distribution_state),
+                    policy_instance_id: self.distribution_state.policy_instance_id,
+                    lease_id,
+                    partition,
+                    prefix_key,
+                    model_id,
+                    target_url,
+                    target_generation_id,
+                    target_revision,
+                    request_digest,
+                    request_len,
+                    creates_owner,
+                    finished: false,
+                })
+            }
+        }
+    }
+
+    fn distribution_observed_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
+        workers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, worker)| {
+                let state = worker.routing_state();
+                state.healthy.then_some(idx)
+            })
+            .collect()
+    }
+
+    fn routeable_distribution_owners(
+        workers: &[Arc<dyn Worker>],
+        owner_indices: &[usize],
+    ) -> Vec<usize> {
+        owner_indices
+            .iter()
+            .copied()
+            .filter(|&idx| workers[idx].is_available())
+            .collect()
+    }
+
+    fn exact_distribution_candidates(
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        healthy_indices: &[usize],
+        allowed_targets: &[(String, u64, u64)],
+    ) -> Option<Vec<usize>> {
+        let mut allowed_by_url = HashMap::with_capacity(allowed_targets.len());
+        for (url, generation_id, revision) in allowed_targets {
+            if url.is_empty() {
+                return None;
+            }
+            if let Some(previous) = allowed_by_url.insert(url.as_str(), (*generation_id, *revision))
+            {
+                if previous != (*generation_id, *revision) {
+                    return None;
+                }
+            }
+        }
+
+        let mut matched_by_url = HashMap::with_capacity(allowed_by_url.len());
+        for &idx in healthy_indices {
+            let worker = &workers[idx];
+            if allowed_by_url.get(worker.url()).copied()
+                != Some((worker.generation_id(), worker.revision()))
+            {
+                continue;
+            }
+            if matched_by_url.insert(worker.url(), idx).is_some() {
+                // An exact URL and revision must identify one worker object.
+                return None;
+            }
+        }
+        let candidate_indices: Vec<usize> = matched_by_url.into_values().collect();
+        Some(SizeAwarePowerOfTwoPolicy::eligible_candidates(
+            workers,
+            info,
+            &candidate_indices,
+        ))
+    }
+
+    fn best_distribution_candidate(
+        workers: &[Arc<dyn Worker>],
+        candidate_indices: &[usize],
+        pressure_plan: &EnginePressurePlan,
+    ) -> Option<usize> {
+        candidate_indices.iter().copied().min_by(|&left, &right| {
+            let left_pressure = pressure_plan.pressure_by_index[&left];
+            let right_pressure = pressure_plan.pressure_by_index[&right];
+            left_pressure
+                .pressure
+                .total_cmp(&right_pressure.pressure)
+                .then_with(|| {
+                    left_pressure
+                        .waiting_requests
+                        .cmp(&right_pressure.waiting_requests)
+                })
+                .then_with(|| workers[left].load().cmp(&workers[right].load()))
+                .then_with(|| workers[left].url().cmp(workers[right].url()))
+        })
+    }
+
+    fn exact_lease_target_index(
+        workers: &[Arc<dyn Worker>],
+        expected_worker: &Arc<dyn Worker>,
+        lease: &CacheDistributionLease,
+    ) -> Option<usize> {
+        if expected_worker.url() != lease.target_url.as_ref()
+            || expected_worker.generation_id() != lease.target_generation_id
+            || expected_worker.revision() != lease.target_revision
+            || !expected_worker.is_available()
+        {
+            return None;
+        }
+        let mut matches = workers.iter().enumerate().filter(|(_, worker)| {
+            worker.url() == lease.target_url.as_ref()
+                && worker.generation_id() == lease.target_generation_id
+                && worker.revision() == lease.target_revision
+                && worker.is_available()
+        });
+        let (idx, current) = matches.next()?;
+        if matches.next().is_some() || !Arc::ptr_eq(current, expected_worker) {
+            return None;
+        }
+        Some(idx)
     }
 
     /// True when the pool is imbalanced enough to abandon cache affinity.
@@ -1021,6 +1674,9 @@ impl TreeHandle for CacheAwarePolicy {
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        let _distribution_selection_guard = info
+            .forbid_unleased_cache_owner_expansion
+            .then(|| self.distribution_selection_lock.lock());
         let request_text = info.request_text;
         let request_tokens = info.tokens;
 
@@ -1049,6 +1705,68 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // The router pre-filters workers by model, so any healthy worker gives
         // us the model key before engine pressure narrows the candidate set.
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+
+        if info.forbid_unleased_cache_owner_expansion
+            && !self.distribution_index_within_bound(model_id)
+        {
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "distribution_index_bound_exceeded",
+                0,
+            );
+            return None;
+        }
+
+        // Distribution-enabled ordinary traffic may consume only ownership
+        // that was already committed before this selection. Include healthy
+        // circuit-open workers in the ownership lookup so an unavailable owner
+        // cannot be mistaken for a cold prefix and silently replicated. This
+        // early return is the tri-state "blocked" boundary: `None` must not
+        // fall through to either pressure-spill or fleet-wide fallback.
+        let observed_indices = info
+            .forbid_unleased_cache_owner_expansion
+            .then(|| Self::distribution_observed_indices(workers));
+        let ownership_indices = observed_indices.as_deref().unwrap_or(&healthy_indices);
+        let guarded_ownership = self.prefix_ownership(workers, info, ownership_indices, model_id);
+        if info.forbid_unleased_cache_owner_expansion && guarded_ownership.has_known_owner {
+            let committed_owners = SizeAwarePowerOfTwoPolicy::eligible_candidates(
+                workers,
+                info,
+                &guarded_ownership.owners,
+            );
+            let result = if committed_owners.is_empty() {
+                "unleased_owner_expansion_blocked"
+            } else {
+                "committed_owner_only"
+            };
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                result,
+                guarded_ownership.owners.len(),
+            );
+            return self.select_from_cached_owners(workers, info, &committed_owners, model_id);
+        }
+
+        // A distribution seed is the only request allowed to reach its exact
+        // clean-peer target until that request proves successful ownership.
+        // Keep ordinary traffic on committed owners while the seed is pending.
+        // Returning here, including `None` when no committed owner can execute,
+        // also prevents the ordinary pressure-spill fallback from bypassing the
+        // one-in-flight distribution permit.
+        let pending_ownership = guarded_ownership;
+        if self.has_pending_distribution_seed(pending_ownership.key, info, model_id) {
+            let committed_owners = SizeAwarePowerOfTwoPolicy::eligible_candidates(
+                workers,
+                info,
+                &pending_ownership.owners,
+            );
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "distribution_pending_owner_hold",
+                pending_ownership.owners.len(),
+            );
+            return self.select_from_cached_owners(workers, info, &committed_owners, model_id);
+        }
         let pressure_plan = self.engine_pressure_plan(workers, &healthy_indices);
 
         // Prefix ownership is evaluated before fleet-wide imbalance. This is
@@ -1247,6 +1965,7 @@ impl CacheAwarePolicy {
     ) -> PrefixOwnership {
         let mut owners = Vec::new();
         let mut matched_tokens = 0usize;
+        let mut has_known_owner = false;
         if let Some(tree) = self
             .token_trees
             .get(model_id)
@@ -1260,6 +1979,7 @@ impl CacheAwarePolicy {
             };
             if match_rate > self.config.cache_threshold {
                 matched_tokens = result.matched_token_count;
+                has_known_owner = !result.tenants.is_empty();
                 owners = healthy_indices
                     .iter()
                     .copied()
@@ -1285,6 +2005,7 @@ impl CacheAwarePolicy {
                 kind: PrefixKind::Token,
             },
             owners,
+            has_known_owner,
         }
     }
 
@@ -1322,6 +2043,7 @@ impl CacheAwarePolicy {
                                     kind: PrefixKind::Token,
                                 },
                                 owners,
+                                has_known_owner: true,
                             };
                         }
                     }
@@ -1338,6 +2060,7 @@ impl CacheAwarePolicy {
         let text = info.request_text.unwrap_or("");
         let mut owners = Vec::new();
         let mut matched_chars = 0usize;
+        let mut has_known_owner = false;
         if let Some(tree) = self
             .string_trees
             .get(model_id)
@@ -1351,6 +2074,7 @@ impl CacheAwarePolicy {
             };
             if match_rate > self.config.cache_threshold {
                 matched_chars = result.matched_char_count;
+                has_known_owner = !result.tenants.is_empty();
                 owners = healthy_indices
                     .iter()
                     .copied()
@@ -1375,6 +2099,7 @@ impl CacheAwarePolicy {
                 kind: PrefixKind::String,
             },
             owners,
+            has_known_owner,
         }
     }
 
@@ -1538,6 +2263,38 @@ impl CacheAwarePolicy {
             .iter()
             .copied()
             .find(|&idx| workers[idx].url() == state.provisional_owner)
+    }
+
+    /// Return whether this request matches an in-flight exact distribution
+    /// seed. The trusted admission partition header selects the one pending
+    /// record; standalone traffic falls back to the model key.
+    ///
+    /// Ordinary routing must never follow a pending seed. Doing so would turn
+    /// one bounded distribution permit into an unbounded fan-out before the
+    /// target has proved that it owns the prefix. Callers instead hold traffic
+    /// on already committed owners, or fail closed when none is executable.
+    fn has_pending_distribution_seed(
+        &self,
+        key: PrefixBudgetKey,
+        info: &SelectWorkerInfo<'_>,
+        model_id: &str,
+    ) -> bool {
+        if self.distribution_state.pending_by_partition.is_empty() {
+            return false;
+        }
+        let partition = info
+            .headers
+            .and_then(|headers| headers.get(ADMISSION_PARTITION_HEADER))
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(model_id);
+        self.distribution_state
+            .pending_by_partition
+            .get(partition)
+            .is_some_and(|pending| {
+                pending.prefix_key == key && pending.model_id.as_ref() == model_id
+            })
     }
 
     /// Atomically claim the next replication slot for a prefix. The first
@@ -1995,6 +2752,70 @@ mod tests {
         }
     }
 
+    fn engine_load_with_scheduler(
+        token_usage: f64,
+        utilization: f64,
+        running: i32,
+        waiting: i32,
+        max_running: i32,
+    ) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                token_usage,
+                utilization,
+                num_running_reqs: running,
+                num_waiting_reqs: waiting,
+                max_running_requests: max_running,
+                ..Default::default()
+            }],
+            dp_rank_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn engine_load_with_scheduler_ranks(ranks: &[(i32, i32, i32)]) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            loads: ranks
+                .iter()
+                .enumerate()
+                .map(
+                    |(dp_rank, &(running, waiting, max_running))| SchedulerLoadSnapshot {
+                        dp_rank: i32::try_from(dp_rank).unwrap(),
+                        token_usage: 0.10,
+                        utilization: 0.10,
+                        num_running_reqs: running,
+                        num_waiting_reqs: waiting,
+                        max_running_requests: max_running,
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+            dp_rank_count: i32::try_from(ranks.len()).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    fn engine_load_with_standard_scheduler_missing_cap(
+        token_usage: f64,
+        utilization: f64,
+        running: i32,
+        waiting: i32,
+    ) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                token_usage,
+                utilization,
+                num_running_reqs: running,
+                num_waiting_reqs: waiting,
+                num_total_reqs: running.saturating_add(waiting),
+                max_running_requests: 0,
+                ..Default::default()
+            }],
+            dp_rank_count: 1,
+            ..Default::default()
+        }
+    }
+
     fn two_workers() -> Vec<Arc<dyn Worker>> {
         vec![
             Arc::new(
@@ -2010,6 +2831,24 @@ mod tests {
                     .build(),
             ),
         ]
+    }
+
+    fn two_workers_with_max_running(max_running: u16) -> Vec<Arc<dyn Worker>> {
+        ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .labels(HashMap::from([(
+                            "max_running_requests".to_string(),
+                            max_running.to_string(),
+                        )]))
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
     }
 
     fn engine_aware_policy() -> CacheAwarePolicy {
@@ -2032,6 +2871,404 @@ mod tests {
             .get(model_id)
             .unwrap()
             .insert_text(text, workers[0].url());
+    }
+
+    fn scheduler_pressure_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            engine_load: true,
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        })
+    }
+
+    fn select_text(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], text: &str) -> usize {
+        policy
+            .select_worker(
+                workers,
+                &SelectWorkerInfo {
+                    request_text: Some(text),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    }
+
+    fn partition_headers(partition: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            ADMISSION_PARTITION_HEADER,
+            partition.parse().expect("valid partition header"),
+        );
+        headers
+    }
+
+    fn owner_pressure_loads(policy: &CacheAwarePolicy) {
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 34, 0, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+    }
+
+    fn exact_target(worker: &Arc<dyn Worker>) -> Vec<(String, u64, u64)> {
+        vec![(
+            worker.url().to_string(),
+            worker.generation_id(),
+            worker.revision(),
+        )]
+    }
+
+    #[test]
+    fn distribution_lease_is_default_off() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 34, 0, 37),
+            ),
+            (
+                workers[1].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+        let headers = partition_headers("kimi-k3");
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+
+        assert!(policy
+            .begin_distribution_lease(
+                model_id,
+                &workers,
+                &info,
+                "kimi-k3",
+                &exact_target(&workers[1]),
+            )
+            .is_none());
+        assert!(policy.distribution_state.pending_by_partition.is_empty());
+    }
+
+    #[test]
+    fn distribution_seed_is_isolated_until_success_is_committed() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        owner_pressure_loads(&policy);
+        for _ in 0..5 {
+            workers[0].record_outcome(503);
+        }
+        assert!(workers[0].is_healthy());
+        assert!(!workers[0].is_available());
+        policy.update_loads(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 1, 0, 37),
+            ),
+            (
+                workers[1].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+        let headers = partition_headers("kimi-k3");
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            headers: Some(&headers),
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+        let allowed = exact_target(&workers[1]);
+
+        assert!(policy
+            .begin_distribution_lease(
+                model_id,
+                &workers,
+                &info,
+                "kimi-k3",
+                &[(
+                    workers[1].url().to_string(),
+                    workers[1].generation_id(),
+                    workers[1].revision() + 1,
+                )],
+            )
+            .is_none());
+
+        let (target_idx, mut lease) = policy
+            .begin_distribution_lease(model_id, &workers, &info, "kimi-k3", &allowed)
+            .expect("idle exact target should receive one seed");
+        assert_eq!(target_idx, 1);
+        assert_eq!(lease.target_url(), workers[1].url());
+        assert_eq!(lease.target_generation_id(), workers[1].generation_id());
+        assert_eq!(lease.target_revision(), workers[1].revision());
+        assert!(lease.creates_owner);
+        assert_eq!(
+            policy.distribution_state.pending_by_partition.len(),
+            1,
+            "the seed must occupy the partition before dispatch"
+        );
+
+        let before = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("shared prefix");
+        assert_eq!(before.tenants.len(), 1);
+        assert!(before
+            .tenants
+            .iter()
+            .any(|tenant| tenant.as_ref() == workers[0].url()));
+        assert!(policy.replication_state.is_empty());
+
+        assert!(policy
+            .begin_distribution_lease(model_id, &workers, &info, "kimi-k3", &allowed)
+            .is_none());
+        for _ in 0..8 {
+            assert_eq!(
+                policy.select_worker(&workers, &info),
+                None,
+                "ordinary traffic must not fan out to an uncommitted seed target"
+            );
+            assert_eq!(
+                policy.distribution_state.pending_by_partition.len(),
+                1,
+                "ordinary routing must not consume the exact seed lease"
+            );
+            assert!(
+                policy.replication_state.is_empty(),
+                "ordinary routing must not create a provisional spill around the seed permit"
+            );
+        }
+        let while_pending = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("shared prefix");
+        assert_eq!(
+            while_pending.tenants.len(),
+            1,
+            "pending routing must not publish tree ownership"
+        );
+
+        assert!(policy.validate_distribution_lease(model_id, &workers, &info, &workers[1], &lease,));
+        assert!(policy.commit_distribution_success(
+            model_id,
+            &workers,
+            "shared prefix",
+            &workers[1],
+            &mut lease,
+        ));
+        assert!(policy.distribution_state.pending_by_partition.is_empty());
+        assert_eq!(policy.replication_state.len(), 1);
+        let committed = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("shared prefix");
+        assert_eq!(committed.tenants.len(), 2);
+        assert!(committed
+            .tenants
+            .iter()
+            .any(|tenant| tenant.as_ref() == workers[1].url()));
+        assert_eq!(
+            policy.select_worker(&workers, &info),
+            Some(1),
+            "the exact target becomes routeable only after successful ownership commit"
+        );
+    }
+
+    #[test]
+    fn distribution_existing_owner_uses_pending_slot_without_new_cooldown() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 1, 0, 37),
+            ),
+            (
+                workers[1].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+        let headers = partition_headers("kimi-k3");
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+        let allowed = exact_target(&workers[0]);
+
+        let (target_idx, mut lease) = policy
+            .begin_distribution_lease(model_id, &workers, &info, "kimi-k3", &allowed)
+            .expect("an exact suitable owner may consume the one-shot route");
+        assert_eq!(target_idx, 0);
+        assert!(!lease.creates_owner);
+        assert!(policy
+            .begin_distribution_lease(model_id, &workers, &info, "kimi-k3", &allowed)
+            .is_none());
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert!(policy.validate_distribution_lease(model_id, &workers, &info, &workers[0], &lease,));
+        assert!(policy.commit_distribution_success(
+            model_id,
+            &workers,
+            "shared prefix",
+            &workers[0],
+            &mut lease,
+        ));
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn distribution_lease_fails_closed_on_target_or_policy_change() {
+        let policy = scheduler_pressure_policy();
+        let other_policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        owner_pressure_loads(&policy);
+        let headers = partition_headers("kimi-k3");
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let changed_info = SelectWorkerInfo {
+            request_text: Some("different request"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+        let (_, lease) = policy
+            .begin_distribution_lease(
+                model_id,
+                &workers,
+                &info,
+                "kimi-k3",
+                &exact_target(&workers[1]),
+            )
+            .unwrap();
+
+        assert!(!policy.validate_distribution_lease(
+            model_id,
+            &workers,
+            &changed_info,
+            &workers[1],
+            &lease,
+        ));
+        assert!(!other_policy.validate_distribution_lease(
+            model_id,
+            &workers,
+            &info,
+            &workers[1],
+            &lease,
+        ));
+        workers[1].set_status(WorkerStatus::NotReady);
+        assert!(!policy.validate_distribution_lease(
+            model_id,
+            &workers,
+            &info,
+            &workers[1],
+            &lease,
+        ));
+        drop(lease);
+        assert!(policy.distribution_state.pending_by_partition.is_empty());
+    }
+
+    #[test]
+    fn stale_distribution_lease_cannot_remove_newer_partition_state() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        owner_pressure_loads(&policy);
+        let headers = partition_headers("kimi-k3");
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+        let allowed = exact_target(&workers[1]);
+        let (_, stale) = policy
+            .begin_distribution_lease(model_id, &workers, &info, "kimi-k3", &allowed)
+            .unwrap();
+        assert!(policy
+            .distribution_state
+            .release_if_current("kimi-k3", stale.lease_id));
+
+        let (_, current) = policy
+            .begin_distribution_lease(model_id, &workers, &info, "kimi-k3", &allowed)
+            .unwrap();
+        let current_id = current.lease_id;
+        assert_ne!(stale.lease_id, current_id);
+        drop(stale);
+        assert_eq!(
+            policy
+                .distribution_state
+                .pending_by_partition
+                .get("kimi-k3")
+                .unwrap()
+                .lease_id,
+            current_id
+        );
+        drop(current);
+        assert!(policy.distribution_state.pending_by_partition.is_empty());
+    }
+
+    #[test]
+    fn distribution_lease_rejects_same_url_new_worker_generation() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        owner_pressure_loads(&policy);
+        let headers = partition_headers("kimi-k3");
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+        let (_, lease) = policy
+            .begin_distribution_lease(
+                model_id,
+                &workers,
+                &info,
+                "kimi-k3",
+                &exact_target(&workers[1]),
+            )
+            .unwrap();
+
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(workers[1].url())
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert_eq!(replacement.revision(), lease.target_revision());
+        assert_ne!(replacement.generation_id(), lease.target_generation_id());
+        let replaced_workers = vec![Arc::clone(&workers[0]), Arc::clone(&replacement)];
+        assert!(!policy.validate_distribution_lease(
+            model_id,
+            &replaced_workers,
+            &info,
+            &replacement,
+            &lease,
+        ));
     }
 
     #[test]
@@ -2078,6 +3315,252 @@ mod tests {
             )
             .unwrap();
         assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn scheduler_pressure_keeps_affinity_below_watermark() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 32, 1, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_spills_above_watermark() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 33, 1, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 1);
+        assert_eq!(policy.replication_state.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_pressure_sums_complete_rank_caps() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(17, 0, 37), (17, 0, 37)]),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(0, 0, 37), (0, 0, 37)]),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_uses_registered_cap_for_single_standard_rank() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers_with_max_running(37);
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_standard_scheduler_missing_cap(0.10, 0.10, 33, 1),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_standard_scheduler_missing_cap(0.10, 0.10, 0, 0),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 1);
+        assert_eq!(policy.replication_state.len(), 1);
+    }
+
+    #[test]
+    fn distribution_seed_uses_registered_cap_for_single_standard_rank() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers_with_max_running(38);
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_standard_scheduler_missing_cap(0.10, 0.10, 38, 1),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_standard_scheduler_missing_cap(0.10, 0.10, 0, 0),
+            ),
+        ]));
+        let headers = partition_headers("kimi-k3");
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+
+        let (target_idx, _lease) = policy
+            .begin_distribution_lease(
+                model_id,
+                &workers,
+                &info,
+                "kimi-k3",
+                &exact_target(&workers[1]),
+            )
+            .expect("the clean peer must be targetable from canonical single-rank telemetry");
+
+        assert_eq!(target_idx, 1);
+    }
+
+    #[test]
+    fn scheduler_pressure_ignores_metadata_cap_when_rank_caps_are_missing() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers_with_max_running(37);
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(17, 0, 0), (17, 0, 0)]),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(0, 0, 0), (0, 0, 0)]),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_ignores_partial_rank_caps() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(17, 0, 37), (17, 0, 0)]),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(0, 0, 37), (0, 0, 37)]),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_ignores_tp_duplicated_counts_without_snapshot_cap() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers_with_max_running(37);
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 176, 32, 0),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 0),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_uses_an_existing_suitable_owner_before_spilling() {
+        let policy = scheduler_pressure_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let model_id = normalize_model_key(workers[0].model_id());
+        let tree = policy.string_trees.get(model_id).unwrap().value().clone();
+        tree.insert_text("hot prefix", workers[0].url());
+        tree.insert_text("hot prefix", workers[1].url());
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 37, 116, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 20, 0, 37),
+            ),
+            (
+                "http://w3:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "hot prefix");
+
+        assert_eq!(selected, 1);
+        assert!(policy.replication_state.is_empty());
+        assert_eq!(tree.match_prefix_with_counts("hot prefix").tenants.len(), 2);
+    }
+
+    #[test]
+    fn scheduler_pressure_skips_a_saturated_spill_candidate() {
+        let policy = scheduler_pressure_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 37, 116, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 37, 0, 37),
+            ),
+            (
+                "http://w3:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "hot prefix");
+
+        assert_eq!(selected, 2);
     }
 
     #[test]
@@ -2392,6 +3875,193 @@ mod tests {
             .unwrap()
             .match_prefix_with_counts("hot prefix");
         assert_eq!(matched.tenants.len(), 2);
+    }
+
+    #[test]
+    fn distribution_guard_keeps_ordinary_pressure_on_committed_owner() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            engine_load: true,
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        policy.update_loads(&HashMap::from([
+            ("http://w1:8000".to_string(), engine_load(0.95, 0.95, 4)),
+            ("http://w2:8000".to_string(), engine_load(0.20, 0.20, 0)),
+            ("http://w3:8000".to_string(), engine_load(0.20, 0.20, 0)),
+        ]));
+        let info = SelectWorkerInfo {
+            request_text: Some("hot prefix"),
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+
+        for _ in 0..8 {
+            assert_eq!(
+                policy.select_worker(&workers, &info),
+                Some(0),
+                "ordinary traffic must remain on a committed owner"
+            );
+        }
+        assert!(policy.replication_state.is_empty());
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("hot prefix");
+        assert_eq!(matched.tenants.len(), 1);
+    }
+
+    #[test]
+    fn distribution_guard_fails_closed_when_recorded_owner_cannot_execute() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        owner_pressure_loads(&policy);
+        for _ in 0..5 {
+            workers[0].record_outcome(503);
+        }
+        assert!(workers[0].is_healthy());
+        assert!(!workers[0].is_available());
+        let info = SelectWorkerInfo {
+            request_text: Some("hot prefix"),
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+
+        assert_eq!(policy.select_worker(&workers, &info), None);
+        assert!(policy.replication_state.is_empty());
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("hot prefix");
+        assert_eq!(matched.tenants.len(), 1);
+        assert!(matched
+            .tenants
+            .iter()
+            .all(|tenant| tenant.as_ref() != workers[1].url()));
+    }
+
+    #[test]
+    fn distribution_guard_allows_one_cold_bootstrap_owner() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        policy.init_workers(&workers);
+        policy.update_loads(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+            (
+                workers[1].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+        let info = SelectWorkerInfo {
+            request_text: Some("new cold prefix"),
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+
+        let first = policy.select_worker(&workers, &info).unwrap();
+        let second = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(second, first);
+        assert!(policy.replication_state.is_empty());
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("new cold prefix");
+        assert_eq!(matched.tenants.len(), 1);
+    }
+
+    #[test]
+    fn distribution_guard_serializes_concurrent_cold_bootstrap() {
+        let policy = Arc::new(scheduler_pressure_policy());
+        let workers = two_workers();
+        policy.init_workers(&workers);
+        policy.update_loads(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+            (
+                workers[1].url().to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+
+        let selected = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let policy = Arc::clone(&policy);
+                    let workers = &workers;
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let info = SelectWorkerInfo {
+                            request_text: Some("concurrent cold prefix"),
+                            forbid_unleased_cache_owner_expansion: true,
+                            ..Default::default()
+                        };
+                        barrier.wait();
+                        policy.select_worker(workers, &info).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert!(selected.iter().all(|idx| *idx == selected[0]));
+        assert!(policy.replication_state.is_empty());
+        let model_id = normalize_model_key(workers[0].model_id());
+        let matched = policy
+            .string_trees
+            .get(model_id)
+            .unwrap()
+            .match_prefix_with_counts("concurrent cold prefix");
+        assert_eq!(matched.tenants.len(), 1);
+    }
+
+    #[test]
+    fn distribution_guard_fails_closed_after_tree_bound_is_crossed() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            engine_load: true,
+            eviction_interval_secs: 0,
+            max_tree_size: 4,
+            max_cached_owners_per_prefix: 2,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
+        let workers = two_workers();
+        policy.init_workers(&workers);
+        let model_id = normalize_model_key(workers[0].model_id());
+        let tree = policy.string_trees.get(model_id).unwrap().value().clone();
+        tree.insert_text("oversized prefix", workers[0].url());
+        assert!(tree
+            .tenant_char_count
+            .iter()
+            .any(|entry| *entry.value() > policy.config.max_tree_size));
+        assert!(!policy.distribution_index_within_bound(model_id));
+
+        let info = SelectWorkerInfo {
+            request_text: Some("oversized prefix continues"),
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &info), None);
     }
 
     #[test]

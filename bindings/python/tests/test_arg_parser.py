@@ -72,6 +72,8 @@ class TestRouterArgs:
         assert args.adaptive_admission_feedback_max_waiting_requests_per_healthy_replica == 2
         assert args.adaptive_admission_feedback_max_token_usage == 0.9
         assert args.adaptive_admission_feedback_throughput_improvement_ratio == 0.02
+        assert args.adaptive_admission_distribution_headroom_partition == []
+        assert args.adaptive_admission_distribution_headroom_max_inflight == 0
 
     def test_parse_priority_scheduler_options(self):
         args = parse_router_args(
@@ -146,6 +148,12 @@ class TestRouterArgs:
                 "0.85",
                 "--adaptive-admission-feedback-throughput-improvement-ratio",
                 "0.03",
+                "--adaptive-admission-distribution-headroom-partition",
+                "k3",
+                "--adaptive-admission-distribution-headroom-partition",
+                "canary-k3",
+                "--adaptive-admission-distribution-headroom-max-inflight",
+                "4",
             ]
         )
 
@@ -162,6 +170,21 @@ class TestRouterArgs:
         assert args.adaptive_admission_feedback_max_waiting_requests_per_healthy_replica == 4
         assert args.adaptive_admission_feedback_max_token_usage == 0.85
         assert args.adaptive_admission_feedback_throughput_improvement_ratio == 0.03
+        assert args.adaptive_admission_distribution_headroom_partition == [
+            "k3",
+            "canary-k3",
+        ]
+        assert args.adaptive_admission_distribution_headroom_max_inflight == 4
+
+    def test_distribution_headroom_partition_default_is_not_shared(self):
+        """An omitted repeatable flag must produce a fresh, inert allowlist."""
+        first = parse_router_args([])
+        second = parse_router_args([])
+
+        first.adaptive_admission_distribution_headroom_partition.append("k3")
+
+        assert second.adaptive_admission_distribution_headroom_partition == []
+        assert second.adaptive_admission_distribution_headroom_max_inflight == 0
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""

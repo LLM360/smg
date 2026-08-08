@@ -278,6 +278,12 @@ pub struct SelectWorkerInfo<'a> {
     /// Whether this request path attaches a completion guard that can release
     /// router-local work reserved during selection.
     pub reserve_work: bool,
+    /// Forbid cache-aware routing from creating or following an uncommitted
+    /// additional owner for an already-owned prefix. The exact distribution
+    /// lease path sets no such constraint because it independently proves and
+    /// reserves one target; ordinary traffic in an enabled distribution
+    /// partition sets this to keep owner expansion permit-bound.
+    pub forbid_unleased_cache_owner_expansion: bool,
     /// Which PD leg this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
     pub leg: WorkerLeg,

@@ -48,7 +48,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     sync::{Arc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::future;
@@ -71,6 +71,86 @@ use crate::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Load sample tied to the exact worker generation that produced it.
+/// Adaptive distribution headroom consumes this stricter stream so a late
+/// response from a replaced same-URL worker cannot authorize new dispatch.
+#[derive(Clone, Debug)]
+pub(crate) struct ObservedWorkerLoad {
+    pub(crate) response: WorkerLoadResponse,
+    pub(crate) observed_at: Instant,
+    pub(crate) worker_generation_id: u64,
+    pub(crate) worker_revision: u64,
+    pub(crate) router_load_at_observation: usize,
+    pub(crate) source: WorkerLoadSource,
+    pub(crate) scheduler_counts_present: bool,
+}
+
+impl ObservedWorkerLoad {
+    /// Distribution headroom requires canonical scheduler occupancy. The
+    /// ordinary load-aware path may still consume ratio-only Prometheus data,
+    /// but it must never interpret missing request counts as an idle worker.
+    pub(crate) fn authorizes_distribution_headroom(&self) -> bool {
+        self.scheduler_counts_present
+            && matches!(
+                self.source,
+                WorkerLoadSource::NativeLoads | WorkerLoadSource::SglangGetLoad
+            )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerLoadSource {
+    /// HTTP `/v1/loads`; presence is checked on its per-rank objects.
+    NativeLoads,
+    /// SGLang HTTP `/get_load`; running occupancy is derived from explicit
+    /// total and waiting fields.
+    SglangGetLoad,
+    /// Ratio/count gauges normalized from `/metrics` without a scheduler
+    /// snapshot. Never sufficient for distribution headroom.
+    PrometheusOnly,
+    /// gRPC `GetLoads`; excluded until distribution supports and reviews a
+    /// gRPC target contract.
+    GrpcGetLoads,
+}
+
+struct FetchedWorkerLoad {
+    response: WorkerLoadResponse,
+    source: WorkerLoadSource,
+    scheduler_counts_present: bool,
+}
+
+fn json_nonnegative_i32(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|value| (0..=i64::from(i32::MAX)).contains(&value))
+}
+
+fn json_unit_ratio(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+}
+
+fn json_optional_nonnegative_i32(value: Option<&serde_json::Value>) -> bool {
+    value.is_none() || json_nonnegative_i32(value)
+}
+
+fn native_distribution_signals_valid(value: &serde_json::Value) -> bool {
+    value
+        .get("loads")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|loads| {
+            !loads.is_empty()
+                && loads.iter().all(|load| {
+                    json_nonnegative_i32(load.get("num_running_reqs"))
+                        && json_nonnegative_i32(load.get("num_waiting_reqs"))
+                        && json_unit_ratio(load.get("token_usage"))
+                        && json_unit_ratio(load.get("utilization"))
+                        && json_optional_nonnegative_i32(load.get("max_running_requests"))
+                })
+        })
+}
+
 /// Minimal Prometheus text-format scraper: metric name -> sample values
 /// (one per label-set). Only the flat `name{labels} value` / `name value`
 /// gauge lines that the engine load fetchers look up are collected;
@@ -90,11 +170,11 @@ struct PromScrape {
 struct SglangHttpLoadSnapshot {
     dp_rank: i32,
     /// Total scheduler requests, including `num_waiting_reqs`.
-    num_reqs: i32,
-    num_waiting_reqs: i32,
+    num_reqs: Option<i32>,
+    num_waiting_reqs: Option<i32>,
     num_tokens: i32,
     num_pending_tokens: i32,
-    max_running_requests: i32,
+    max_running_requests: Option<i32>,
 }
 
 impl PromScrape {
@@ -233,6 +313,8 @@ pub struct WorkerMonitor {
     engine_metrics: bool,
     load_tx: watch::Sender<HashMap<String, WorkerLoadResponse>>,
     load_rx: watch::Receiver<HashMap<String, WorkerLoadResponse>>,
+    observed_load_tx: watch::Sender<HashMap<String, ObservedWorkerLoad>>,
+    observed_load_rx: watch::Receiver<HashMap<String, ObservedWorkerLoad>>,
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -259,6 +341,7 @@ impl WorkerMonitor {
         engine_metrics: bool,
     ) -> Self {
         let (load_tx, load_rx) = watch::channel(HashMap::new());
+        let (observed_load_tx, observed_load_rx) = watch::channel(HashMap::new());
         Self {
             worker_registry,
             policy_registry,
@@ -268,6 +351,8 @@ impl WorkerMonitor {
             engine_metrics,
             load_tx,
             load_rx,
+            observed_load_tx,
+            observed_load_rx,
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
         }
@@ -279,6 +364,12 @@ impl WorkerMonitor {
     /// stale entries are pruned on each tick of the relevant group.
     pub fn subscribe(&self) -> watch::Receiver<HashMap<String, WorkerLoadResponse>> {
         self.load_rx.clone()
+    }
+
+    pub(crate) fn subscribe_observed(
+        &self,
+    ) -> watch::Receiver<HashMap<String, ObservedWorkerLoad>> {
+        self.observed_load_rx.clone()
     }
 
     /// Subscribe to registry events, run a synchronous bootstrap
@@ -345,6 +436,7 @@ impl WorkerMonitor {
         // seeded the cache without going through a group loop, and
         // makes the function harder to reason about as a "reset".
         self.load_tx.send_modify(|map| map.clear());
+        self.observed_load_tx.send_modify(|map| map.clear());
         self.worker_load_manager.clear();
     }
 
@@ -450,6 +542,9 @@ impl WorkerMonitor {
         self.load_tx.send_modify(|map| {
             map.remove(url);
         });
+        self.observed_load_tx.send_modify(|map| {
+            map.remove(url);
+        });
         self.worker_load_manager.remove_worker(url);
         if self.engine_metrics {
             // A worker can serve multiple models (one load group per model),
@@ -493,6 +588,15 @@ impl WorkerMonitor {
         client: &reqwest::Client,
         worker: &Arc<dyn Worker>,
     ) -> Option<WorkerLoadResponse> {
+        Self::fetch_http_load_observed(client, worker)
+            .await
+            .map(|fetched| fetched.response)
+    }
+
+    async fn fetch_http_load_observed(
+        client: &reqwest::Client,
+        worker: &Arc<dyn Worker>,
+    ) -> Option<FetchedWorkerLoad> {
         match worker.metadata().spec.runtime_type {
             RuntimeType::Vllm => Self::fetch_http_load_vllm(client, worker).await,
             RuntimeType::Sglang => Self::fetch_http_load_sglang(client, worker).await,
@@ -513,14 +617,24 @@ impl WorkerMonitor {
     async fn fetch_http_load_native(
         client: &reqwest::Client,
         worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
+    ) -> Option<FetchedWorkerLoad> {
         let url = format!(
             "{}/v1/loads?include=core,disagg,queues,memory",
             worker.url()
         );
         let resp = Self::authed_get(client, worker, &url).await?;
-        let response: WorkerLoadResponse = resp.json().await.ok()?;
-        (!response.loads.is_empty()).then_some(response)
+        let value: serde_json::Value = resp.json().await.ok()?;
+        // Serde defaults keep the ordinary load-aware path compatible with
+        // older payloads. Distribution headroom is stricter: all occupancy
+        // and pressure fields must be explicitly present and valid so a
+        // missing or malformed value cannot deserialize as a plausible zero.
+        let scheduler_counts_present = native_distribution_signals_valid(&value);
+        let response: WorkerLoadResponse = serde_json::from_value(value).ok()?;
+        (!response.loads.is_empty()).then_some(FetchedWorkerLoad {
+            response,
+            source: WorkerLoadSource::NativeLoads,
+            scheduler_counts_present,
+        })
     }
 
     /// vLLM HTTP: derive load from the Prometheus `/metrics` endpoint.
@@ -530,7 +644,7 @@ impl WorkerMonitor {
     async fn fetch_http_load_vllm(
         client: &reqwest::Client,
         worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
+    ) -> Option<FetchedWorkerLoad> {
         let url = format!("{}/metrics", worker.url());
         let body = Self::authed_get(client, worker, &url)
             .await?
@@ -546,13 +660,18 @@ impl WorkerMonitor {
             .into_iter()
             .find(|name| m.has(name))?;
 
-        Some(Self::single_rank(SchedulerLoadSnapshot {
-            num_running_reqs: m.sum("vllm:num_requests_running") as i32,
-            num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
-            token_usage: m.mean(kv_usage),
-            cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
-            ..Default::default()
-        }))
+        Some(FetchedWorkerLoad {
+            response: Self::single_rank(SchedulerLoadSnapshot {
+                num_running_reqs: m.sum("vllm:num_requests_running") as i32,
+                num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
+                token_usage: m.mean(kv_usage),
+                cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
+                ..Default::default()
+            }),
+            source: WorkerLoadSource::PrometheusOnly,
+            scheduler_counts_present: m.has("vllm:num_requests_running")
+                && m.has("vllm:num_requests_waiting"),
+        })
     }
 
     /// SGLang HTTP: try the custom `/v1/loads` endpoint first (some builds
@@ -571,7 +690,7 @@ impl WorkerMonitor {
     async fn fetch_http_load_sglang(
         client: &reqwest::Client,
         worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
+    ) -> Option<FetchedWorkerLoad> {
         if let Some(resp) = Self::fetch_http_load_native(client, worker).await {
             return Some(resp);
         }
@@ -592,19 +711,27 @@ impl WorkerMonitor {
             .into_iter()
             .find(|p| m.has(&format!("{p}token_usage")))?;
 
-        if let Some(loads) = standard_loads {
-            return Self::combine_sglang_standard_loads(loads, &m, prefix);
+        if let Some(fetched) =
+            standard_loads.and_then(|loads| Self::combine_sglang_standard_loads(loads, &m, prefix))
+        {
+            return Some(fetched);
         }
 
-        Some(Self::single_rank(SchedulerLoadSnapshot {
-            num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
-            num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
-            token_usage: m.mean(&format!("{prefix}token_usage")),
-            gen_throughput: m.mean(&format!("{prefix}gen_throughput")),
-            cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
-            utilization: m.mean(&format!("{prefix}utilization")),
-            ..Default::default()
-        }))
+        let running_name = format!("{prefix}num_running_reqs");
+        let waiting_name = format!("{prefix}num_queue_reqs");
+        Some(FetchedWorkerLoad {
+            response: Self::single_rank(SchedulerLoadSnapshot {
+                num_running_reqs: m.sum(&running_name) as i32,
+                num_waiting_reqs: m.sum(&waiting_name) as i32,
+                token_usage: m.mean(&format!("{prefix}token_usage")),
+                gen_throughput: m.mean(&format!("{prefix}gen_throughput")),
+                cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
+                utilization: m.mean(&format!("{prefix}utilization")),
+                ..Default::default()
+            }),
+            source: WorkerLoadSource::PrometheusOnly,
+            scheduler_counts_present: m.has(&running_name) && m.has(&waiting_name),
+        })
     }
 
     /// Fetch upstream SGLang's standard per-DP-rank scheduler snapshot.
@@ -628,7 +755,7 @@ impl WorkerMonitor {
         loads: Vec<SglangHttpLoadSnapshot>,
         metrics: &PromScrape,
         prefix: &str,
-    ) -> Option<WorkerLoadResponse> {
+    ) -> Option<FetchedWorkerLoad> {
         if loads.is_empty() {
             return None;
         }
@@ -642,11 +769,23 @@ impl WorkerMonitor {
         let cache_hit_rate = metrics.mean(&format!("{prefix}cache_hit_rate"));
         let utilization = metrics.mean(&format!("{prefix}utilization"));
         let dp_rank_count = i32::try_from(loads.len()).unwrap_or(i32::MAX);
+        let scheduler_counts_present = loads.iter().all(|load| {
+            matches!(
+                (load.num_reqs, load.num_waiting_reqs),
+                (Some(total), Some(waiting)) if total >= 0 && waiting >= 0 && waiting <= total
+            ) && load
+                .max_running_requests
+                .is_none_or(|capacity| capacity >= 0)
+        });
         let loads = loads
             .into_iter()
             .map(|load| {
-                let total_requests = load.num_reqs.max(0);
-                let waiting_requests = load.num_waiting_reqs.max(0).min(total_requests);
+                let total_requests = load.num_reqs.unwrap_or_default().max(0);
+                let waiting_requests = load
+                    .num_waiting_reqs
+                    .unwrap_or_default()
+                    .max(0)
+                    .min(total_requests);
                 SchedulerLoadSnapshot {
                     dp_rank: load.dp_rank,
                     num_running_reqs: total_requests.saturating_sub(waiting_requests),
@@ -658,15 +797,19 @@ impl WorkerMonitor {
                     gen_throughput,
                     cache_hit_rate,
                     utilization,
-                    max_running_requests: load.max_running_requests.max(0),
+                    max_running_requests: load.max_running_requests.unwrap_or_default().max(0),
                     ..Default::default()
                 }
             })
             .collect();
-        Some(WorkerLoadResponse {
-            dp_rank_count,
-            loads,
-            ..Default::default()
+        Some(FetchedWorkerLoad {
+            response: WorkerLoadResponse {
+                dp_rank_count,
+                loads,
+                ..Default::default()
+            },
+            source: WorkerLoadSource::SglangGetLoad,
+            scheduler_counts_present,
         })
     }
 
@@ -921,15 +1064,30 @@ async fn group_monitor_loop(
             .map(|worker| {
                 let client = monitor.client.clone();
                 let worker = Arc::clone(worker);
+                let worker_generation_id = worker.generation_id();
+                let worker_revision = worker.revision();
                 let connection_mode = group_key.connection_mode;
                 async move {
-                    let response = match connection_mode {
-                        ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&client, &worker).await
-                        }
-                        ConnectionMode::Grpc => WorkerMonitor::fetch_grpc_load(&worker).await,
-                    };
-                    (worker.url().to_string(), response)
+                    let response =
+                        match connection_mode {
+                            ConnectionMode::Http => {
+                                WorkerMonitor::fetch_http_load_observed(&client, &worker).await
+                            }
+                            ConnectionMode::Grpc => WorkerMonitor::fetch_grpc_load(&worker)
+                                .await
+                                .map(|response| FetchedWorkerLoad {
+                                    response,
+                                    source: WorkerLoadSource::GrpcGetLoads,
+                                    scheduler_counts_present: true,
+                                }),
+                        };
+                    (
+                        worker.url().to_string(),
+                        worker_generation_id,
+                        worker_revision,
+                        Instant::now(),
+                        response,
+                    )
                 }
             })
             .collect();
@@ -937,10 +1095,32 @@ async fn group_monitor_loop(
         let results = future::join_all(futures).await;
 
         let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
+        let mut group_observed_loads: HashMap<String, ObservedWorkerLoad> = HashMap::new();
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
-        for (url, response) in results {
-            if let Some(load) = response {
+        for (url, worker_generation_id, worker_revision, observed_at, response) in results {
+            if let Some(fetched) = response {
+                let FetchedWorkerLoad {
+                    response: load,
+                    source,
+                    scheduler_counts_present,
+                } = fetched;
+                let Some(current_worker) = monitor.worker_registry.get_by_url(&url) else {
+                    continue;
+                };
+                if current_worker.status() != WorkerStatus::Ready
+                    || worker_generation_id == 0
+                    || current_worker.generation_id() != worker_generation_id
+                    || current_worker.revision() != worker_revision
+                {
+                    debug!(
+                        url,
+                        worker_generation_id,
+                        worker_revision,
+                        "Discarding stale worker load response"
+                    );
+                    continue;
+                }
                 // Only feed the DP-rank cache from responses that carry real
                 // absolute per-rank token counts. Ratio-only snapshots,
                 // which would otherwise poison with a fake `{0: 0}`
@@ -950,6 +1130,22 @@ async fn group_monitor_loop(
                 } else {
                     dp_evict.push(url.clone());
                 }
+                // A Ready circuit-open worker still contributes existing
+                // occupancy and hard capacity to the strict aggregate proof.
+                // Adaptive admission separately excludes it from exact target
+                // headroom, so it can never receive the seeded request.
+                group_observed_loads.insert(
+                    url.clone(),
+                    ObservedWorkerLoad {
+                        response: load.clone(),
+                        observed_at,
+                        worker_generation_id,
+                        worker_revision,
+                        router_load_at_observation: current_worker.load(),
+                        source,
+                        scheduler_counts_present,
+                    },
+                );
                 group_loads.insert(url, load);
             }
         }
@@ -967,6 +1163,11 @@ async fn group_monitor_loop(
                 policy.update_loads_for_workers(&group_loads, &all_group_urls);
             }
             monitor.load_tx.send_modify(|map| {
+                for url in &all_group_urls {
+                    map.remove(url);
+                }
+            });
+            monitor.observed_load_tx.send_modify(|map| {
                 for url in &all_group_urls {
                     map.remove(url);
                 }
@@ -1010,6 +1211,12 @@ async fn group_monitor_loop(
                 map.remove(url);
             }
             map.extend(group_loads);
+        });
+        monitor.observed_load_tx.send_modify(|map| {
+            for url in &all_group_urls {
+                map.remove(url);
+            }
+            map.extend(group_observed_loads);
         });
 
         // Drop the temporary strong reference so we do not keep the
@@ -1438,8 +1645,10 @@ sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
         assert_eq!(metrics.sum("sglang:num_running_reqs"), 176.0);
         assert_eq!(metrics.sum("sglang:num_queue_reqs"), 32.0);
 
-        let response =
+        let fetched =
             WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:").unwrap();
+        let response = fetched.response;
+        assert!(fetched.scheduler_counts_present);
         assert_eq!(response.dp_rank_count, 1);
         assert_eq!(response.loads[0].num_running_reqs, 28);
         assert_eq!(response.loads[0].num_waiting_reqs, 6);
@@ -1463,8 +1672,10 @@ sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
              sglang:gen_throughput{dp_rank=\"1\"} 20\n",
         );
 
-        let response =
+        let fetched =
             WorkerMonitor::combine_sglang_standard_loads(standard, &metrics, "sglang:").unwrap();
+        let response = fetched.response;
+        assert!(fetched.scheduler_counts_present);
         assert_eq!(response.dp_rank_count, 2);
         assert_eq!(
             response
@@ -1492,6 +1703,122 @@ sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
         );
         assert!((response.effective_token_usage() - 0.3).abs() < f64::EPSILON);
         assert!((response.total_gen_throughput() - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn canonical_loads_require_valid_distribution_signals_on_every_rank() {
+        let canonical = serde_json::json!({
+            "loads": [
+                {
+                    "num_running_reqs": 0,
+                    "num_waiting_reqs": 0,
+                    "token_usage": 0.0,
+                    "utilization": 0.1
+                },
+                {
+                    "num_running_reqs": 1,
+                    "num_waiting_reqs": 2,
+                    "token_usage": 0.2,
+                    "utilization": 1.0
+                }
+            ]
+        });
+        assert!(native_distribution_signals_valid(&canonical));
+
+        let missing = serde_json::json!({
+            "loads": [
+                {
+                    "num_running_reqs": 0,
+                    "num_waiting_reqs": 0,
+                    "token_usage": 0.0,
+                    "utilization": 0.0
+                },
+                {"token_usage": 0.1}
+            ]
+        });
+        assert!(!native_distribution_signals_valid(&missing));
+
+        let renamed = serde_json::json!({
+            "loads": [{
+                "running_requests": 0,
+                "waiting_requests": 0,
+                "token_usage": 0.0,
+                "utilization": 0.0
+            }]
+        });
+        assert!(!native_distribution_signals_valid(&renamed));
+
+        for malformed in [
+            serde_json::json!({
+                "loads": [{
+                    "num_running_reqs": -1,
+                    "num_waiting_reqs": 0,
+                    "token_usage": 0.0,
+                    "utilization": 0.0
+                }]
+            }),
+            serde_json::json!({
+                "loads": [{
+                    "num_running_reqs": 0,
+                    "num_waiting_reqs": 0,
+                    "token_usage": 1.1,
+                    "utilization": 0.0
+                }]
+            }),
+            serde_json::json!({
+                "loads": [{
+                    "num_running_reqs": 0,
+                    "num_waiting_reqs": 0,
+                    "token_usage": 0.0
+                }]
+            }),
+            serde_json::json!({
+                "loads": [{
+                    "num_running_reqs": 0,
+                    "num_waiting_reqs": 0,
+                    "token_usage": 0.0,
+                    "utilization": 0.0,
+                    "max_running_requests": -1
+                }]
+            }),
+        ] {
+            assert!(!native_distribution_signals_valid(&malformed));
+        }
+    }
+
+    #[test]
+    fn sglang_get_load_marks_absent_or_renamed_counts_untrusted() {
+        let metrics = PromScrape::parse("sglang:token_usage 0.1\n");
+        for payload in [
+            r#"[{"dp_rank":0,"num_reqs":0}]"#,
+            r#"[{"dp_rank":0,"running_requests":0,"waiting_requests":0}]"#,
+            r#"[{"dp_rank":0,"num_reqs":0,"num_waiting_reqs":0},{"dp_rank":1,"num_reqs":1}]"#,
+            r#"[{"dp_rank":0,"num_reqs":null,"num_waiting_reqs":0}]"#,
+        ] {
+            let loads: Vec<SglangHttpLoadSnapshot> = serde_json::from_str(payload).unwrap();
+            let fetched =
+                WorkerMonitor::combine_sglang_standard_loads(loads, &metrics, "sglang:").unwrap();
+            assert!(!fetched.scheduler_counts_present);
+            assert_eq!(fetched.response.loads[0].num_running_reqs, 0);
+            assert_eq!(fetched.response.loads[0].num_waiting_reqs, 0);
+        }
+    }
+
+    #[test]
+    fn sglang_get_load_rejects_negative_or_inconsistent_counts_for_headroom() {
+        let metrics = PromScrape::parse("sglang:token_usage 0.1\n");
+        for payload in [
+            r#"[{"dp_rank":0,"num_reqs":-1,"num_waiting_reqs":0}]"#,
+            r#"[{"dp_rank":0,"num_reqs":1,"num_waiting_reqs":-1}]"#,
+            r#"[{"dp_rank":0,"num_reqs":1,"num_waiting_reqs":2}]"#,
+            r#"[{"dp_rank":0,"num_reqs":0,"num_waiting_reqs":0,"max_running_requests":-1}]"#,
+            r#"[{"dp_rank":0,"num_reqs":0,"num_waiting_reqs":0},{"dp_rank":1,"num_reqs":1,"num_waiting_reqs":2}]"#,
+        ] {
+            let loads: Vec<SglangHttpLoadSnapshot> = serde_json::from_str(payload).unwrap();
+            let fetched =
+                WorkerMonitor::combine_sglang_standard_loads(loads, &metrics, "sglang:").unwrap();
+            assert!(!fetched.scheduler_counts_present);
+        }
     }
 
     #[test]

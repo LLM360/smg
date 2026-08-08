@@ -218,8 +218,35 @@ impl SizeAwarePowerOfTwoPolicy {
         Some(selected_idx)
     }
 
+    /// Reserve estimated work for a target selected by a higher-level policy.
+    ///
+    /// Exact cache-distribution routing constrains the worker before this
+    /// fallback policy runs, so invoking ordinary P2C selection here could
+    /// silently choose a different target. This primitive records the same
+    /// request cost directly against the already-proved worker instead.
+    pub(crate) fn reserve_exact_worker(
+        &self,
+        worker_url: &str,
+        info: &SelectWorkerInfo<'_>,
+    ) -> u64 {
+        let estimated_work = self.estimated_work(info);
+        let mut reserved = self.reserved_work.lock();
+        let entry = reserved.entry(worker_url.to_string()).or_default();
+        *entry = entry.saturating_add(estimated_work);
+        let selected_load = *entry;
+        drop(reserved);
+
+        debug!(
+            worker_url,
+            estimated_work,
+            reserved_work = selected_load,
+            "Reserved size-aware work for exact target"
+        );
+        estimated_work
+    }
+
     #[cfg(test)]
-    fn reserved_for(&self, worker_url: &str) -> u64 {
+    pub(crate) fn reserved_for(&self, worker_url: &str) -> u64 {
         self.reserved_work
             .lock()
             .get(worker_url)
@@ -413,5 +440,26 @@ mod tests {
         policy.release_reservation(workers[selected].url(), 1_500);
 
         assert_eq!(policy.reserved_for(workers[selected].url()), 0);
+    }
+
+    #[test]
+    fn exact_target_reservation_uses_same_cost_and_releases_exactly_once() {
+        let policy = SizeAwarePowerOfTwoPolicy::new(1_000);
+        let workers = workers();
+        let text = "x".repeat(4_000);
+        let info = SelectWorkerInfo {
+            request_text: Some(&text),
+            max_output_tokens: Some(500),
+            // Exact-target routing owns this reservation independently of the
+            // ordinary selection switch.
+            reserve_work: false,
+            ..Default::default()
+        };
+
+        let cost = policy.reserve_exact_worker(workers[0].url(), &info);
+        assert_eq!(cost, 1_500);
+        assert_eq!(policy.reserved_for(workers[0].url()), 1_500);
+        policy.release_reservation(workers[0].url(), cost);
+        assert_eq!(policy.reserved_for(workers[0].url()), 0);
     }
 }
