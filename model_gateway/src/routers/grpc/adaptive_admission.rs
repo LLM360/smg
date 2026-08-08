@@ -3316,6 +3316,13 @@ mod tests {
         };
         assert!(strict_worker_capacity(&valid, None).is_some());
 
+        let mut zero_rank_count = valid.clone();
+        zero_rank_count.dp_rank_count = 0;
+        assert!(strict_worker_capacity(&zero_rank_count, None).is_none());
+        let mut mismatched_rank_count = valid.clone();
+        mismatched_rank_count.dp_rank_count = 2;
+        assert!(strict_worker_capacity(&mismatched_rank_count, None).is_none());
+
         let mut negative = valid.clone();
         negative.loads[0].num_waiting_reqs = -1;
         assert!(strict_worker_capacity(&negative, None).is_none());

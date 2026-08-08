@@ -151,6 +151,27 @@ fn native_distribution_signals_valid(value: &serde_json::Value) -> bool {
         })
 }
 
+fn decode_native_load(value: serde_json::Value) -> Option<FetchedWorkerLoad> {
+    let scheduler_counts_present = native_distribution_signals_valid(&value);
+    // Current SGLang `/v1/loads` envelopes intentionally omit
+    // `dp_rank_count`; the `loads` array is the canonical rank list. Infer
+    // only when the field is absent so an explicit zero or mismatched count
+    // remains visible to the strict distribution-headroom validator.
+    let rank_count_missing = value.get("dp_rank_count").is_none();
+    let mut response: WorkerLoadResponse = serde_json::from_value(value).ok()?;
+    if response.loads.is_empty() {
+        return None;
+    }
+    if rank_count_missing {
+        response.dp_rank_count = i32::try_from(response.loads.len()).ok()?;
+    }
+    Some(FetchedWorkerLoad {
+        response,
+        source: WorkerLoadSource::NativeLoads,
+        scheduler_counts_present,
+    })
+}
+
 /// Minimal Prometheus text-format scraper: metric name -> sample values
 /// (one per label-set). Only the flat `name{labels} value` / `name value`
 /// gauge lines that the engine load fetchers look up are collected;
@@ -624,17 +645,7 @@ impl WorkerMonitor {
         );
         let resp = Self::authed_get(client, worker, &url).await?;
         let value: serde_json::Value = resp.json().await.ok()?;
-        // Serde defaults keep the ordinary load-aware path compatible with
-        // older payloads. Distribution headroom is stricter: all occupancy
-        // and pressure fields must be explicitly present and valid so a
-        // missing or malformed value cannot deserialize as a plausible zero.
-        let scheduler_counts_present = native_distribution_signals_valid(&value);
-        let response: WorkerLoadResponse = serde_json::from_value(value).ok()?;
-        (!response.loads.is_empty()).then_some(FetchedWorkerLoad {
-            response,
-            source: WorkerLoadSource::NativeLoads,
-            scheduler_counts_present,
-        })
+        decode_native_load(value)
     }
 
     /// vLLM HTTP: derive load from the Prometheus `/metrics` endpoint.
@@ -1533,6 +1544,30 @@ mod worker_monitor_tests {
 mod prom_scrape_tests {
     use super::*;
 
+    fn upstream_sglang_loads() -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-08-08T07:10:30Z",
+            "version": "0.5.16",
+            "accelerator": "NVIDIA H200",
+            "loads": [{
+                "timestamp": 1786173030.0,
+                "dp_rank": 0,
+                "num_running_reqs": 38,
+                "num_waiting_reqs": 1,
+                "num_waiting_uncached_tokens": 8192,
+                "num_used_tokens": 240010,
+                "num_total_tokens": 240010,
+                "num_active_tokens": 240010,
+                "max_total_num_tokens": 1012544,
+                "max_running_requests": 38,
+                "token_usage": 0.0738,
+                "gen_throughput": 14.71,
+                "cache_hit_rate": 0.0,
+                "utilization": 0.0
+            }]
+        })
+    }
+
     // Trimmed sample mirroring the fields observed on a live vLLM v0.7.3
     // `/metrics` endpoint (dev ORD cluster).
     const VLLM_METRICS: &str = r#"
@@ -1784,6 +1819,48 @@ sglang:gen_throughput{model_name="glm",tp_rank="7"} 1147
         ] {
             assert!(!native_distribution_signals_valid(&malformed));
         }
+    }
+
+    #[test]
+    fn upstream_sglang_native_loads_infers_omitted_rank_count() {
+        let fetched = decode_native_load(upstream_sglang_loads()).unwrap();
+
+        assert_eq!(fetched.source, WorkerLoadSource::NativeLoads);
+        assert!(fetched.scheduler_counts_present);
+        assert_eq!(fetched.response.dp_rank_count, 1);
+        assert_eq!(fetched.response.loads.len(), 1);
+        assert_eq!(fetched.response.loads[0].num_running_reqs, 38);
+        assert_eq!(fetched.response.loads[0].num_waiting_reqs, 1);
+    }
+
+    #[test]
+    fn native_loads_preserves_explicit_rank_count_for_strict_validation() {
+        for explicit_count in [0, 2] {
+            let mut value = upstream_sglang_loads();
+            value["dp_rank_count"] = serde_json::json!(explicit_count);
+            let fetched = decode_native_load(value).unwrap();
+
+            assert_eq!(fetched.response.dp_rank_count, explicit_count);
+            assert_eq!(fetched.response.loads.len(), 1);
+        }
+    }
+
+    #[test]
+    fn native_rank_inference_does_not_upgrade_invalid_scheduler_signals() {
+        let mut missing = upstream_sglang_loads();
+        missing["loads"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("num_waiting_reqs");
+        let missing = decode_native_load(missing).unwrap();
+        assert_eq!(missing.response.dp_rank_count, 1);
+        assert!(!missing.scheduler_counts_present);
+
+        let mut invalid = upstream_sglang_loads();
+        invalid["loads"][0]["utilization"] = serde_json::json!(1.1);
+        let invalid = decode_native_load(invalid).unwrap();
+        assert_eq!(invalid.response.dp_rank_count, 1);
+        assert!(!invalid.scheduler_counts_present);
     }
 
     #[test]
