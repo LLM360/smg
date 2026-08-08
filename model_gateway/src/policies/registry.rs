@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-    policies::cache_aware::{CacheDistributionLease, LoadReceiver},
+    policies::cache_aware::{CacheColdBootstrapLease, CacheDistributionLease, LoadReceiver},
     routers::common::header_utils::extract_routing_key,
     worker::{KvEventMonitor, Worker, WorkerLoadGuard},
 };
@@ -65,6 +65,52 @@ pub(crate) struct CacheDistributionRoute {
     worker: Arc<dyn Worker>,
     lease: CacheDistributionLease,
     work_reservation: Option<CacheDistributionWorkReservation>,
+}
+
+/// One exact guarded ordinary target plus its provisional cold-owner lease.
+/// Dropping this route before a proved success rolls the bootstrap back.
+#[derive(Debug)]
+pub(crate) struct CacheColdBootstrapRoute {
+    worker: Arc<dyn Worker>,
+    lease: CacheColdBootstrapLease,
+}
+
+impl CacheColdBootstrapRoute {
+    pub(crate) fn worker(&self) -> Arc<dyn Worker> {
+        Arc::clone(&self.worker)
+    }
+
+    pub(crate) fn target_url(&self) -> &str {
+        self.lease.target_url()
+    }
+
+    pub(crate) fn target_revision(&self) -> u64 {
+        self.lease.target_revision()
+    }
+
+    pub(crate) fn target_generation_id(&self) -> u64 {
+        self.lease.target_generation_id()
+    }
+
+    pub(crate) fn validate_before_dispatch(
+        &self,
+        registry: &PolicyRegistry,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> bool {
+        registry.validate_cache_cold_bootstrap_route(model_id, workers, info, self)
+    }
+
+    pub(crate) fn commit_after_success(
+        &mut self,
+        registry: &PolicyRegistry,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        request_text: &str,
+    ) -> bool {
+        registry.commit_cache_cold_bootstrap_route(model_id, workers, request_text, self)
+    }
 }
 
 impl CacheDistributionRoute {
@@ -252,6 +298,72 @@ impl PolicyRegistry {
 
         let idx = policy.select_worker(workers, info)?;
         Some((idx, policy.reservation_cost(info)))
+    }
+
+    /// Select default-off guarded ordinary traffic. A cold prefix returns an
+    /// exact provisional route; an existing prefix returns its committed owner
+    /// with no lease. `None` is the fail-closed result for an in-flight cold
+    /// bootstrap, an unavailable owner, or an incompatible policy.
+    pub(crate) fn begin_guarded_cache_route(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        partition: &str,
+    ) -> Option<(usize, Option<CacheColdBootstrapRoute>)> {
+        let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>()?;
+        let (target_idx, lease) =
+            cache_aware.begin_guarded_ordinary_lease(model_id, workers, info, partition)?;
+        let route = lease.map(|lease| CacheColdBootstrapRoute {
+            worker: Arc::clone(&workers[target_idx]),
+            lease,
+        });
+        Some((target_idx, route))
+    }
+
+    fn validate_cache_cold_bootstrap_route(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        route: &CacheColdBootstrapRoute,
+    ) -> bool {
+        let policy = self.get_policy_or_default(model_id);
+        policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .is_some_and(|cache_aware| {
+                cache_aware.validate_cold_bootstrap_lease(
+                    model_id,
+                    workers,
+                    info,
+                    &route.worker,
+                    &route.lease,
+                )
+            })
+    }
+
+    fn commit_cache_cold_bootstrap_route(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        request_text: &str,
+        route: &mut CacheColdBootstrapRoute,
+    ) -> bool {
+        let policy = self.get_policy_or_default(model_id);
+        policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .is_some_and(|cache_aware| {
+                cache_aware.commit_cold_bootstrap_success(
+                    model_id,
+                    workers,
+                    request_text,
+                    &route.worker,
+                    &mut route.lease,
+                )
+            })
     }
 
     /// Begin a default-off exact cache-distribution route through a

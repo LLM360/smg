@@ -50,7 +50,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{CacheColdBootstrapRoute, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
             header_utils,
@@ -106,6 +106,7 @@ struct WorkerSelection {
     worker: Arc<dyn Worker>,
     policy: Arc<dyn LoadBalancingPolicy>,
     reservation_cost: Option<u64>,
+    cold_bootstrap_route: Option<CacheColdBootstrapRoute>,
 }
 
 enum WorkerSelectionResult {
@@ -551,7 +552,7 @@ fn buffered_completion_has_proof(body: &[u8]) -> bool {
 struct CacheDistributionStreamingBody {
     inner: Body,
     commit: Box<dyn FnMut() + Send>,
-    _load_guard: WorkerLoadGuard,
+    _load_guard: Option<WorkerLoadGuard>,
     proof: CacheDistributionStreamProof,
     commit_attempted: bool,
 }
@@ -560,6 +561,23 @@ impl CacheDistributionStreamingBody {
     fn wrap_response(
         response: Response,
         load_guard: WorkerLoadGuard,
+        commit: impl FnMut() + Send + 'static,
+    ) -> Response {
+        Self::wrap_response_inner(response, Some(load_guard), commit)
+    }
+
+    /// The ordinary send path already attached its load guard to the inner
+    /// body. Keep only the provisional ownership lease in this outer proof.
+    fn wrap_response_with_attached_guard(
+        response: Response,
+        commit: impl FnMut() + Send + 'static,
+    ) -> Response {
+        Self::wrap_response_inner(response, None, commit)
+    }
+
+    fn wrap_response_inner(
+        response: Response,
+        load_guard: Option<WorkerLoadGuard>,
         commit: impl FnMut() + Send + 'static,
     ) -> Response {
         let (parts, body) = response.into_parts();
@@ -777,15 +795,25 @@ impl Router {
         } else {
             &available
         };
-        let Some(idx) = self
-            .policy_registry
-            .select_worker(&policy, selection_workers, &info)
-        else {
-            return if forbid_unleased_cache_owner_expansion {
-                WorkerSelectionResult::UnleasedOwnerExpansionBlocked
-            } else {
-                WorkerSelectionResult::NoAvailable
+        let (idx, cold_bootstrap_route) = if let Some(partition) = owner_expansion_guard_partition {
+            let Some((idx, route)) = self.policy_registry.begin_guarded_cache_route(
+                &policy,
+                model_id,
+                selection_workers,
+                &info,
+                partition,
+            ) else {
+                return WorkerSelectionResult::UnleasedOwnerExpansionBlocked;
             };
+            (idx, route)
+        } else {
+            let Some(idx) = self
+                .policy_registry
+                .select_worker(&policy, selection_workers, &info)
+            else {
+                return WorkerSelectionResult::NoAvailable;
+            };
+            (idx, None)
         };
 
         // Record worker selection metric (Layer 3)
@@ -800,6 +828,7 @@ impl Router {
             worker: selection_workers[idx].clone(),
             policy,
             reservation_cost,
+            cold_bootstrap_route,
         })
     }
 
@@ -1356,18 +1385,23 @@ impl Router {
                 };
             }
         };
-        let worker = selection.worker;
+        let WorkerSelection {
+            worker,
+            policy,
+            reservation_cost,
+            cold_bootstrap_route,
+        } = selection;
 
-        let load_guard = if let Some(cost) = selection.reservation_cost {
+        let load_guard = if let Some(cost) = reservation_cost {
             Some(WorkerLoadGuard::with_policy_reservation(
                 worker.clone(),
                 headers,
-                selection.policy,
+                policy,
                 cost,
             ))
         } else {
             ["cache_aware", "manual"]
-                .contains(&selection.policy.name())
+                .contains(&policy.name())
                 .then(|| WorkerLoadGuard::new(worker.clone(), headers))
         };
 
@@ -1377,8 +1411,130 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let response = self
-            .send_typed_request(
+        let mut response = if let Some(mut cold_route) = cold_bootstrap_route {
+            let Some(partition) = owner_expansion_guard_partition else {
+                return local_distribution_rejection(
+                    "cold-bootstrap route lost its guarded partition",
+                );
+            };
+            if worker.url() != cold_route.target_url()
+                || worker.generation_id() != cold_route.target_generation_id()
+                || worker.revision() != cold_route.target_revision()
+                || !Arc::ptr_eq(&worker, &cold_route.worker())
+            {
+                return local_distribution_rejection(
+                    "cold-bootstrap worker generation did not match its lease",
+                );
+            }
+            let model_filter = (model_id != crate::worker::UNKNOWN_MODEL_ID).then_some(model_id);
+            let current_workers = workers_in_admission_partition(
+                &self.worker_registry.get_workers_filtered(
+                    model_filter,
+                    Some(WorkerType::Regular),
+                    Some(ConnectionMode::Http),
+                    None,
+                    false,
+                ),
+                partition,
+            );
+            let hash_ring = self.worker_registry.get_hash_ring(model_id);
+            let info = SelectWorkerInfo {
+                request_text: Some(text),
+                tokens: None,
+                headers,
+                hash_ring,
+                max_output_tokens: typed_req.max_output_tokens_for_routing().map(u64::from),
+                reserve_work: true,
+                forbid_unleased_cache_owner_expansion: true,
+                leg: crate::policies::WorkerLeg::Single,
+            };
+            let prepared_request = match self.prepare_typed_request(
+                headers,
+                typed_req,
+                route,
+                canonical_model,
+                worker.as_ref(),
+            ) {
+                Ok(request) => request,
+                Err(response) => return *response,
+            };
+            if !cold_route.validate_before_dispatch(
+                &self.policy_registry,
+                model_id,
+                &current_workers,
+                &info,
+            ) {
+                return local_distribution_rejection(
+                    "cold-bootstrap route changed immediately before dispatch",
+                );
+            }
+
+            let mut response = self
+                .send_prepared_typed_request(
+                    &self.no_redirect_client,
+                    prepared_request,
+                    route,
+                    worker.as_ref(),
+                    is_stream,
+                    load_guard,
+                )
+                .await;
+            let status = response.status();
+            if is_stream {
+                if status.is_success() {
+                    let policy_registry = Arc::clone(&self.policy_registry);
+                    let commit_model = model_id.to_string();
+                    let commit_text = text.to_string();
+                    let commit_partition = partition.to_string();
+                    let commit_worker_url = worker.url().to_string();
+                    response = CacheDistributionStreamingBody::wrap_response_with_attached_guard(
+                        response,
+                        move || {
+                            if !cold_route.commit_after_success(
+                                &policy_registry,
+                                &commit_model,
+                                &current_workers,
+                                &commit_text,
+                            ) {
+                                warn!(
+                                    model_id = commit_model,
+                                    partition = commit_partition,
+                                    worker_url = commit_worker_url,
+                                    "cold-bootstrap route could not commit after terminal stream success"
+                                );
+                            }
+                        },
+                    );
+                }
+            } else if status.is_success() {
+                let completion_proved = response
+                    .extensions()
+                    .get::<BufferedResponseBytes>()
+                    .is_some_and(|body| buffered_completion_has_proof(&body.0));
+                if !completion_proved {
+                    warn!(
+                        model_id,
+                        partition,
+                        worker_url = worker.url(),
+                        "cold-bootstrap route lacked non-streaming terminal usage proof"
+                    );
+                } else if !cold_route.commit_after_success(
+                    &self.policy_registry,
+                    model_id,
+                    &current_workers,
+                    text,
+                ) {
+                    warn!(
+                        model_id,
+                        partition,
+                        worker_url = worker.url(),
+                        "cold-bootstrap route could not commit after proved backend completion"
+                    );
+                }
+            }
+            response
+        } else {
+            self.send_typed_request(
                 headers,
                 typed_req,
                 route,
@@ -1387,7 +1543,8 @@ impl Router {
                 is_stream,
                 load_guard,
             )
-            .await;
+            .await
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -3201,6 +3358,194 @@ mod tests {
         .unwrap();
         TenantRequestMeta::new(tenant)
             .with_extension(RedeemedCapacityCreditAuthorization::new(binding))
+    }
+
+    #[tokio::test]
+    async fn guarded_cold_bootstrap_nonstream_rolls_back_without_terminal_usage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let invalid_body =
+            br#"{"text":"ok","meta_info":{"finish_reason":{"type":"stop"}}}"#.to_vec();
+        let valid_body =
+            br#"{"text":"ok","meta_info":{"completion_tokens":7,"finish_reason":{"type":"stop"}}}"#
+                .to_vec();
+        let server_bodies = [invalid_body.clone(), valid_body.clone()];
+        let server = tokio::spawn(async move {
+            for response_bytes in server_bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_bytes.len()
+                );
+                socket.write_all(response_head.as_bytes()).await.unwrap();
+                socket.write_all(&response_bytes).await.unwrap();
+            }
+        });
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(worker_url)
+                .model(ModelCard::new("test-model"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .label(ADMISSION_PARTITION_LABEL, "test-model")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let workers = vec![Arc::clone(&worker)];
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register(Arc::clone(&worker)).unwrap();
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+            fallback_output_token_estimate: 2_048,
+            block_size: 16,
+            engine_load: true,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 2,
+            cache_owner_spill_cooldown_secs: 60,
+        }));
+        let cache_policy = policy_registry.get_default_policy();
+        cache_policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .init_workers(&workers);
+
+        let load = distribution_test_load(0, 0, 38);
+        let loads = HashMap::from([(worker.url().to_string(), load.clone())]);
+        cache_policy.update_loads(&loads);
+        let observed_loads = HashMap::from([(
+            worker.url().to_string(),
+            ObservedWorkerLoad {
+                response: load,
+                observed_at: Instant::now(),
+                worker_generation_id: worker.generation_id(),
+                worker_revision: worker.revision(),
+                router_load_at_observation: worker.load(),
+                source: WorkerLoadSource::NativeLoads,
+                scheduler_counts_present: true,
+            },
+        )]);
+        let (_loads_tx, loads_rx) = watch::channel(loads);
+        let (_observed_loads_tx, observed_loads_rx) = watch::channel(observed_loads);
+        let controller = AdaptiveAdmissionController::new(
+            AdaptiveAdmissionConfig {
+                mode: AdaptiveAdmissionMode::Enforce,
+                strategy: AdaptiveAdmissionStrategy::EngineFeedback,
+                min_load_coverage: 1.0,
+                feedback_max_waiting_requests_per_healthy_replica: 0,
+                distribution_headroom_partitions: vec!["test-model".to_string()],
+                distribution_headroom_max_inflight: 1,
+                ..Default::default()
+            },
+            Arc::clone(&worker_registry),
+        );
+        controller.start_load_updates(loads_rx, observed_loads_rx);
+
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            no_redirect_client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            retry_config: RetryConfig::default(),
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+            adaptive_admission: Some(controller),
+        };
+        let mut partition_headers = HeaderMap::new();
+        partition_headers.insert(
+            ADMISSION_PARTITION_HEADER,
+            HeaderValue::from_static("test-model"),
+        );
+        let typed_req = TestGenerationRequest {
+            stream: false,
+            n: 1,
+            max_tokens: 1,
+            tools: Vec::new(),
+            response_format: serde_json::Value::Null,
+            reasoning_effort: String::new(),
+        };
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("tenant-a"));
+
+        let invalid_response = router
+            .route_typed_request(
+                Some(&partition_headers),
+                &tenant_meta,
+                &typed_req,
+                "/generate",
+                "test-model",
+            )
+            .await;
+        assert_eq!(invalid_response.status(), StatusCode::OK);
+        assert!(invalid_response
+            .extensions()
+            .get::<BufferedResponseBytes>()
+            .is_some_and(|body| !buffered_completion_has_proof(&body.0)));
+        assert_eq!(
+            to_bytes(invalid_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            invalid_body
+        );
+        assert_eq!(
+            cache_policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("abcdefgh"),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            ),
+            None,
+            "an invalid 2xx body must not publish the cold owner"
+        );
+
+        let valid_response = router
+            .route_typed_request(
+                Some(&partition_headers),
+                &tenant_meta,
+                &typed_req,
+                "/generate",
+                "test-model",
+            )
+            .await;
+        assert_eq!(valid_response.status(), StatusCode::OK);
+        assert!(valid_response
+            .extensions()
+            .get::<BufferedResponseBytes>()
+            .is_some_and(|body| buffered_completion_has_proof(&body.0)));
+        assert_eq!(
+            to_bytes(valid_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            valid_body
+        );
+        assert_eq!(
+            cache_policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("abcdefgh"),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            ),
+            Some(0),
+            "a terminal body with usage must publish the exact cold owner"
+        );
+
+        server.await.unwrap();
     }
 
     #[tokio::test]

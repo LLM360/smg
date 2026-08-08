@@ -132,11 +132,29 @@ struct PendingDistributionSeed {
     creates_owner: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ColdBootstrapKey {
+    partition: Arc<str>,
+    prefix_key: PrefixBudgetKey,
+}
+
+#[derive(Debug, Clone)]
+struct PendingColdBootstrap {
+    lease_id: u64,
+    model_id: Arc<str>,
+    target_url: Arc<str>,
+    target_generation_id: u64,
+    target_revision: u64,
+    request_digest: blake3::Hash,
+    request_len: usize,
+}
+
 #[derive(Debug)]
 struct CacheDistributionState {
     policy_instance_id: u64,
     next_lease_id: AtomicU64,
     pending_by_partition: DashMap<String, PendingDistributionSeed>,
+    pending_cold_bootstrap: DashMap<ColdBootstrapKey, PendingColdBootstrap>,
 }
 
 impl CacheDistributionState {
@@ -149,6 +167,7 @@ impl CacheDistributionState {
             policy_instance_id,
             next_lease_id: AtomicU64::new(1),
             pending_by_partition: DashMap::new(),
+            pending_cold_bootstrap: DashMap::new(),
         }
     }
 
@@ -163,6 +182,12 @@ impl CacheDistributionState {
     fn release_if_current(&self, partition: &str, lease_id: u64) -> bool {
         self.pending_by_partition
             .remove_if(partition, |_, pending| pending.lease_id == lease_id)
+            .is_some()
+    }
+
+    fn release_cold_if_current(&self, key: &ColdBootstrapKey, lease_id: u64) -> bool {
+        self.pending_cold_bootstrap
+            .remove_if(key, |_, pending| pending.lease_id == lease_id)
             .is_some()
     }
 }
@@ -245,6 +270,78 @@ impl Drop for CacheDistributionLease {
         if !self.finished {
             self.state
                 .release_if_current(self.partition.as_ref(), self.lease_id);
+        }
+    }
+}
+
+/// One provisional ordinary route for a prefix with no committed owner.
+///
+/// Unlike the fair-share-authorized distribution lease, this lease consumes
+/// only an ordinary admission slot. It prevents concurrent guarded requests
+/// from treating the same cold prefix as independently unowned, and it
+/// publishes ownership only after the HTTP layer proves terminal success.
+#[derive(Debug)]
+pub(crate) struct CacheColdBootstrapLease {
+    state: Arc<CacheDistributionState>,
+    policy_instance_id: u64,
+    lease_id: u64,
+    key: ColdBootstrapKey,
+    model_id: Arc<str>,
+    target_url: Arc<str>,
+    target_generation_id: u64,
+    target_revision: u64,
+    request_digest: blake3::Hash,
+    request_len: usize,
+    finished: bool,
+}
+
+impl CacheColdBootstrapLease {
+    pub(super) fn target_url(&self) -> &str {
+        &self.target_url
+    }
+
+    pub(super) fn target_revision(&self) -> u64 {
+        self.target_revision
+    }
+
+    pub(super) fn target_generation_id(&self) -> u64 {
+        self.target_generation_id
+    }
+
+    fn request_matches(&self, text: &str) -> bool {
+        text.len() == self.request_len && blake3::hash(text.as_bytes()) == self.request_digest
+    }
+
+    fn pending_matches(&self) -> bool {
+        self.policy_instance_id == self.state.policy_instance_id
+            && self
+                .state
+                .pending_cold_bootstrap
+                .get(&self.key)
+                .is_some_and(|pending| {
+                    pending.lease_id == self.lease_id
+                        && pending.model_id == self.model_id
+                        && pending.target_url == self.target_url
+                        && pending.target_generation_id == self.target_generation_id
+                        && pending.target_revision == self.target_revision
+                        && pending.request_digest == self.request_digest
+                        && pending.request_len == self.request_len
+                })
+    }
+
+    fn finish(&mut self) -> bool {
+        let removed = self.state.release_cold_if_current(&self.key, self.lease_id);
+        if removed {
+            self.finished = true;
+        }
+        removed
+    }
+}
+
+impl Drop for CacheColdBootstrapLease {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.state.release_cold_if_current(&self.key, self.lease_id);
         }
     }
 }
@@ -716,6 +813,101 @@ impl CacheAwarePolicy {
         })
     }
 
+    /// Select guarded ordinary traffic without publishing a cold owner.
+    ///
+    /// Existing committed owners keep the ordinary cache-aware path. A prefix
+    /// with no committed owner receives one exact, prefix-scoped bootstrap
+    /// lease. Concurrent same-prefix requests fail closed until that lease is
+    /// either success-committed by the HTTP response proof or dropped.
+    pub(crate) fn begin_guarded_ordinary_lease(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        partition: &str,
+    ) -> Option<(usize, Option<CacheColdBootstrapLease>)> {
+        let _selection_guard = self.distribution_selection_lock.lock();
+        if !info.forbid_unleased_cache_owner_expansion
+            || !self.config.engine_load
+            || self.config.max_cached_owners_per_prefix == 0
+            || self.config.cache_owner_spill_cooldown_secs == 0
+            || partition.is_empty()
+            || info.tokens.is_some()
+        {
+            return None;
+        }
+        let text = info.request_text?;
+        if let Some(value) = info
+            .headers
+            .and_then(|headers| headers.get(ADMISSION_PARTITION_HEADER))
+        {
+            if value.to_str().ok()?.trim() != partition {
+                return None;
+            }
+        }
+
+        let observed_indices = Self::distribution_observed_indices(workers);
+        let first_idx = *observed_indices.first()?;
+        let tree_model_id = normalize_model_key(workers[first_idx].model_id());
+        if normalize_model_key(model_id) != tree_model_id
+            || observed_indices
+                .iter()
+                .any(|&idx| normalize_model_key(workers[idx].model_id()) != tree_model_id)
+            || !self.distribution_index_within_bound(tree_model_id)
+        {
+            return None;
+        }
+
+        let ownership = self.prefix_ownership(workers, info, &observed_indices, tree_model_id);
+        if ownership.has_known_owner {
+            let committed_owners =
+                SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &ownership.owners);
+            let selected =
+                self.select_from_cached_owners(workers, info, &committed_owners, tree_model_id)?;
+            return Some((selected, None));
+        }
+
+        if self.has_pending_distribution_seed(ownership.key, info, tree_model_id) {
+            return None;
+        }
+        let key = ColdBootstrapKey {
+            partition: Arc::from(partition),
+            prefix_key: ownership.key,
+        };
+        if self
+            .distribution_state
+            .pending_cold_bootstrap
+            .contains_key(&key)
+        {
+            return None;
+        }
+
+        let executable_indices =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &observed_indices);
+        if executable_indices.is_empty() {
+            return None;
+        }
+        let pressure_plan = self.engine_pressure_plan(workers, &executable_indices);
+        let candidates = pressure_plan
+            .as_ref()
+            .map_or(executable_indices.as_slice(), |plan| {
+                plan.allowed_indices.as_slice()
+            });
+        let selected = self
+            .fallback
+            .select_worker_from_candidates(workers, info, candidates)?;
+        let Some(lease) =
+            self.acquire_cold_bootstrap_lease(key, tree_model_id, workers[selected].as_ref(), text)
+        else {
+            if let Some(cost) = self.fallback.reservation_cost(info) {
+                self.fallback
+                    .release_reservation(workers[selected].url(), cost);
+            }
+            return None;
+        };
+        Some((selected, Some(lease)))
+    }
+
     /// Begin one exact HTTP cache-distribution decision.
     ///
     /// This is intentionally not part of [`LoadBalancingPolicy`]. Callers must
@@ -971,6 +1163,150 @@ impl CacheAwarePolicy {
         lease.finish()
     }
 
+    /// Revalidate one provisional cold-bootstrap target immediately before
+    /// dispatch. A newly observed committed owner is acceptable only when it
+    /// is the exact target already bound by this lease.
+    pub(crate) fn validate_cold_bootstrap_lease(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        expected_worker: &Arc<dyn Worker>,
+        lease: &CacheColdBootstrapLease,
+    ) -> bool {
+        let _selection_guard = self.distribution_selection_lock.lock();
+        if !Arc::ptr_eq(&self.distribution_state, &lease.state)
+            || self.distribution_state.policy_instance_id != lease.policy_instance_id
+            || normalize_model_key(model_id) != lease.model_id.as_ref()
+            || info.tokens.is_some()
+            || !info
+                .request_text
+                .is_some_and(|text| lease.request_matches(text))
+            || info
+                .headers
+                .and_then(|headers| headers.get(ADMISSION_PARTITION_HEADER))
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .is_some_and(|partition| partition != lease.key.partition.as_ref())
+            || !lease.pending_matches()
+        {
+            return false;
+        }
+        let Some(target_idx) =
+            Self::exact_cold_bootstrap_target_index(workers, expected_worker, lease)
+        else {
+            return false;
+        };
+        let observed_indices = Self::distribution_observed_indices(workers);
+        if !observed_indices.contains(&target_idx)
+            || normalize_model_key(workers[target_idx].model_id()) != lease.model_id.as_ref()
+            || !self.distribution_index_within_bound(&lease.model_id)
+        {
+            return false;
+        }
+        let ownership = self.prefix_ownership(workers, info, &observed_indices, &lease.model_id);
+        if ownership.key != lease.key.prefix_key
+            || (ownership.has_known_owner && !ownership.owners.contains(&target_idx))
+        {
+            return false;
+        }
+        let executable_indices =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &observed_indices);
+        self.engine_pressure_plan(workers, &executable_indices)
+            .is_none_or(|plan| plan.allowed_indices.contains(&target_idx))
+    }
+
+    /// Publish a cold owner only after the HTTP layer proved terminal backend
+    /// success for the exact request and worker generation bound by the lease.
+    pub(crate) fn commit_cold_bootstrap_success(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        request_text: &str,
+        expected_worker: &Arc<dyn Worker>,
+        lease: &mut CacheColdBootstrapLease,
+    ) -> bool {
+        let _selection_guard = self.distribution_selection_lock.lock();
+        if !Arc::ptr_eq(&self.distribution_state, &lease.state)
+            || self.distribution_state.policy_instance_id != lease.policy_instance_id
+            || normalize_model_key(model_id) != lease.model_id.as_ref()
+            || !lease.request_matches(request_text)
+            || !lease.pending_matches()
+            || Self::exact_cold_bootstrap_target_index(workers, expected_worker, lease).is_none()
+        {
+            return false;
+        }
+
+        let Some(tree) = self
+            .string_trees
+            .get(lease.model_id.as_ref())
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+        let result = tree.match_and_insert_with(request_text, |_| Some(lease.target_url.as_ref()));
+        if self.should_populate_hash_index() {
+            let matched_prefix: String = request_text
+                .chars()
+                .take(result.matched_char_count)
+                .collect();
+            self.hash_index
+                .entry(lease.model_id.to_string())
+                .or_default()
+                .string_tree
+                .insert(kv_index::hash_node_path(request_text), matched_prefix);
+        }
+        lease.finish()
+    }
+
+    fn acquire_cold_bootstrap_lease(
+        &self,
+        key: ColdBootstrapKey,
+        model_id: &str,
+        target: &dyn Worker,
+        request_text: &str,
+    ) -> Option<CacheColdBootstrapLease> {
+        let lease_id = self.distribution_state.next_lease_id()?;
+        let model_id: Arc<str> = Arc::from(model_id);
+        let target_url: Arc<str> = Arc::from(target.url());
+        let target_generation_id = target.generation_id();
+        let target_revision = target.revision();
+        let request_digest = blake3::hash(request_text.as_bytes());
+        let request_len = request_text.len();
+        let pending = PendingColdBootstrap {
+            lease_id,
+            model_id: Arc::clone(&model_id),
+            target_url: Arc::clone(&target_url),
+            target_generation_id,
+            target_revision,
+            request_digest,
+            request_len,
+        };
+        match self
+            .distribution_state
+            .pending_cold_bootstrap
+            .entry(key.clone())
+        {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(entry) => {
+                entry.insert(pending);
+                Some(CacheColdBootstrapLease {
+                    state: Arc::clone(&self.distribution_state),
+                    policy_instance_id: self.distribution_state.policy_instance_id,
+                    lease_id,
+                    key,
+                    model_id,
+                    target_url,
+                    target_generation_id,
+                    target_revision,
+                    request_digest,
+                    request_len,
+                    finished: false,
+                })
+            }
+        }
+    }
+
     fn acquire_distribution_lease(
         &self,
         partition: &str,
@@ -1113,6 +1449,31 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         expected_worker: &Arc<dyn Worker>,
         lease: &CacheDistributionLease,
+    ) -> Option<usize> {
+        if expected_worker.url() != lease.target_url.as_ref()
+            || expected_worker.generation_id() != lease.target_generation_id
+            || expected_worker.revision() != lease.target_revision
+            || !expected_worker.is_available()
+        {
+            return None;
+        }
+        let mut matches = workers.iter().enumerate().filter(|(_, worker)| {
+            worker.url() == lease.target_url.as_ref()
+                && worker.generation_id() == lease.target_generation_id
+                && worker.revision() == lease.target_revision
+                && worker.is_available()
+        });
+        let (idx, current) = matches.next()?;
+        if matches.next().is_some() || !Arc::ptr_eq(current, expected_worker) {
+            return None;
+        }
+        Some(idx)
+    }
+
+    fn exact_cold_bootstrap_target_index(
+        workers: &[Arc<dyn Worker>],
+        expected_worker: &Arc<dyn Worker>,
+        lease: &CacheColdBootstrapLease,
     ) -> Option<usize> {
         if expected_worker.url() != lease.target_url.as_ref()
             || expected_worker.generation_id() != lease.target_generation_id
@@ -1766,6 +2127,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 pending_ownership.owners.len(),
             );
             return self.select_from_cached_owners(workers, info, &committed_owners, model_id);
+        }
+        if info.forbid_unleased_cache_owner_expansion {
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "cold_bootstrap_lease_required",
+                0,
+            );
+            return None;
         }
         let pressure_plan = self.engine_pressure_plan(workers, &healthy_indices);
 
@@ -2964,6 +3333,32 @@ mod tests {
     }
 
     #[test]
+    fn guarded_cold_bootstrap_lease_is_default_off() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers = two_workers();
+        policy.init_workers(&workers);
+        let model_id = normalize_model_key(workers[0].model_id());
+        let headers = partition_headers(model_id);
+        let info = SelectWorkerInfo {
+            request_text: Some("cold prefix"),
+            headers: Some(&headers),
+            reserve_work: true,
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+
+        assert!(policy
+            .begin_guarded_ordinary_lease(model_id, &workers, &info, model_id)
+            .is_none());
+        let ownership = policy.prefix_ownership(&workers, &info, &[0, 1], model_id);
+        assert!(!ownership.has_known_owner);
+        assert!(policy.distribution_state.pending_cold_bootstrap.is_empty());
+    }
+
+    #[test]
     fn distribution_seed_is_isolated_until_success_is_committed() {
         let policy = scheduler_pressure_policy();
         let workers = two_workers();
@@ -3950,7 +4345,7 @@ mod tests {
     }
 
     #[test]
-    fn distribution_guard_allows_one_cold_bootstrap_owner() {
+    fn distribution_guard_cold_bootstrap_is_provisional_and_rolls_back() {
         let policy = scheduler_pressure_policy();
         let workers = two_workers();
         policy.init_workers(&workers);
@@ -3964,27 +4359,66 @@ mod tests {
                 engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
             ),
         ]));
+        let model_id = normalize_model_key(workers[0].model_id());
+        let headers = partition_headers(model_id);
         let info = SelectWorkerInfo {
             request_text: Some("new cold prefix"),
+            headers: Some(&headers),
+            reserve_work: true,
             forbid_unleased_cache_owner_expansion: true,
             ..Default::default()
         };
 
-        let first = policy.select_worker(&workers, &info).unwrap();
-        let second = policy.select_worker(&workers, &info).unwrap();
-        assert_eq!(second, first);
+        assert_eq!(policy.select_worker(&workers, &info), None);
+        let (first, first_lease) = policy
+            .begin_guarded_ordinary_lease(model_id, &workers, &info, model_id)
+            .expect("the first guarded request claims the cold prefix");
+        let first_lease = first_lease.expect("a cold prefix requires a provisional lease");
+        assert!(policy
+            .begin_guarded_ordinary_lease(model_id, &workers, &info, model_id)
+            .is_none());
+        let ownership = policy.prefix_ownership(&workers, &info, &[0, 1], model_id);
+        assert!(!ownership.has_known_owner);
+        assert!(ownership.owners.is_empty());
         assert!(policy.replication_state.is_empty());
-        let model_id = normalize_model_key(workers[0].model_id());
+
+        drop(first_lease);
+        let cost = policy.reservation_cost(&info).unwrap();
+        policy.release_reservation(workers[first].url(), cost);
+        let (retry, retry_lease) = policy
+            .begin_guarded_ordinary_lease(model_id, &workers, &info, model_id)
+            .expect("dropping a failed bootstrap must release the prefix");
+        let mut retry_lease = retry_lease.expect("retry remains provisional");
+        assert!(policy.validate_cold_bootstrap_lease(
+            model_id,
+            &workers,
+            &info,
+            &workers[retry],
+            &retry_lease,
+        ));
+        assert!(policy.commit_cold_bootstrap_success(
+            model_id,
+            &workers,
+            "new cold prefix",
+            &workers[retry],
+            &mut retry_lease,
+        ));
+        policy.release_reservation(workers[retry].url(), cost);
+
         let matched = policy
             .string_trees
             .get(model_id)
             .unwrap()
             .match_prefix_with_counts("new cold prefix");
         assert_eq!(matched.tenants.len(), 1);
+        assert!(matched
+            .tenants
+            .iter()
+            .any(|tenant| tenant.as_ref() == workers[retry].url()));
     }
 
     #[test]
-    fn distribution_guard_serializes_concurrent_cold_bootstrap() {
+    fn distribution_guard_serializes_concurrent_cold_bootstrap_leases() {
         let policy = Arc::new(scheduler_pressure_policy());
         let workers = two_workers();
         policy.init_workers(&workers);
@@ -3998,6 +4432,7 @@ mod tests {
                 engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
             ),
         ]));
+        let model_id = normalize_model_key(workers[0].model_id()).to_string();
         let barrier = Arc::new(std::sync::Barrier::new(16));
 
         let selected = std::thread::scope(|scope| {
@@ -4006,14 +4441,18 @@ mod tests {
                     let policy = Arc::clone(&policy);
                     let workers = &workers;
                     let barrier = Arc::clone(&barrier);
+                    let model_id = model_id.clone();
                     scope.spawn(move || {
+                        let headers = partition_headers(&model_id);
                         let info = SelectWorkerInfo {
                             request_text: Some("concurrent cold prefix"),
+                            headers: Some(&headers),
+                            reserve_work: true,
                             forbid_unleased_cache_owner_expansion: true,
                             ..Default::default()
                         };
                         barrier.wait();
-                        policy.select_worker(workers, &info).unwrap()
+                        policy.begin_guarded_ordinary_lease(&model_id, workers, &info, &model_id)
                     })
                 })
                 .collect();
@@ -4023,15 +4462,31 @@ mod tests {
                 .collect::<Vec<_>>()
         });
 
-        assert!(selected.iter().all(|idx| *idx == selected[0]));
+        assert_eq!(selected.iter().filter(|result| result.is_some()).count(), 1);
         assert!(policy.replication_state.is_empty());
-        let model_id = normalize_model_key(workers[0].model_id());
-        let matched = policy
-            .string_trees
-            .get(model_id)
-            .unwrap()
-            .match_prefix_with_counts("concurrent cold prefix");
-        assert_eq!(matched.tenants.len(), 1);
+        let headers = partition_headers(&model_id);
+        let info = SelectWorkerInfo {
+            request_text: Some("concurrent cold prefix"),
+            headers: Some(&headers),
+            reserve_work: true,
+            forbid_unleased_cache_owner_expansion: true,
+            ..Default::default()
+        };
+        let ownership = policy.prefix_ownership(&workers, &info, &[0, 1], &model_id);
+        assert!(!ownership.has_known_owner);
+        let (selected_idx, lease) = selected
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("one thread owns the lease");
+        drop(lease);
+        let cost = policy.reservation_cost(&info).unwrap();
+        policy.release_reservation(workers[selected_idx].url(), cost);
+        let (retry_idx, retry_lease) = policy
+            .begin_guarded_ordinary_lease(&model_id, &workers, &info, &model_id)
+            .expect("rollback must make a new bootstrap issuable");
+        drop(retry_lease);
+        policy.release_reservation(workers[retry_idx].url(), cost);
     }
 
     #[test]
