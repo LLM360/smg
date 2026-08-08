@@ -1502,6 +1502,16 @@ impl Router {
                 Ok(request) => request,
                 Err(response) => return *response,
             };
+            if is_stream {
+                if let Err(message) =
+                    validate_guarded_stream_usage_contract(route, &prepared_request)
+                {
+                    // No backend attempt has started. Dropping the provisional
+                    // cold-owner lease and ordinary load guard makes a later
+                    // request eligible to bootstrap the prefix again.
+                    return local_distribution_rejection(message);
+                }
+            }
             if !cold_route.validate_before_dispatch(
                 &self.policy_registry,
                 model_id,
@@ -3406,6 +3416,104 @@ mod tests {
             .with_extension(RedeemedCapacityCreditAuthorization::new(binding))
     }
 
+    struct ColdBootstrapTestFixture {
+        router: Router,
+        cache_policy: Arc<dyn LoadBalancingPolicy>,
+        workers: Vec<Arc<dyn Worker>>,
+        partition_headers: HeaderMap,
+    }
+
+    fn cold_bootstrap_test_fixture(worker_url: String) -> ColdBootstrapTestFixture {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(worker_url)
+                .model(ModelCard::new("test-model"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .label(ADMISSION_PARTITION_LABEL, "test-model")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let workers = vec![Arc::clone(&worker)];
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register(Arc::clone(&worker)).unwrap();
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+            fallback_output_token_estimate: 2_048,
+            block_size: 16,
+            engine_load: true,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            max_cached_owners_per_prefix: 2,
+            cache_owner_spill_cooldown_secs: 60,
+        }));
+        let cache_policy = policy_registry.get_default_policy();
+        cache_policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .init_workers(&workers);
+
+        let load = distribution_test_load(0, 0, 38);
+        let loads = HashMap::from([(worker.url().to_string(), load.clone())]);
+        cache_policy.update_loads(&loads);
+        let observed_loads = HashMap::from([(
+            worker.url().to_string(),
+            ObservedWorkerLoad {
+                response: load,
+                observed_at: Instant::now(),
+                worker_generation_id: worker.generation_id(),
+                worker_revision: worker.revision(),
+                router_load_at_observation: worker.load(),
+                source: WorkerLoadSource::NativeLoads,
+                scheduler_counts_present: true,
+            },
+        )]);
+        let (_loads_tx, loads_rx) = watch::channel(loads);
+        let (_observed_loads_tx, observed_loads_rx) = watch::channel(observed_loads);
+        let controller = AdaptiveAdmissionController::new(
+            AdaptiveAdmissionConfig {
+                mode: AdaptiveAdmissionMode::Enforce,
+                strategy: AdaptiveAdmissionStrategy::EngineFeedback,
+                min_load_coverage: 1.0,
+                feedback_max_waiting_requests_per_healthy_replica: 0,
+                distribution_headroom_partitions: vec!["test-model".to_string()],
+                distribution_headroom_max_inflight: 1,
+                ..Default::default()
+            },
+            Arc::clone(&worker_registry),
+        );
+        controller.start_load_updates(loads_rx, observed_loads_rx);
+
+        let mut partition_headers = HeaderMap::new();
+        partition_headers.insert(
+            ADMISSION_PARTITION_HEADER,
+            HeaderValue::from_static("test-model"),
+        );
+        ColdBootstrapTestFixture {
+            router: Router {
+                worker_registry,
+                policy_registry,
+                client: Client::new(),
+                no_redirect_client: Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+                retry_config: RetryConfig::default(),
+                realtime_registry: Arc::new(RealtimeRegistry::new()),
+                webrtc_bind_addr: None,
+                webrtc_stun_server: None,
+                adaptive_admission: Some(controller),
+            },
+            cache_policy,
+            workers,
+            partition_headers,
+        }
+    }
+
     #[tokio::test]
     async fn guarded_cold_bootstrap_nonstream_rolls_back_without_terminal_usage() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3591,6 +3699,179 @@ mod tests {
             "a terminal body with usage must publish the exact cold owner"
         );
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn guarded_cold_bootstrap_openai_stream_without_usage_rejects_before_dispatch() {
+        let ColdBootstrapTestFixture {
+            router,
+            cache_policy,
+            workers,
+            partition_headers,
+        } = cold_bootstrap_test_fixture("http://127.0.0.1:9".to_string());
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("tenant-a"));
+
+        for include_usage in [None, Some(false)] {
+            let response = router
+                .route_typed_request(
+                    Some(&partition_headers),
+                    &tenant_meta,
+                    &streaming_chat_request(include_usage),
+                    "/v1/chat/completions",
+                    "test-model",
+                )
+                .await;
+
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(response
+                .extensions()
+                .get::<LocalAdaptiveRejection>()
+                .is_some());
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("stream_options.include_usage=true"));
+            assert_eq!(
+                workers[0].load(),
+                0,
+                "local refusal must release worker load"
+            );
+            assert_eq!(
+                cache_policy.select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some("abcdefgh"),
+                        headers: Some(&partition_headers),
+                        forbid_unleased_cache_owner_expansion: true,
+                        ..Default::default()
+                    },
+                ),
+                None,
+                "local refusal must not publish the cold worker"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_cold_bootstrap_openai_stream_with_usage_dispatches_and_commits() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let stream_body = b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                            data: {\"choices\":[],\"usage\":{\"completion_tokens\":7}}\n\n\
+                            data: [DONE]\n\n"
+            .to_vec();
+        let server_body = stream_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            );
+            socket.write_all(response_head.as_bytes()).await.unwrap();
+            socket.write_all(&server_body).await.unwrap();
+        });
+
+        let ColdBootstrapTestFixture {
+            router,
+            cache_policy,
+            workers,
+            partition_headers,
+        } = cold_bootstrap_test_fixture(worker_url);
+        let response = router
+            .route_typed_request(
+                Some(&partition_headers),
+                &TenantRequestMeta::new(TenantKey::new("tenant-a")),
+                &streaming_chat_request(Some(true)),
+                "/v1/chat/completions",
+                "test-model",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            stream_body
+        );
+        assert_eq!(workers[0].load(), 0);
+        assert_eq!(
+            cache_policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("abcdefgh"),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            ),
+            Some(0),
+            "terminal OpenAI usage proof must publish the cold worker"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn guarded_cold_bootstrap_generate_stream_still_dispatches_and_commits() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let stream_body = b"data: {\"text\":\"ok\",\"meta_info\":{\"completion_tokens\":7,\"finish_reason\":{\"type\":\"stop\"}}}\n\n"
+            .to_vec();
+        let server_body = stream_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            );
+            socket.write_all(response_head.as_bytes()).await.unwrap();
+            socket.write_all(&server_body).await.unwrap();
+        });
+
+        let ColdBootstrapTestFixture {
+            router,
+            cache_policy,
+            workers,
+            partition_headers,
+        } = cold_bootstrap_test_fixture(worker_url);
+        let typed_req = TestGenerationRequest {
+            stream: true,
+            n: 1,
+            max_tokens: 1,
+            tools: Vec::new(),
+            response_format: serde_json::Value::Null,
+            reasoning_effort: String::new(),
+        };
+        let response = router
+            .route_typed_request(
+                Some(&partition_headers),
+                &TenantRequestMeta::new(TenantKey::new("tenant-a")),
+                &typed_req,
+                "/generate",
+                "test-model",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            stream_body
+        );
+        assert_eq!(workers[0].load(), 0);
+        assert_eq!(
+            cache_policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("abcdefgh"),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            ),
+            Some(0),
+            "native terminal usage proof must still publish the cold worker"
+        );
         server.await.unwrap();
     }
 
