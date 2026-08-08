@@ -59,6 +59,9 @@ jobs:
           cargo test -p smg --lib buffered_distribution_commit_requires_terminal_usage_proof
           cargo test -p smg --lib distribution_nonstream_commits_owner_only_after_terminal_usage_proof
           cargo test -p smg --lib exact_nonstream_response_preserves_terminal_proof_and_body
+          cargo test -p smg --lib guarded_stream_contract_is_endpoint_specific_and_fail_closed
+          cargo test -p smg --lib distribution_openai_stream_without_usage_is_rejected_before_dispatch
+          cargo test -p smg --lib distribution_openai_stream_with_usage_dispatches_and_commits
           cargo test -p smg --lib cache_distribution_stream
           cargo test -p smg --lib distribution_guard
           cargo test -p smg --lib distribution_headroom
