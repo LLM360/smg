@@ -59,6 +59,10 @@ jobs:
           cargo test -p smg --lib buffered_distribution_commit_requires_terminal_usage_proof
           cargo test -p smg --lib distribution_nonstream_commits_owner_only_after_terminal_usage_proof
           cargo test -p smg --lib exact_nonstream_response_preserves_terminal_proof_and_body
+          cargo test -p smg --lib guarded_cold_bootstrap_lease_is_default_off
+          cargo test -p smg --lib distribution_guard_cold_bootstrap_is_provisional_and_rolls_back
+          cargo test -p smg --lib distribution_guard_serializes_concurrent_cold_bootstrap_leases
+          cargo test -p smg --lib guarded_cold_bootstrap_nonstream_rolls_back_without_terminal_usage
           cargo test -p smg --lib cache_distribution_stream
           cargo test -p smg --lib distribution_guard
           cargo test -p smg --lib distribution_headroom
