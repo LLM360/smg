@@ -3648,7 +3648,10 @@ mod tests {
                 .await
         });
 
-        request_seen_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), request_seen_rx)
+            .await
+            .expect("the guarded request must reach its selected worker")
+            .unwrap();
         let worker_id = router.worker_registry.get_id_by_url(&worker_url).unwrap();
         match mutation {
             TerminalTopologyMutation::Remove => {
@@ -3672,7 +3675,10 @@ mod tests {
         }
         send_response_tx.send(()).unwrap();
 
-        let response = request.await.unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+            .await
+            .expect("the guarded request must finish after its worker responds")
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response
             .extensions()
@@ -3695,7 +3701,10 @@ mod tests {
             None,
             "terminal success from a stale target must not publish cache ownership"
         );
-        server.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the test worker must finish its response")
+            .unwrap();
         drop((_loads_tx, _observed_loads_tx));
     }
 
