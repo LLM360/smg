@@ -69,6 +69,8 @@ jobs:
           cargo test -p smg --lib guarded_cold_bootstrap_openai_stream_without_usage_rejects_before_dispatch
           cargo test -p smg --lib guarded_cold_bootstrap_openai_stream_with_usage_dispatches_and_commits
           cargo test -p smg --lib guarded_cold_bootstrap_generate_stream_still_dispatches_and_commits
+          cargo test -p smg --lib terminal_proof_rejects
+          cargo test -p smg --lib terminal_cold_owner_rejects
           cargo test -p smg --lib cache_distribution_stream
           cargo test -p smg --lib distribution_guard
           cargo test -p smg --lib distribution_headroom

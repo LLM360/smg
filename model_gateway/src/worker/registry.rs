@@ -207,6 +207,39 @@ impl WorkerRegistry {
         self.resolve_url_to_id(url).and_then(|id| self.get(&id))
     }
 
+    /// Run `f` only while `expected` is still the exact worker installed for
+    /// its URL.
+    ///
+    /// The per-worker mutation lock is also held by remove and same-URL
+    /// replace. Holding it through `f` gives terminal request proofs a single
+    /// authoritative ordering against those topology changes: either the
+    /// proof publishes before the mutation, or it observes that `expected` is
+    /// no longer registered and fails closed. A stale `Arc` and a URL match
+    /// alone are not membership proofs because a replacement keeps the URL.
+    pub(crate) fn with_authoritative_worker<T>(
+        &self,
+        expected: &Arc<dyn Worker>,
+        f: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let worker_id = self.resolve_url_to_id(expected.url())?;
+        let mutation_lock = self.worker_mutation_locks.get(&worker_id)?.clone();
+        let _guard = mutation_lock.lock();
+
+        let mapped_id = self.url_to_id.get(expected.url())?;
+        if *mapped_id != worker_id {
+            return None;
+        }
+        drop(mapped_id);
+
+        let current = self.workers.get(&worker_id)?.clone();
+        if !Arc::ptr_eq(&current, expected) {
+            return None;
+        }
+        drop(current);
+
+        Some(f())
+    }
+
     /// Look up a worker's ID by its URL.
     ///
     /// Returns `Some(id)` when a worker with this URL is registered,
@@ -3202,5 +3235,63 @@ mod tests {
             }
             other => panic!("Expected Removed event, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn terminal_proof_rejects_worker_removed_after_dispatch() {
+        let registry = WorkerRegistry::new();
+        let dispatched: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://removed-during-request:8080")
+                .model(ModelCard::new("test-model"))
+                .health_config(no_health_check())
+                .build(),
+        );
+        let worker_id = registry.register(Arc::clone(&dispatched)).unwrap();
+
+        registry.remove(&worker_id).unwrap();
+        // Keep the stale Arc executable to prove that lifecycle state is not
+        // being mistaken for authoritative registry membership.
+        dispatched.set_status(WorkerStatus::Ready);
+
+        let mut published = false;
+        let result = registry.with_authoritative_worker(&dispatched, || {
+            published = true;
+        });
+
+        assert!(result.is_none());
+        assert!(!published, "a removed target must not publish an owner");
+    }
+
+    #[test]
+    fn terminal_proof_rejects_same_url_worker_replaced_after_dispatch() {
+        let registry = WorkerRegistry::new();
+        let dispatched: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://replaced-during-request:8080")
+                .model(ModelCard::new("test-model"))
+                .health_config(no_health_check())
+                .build(),
+        );
+        let worker_id = registry.register(Arc::clone(&dispatched)).unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://replaced-during-request:8080")
+                .model(ModelCard::new("test-model"))
+                .health_config(no_health_check())
+                .build(),
+        );
+
+        assert!(registry.replace(&worker_id, Arc::clone(&replacement)));
+
+        let mut stale_published = false;
+        let stale_result = registry.with_authoritative_worker(&dispatched, || {
+            stale_published = true;
+        });
+        let current_result = registry.with_authoritative_worker(&replacement, || true);
+
+        assert!(stale_result.is_none());
+        assert!(
+            !stale_published,
+            "a replaced target must not publish an owner"
+        );
+        assert_eq!(current_result, Some(true));
     }
 }

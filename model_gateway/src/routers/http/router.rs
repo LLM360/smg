@@ -152,6 +152,39 @@ fn workers_in_admission_partition(
         .collect()
 }
 
+/// Publish a terminal cache-owner proof only while the exact dispatched
+/// worker is still authoritative in the registry.
+///
+/// `with_authoritative_worker` holds the target's mutation lock through the
+/// policy commit, so remove and same-URL replace cannot land between this
+/// membership check and owner publication. The worker list is deliberately
+/// re-read inside that critical section instead of reusing a pre-dispatch
+/// snapshot.
+fn commit_cache_owner_if_authoritative(
+    worker_registry: &WorkerRegistry,
+    expected_worker: &Arc<dyn Worker>,
+    model_id: &str,
+    partition: &str,
+    commit: impl FnOnce(&[Arc<dyn Worker>]) -> bool,
+) -> bool {
+    worker_registry
+        .with_authoritative_worker(expected_worker, || {
+            let model_filter = (model_id != crate::worker::UNKNOWN_MODEL_ID).then_some(model_id);
+            let current_workers = workers_in_admission_partition(
+                &worker_registry.get_workers_filtered(
+                    model_filter,
+                    Some(WorkerType::Regular),
+                    Some(ConnectionMode::Http),
+                    None,
+                    false,
+                ),
+                partition,
+            );
+            commit(&current_workers)
+        })
+        .unwrap_or(false)
+}
+
 fn local_distribution_rejection(message: &'static str) -> Response {
     let mut response = error::create_error(
         StatusCode::TOO_MANY_REQUESTS,
@@ -1310,7 +1343,8 @@ impl Router {
             if status.is_success() {
                 let (mut cache_route, load_guard) = route_lifetime;
                 let policy_registry = Arc::clone(&self.policy_registry);
-                let commit_workers = workers;
+                let worker_registry = Arc::clone(&self.worker_registry);
+                let expected_worker = Arc::clone(&worker);
                 let commit_model = model_id.to_string();
                 let commit_text = text.to_string();
                 let commit_partition = partition.to_string();
@@ -1319,11 +1353,19 @@ impl Router {
                     response,
                     load_guard,
                     move || {
-                        if !cache_route.commit_after_success(
-                            &policy_registry,
+                        if !commit_cache_owner_if_authoritative(
+                            &worker_registry,
+                            &expected_worker,
                             &commit_model,
-                            &commit_workers,
-                            &commit_text,
+                            &commit_partition,
+                            |current_workers| {
+                                cache_route.commit_after_success(
+                                    &policy_registry,
+                                    &commit_model,
+                                    current_workers,
+                                    &commit_text,
+                                )
+                            },
                         ) {
                             warn!(
                                 model_id = commit_model,
@@ -1358,11 +1400,19 @@ impl Router {
                     worker_url = worker.url(),
                     "cache distribution route lacked non-streaming terminal usage proof"
                 );
-            } else if !route_lifetime.0.commit_after_success(
-                &self.policy_registry,
+            } else if !commit_cache_owner_if_authoritative(
+                &self.worker_registry,
+                &worker,
                 model_id,
-                &workers,
-                text,
+                partition,
+                |current_workers| {
+                    route_lifetime.0.commit_after_success(
+                        &self.policy_registry,
+                        model_id,
+                        current_workers,
+                        text,
+                    )
+                },
             ) {
                 warn!(
                     model_id,
@@ -1537,6 +1587,8 @@ impl Router {
             if is_stream {
                 if status.is_success() {
                     let policy_registry = Arc::clone(&self.policy_registry);
+                    let worker_registry = Arc::clone(&self.worker_registry);
+                    let expected_worker = Arc::clone(&worker);
                     let commit_model = model_id.to_string();
                     let commit_text = text.to_string();
                     let commit_partition = partition.to_string();
@@ -1544,11 +1596,19 @@ impl Router {
                     response = CacheDistributionStreamingBody::wrap_response_with_attached_guard(
                         response,
                         move || {
-                            if !cold_route.commit_after_success(
-                                &policy_registry,
+                            if !commit_cache_owner_if_authoritative(
+                                &worker_registry,
+                                &expected_worker,
                                 &commit_model,
-                                &current_workers,
-                                &commit_text,
+                                &commit_partition,
+                                |current_workers| {
+                                    cold_route.commit_after_success(
+                                        &policy_registry,
+                                        &commit_model,
+                                        current_workers,
+                                        &commit_text,
+                                    )
+                                },
                             ) {
                                 warn!(
                                     model_id = commit_model,
@@ -1572,11 +1632,19 @@ impl Router {
                         worker_url = worker.url(),
                         "cold-bootstrap route lacked non-streaming terminal usage proof"
                     );
-                } else if !cold_route.commit_after_success(
-                    &self.policy_registry,
+                } else if !commit_cache_owner_if_authoritative(
+                    &self.worker_registry,
+                    &worker,
                     model_id,
-                    &current_workers,
-                    text,
+                    partition,
+                    |current_workers| {
+                        cold_route.commit_after_success(
+                            &self.policy_registry,
+                            model_id,
+                            current_workers,
+                            text,
+                        )
+                    },
                 ) {
                     warn!(
                         model_id,
@@ -3517,6 +3585,132 @@ mod tests {
             _loads_tx,
             _observed_loads_tx,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TerminalTopologyMutation {
+        Remove,
+        ReplaceSameUrl,
+    }
+
+    async fn assert_terminal_cold_owner_rejects_topology_mutation(
+        mutation: TerminalTopologyMutation,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let valid_body =
+            br#"{"text":"ok","meta_info":{"completion_tokens":7,"finish_reason":{"type":"stop"}}}"#
+                .to_vec();
+        let server_body = valid_body.clone();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (send_response_tx, send_response_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            request_seen_tx.send(()).unwrap();
+            send_response_rx.await.unwrap();
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            );
+            socket.write_all(response_head.as_bytes()).await.unwrap();
+            socket.write_all(&server_body).await.unwrap();
+        });
+
+        let ColdBootstrapTestFixture {
+            router,
+            cache_policy,
+            workers,
+            partition_headers,
+            _loads_tx,
+            _observed_loads_tx,
+        } = cold_bootstrap_test_fixture(worker_url.clone());
+        let router = Arc::new(router);
+        let request_router = Arc::clone(&router);
+        let request_headers = partition_headers.clone();
+        let request = tokio::spawn(async move {
+            request_router
+                .route_typed_request(
+                    Some(&request_headers),
+                    &TenantRequestMeta::new(TenantKey::new("tenant-a")),
+                    &TestGenerationRequest {
+                        stream: false,
+                        n: 1,
+                        max_tokens: 1,
+                        tools: Vec::new(),
+                        response_format: serde_json::Value::Null,
+                        reasoning_effort: String::new(),
+                    },
+                    "/generate",
+                    "test-model",
+                )
+                .await
+        });
+
+        request_seen_rx.await.unwrap();
+        let worker_id = router.worker_registry.get_id_by_url(&worker_url).unwrap();
+        match mutation {
+            TerminalTopologyMutation::Remove => {
+                router.worker_registry.remove(&worker_id).unwrap();
+                // A stale Arc can become executable again independently of
+                // membership. The authoritative guard must still reject it.
+                workers[0].set_status(openai_protocol::worker::WorkerStatus::Ready);
+            }
+            TerminalTopologyMutation::ReplaceSameUrl => {
+                let replacement: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(worker_url)
+                        .model(ModelCard::new("test-model"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Http)
+                        .label(ADMISSION_PARTITION_LABEL, "test-model")
+                        .health_config(no_health_check())
+                        .build(),
+                );
+                assert!(router.worker_registry.replace(&worker_id, replacement));
+            }
+        }
+        send_response_tx.send(()).unwrap();
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .extensions()
+            .get::<BufferedResponseBytes>()
+            .is_some_and(|body| buffered_completion_has_proof(&body.0)));
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            valid_body
+        );
+        assert_eq!(
+            cache_policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("abcdefgh"),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            ),
+            None,
+            "terminal success from a stale target must not publish cache ownership"
+        );
+        server.await.unwrap();
+        drop((_loads_tx, _observed_loads_tx));
+    }
+
+    #[tokio::test]
+    async fn terminal_cold_owner_rejects_worker_removed_after_dispatch() {
+        assert_terminal_cold_owner_rejects_topology_mutation(TerminalTopologyMutation::Remove)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_cold_owner_rejects_same_url_replacement_after_dispatch() {
+        assert_terminal_cold_owner_rejects_topology_mutation(
+            TerminalTopologyMutation::ReplaceSameUrl,
+        )
+        .await;
     }
 
     #[tokio::test]
