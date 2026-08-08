@@ -3478,7 +3478,8 @@ mod tests {
             workers,
             partition_headers,
             request_text,
-            ..
+            _loads_tx,
+            _observed_loads_tx,
         } = distribution_test_fixture("http://127.0.0.1:9".to_string());
 
         for (request_id, include_usage) in
@@ -3552,7 +3553,8 @@ mod tests {
             workers,
             partition_headers,
             request_text,
-            ..
+            _loads_tx,
+            _observed_loads_tx,
         } = distribution_test_fixture(idle_url);
         let meta = distribution_test_meta("request-with-usage");
         let response = router
@@ -3627,7 +3629,8 @@ mod tests {
             workers,
             partition_headers,
             request_text,
-            ..
+            _loads_tx,
+            _observed_loads_tx,
         } = distribution_test_fixture(idle_url);
         let idle = Arc::clone(&workers[1]);
         let typed_req = TestGenerationRequest {
