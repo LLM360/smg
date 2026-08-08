@@ -289,6 +289,31 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn capacity_credit_generation(mut self, generation: Option<String>) -> Self {
+        self.config.capacity_credit_generation = generation;
+        self
+    }
+
+    pub fn capacity_credit_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.config.capacity_credit_ttl_ms = ttl_ms;
+        self
+    }
+
+    pub fn capacity_credit_terminal_retention_secs(mut self, retention_secs: u64) -> Self {
+        self.config.capacity_credit_terminal_retention_secs = retention_secs;
+        self
+    }
+
+    pub fn capacity_credit_required(mut self, required: bool) -> Self {
+        self.config.capacity_credit_required = required;
+        self
+    }
+
+    pub fn priority_scheduler_adaptive_capacity(mut self, enabled: bool) -> Self {
+        self.config.priority_scheduler_adaptive_capacity = enabled;
+        self
+    }
+
     pub fn adaptive_admission(mut self, config: super::types::AdaptiveAdmissionConfig) -> Self {
         self.config.adaptive_admission = config;
         self

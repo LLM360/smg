@@ -1123,7 +1123,7 @@ impl GlobalFairShare {
     }
 
     #[cfg(test)]
-    fn model_snapshot(
+    pub(crate) fn model_snapshot(
         &self,
         scope_id: u64,
         model: &str,

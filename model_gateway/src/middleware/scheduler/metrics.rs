@@ -32,6 +32,8 @@ const FAIR_SHARE_RESERVED_OUTPUT_TOKENS: &str = "smg_fair_share_reserved_output_
 const FAIR_SHARE_QUEUE_WAIT_SECONDS: &str = "smg_fair_share_queue_wait_seconds";
 const FAIR_SHARE_FALLBACK_TOTAL: &str = "smg_fair_share_fallback_total";
 const FAIR_SHARE_UNKNOWN_TENANT_TOTAL: &str = "smg_fair_share_unknown_tenant_total";
+const CAPACITY_CREDIT_OPERATIONS_TOTAL: &str = "smg_capacity_credit_operations_total";
+const CAPACITY_CREDIT_ACTIVE: &str = "smg_capacity_credit_active";
 
 // Capacity / autoscaling gauges, refreshed by the sampler task.
 const INFLIGHT: &str = "smg_scheduler_inflight";
@@ -59,6 +61,22 @@ pub mod outcome {
     pub const PREEMPTED: &str = "preempted";
     /// The caller's client disconnected before admission completed.
     pub const CLIENT_CANCELLED: &str = "client_cancelled";
+}
+
+/// Bounded `outcome` values for capacity-credit protocol metrics.
+pub mod capacity_credit_outcome {
+    pub const ISSUED: &str = "issued";
+    pub const IDEMPOTENT_RETRY: &str = "idempotent_retry";
+    pub const REDEEMED: &str = "redeemed";
+    pub const CANCELLED: &str = "cancelled";
+    pub const EXPIRED: &str = "expired";
+    pub const NO_CAPACITY: &str = "no_capacity";
+    pub const INVALID_BINDING: &str = "invalid_binding";
+    pub const BINDING_MISMATCH: &str = "binding_mismatch";
+    pub const REQUEST_CONFLICT: &str = "request_conflict";
+    pub const WRONG_GENERATION: &str = "wrong_generation";
+    pub const REPLAY: &str = "replay";
+    pub const UNKNOWN: &str = "unknown";
 }
 
 /// Register descriptions. Called once from `observability::metrics::init_metrics`.
@@ -118,6 +136,14 @@ pub fn describe() {
     describe_counter!(
         FAIR_SHARE_UNKNOWN_TENANT_TOTAL,
         "Requests whose resolved tenant has no explicit fair-share weight"
+    );
+    describe_counter!(
+        CAPACITY_CREDIT_OPERATIONS_TOTAL,
+        "Capacity-credit lifecycle and protocol outcomes by configured admission partition"
+    );
+    describe_gauge!(
+        CAPACITY_CREDIT_ACTIVE,
+        "Active unredeemed capacity credits holding scheduler slots by admission partition"
     );
     describe_gauge!(INFLIGHT, "Current in-flight request count per class");
     describe_gauge!(QUEUE_DEPTH, "Current queued waiter count per class");
@@ -271,6 +297,31 @@ pub fn record_fair_share_unknown_tenant(tenant: &str) {
         "tenant" => intern_string(tenant)
     )
     .increment(1);
+}
+
+pub fn record_capacity_credit_operation(partition: &str, outcome: &'static str) {
+    counter!(
+        CAPACITY_CREDIT_OPERATIONS_TOTAL,
+        "partition" => intern_string(partition),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+pub fn increment_capacity_credit_active(partition: &str) {
+    gauge!(
+        CAPACITY_CREDIT_ACTIVE,
+        "partition" => intern_string(partition)
+    )
+    .increment(1.0);
+}
+
+pub fn decrement_capacity_credit_active(partition: &str) {
+    gauge!(
+        CAPACITY_CREDIT_ACTIVE,
+        "partition" => intern_string(partition)
+    )
+    .decrement(1.0);
 }
 
 /// Set the in-flight gauge for a class (sampler).

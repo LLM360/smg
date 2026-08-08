@@ -709,6 +709,70 @@ impl ConfigValidator {
             }
         }
 
+        if let Some(generation) = &config.capacity_credit_generation {
+            if generation.is_empty() || generation.trim() != generation || generation.len() > 128 {
+                return Err(ConfigError::InvalidValue {
+                    field: "capacity_credit_generation".to_string(),
+                    value: generation.clone(),
+                    reason: "Must be non-empty, unpadded, and at most 128 bytes".to_string(),
+                });
+            }
+            if !config.priority_scheduler_enabled {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "capacity_credit_generation requires priority_scheduler_enabled"
+                        .to_string(),
+                });
+            }
+            if config.api_key.as_deref().is_none_or(str::is_empty) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "capacity credits require a non-empty shared api_key for the internal issue/cancel API"
+                        .to_string(),
+                });
+            }
+            if !config.tenant_resolution.trust_tenant_header
+                || !config.tenant_resolution.prefer_trusted_tenant_header
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "capacity credits require trust_tenant_header and prefer_trusted_tenant_header so the service key does not collapse users into one tenant"
+                        .to_string(),
+                });
+            }
+        }
+        if config.capacity_credit_ttl_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "capacity_credit_ttl_ms".to_string(),
+                value: config.capacity_credit_ttl_ms.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if config.capacity_credit_terminal_retention_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "capacity_credit_terminal_retention_secs".to_string(),
+                value: config.capacity_credit_terminal_retention_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if config.capacity_credit_required && config.capacity_credit_generation.is_none() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "capacity_credit_required requires capacity_credit_generation".to_string(),
+            });
+        }
+        if config.priority_scheduler_adaptive_capacity
+            && (config.adaptive_admission.mode != AdaptiveAdmissionMode::Enforce
+                || config.adaptive_admission.strategy != AdaptiveAdmissionStrategy::EngineFeedback)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "priority_scheduler_adaptive_capacity requires adaptive admission mode=enforce and strategy=engine_feedback"
+                    .to_string(),
+            });
+        }
+        if config.priority_scheduler_adaptive_capacity && !config.priority_scheduler_enabled {
+            return Err(ConfigError::ValidationFailed {
+                reason: "priority_scheduler_adaptive_capacity requires priority_scheduler_enabled"
+                    .to_string(),
+            });
+        }
+
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_timeout_secs".to_string(),
@@ -1972,6 +2036,50 @@ mod tests {
         config.health_check_port = Some(8081);
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn capacity_credits_are_disabled_and_inert_by_default() {
+        let config = RouterConfig::default();
+        assert!(config.capacity_credit_generation.is_none());
+        assert!(!config.capacity_credit_required);
+        assert!(!config.priority_scheduler_adaptive_capacity);
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn capacity_credit_generation_requires_scheduler_service_key_and_preferred_identity() {
+        let mut config = RouterConfig {
+            capacity_credit_generation: Some("green-1".to_string()),
+            ..RouterConfig::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        config.priority_scheduler_enabled = true;
+        config.api_key = Some("service-key".to_string());
+        config.tenant_resolution.trust_tenant_header = true;
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        config.tenant_resolution.prefer_trusted_tenant_header = true;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn required_credit_needs_generation_and_adaptive_coupling_needs_enforced_feedback() {
+        let mut config = RouterConfig {
+            capacity_credit_required: true,
+            ..RouterConfig::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        config.capacity_credit_required = false;
+        config.priority_scheduler_adaptive_capacity = true;
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.adaptive_admission.mode = AdaptiveAdmissionMode::Enforce;
+        config.adaptive_admission.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.priority_scheduler_enabled = true;
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 }

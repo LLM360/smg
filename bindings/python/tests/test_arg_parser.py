@@ -51,6 +51,11 @@ class TestRouterArgs:
         assert args.priority_scheduler_default_max_class == "default"
         assert args.priority_scheduler_config is None
         assert args.priority_scheduler_tenant_metric_top_n == 32
+        assert args.capacity_credit_generation is None
+        assert args.capacity_credit_ttl_ms == 30_000
+        assert args.capacity_credit_terminal_retention_secs == 600
+        assert args.capacity_credit_required is False
+        assert args.priority_scheduler_adaptive_capacity is False
         assert args.trust_tenant_header is False
         assert args.prefer_trusted_tenant_header is False
         assert args.tenant_header_name == "x-smg-tenant-id"
@@ -78,6 +83,14 @@ class TestRouterArgs:
                 "/tmp/priority.yaml",
                 "--priority-scheduler-tenant-metric-top-n",
                 "16",
+                "--capacity-credit-generation",
+                "green-1",
+                "--capacity-credit-ttl-ms",
+                "45000",
+                "--capacity-credit-terminal-retention-secs",
+                "900",
+                "--capacity-credit-required",
+                "--priority-scheduler-adaptive-capacity",
             ]
         )
 
@@ -85,6 +98,11 @@ class TestRouterArgs:
         assert args.priority_scheduler_default_max_class == "interactive"
         assert args.priority_scheduler_config == "/tmp/priority.yaml"
         assert args.priority_scheduler_tenant_metric_top_n == 16
+        assert args.capacity_credit_generation == "green-1"
+        assert args.capacity_credit_ttl_ms == 45_000
+        assert args.capacity_credit_terminal_retention_secs == 900
+        assert args.capacity_credit_required is True
+        assert args.priority_scheduler_adaptive_capacity is True
 
     def test_parse_preferred_trusted_tenant_header_options(self):
         args = parse_router_args(

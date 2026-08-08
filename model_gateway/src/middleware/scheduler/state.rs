@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use super::{
+    capacity_credit::{CapacityCreditRegistry, HeldSchedulerPermit},
     fair_share::{FairShareProfile, REQUEST_MODEL_HEADER},
     Class, GlobalFairShare, PriorityScheduler, SchedulerSettings, StaticTenantPolicyResolver,
     TenantPolicyResolver,
@@ -35,6 +36,14 @@ pub const ADMISSION_PARTITION_HEADER: &str = "x-smg-admission-partition";
 /// replica to a partition other than its primary model id.
 pub const ADMISSION_PARTITION_LABEL: &str = "admission_partition";
 
+/// Optional live total-capacity ceiling supplied by adaptive admission.
+/// SlotPool remains authoritative for local in-flight accounting.
+pub(crate) trait AdaptiveCapacityProvider: Send + Sync {
+    fn effective_capacity(&self, partition: &str, static_capacity: u16) -> u16;
+
+    fn subscribe_capacity_changes(&self) -> watch::Receiver<u64>;
+}
+
 #[derive(Clone)]
 pub struct SchedulerPartition {
     pub name: Arc<str>,
@@ -57,6 +66,8 @@ pub struct SchedulerState {
     /// it as a concurrency limiter (that would double-limit). `None` =
     /// no RPS limit.
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    capacity_credits: Option<Arc<CapacityCreditRegistry<HeldSchedulerPermit>>>,
+    capacity_credit_required: bool,
 }
 
 impl SchedulerState {
@@ -76,6 +87,30 @@ impl SchedulerState {
                 name: Arc::clone(&self.default_partition),
                 scheduler: Arc::clone(&self.scheduler),
             })
+    }
+
+    /// Resolve an exact configured partition. Capacity credits never fall
+    /// back because their binding must identify the same non-fungible pool at
+    /// issue and redemption time.
+    pub(crate) fn partition_exact(&self, name: &str) -> Option<SchedulerPartition> {
+        self.partitions.get(name).cloned()
+    }
+
+    pub(crate) fn capacity_credits(
+        &self,
+    ) -> Option<&Arc<CapacityCreditRegistry<HeldSchedulerPermit>>> {
+        self.capacity_credits.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn capacity_credit_required(&self) -> bool {
+        self.capacity_credit_required
+    }
+
+    pub(crate) fn canonical_model(&self, raw_model: &str) -> Arc<str> {
+        self.model_registry
+            .resolve_model_alias(raw_model)
+            .unwrap_or_else(|| Arc::from(raw_model))
     }
 
     /// Resolve the trusted request model to a configured fair-share profile.
@@ -102,11 +137,19 @@ impl SchedulerState {
             super::metrics::record_fair_share_fallback("missing_request_model");
             return FairShareProfile::Global;
         };
-        let canonical = self
-            .model_registry
-            .resolve_model_alias(raw_model)
-            .unwrap_or_else(|| Arc::from(raw_model));
+        let canonical = self.canonical_model(raw_model);
         ledger.profile_for_model(&canonical)
+    }
+
+    pub(crate) fn fair_share_profile_for_model(
+        &self,
+        raw_model: &str,
+        ledger: &GlobalFairShare,
+    ) -> FairShareProfile {
+        if !ledger.has_model_profiles() {
+            return FairShareProfile::Global;
+        }
+        ledger.profile_for_model(&self.canonical_model(raw_model))
     }
 }
 
@@ -136,14 +179,8 @@ impl AdmissionMode {
         registry: Arc<WorkerRegistry>,
         rate_limiter: Option<Arc<TokenBucket>>,
     ) -> Self {
-        if !rc.priority_scheduler_enabled {
-            return Self::Legacy;
-        }
-        match Self::try_build_priority(rc, registry, rate_limiter) {
-            Ok(mode) => {
-                info!("priority scheduler enabled");
-                mode
-            }
+        match Self::try_from_config_with_adaptive(rc, registry, rate_limiter, None) {
+            Ok(mode) => mode,
             Err(e) => {
                 error!(
                     error = %e,
@@ -154,10 +191,46 @@ impl AdmissionMode {
         }
     }
 
-    fn try_build_priority(
+    /// Startup path used by the production server.
+    ///
+    /// Existing scheduler-only deployments preserve the legacy fail-safe
+    /// fallback. Once capacity credits or adaptive scheduler capacity are
+    /// configured, construction errors are returned to the caller because the
+    /// admission boundary must never silently disappear.
+    pub(crate) fn try_from_config_with_adaptive(
         rc: &RouterConfig,
         registry: Arc<WorkerRegistry>,
         rate_limiter: Option<Arc<TokenBucket>>,
+        adaptive_capacity_provider: Option<Arc<dyn AdaptiveCapacityProvider>>,
+    ) -> Result<Self, String> {
+        if !rc.priority_scheduler_enabled {
+            return Ok(Self::Legacy);
+        }
+        match Self::try_build_priority(rc, registry, rate_limiter, adaptive_capacity_provider) {
+            Ok(mode) => {
+                info!("priority scheduler enabled");
+                Ok(mode)
+            }
+            Err(error)
+                if rc.capacity_credit_generation.is_none()
+                    && !rc.capacity_credit_required
+                    && !rc.priority_scheduler_adaptive_capacity =>
+            {
+                tracing::error!(
+                    error = %error,
+                    "priority scheduler failed to start; falling back to legacy admission"
+                );
+                Ok(Self::Legacy)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn try_build_priority(
+        rc: &RouterConfig,
+        registry: Arc<WorkerRegistry>,
+        rate_limiter: Option<Arc<TokenBucket>>,
+        adaptive_capacity_provider: Option<Arc<dyn AdaptiveCapacityProvider>>,
     ) -> Result<Self, String> {
         // The configured concurrency value is one global ceiling across the
         // entire healthy worker fleet. Worker-reported capacity may lower the
@@ -194,6 +267,40 @@ impl AdmissionMode {
             settings = settings.with_global_queue_budget(rc.queue_size);
         }
         let fair_share = GlobalFairShare::from_settings(&settings).map(Arc::new);
+        let capacity_credits = if let Some(generation) = &rc.capacity_credit_generation {
+            let ledger = fair_share.as_ref().ok_or_else(|| {
+                "capacity credits require fair_share in the priority-scheduler config".to_string()
+            })?;
+            if !ledger.trusts_output_token_estimate_header()
+                || !ledger.trusts_request_model_header()
+            {
+                return Err(
+                    "capacity credits require trusted output-token estimates and request-model headers"
+                        .to_string(),
+                );
+            }
+            let registry = Arc::new(
+                CapacityCreditRegistry::new(
+                    generation,
+                    Duration::from_millis(rc.capacity_credit_ttl_ms),
+                    Duration::from_secs(rc.capacity_credit_terminal_retention_secs),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            registry.spawn_reaper(Duration::from_millis(
+                rc.capacity_credit_ttl_ms.clamp(10, 1_000),
+            ));
+            Some(registry)
+        } else {
+            None
+        };
+        let adaptive_capacity_provider = if rc.priority_scheduler_adaptive_capacity {
+            Some(adaptive_capacity_provider.ok_or_else(|| {
+                "priority_scheduler_adaptive_capacity requires a live adaptive provider".to_string()
+            })?)
+        } else {
+            None
+        };
         let model_registry = Arc::clone(&registry);
 
         let resolver: Arc<dyn TenantPolicyResolver> =
@@ -210,6 +317,12 @@ impl AdmissionMode {
             .as_ref()
             .filter(|yaml| !yaml.admission_partitions.is_empty())
         else {
+            if capacity_credits.is_some() || adaptive_capacity_provider.is_some() {
+                return Err(
+                    "capacity credits and adaptive scheduler capacity require explicit admission_partitions"
+                        .to_string(),
+                );
+            }
             // The atomic value covers any update that won the race before the
             // receiver subscribed; subsequent updates remain queued for the
             // dispatcher through `capacity_watch`.
@@ -228,6 +341,8 @@ impl AdmissionMode {
                 resolver,
                 model_registry,
                 rate_limiter,
+                capacity_credits: None,
+                capacity_credit_required: false,
             })));
         };
 
@@ -252,6 +367,9 @@ impl AdmissionMode {
         // cannot land in the gap between startup allocation and coordinator
         // activation.
         let worker_events = registry.subscribe_events();
+        let adaptive_capacity_watch = adaptive_capacity_provider
+            .as_ref()
+            .map(|provider| provider.subscribe_capacity_changes());
         let (initial, initial_replicas) = allocate_partition_capacities(
             &partition_configs,
             &partition_config.default_admission_partition,
@@ -271,7 +389,12 @@ impl AdmissionMode {
                 configured_max,
                 config.queue_size as usize,
             );
-            let capacity = initial.get(name).copied().unwrap_or(0);
+            let static_capacity = initial.get(name).copied().unwrap_or(0);
+            let capacity = effective_partition_capacity(
+                adaptive_capacity_provider.as_deref(),
+                name,
+                static_capacity,
+            );
             super::metrics::set_partition_healthy_replicas(
                 name,
                 initial_replicas.get(name).copied().unwrap_or(0),
@@ -314,15 +437,17 @@ impl AdmissionMode {
                 })?
                 .scheduler,
         );
-        spawn_partition_capacity_coordinator(
+        spawn_partition_capacity_coordinator(PartitionCapacityCoordinator {
             capacity_watch,
             worker_capacity,
             registry,
             worker_events,
-            partition_configs,
-            default_partition_name.clone(),
+            configs: partition_configs,
+            default_partition: default_partition_name.clone(),
             capacity_senders,
-        );
+            adaptive_capacity_provider,
+            adaptive_capacity_watch,
+        });
         spawn_partition_metrics_sampler(partitions.values().cloned().collect());
 
         Ok(Self::Priority(Arc::new(SchedulerState {
@@ -332,8 +457,20 @@ impl AdmissionMode {
             resolver,
             model_registry,
             rate_limiter,
+            capacity_credits,
+            capacity_credit_required: rc.capacity_credit_required,
         })))
     }
+}
+
+fn effective_partition_capacity(
+    provider: Option<&dyn AdaptiveCapacityProvider>,
+    partition: &str,
+    static_capacity: u16,
+) -> u16 {
+    provider.map_or(static_capacity, |provider| {
+        provider.effective_capacity(partition, static_capacity)
+    })
 }
 
 fn spawn_partition_metrics_sampler(partitions: Vec<SchedulerPartition>) {
@@ -642,21 +779,39 @@ fn allocate_partition_capacities(
     (allocate_weighted_capacities(&weights, target), counts)
 }
 
-fn spawn_partition_capacity_coordinator(
-    mut capacity_watch: watch::Receiver<u16>,
+struct PartitionCapacityCoordinator {
+    capacity_watch: watch::Receiver<u16>,
     worker_capacity: Arc<WorkerCapacity>,
     registry: Arc<WorkerRegistry>,
-    mut worker_events: broadcast::Receiver<WorkerEvent>,
+    worker_events: broadcast::Receiver<WorkerEvent>,
     configs: Vec<(String, super::AdmissionPartitionConfig)>,
     default_partition: String,
     capacity_senders: Vec<(String, watch::Sender<u16>)>,
-) {
+    adaptive_capacity_provider: Option<Arc<dyn AdaptiveCapacityProvider>>,
+    adaptive_capacity_watch: Option<watch::Receiver<u64>>,
+}
+
+fn spawn_partition_capacity_coordinator(coordinator: PartitionCapacityCoordinator) {
+    let PartitionCapacityCoordinator {
+        mut capacity_watch,
+        worker_capacity,
+        registry,
+        mut worker_events,
+        configs,
+        default_partition,
+        capacity_senders,
+        adaptive_capacity_provider,
+        adaptive_capacity_watch,
+    } = coordinator;
     #[expect(
         clippy::disallowed_methods,
         reason = "gateway-lifetime coordinator owns the capacity tracker and exits when its watch closes"
     )]
     tokio::spawn(async move {
         let _worker_capacity = worker_capacity;
+        let (disabled_tx, disabled_rx) = watch::channel(0_u64);
+        let _disabled_tx = disabled_tx;
+        let mut adaptive_capacity_watch = adaptive_capacity_watch.unwrap_or(disabled_rx);
         loop {
             tokio::select! {
                 changed = capacity_watch.changed() => {
@@ -670,6 +825,11 @@ fn spawn_partition_capacity_coordinator(
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                changed = adaptive_capacity_watch.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
             }
             let (allocations, replica_counts) = allocate_partition_capacities(
                 &configs,
@@ -678,8 +838,19 @@ fn spawn_partition_capacity_coordinator(
                 &registry,
             );
             for (name, sender) in &capacity_senders {
-                if let Some(capacity) = allocations.get(name) {
-                    sender.send_replace(*capacity);
+                if let Some(static_capacity) = allocations.get(name) {
+                    let effective_capacity = effective_partition_capacity(
+                        adaptive_capacity_provider.as_deref(),
+                        name,
+                        *static_capacity,
+                    );
+                    sender.send_if_modified(|current| {
+                        if *current == effective_capacity {
+                            return false;
+                        }
+                        *current = effective_capacity;
+                        true
+                    });
                 }
                 super::metrics::set_partition_healthy_replicas(
                     name,
@@ -714,6 +885,42 @@ mod tests {
         middleware::scheduler::{FairShareConfig, ModelFairShareConfig, PrioritySchedulerYaml},
         worker::BasicWorkerBuilder,
     };
+
+    #[tokio::test]
+    async fn production_startup_preserves_fallback_until_credit_boundary_is_enabled() {
+        let mut yaml = NamedTempFile::new().unwrap();
+        write!(yaml, "not: [valid").unwrap();
+        let config = RouterConfig {
+            priority_scheduler_enabled: true,
+            priority_scheduler_config: Some(yaml.path().to_string_lossy().into_owned()),
+            ..RouterConfig::default()
+        };
+
+        let compatible = AdmissionMode::try_from_config_with_adaptive(
+            &config,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(compatible, AdmissionMode::Legacy));
+        assert!(matches!(
+            AdmissionMode::from_config(&config, Arc::new(WorkerRegistry::new()), None,),
+            AdmissionMode::Legacy
+        ));
+
+        let fail_closed = RouterConfig {
+            capacity_credit_generation: Some("green-1".to_string()),
+            ..config
+        };
+        assert!(AdmissionMode::try_from_config_with_adaptive(
+            &fail_closed,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            None,
+        )
+        .is_err());
+    }
 
     #[test]
     fn trusted_request_model_alias_selects_the_canonical_profile() {
@@ -754,6 +961,8 @@ mod tests {
             resolver: Arc::new(StaticTenantPolicyResolver::from_settings(&settings)),
             model_registry: Arc::clone(&registry),
             rate_limiter: None,
+            capacity_credits: None,
+            capacity_credit_required: false,
         };
         let ledger = GlobalFairShare::from_config(&fair_config);
         let mut headers = HeaderMap::new();
@@ -777,7 +986,7 @@ mod tests {
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None).unwrap()
+            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None, None).unwrap()
         else {
             panic!("priority scheduler should start");
         };
@@ -841,7 +1050,7 @@ mod tests {
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, registry, None).unwrap()
+            AdmissionMode::try_build_priority(&config, registry, None, None).unwrap()
         else {
             panic!("priority scheduler should start");
         };
@@ -1068,7 +1277,7 @@ default_admission_partition: default
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None).unwrap()
+            AdmissionMode::try_build_priority(&config, Arc::clone(&registry), None, None).unwrap()
         else {
             panic!("priority scheduler should start");
         };
@@ -1206,7 +1415,7 @@ default_admission_partition: default
             ..RouterConfig::default()
         };
         let AdmissionMode::Priority(state) =
-            AdmissionMode::try_build_priority(&config, Arc::new(WorkerRegistry::new()), None)
+            AdmissionMode::try_build_priority(&config, Arc::new(WorkerRegistry::new()), None, None)
                 .unwrap()
         else {
             panic!("priority scheduler should start");

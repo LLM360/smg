@@ -101,7 +101,6 @@ pub struct PriorityScheduler {
     slot_pool: SlotPool,
     class_queues: [Arc<dyn ClassQueue>; 4],
     fair_share: Option<Arc<GlobalFairShare>>,
-    #[cfg(test)]
     fair_share_scope: Option<u64>,
     /// One work-conserving occupancy ceiling shared by all class queues.
     queue_budget: Arc<QueueBudget>,
@@ -206,7 +205,6 @@ impl PriorityScheduler {
             slot_pool: SlotPool::new(capacity, effective_reserved),
             class_queues,
             fair_share,
-            #[cfg(test)]
             fair_share_scope,
             queue_budget,
             inflight_registry: RwLock::new(HashMap::new()),
@@ -238,6 +236,46 @@ impl PriorityScheduler {
             return None;
         }
         Some(self.register_inflight(class, request_id, None))
+    }
+
+    /// Immediately acquire one slot for an allocator-selected tenant.
+    ///
+    /// This never enters the scheduler queue. The external allocator owns
+    /// candidate ordering; SMG remains authoritative for the slot and for the
+    /// provisional output-token reservation settled by the response body.
+    pub(crate) fn acquire_for_tenant_profile(
+        self: &Arc<Self>,
+        class: Class,
+        request_id: RequestId,
+        tenant: TenantKey,
+        profile: FairShareProfile,
+        estimated_output_tokens: u32,
+    ) -> Option<SchedulerPermit> {
+        if !self.slot_pool.try_acquire(class) {
+            return None;
+        }
+        let Some(ledger) = &self.fair_share else {
+            return Some(self.register_inflight(class, request_id, None));
+        };
+        let Some(scope_id) = self.fair_share_scope else {
+            self.slot_pool.release(class);
+            return None;
+        };
+
+        ledger.register_waiter_in_profile(scope_id, &profile, &tenant, class);
+        let candidates = [super::fair_share::FairShareCandidate {
+            index: 0,
+            tenant: &tenant,
+            estimated_output_tokens,
+        }];
+        let Some(selection) =
+            ledger.reserve_local_candidate_in_profile(scope_id, &profile, class, &candidates)
+        else {
+            ledger.remove_waiter_in_profile(scope_id, &profile, &tenant, class);
+            self.slot_pool.release(class);
+            return None;
+        };
+        Some(self.register_inflight(class, request_id, Some(selection.reservation)))
     }
 
     /// Register a handle in the registry and wrap it in a permit.
@@ -1098,7 +1136,7 @@ impl SchedulerPermit {
         }
     }
 
-    fn cancel_fair_share_reservation(&mut self) {
+    pub(crate) fn cancel_fair_share_reservation(&mut self) {
         if let Some(reservation) = self.fair_share_reservation.take() {
             reservation.cancel();
         }
@@ -2112,6 +2150,39 @@ mod tests {
         };
         permit.settle_output_tokens(Some(10), SettlementKind::Observed);
         drop(permit);
+        assert_eq!(scheduler.inflight_for_test(Class::Default), 0);
+    }
+
+    #[test]
+    fn allocator_selected_credit_holds_and_releases_the_exact_slot() {
+        let settings = fair_settings();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scheduler = PriorityScheduler::new_with_fair_share(&settings, 1, Some(ledger)).unwrap();
+
+        let permit = scheduler
+            .acquire_for_tenant_profile(
+                Class::Default,
+                rid("credit-a"),
+                TenantKey::new("header:a"),
+                FairShareProfile::Global,
+                10,
+            )
+            .expect("allocator-selected tenant should acquire the free slot");
+        assert!(permit.has_fair_share_reservation());
+        assert!(
+            scheduler
+                .acquire_for_tenant_profile(
+                    Class::Default,
+                    rid("credit-b"),
+                    TenantKey::new("header:b"),
+                    FairShareProfile::Global,
+                    10,
+                )
+                .is_none(),
+            "credit issue must not queue when capacity is exhausted"
+        );
+        let held = super::super::capacity_credit::HeldSchedulerPermit::new(permit);
+        drop(held);
         assert_eq!(scheduler.inflight_for_test(Class::Default), 0);
     }
 
