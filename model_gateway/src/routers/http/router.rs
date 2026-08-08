@@ -545,6 +545,42 @@ fn buffered_completion_has_proof(body: &[u8]) -> bool {
     openai_completed || sglang_completed || responses_completed || anthropic_completed
 }
 
+/// Verify that a guarded streaming request has an endpoint-level contract for
+/// terminal output usage before it is dispatched.
+///
+/// Native SGLang, Anthropic Messages, and OpenAI Responses streams carry usage
+/// in their terminal protocol events. Chat Completions and legacy Completions
+/// make the terminal usage chunk optional, so a distribution seed may use
+/// those endpoints only when the exact outgoing request explicitly asks for
+/// it. We inspect the prepared request, after worker-specific rewriting, and
+/// fail closed if its in-memory JSON body cannot be proven.
+fn validate_guarded_stream_usage_contract(
+    route: &'static str,
+    request: &ReqwestRequest,
+) -> Result<(), &'static str> {
+    match route {
+        "/generate" | "/v1/messages" | "/v1/responses" => Ok(()),
+        "/v1/chat/completions" | "/v1/completions" => {
+            let body = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .ok_or("guarded OpenAI stream body was not inspectable before dispatch")?;
+            let value: serde_json::Value = serde_json::from_slice(body)
+                .map_err(|_| "guarded OpenAI stream body was not valid JSON before dispatch")?;
+            if value
+                .pointer("/stream_options/include_usage")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                Ok(())
+            } else {
+                Err("guarded OpenAI streaming requires stream_options.include_usage=true")
+            }
+        }
+        _ => Err("guarded streaming endpoint has no terminal usage contract"),
+    }
+}
+
 /// Holds the exact cache-distribution proof and worker accounting through a
 /// streaming response. Ownership is published only after a clean end-of-stream
 /// with protocol-level terminal success and observed output usage.
@@ -1157,6 +1193,14 @@ impl Router {
                 return *response;
             }
         };
+        if is_stream {
+            if let Err(message) = validate_guarded_stream_usage_contract(route, &prepared_request) {
+                // This is still a local pre-execution refusal. The scheduler
+                // credit has not been claimed and both provisional headroom
+                // permits are released when this function returns.
+                return local_distribution_rejection(message);
+            }
+        }
         if !authorization.try_claim(partition, model_id) {
             return local_distribution_rejection(
                 "capacity credit route claim was already consumed",
@@ -2517,6 +2561,8 @@ mod tests {
 
     use http_body_util::BodyExt;
     use openai_protocol::{
+        chat::{ChatMessage, MessageContent},
+        common::StreamOptions,
         model_card::ModelCard,
         worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse},
     };
@@ -3203,30 +3249,15 @@ mod tests {
             .with_extension(RedeemedCapacityCreditAuthorization::new(binding))
     }
 
-    #[tokio::test]
-    async fn distribution_nonstream_commits_owner_only_after_terminal_usage_proof() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let idle_url = format!("http://{}", listener.local_addr().unwrap());
-        let invalid_body =
-            br#"{"text":"ok","meta_info":{"finish_reason":{"type":"stop"}}}"#.to_vec();
-        let valid_body =
-            br#"{"text":"ok","meta_info":{"completion_tokens":7,"finish_reason":{"type":"stop"}}}"#
-                .to_vec();
-        let server_bodies = [invalid_body.clone(), valid_body.clone()];
-        let server = tokio::spawn(async move {
-            for response_bytes in server_bodies {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0_u8; 4096];
-                let _ = socket.read(&mut request).await.unwrap();
-                let response_head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response_bytes.len()
-                );
-                socket.write_all(response_head.as_bytes()).await.unwrap();
-                socket.write_all(&response_bytes).await.unwrap();
-            }
-        });
+    struct DistributionTestFixture {
+        router: Router,
+        cache_policy: Arc<dyn LoadBalancingPolicy>,
+        workers: Vec<Arc<dyn Worker>>,
+        partition_headers: HeaderMap,
+        request_text: &'static str,
+    }
 
+    fn distribution_test_fixture(idle_url: String) -> DistributionTestFixture {
         let hot: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://127.0.0.1:1")
                 .model(ModelCard::new("test-model"))
@@ -3347,20 +3378,248 @@ mod tests {
         );
         controller.start_load_updates(loads_rx, observed_loads_rx);
 
-        let router = Router {
-            worker_registry,
-            policy_registry,
-            client: Client::new(),
-            no_redirect_client: Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
+        DistributionTestFixture {
+            router: Router {
+                worker_registry,
+                policy_registry,
+                client: Client::new(),
+                no_redirect_client: Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+                retry_config: RetryConfig::default(),
+                realtime_registry: Arc::new(RealtimeRegistry::new()),
+                webrtc_bind_addr: None,
+                webrtc_stun_server: None,
+                adaptive_admission: Some(controller),
+            },
+            cache_policy,
+            workers,
+            partition_headers,
+            request_text,
+        }
+    }
+
+    fn streaming_chat_request(include_usage: Option<bool>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("abcdefgh".to_string()),
+                name: None,
+            }],
+            model: "test-model".to_string(),
+            max_completion_tokens: Some(1),
+            stream: true,
+            stream_options: include_usage.map(|include_usage| StreamOptions {
+                include_usage: Some(include_usage),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn guarded_stream_contract_is_endpoint_specific_and_fail_closed() {
+        let request = |body: serde_json::Value| {
+            Client::new()
+                .post("http://worker/v1/chat/completions")
+                .json(&body)
                 .build()
-                .unwrap(),
-            retry_config: RetryConfig::default(),
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-            adaptive_admission: Some(controller),
+                .unwrap()
         };
+
+        for route in ["/generate", "/v1/messages", "/v1/responses"] {
+            assert!(validate_guarded_stream_usage_contract(
+                route,
+                &request(serde_json::json!({"stream": true})),
+            )
+            .is_ok());
+        }
+
+        for body in [
+            serde_json::json!({"stream": true}),
+            serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": false}
+            }),
+        ] {
+            assert!(validate_guarded_stream_usage_contract(
+                "/v1/chat/completions",
+                &request(body.clone()),
+            )
+            .is_err());
+            assert!(
+                validate_guarded_stream_usage_contract("/v1/completions", &request(body),).is_err()
+            );
+        }
+
+        let with_usage = request(serde_json::json!({
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }));
+        assert!(
+            validate_guarded_stream_usage_contract("/v1/chat/completions", &with_usage,).is_ok()
+        );
+        assert!(validate_guarded_stream_usage_contract("/v1/completions", &with_usage,).is_ok());
+        assert!(validate_guarded_stream_usage_contract("/future/stream", &with_usage,).is_err());
+    }
+
+    #[tokio::test]
+    async fn distribution_openai_stream_without_usage_is_rejected_before_dispatch() {
+        let DistributionTestFixture {
+            router,
+            cache_policy,
+            workers,
+            partition_headers,
+            request_text,
+        } = distribution_test_fixture("http://127.0.0.1:9".to_string());
+
+        for (request_id, include_usage) in
+            [("request-absent", None), ("request-false", Some(false))]
+        {
+            let meta = distribution_test_meta(request_id);
+            let response = router
+                .route_typed_request(
+                    Some(&partition_headers),
+                    &meta,
+                    &streaming_chat_request(include_usage),
+                    "/v1/chat/completions",
+                    "test-model",
+                )
+                .await;
+
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(response
+                .extensions()
+                .get::<LocalAdaptiveRejection>()
+                .is_some());
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("stream_options.include_usage=true"));
+            assert!(
+                meta.extension::<RedeemedCapacityCreditAuthorization>()
+                    .unwrap()
+                    .try_claim("test-model", "test-model"),
+                "a locally rejected seed must leave its scheduler route claim unused"
+            );
+            assert_eq!(workers[1].load(), 0);
+            assert_eq!(
+                cache_policy.select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(request_text),
+                        headers: Some(&partition_headers),
+                        forbid_unleased_cache_owner_expansion: true,
+                        ..Default::default()
+                    },
+                ),
+                None,
+                "a rejected stream must not publish the clean peer as an owner"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn distribution_openai_stream_with_usage_dispatches_and_commits() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let idle_url = format!("http://{}", listener.local_addr().unwrap());
+        let stream_body = b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                            data: {\"choices\":[],\"usage\":{\"completion_tokens\":7}}\n\n\
+                            data: [DONE]\n\n"
+            .to_vec();
+        let server_body = stream_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            );
+            socket.write_all(response_head.as_bytes()).await.unwrap();
+            socket.write_all(&server_body).await.unwrap();
+        });
+
+        let DistributionTestFixture {
+            router,
+            cache_policy,
+            workers,
+            partition_headers,
+            request_text,
+        } = distribution_test_fixture(idle_url);
+        let meta = distribution_test_meta("request-with-usage");
+        let response = router
+            .route_typed_request(
+                Some(&partition_headers),
+                &meta,
+                &streaming_chat_request(Some(true)),
+                "/v1/chat/completions",
+                "test-model",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .extensions()
+            .get::<LocalAdaptiveRejection>()
+            .is_none());
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            stream_body
+        );
+        assert!(
+            !meta
+                .extension::<RedeemedCapacityCreditAuthorization>()
+                .unwrap()
+                .try_claim("test-model", "test-model"),
+            "a dispatched seed must consume its scheduler route claim"
+        );
+        let committed_idx = cache_policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(request_text),
+                    headers: Some(&partition_headers),
+                    forbid_unleased_cache_owner_expansion: true,
+                    ..Default::default()
+                },
+            )
+            .expect("terminal usage proof must publish the clean peer");
+        assert_eq!(workers[committed_idx].url(), workers[1].url());
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn distribution_nonstream_commits_owner_only_after_terminal_usage_proof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let idle_url = format!("http://{}", listener.local_addr().unwrap());
+        let invalid_body =
+            br#"{"text":"ok","meta_info":{"finish_reason":{"type":"stop"}}}"#.to_vec();
+        let valid_body =
+            br#"{"text":"ok","meta_info":{"completion_tokens":7,"finish_reason":{"type":"stop"}}}"#
+                .to_vec();
+        let server_bodies = [invalid_body.clone(), valid_body.clone()];
+        let server = tokio::spawn(async move {
+            for response_bytes in server_bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_bytes.len()
+                );
+                socket.write_all(response_head.as_bytes()).await.unwrap();
+                socket.write_all(&response_bytes).await.unwrap();
+            }
+        });
+
+        let DistributionTestFixture {
+            router,
+            cache_policy,
+            workers,
+            partition_headers,
+            request_text,
+        } = distribution_test_fixture(idle_url);
+        let idle = Arc::clone(&workers[1]);
         let typed_req = TestGenerationRequest {
             stream: false,
             n: 1,
