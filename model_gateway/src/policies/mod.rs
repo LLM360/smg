@@ -38,6 +38,7 @@ pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
+pub(crate) use registry::CacheColdBootstrapRoute;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 pub use size_aware_power_of_two::{SizeAwarePowerOfTwoPolicy, DEFAULT_OUTPUT_TOKEN_ESTIMATE};
