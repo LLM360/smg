@@ -3686,6 +3686,16 @@ mod tests {
                 "test-model",
             )
             .await;
+        if valid_response.status() != StatusCode::OK {
+            let status = valid_response.status();
+            let body = to_bytes(valid_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            panic!(
+                "second distribution attempt returned {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
         assert_eq!(valid_response.status(), StatusCode::OK);
         assert!(valid_response
             .extensions()
