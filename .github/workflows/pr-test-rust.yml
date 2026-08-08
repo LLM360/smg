@@ -37,6 +37,32 @@ env:
   GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
 
 jobs:
+  # A public-runner escape hatch for isolated manual validation. The shared
+  # k8s CPU queue can be saturated for hours while GPU capacity is idle; this
+  # job executes only the safety-critical owner-pressure filters and never
+  # runs for pushes, pull requests, or ordinary manual dispatches.
+  owner-pressure-focused:
+    if: github.event_name == 'workflow_dispatch' && inputs.cpu_only == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Run owner-pressure safety regressions
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test -p smg --lib buffered_distribution_commit_requires_terminal_usage_proof
+          cargo test -p smg --lib distribution_nonstream_commits_owner_only_after_terminal_usage_proof
+          cargo test -p smg --lib exact_nonstream_response_preserves_terminal_proof_and_body
+          cargo test -p smg --lib cache_distribution_stream
+          cargo test -p smg --lib distribution_guard
+          cargo test -p smg --lib distribution_headroom
+
   pre-commit:
     runs-on: k8s-runner-cpu
     permissions:
