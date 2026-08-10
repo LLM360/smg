@@ -266,6 +266,26 @@ pub struct RouterConfig {
     /// by inflight; the remainder bucket under `tenant="other"`).
     #[serde(default = "default_priority_scheduler_tenant_metric_top_n")]
     pub priority_scheduler_tenant_metric_top_n: u32,
+    /// Unique identifier for the allocator generation allowed to issue and
+    /// redeem scheduler-backed capacity credits. `None` keeps the entire
+    /// credit protocol unwired and behavior-preserving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_credit_generation: Option<String>,
+    /// Lifetime of an issued but unredeemed credit.
+    #[serde(default = "default_capacity_credit_ttl_ms")]
+    pub capacity_credit_ttl_ms: u64,
+    /// Replay-tombstone lifetime after redeem, cancel, or expiry.
+    #[serde(default = "default_capacity_credit_terminal_retention_secs")]
+    pub capacity_credit_terminal_retention_secs: u64,
+    /// Reject protected inference requests that do not redeem a valid credit.
+    /// This is the enforcement switch; the issue API can be enabled first
+    /// while this remains false.
+    #[serde(default)]
+    pub capacity_credit_required: bool,
+    /// Let enforced engine-feedback telemetry lower each explicit admission
+    /// partition's scheduler capacity. Disabled by default.
+    #[serde(default)]
+    pub priority_scheduler_adaptive_capacity: bool,
     /// Optional predictive token-work admission. Off by default. Shadow mode
     /// is behavior-preserving and is the required first deployment state.
     #[serde(default)]
@@ -440,6 +460,14 @@ fn default_priority_scheduler_max_class() -> String {
 
 fn default_priority_scheduler_tenant_metric_top_n() -> u32 {
     32
+}
+
+fn default_capacity_credit_ttl_ms() -> u64 {
+    30_000
+}
+
+fn default_capacity_credit_terminal_retention_secs() -> u64 {
+    600
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -1010,6 +1038,12 @@ impl Default for RouterConfig {
             priority_scheduler_config: None,
             priority_scheduler_tenant_metric_top_n: default_priority_scheduler_tenant_metric_top_n(
             ),
+            capacity_credit_generation: None,
+            capacity_credit_ttl_ms: default_capacity_credit_ttl_ms(),
+            capacity_credit_terminal_retention_secs:
+                default_capacity_credit_terminal_retention_secs(),
+            capacity_credit_required: false,
+            priority_scheduler_adaptive_capacity: false,
             adaptive_admission: AdaptiveAdmissionConfig::default(),
             tenant_rate_limit_enabled: false,
             tenant_rate_limit_config: None,

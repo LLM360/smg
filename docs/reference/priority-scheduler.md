@@ -74,9 +74,18 @@ smg \
 | `--priority-scheduler-default-max-class` | `default` | Maximum class for tenants not listed in the YAML (`system` \| `interactive` \| `default` \| `bulk`). Parsed with the same rules as the header — an unknown value falls back to `default`. |
 | `--priority-scheduler-config` | unset | Path to the optional priority-scheduler YAML (per-class overrides + per-tenant policy). Absent → built-in defaults and an empty tenant policy map. |
 | `--priority-scheduler-tenant-metric-top-n` | `32` | Cap on configured tenants emitted as distinct fair-share metric labels. Remaining tenants use `tenant="other"`. Existing non-fair-share tenant counters still intern their raw tenant label. |
+| `--capacity-credit-generation` | unset | Enable the authenticated capacity-credit protocol for one allocator generation. Omit to leave the protocol completely unwired. |
+| `--capacity-credit-ttl-ms` | `30000` | How long an unredeemed credit holds its scheduler slot before expiring. Must be greater than zero. |
+| `--capacity-credit-terminal-retention-secs` | `600` | How long redeemed, cancelled, and expired token tombstones remain for replay protection. Must be greater than zero. |
+| `--capacity-credit-required` | `false` | Reject protected inference requests that do not redeem a valid credit. Requires `--capacity-credit-generation`. |
+| `--priority-scheduler-adaptive-capacity` | `false` | Let enforced engine-feedback telemetry lower explicit partition capacities. Requires adaptive admission in `enforce` mode with the `engine_feedback` strategy. |
 
 !!! warning "Fail-safe startup"
     If the scheduler is enabled but cannot start — unparsable YAML, or class reservation floors + shares that sum to more than the live backend capacity — the gateway logs at `ERROR` and **falls back to legacy admission** instead of aborting. It does not take the data plane down.
+
+    Once capacity credits or adaptive scheduler capacity are configured, the
+    gateway instead fails startup on scheduler construction errors. An
+    explicitly configured admission boundary must not silently disappear.
 
 ---
 
@@ -237,6 +246,49 @@ oldest eligible waiter before applying that model's policy. Consequently:
   old and new gateway processes during a rollout. Strict cross-gateway fairness
   requires a distributed ledger or one authoritative admission front door.
 
+### External capacity credits
+
+Capacity credits let an external allocator keep large user backlogs outside
+SMG while SMG remains authoritative for real model capacity. The allocator
+asks for the next request selected by its per-model fair-share policy, then
+calls `POST /internal/capacity-credits`. SMG either returns one short-lived
+credit immediately or returns retryable **429** without placing another request
+in an internal queue.
+
+Each active credit holds exactly one scheduler slot plus that request's
+provisional output-token reservation. The inference request must redeem the
+credit once using the exact generation, policy epoch, admission partition,
+canonical model, tenant, request ID, and output-token estimate used at issue
+time. A mismatched or replayed credit is rejected. Cancellation or expiry
+releases the slot and reservation. A successful response replaces the estimate
+with terminal actual output tokens; a missing or invalid terminal usage record
+keeps the conservative provisional charge. The credit TTL applies only before
+redemption and never imposes a deadline on a running inference request.
+
+The issue and cancel routes are mounted only when
+`--capacity-credit-generation` is set and use the configured shared service-key
+authentication. The trusted proxy must strip client copies and inject the
+canonical end-user, model, partition, and estimate headers. Capacity credits
+therefore also require preferred trusted tenant identity, trusted model and
+estimate headers in `fair_share`, and explicit admission partitions.
+
+When `--capacity-credit-required` is set, a raw inference request without a
+valid credit receives retryable **429**. This is the enforcement switch and can
+be enabled after observing issue traffic. Local adaptive rejection remains a
+handler-side safety backstop; it cancels the redeemed fair-share reservation so
+rejected work is not charged output tokens.
+
+With `--priority-scheduler-adaptive-capacity`, engine feedback supplies a total
+ceiling for each explicit partition. The scheduler's slot pool remains the sole
+authority that subtracts local in-flight work. A falling ceiling stops new
+credit issue while existing work drains; a real capacity increase wakes the
+allocator-facing path without per-request polling.
+
+Credits are process-local and generation-bound. They do not survive a gateway
+handoff and cannot be redeemed by another SMG process. The allocator must treat
+gateway generation changes as a new epoch and reissue outstanding work rather
+than replaying old credits.
+
 ### Preferred trusted tenant identity
 
 By default, tenant resolution remains authenticated caller, then trusted
@@ -299,6 +351,8 @@ The scheduler exposes these Prometheus metrics (see the [Metrics Reference](metr
 | `smg_fair_share_queue_wait_seconds` | Histogram | `model`, `tenant`, `class` | Fair-share queue wait by model profile, tenant, and priority class. |
 | `smg_fair_share_fallback_total` | Counter | `reason` | Settlement or estimate paths that used a configured fallback. |
 | `smg_fair_share_unknown_tenant_total` | Counter | `tenant` | Requests whose canonical tenant has no explicit configured weight. |
+| `smg_capacity_credit_operations_total` | Counter | `partition`, `outcome` | Bounded lifecycle outcomes including issue, idempotent retry, redemption, cancellation, expiry, no capacity, bad binding, and replay. |
+| `smg_capacity_credit_active` | Gauge | `partition` | Active unredeemed credits currently holding scheduler slots. |
 
 ---
 

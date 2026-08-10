@@ -124,6 +124,11 @@ class RouterArgs:
     priority_scheduler_default_max_class: str = "default"
     priority_scheduler_config: str | None = None
     priority_scheduler_tenant_metric_top_n: int = 32
+    capacity_credit_generation: str | None = None
+    capacity_credit_ttl_ms: int = 30_000
+    capacity_credit_terminal_retention_secs: int = 600
+    capacity_credit_required: bool = False
+    priority_scheduler_adaptive_capacity: bool = False
     # Engine telemetry and predictive token-work admission.
     engine_metrics: bool = False
     adaptive_admission_mode: str = "off"
@@ -906,6 +911,36 @@ class RouterArgs:
             type=int,
             default=RouterArgs.priority_scheduler_tenant_metric_top_n,
             help="Maximum number of tenant labels retained in scheduler metrics",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-generation",
+            type=str,
+            default=RouterArgs.capacity_credit_generation,
+            help="Enable scheduler-backed credits for this allocator generation",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-ttl-ms",
+            type=int,
+            default=RouterArgs.capacity_credit_ttl_ms,
+            help="Lifetime in milliseconds of an unredeemed capacity credit",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-terminal-retention-secs",
+            type=int,
+            default=RouterArgs.capacity_credit_terminal_retention_secs,
+            help="Replay-tombstone retention after a credit becomes terminal",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-required",
+            action="store_true",
+            default=RouterArgs.capacity_credit_required,
+            help="Reject inference requests that do not redeem a valid credit",
+        )
+        priority_scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-adaptive-capacity",
+            action="store_true",
+            default=RouterArgs.priority_scheduler_adaptive_capacity,
+            help="Use enforced engine feedback as the scheduler partition ceiling",
         )
         adaptive_admission_group.add_argument(
             f"--{prefix}engine-metrics",

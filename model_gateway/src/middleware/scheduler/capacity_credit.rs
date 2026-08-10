@@ -1,14 +1,15 @@
 //! Short-lived, single-use capacity credit registry.
 //!
-//! The registry is deliberately transport-agnostic and is not wired into the
-//! request path. A follow-up can store an acquired [`super::SchedulerPermit`]
-//! as the payload, then expose issue and redemption through authenticated
-//! internal Comet-to-SMG endpoints.
+//! An issued credit owns one scheduler permit and its provisional fair-share
+//! reservation until the matching inference request redeems it. Cancellation
+//! or expiry releases both resources. The registry remains transport-agnostic;
+//! [`super::capacity_credit_api`] provides the authenticated internal HTTP
+//! issue/cancel surface and validates inference-request bindings.
 
 use std::{
-    collections::HashMap,
+    collections::{btree_map::Entry, BTreeMap, HashMap},
     fmt,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -17,9 +18,53 @@ use parking_lot::Mutex;
 use rand::Rng;
 use thiserror::Error;
 
+use super::{metrics as sched_metrics, SchedulerPermit};
 use crate::tenant::TenantKey;
 
 const TOKEN_BYTES: usize = 32;
+
+/// Scheduler slot held between credit issue and redemption. If the credit is
+/// cancelled or expires before backend work starts, Drop cancels the
+/// provisional fair-share reservation before releasing the slot.
+pub struct HeldSchedulerPermit {
+    permit: Option<SchedulerPermit>,
+}
+
+impl HeldSchedulerPermit {
+    #[must_use]
+    pub fn new(permit: SchedulerPermit) -> Self {
+        Self {
+            permit: Some(permit),
+        }
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "the owned payload can be extracted only by consuming this wrapper"
+    )]
+    pub fn into_permit(mut self) -> SchedulerPermit {
+        self.permit
+            .take()
+            .expect("held scheduler permit can be consumed only once")
+    }
+}
+
+impl fmt::Debug for HeldSchedulerPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeldSchedulerPermit")
+            .field("active", &self.permit.is_some())
+            .finish()
+    }
+}
+
+impl Drop for HeldSchedulerPermit {
+    fn drop(&mut self) {
+        if let Some(mut permit) = self.permit.take() {
+            permit.cancel_fair_share_reservation();
+            drop(permit);
+        }
+    }
+}
 
 /// Opaque bearer token for one capacity credit.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -113,6 +158,31 @@ impl CapacityCreditBinding {
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
+
+    #[must_use]
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+
+    #[must_use]
+    pub fn partition(&self) -> &str {
+        &self.partition
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[must_use]
+    pub fn tenant(&self) -> &TenantKey {
+        &self.tenant
+    }
+
+    #[must_use]
+    pub fn estimated_output_tokens(&self) -> u32 {
+        self.estimated_output_tokens
+    }
 }
 
 fn checked_label(name: &'static str, value: &str) -> Result<Arc<str>, CapacityCreditError> {
@@ -160,6 +230,8 @@ pub enum CapacityCreditError {
     Cancelled,
     #[error("capacity credit registry state is inconsistent")]
     InternalState,
+    #[error("scheduler has no capacity for a new credit")]
+    NoCapacity,
 }
 
 enum CreditState<P> {
@@ -176,9 +248,17 @@ struct CreditRecord<P> {
     state: CreditState<P>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadlineKind {
+    Active,
+    Terminal,
+}
+
 struct RegistryInner<P> {
     by_token: HashMap<CapacityCreditToken, CreditRecord<P>>,
     by_request: HashMap<Arc<str>, CapacityCreditToken>,
+    deadlines: BTreeMap<(Instant, u64), (CapacityCreditToken, DeadlineKind)>,
+    next_deadline_id: u64,
 }
 
 /// Process-local registry for one active SMG generation.
@@ -210,6 +290,8 @@ impl<P> CapacityCreditRegistry<P> {
             inner: Mutex::new(RegistryInner {
                 by_token: HashMap::new(),
                 by_request: HashMap::new(),
+                deadlines: BTreeMap::new(),
+                next_deadline_id: 0,
             }),
         })
     }
@@ -220,21 +302,53 @@ impl<P> CapacityCreditRegistry<P> {
         binding: CapacityCreditBinding,
         payload: P,
     ) -> Result<IssuedCapacityCredit, CapacityCreditError> {
-        self.issue_at(binding, payload, Instant::now())
+        self.issue_with_at(binding, || Ok(payload), Instant::now())
     }
 
+    /// Issue a credit while constructing its capacity payload only when the
+    /// request does not already own an active credit. The factory must be
+    /// immediate and nonblocking because it runs under the registry lock.
+    pub fn issue_with<F>(
+        &self,
+        binding: CapacityCreditBinding,
+        payload_factory: F,
+    ) -> Result<IssuedCapacityCredit, CapacityCreditError>
+    where
+        F: FnOnce() -> Result<P, CapacityCreditError>,
+    {
+        self.issue_with_at(binding, payload_factory, Instant::now())
+    }
+
+    #[cfg(test)]
     fn issue_at(
         &self,
         binding: CapacityCreditBinding,
         payload: P,
         now: Instant,
     ) -> Result<IssuedCapacityCredit, CapacityCreditError> {
+        self.issue_with_at(binding, || Ok(payload), now)
+    }
+
+    fn issue_with_at<F>(
+        &self,
+        binding: CapacityCreditBinding,
+        payload_factory: F,
+        now: Instant,
+    ) -> Result<IssuedCapacityCredit, CapacityCreditError>
+    where
+        F: FnOnce() -> Result<P, CapacityCreditError>,
+    {
+        let metric_partition = Arc::clone(&binding.partition);
         if binding.generation.as_ref() != self.generation.as_ref() {
+            sched_metrics::record_capacity_credit_operation(
+                &metric_partition,
+                sched_metrics::capacity_credit_outcome::WRONG_GENERATION,
+            );
             return Err(CapacityCreditError::WrongGeneration);
         }
         self.maintain_at(now);
 
-        let mut unused_payload = Some(payload);
+        let mut unused_factory = Some(payload_factory);
         let result = {
             let mut inner = self.inner.lock();
             if let Some(token) = inner.by_request.get(&binding.request_id).cloned() {
@@ -256,6 +370,10 @@ impl<P> CapacityCreditRegistry<P> {
                     Err(CapacityCreditError::RequestConflict)
                 }
             } else {
+                let factory = unused_factory
+                    .take()
+                    .ok_or(CapacityCreditError::InternalState)?;
+                let payload = factory()?;
                 let token = loop {
                     let candidate = CapacityCreditToken::random();
                     if !inner.by_token.contains_key(&candidate) {
@@ -263,6 +381,7 @@ impl<P> CapacityCreditRegistry<P> {
                     }
                 };
                 let expires_at = now + self.ttl;
+                schedule_deadline(&mut inner, expires_at, token.clone(), DeadlineKind::Active);
                 inner
                     .by_request
                     .insert(Arc::clone(&binding.request_id), token.clone());
@@ -272,11 +391,7 @@ impl<P> CapacityCreditRegistry<P> {
                         binding,
                         expires_at,
                         terminal_until: None,
-                        state: CreditState::Active(
-                            unused_payload
-                                .take()
-                                .ok_or(CapacityCreditError::InternalState)?,
-                        ),
+                        state: CreditState::Active(payload),
                     },
                 );
                 Ok(IssuedCapacityCredit {
@@ -286,7 +401,21 @@ impl<P> CapacityCreditRegistry<P> {
                 })
             }
         };
-        drop(unused_payload);
+        drop(unused_factory);
+        match &result {
+            Ok(issued) if issued.newly_issued => {
+                sched_metrics::record_capacity_credit_operation(
+                    &metric_partition,
+                    sched_metrics::capacity_credit_outcome::ISSUED,
+                );
+                sched_metrics::increment_capacity_credit_active(&metric_partition);
+            }
+            Ok(_) => sched_metrics::record_capacity_credit_operation(
+                &metric_partition,
+                sched_metrics::capacity_credit_outcome::IDEMPOTENT_RETRY,
+            ),
+            Err(error) => record_capacity_credit_error(&metric_partition, *error),
+        }
         result
     }
 
@@ -305,47 +434,83 @@ impl<P> CapacityCreditRegistry<P> {
         presented: &CapacityCreditBinding,
         now: Instant,
     ) -> Result<RedeemedCapacityCredit<P>, CapacityCreditError> {
-        let (result, expired_payload) = {
+        let (result, expired_payload, metric_partition, active_released) = {
             let mut inner = self.inner.lock();
             let Some(record) = inner.by_token.get_mut(token) else {
+                sched_metrics::record_capacity_credit_operation(
+                    "unknown",
+                    sched_metrics::capacity_credit_outcome::UNKNOWN,
+                );
                 return Err(CapacityCreditError::Unknown);
             };
+            let metric_partition = Arc::clone(&record.binding.partition);
+            let terminal_until = now + self.terminal_retention;
             if now >= record.expires_at {
-                let payload = transition_terminal(
-                    record,
-                    CreditState::Expired,
-                    now + self.terminal_retention,
-                );
-                (Err(CapacityCreditError::Expired), payload)
-            } else if record.binding != *presented {
-                (Err(CapacityCreditError::BindingMismatch), None)
-            } else {
-                match std::mem::replace(&mut record.state, CreditState::Redeemed) {
-                    CreditState::Active(payload) => {
-                        record.terminal_until = Some(now + self.terminal_retention);
-                        (
-                            Ok(RedeemedCapacityCredit {
-                                binding: record.binding.clone(),
-                                payload,
-                            }),
-                            None,
-                        )
-                    }
-                    CreditState::Redeemed => {
-                        record.state = CreditState::Redeemed;
-                        (Err(CapacityCreditError::AlreadyRedeemed), None)
-                    }
-                    CreditState::Cancelled => {
-                        record.state = CreditState::Cancelled;
-                        (Err(CapacityCreditError::Cancelled), None)
-                    }
-                    CreditState::Expired => {
-                        record.state = CreditState::Expired;
-                        (Err(CapacityCreditError::Expired), None)
-                    }
+                let payload = transition_terminal(record, CreditState::Expired, terminal_until);
+                let active_released = payload.is_some();
+                let result = (Err(CapacityCreditError::Expired), payload);
+                if result.1.is_some() {
+                    schedule_deadline(
+                        &mut inner,
+                        terminal_until,
+                        token.clone(),
+                        DeadlineKind::Terminal,
+                    );
                 }
+                (result.0, result.1, metric_partition, active_released)
+            } else if record.binding != *presented {
+                (
+                    Err(CapacityCreditError::BindingMismatch),
+                    None,
+                    metric_partition,
+                    false,
+                )
+            } else {
+                let (result, active_released) =
+                    match std::mem::replace(&mut record.state, CreditState::Redeemed) {
+                        CreditState::Active(payload) => {
+                            record.terminal_until = Some(terminal_until);
+                            let result = (
+                                Ok(RedeemedCapacityCredit {
+                                    binding: record.binding.clone(),
+                                    payload,
+                                }),
+                                None,
+                            );
+                            schedule_deadline(
+                                &mut inner,
+                                terminal_until,
+                                token.clone(),
+                                DeadlineKind::Terminal,
+                            );
+                            (result, true)
+                        }
+                        CreditState::Redeemed => {
+                            record.state = CreditState::Redeemed;
+                            ((Err(CapacityCreditError::AlreadyRedeemed), None), false)
+                        }
+                        CreditState::Cancelled => {
+                            record.state = CreditState::Cancelled;
+                            ((Err(CapacityCreditError::Cancelled), None), false)
+                        }
+                        CreditState::Expired => {
+                            record.state = CreditState::Expired;
+                            ((Err(CapacityCreditError::Expired), None), false)
+                        }
+                    };
+                (result.0, result.1, metric_partition, active_released)
             }
         };
+        if active_released {
+            sched_metrics::decrement_capacity_credit_active(&metric_partition);
+        }
+        match &result {
+            Ok(_) => sched_metrics::record_capacity_credit_operation(
+                &metric_partition,
+                sched_metrics::capacity_credit_outcome::REDEEMED,
+            ),
+            Err(error) => record_capacity_credit_error(&metric_partition, *error),
+        }
         drop(expired_payload);
         result
     }
@@ -356,18 +521,32 @@ impl<P> CapacityCreditRegistry<P> {
     }
 
     fn cancel_at(&self, token: &CapacityCreditToken, now: Instant) -> bool {
-        let payload = {
+        let terminal_until = now + self.terminal_retention;
+        let (payload, metric_partition) = {
             let mut inner = self.inner.lock();
             let Some(record) = inner.by_token.get_mut(token) else {
                 return false;
             };
-            transition_terminal(
-                record,
-                CreditState::Cancelled,
-                now + self.terminal_retention,
-            )
+            let metric_partition = Arc::clone(&record.binding.partition);
+            let payload = transition_terminal(record, CreditState::Cancelled, terminal_until);
+            if payload.is_some() {
+                schedule_deadline(
+                    &mut inner,
+                    terminal_until,
+                    token.clone(),
+                    DeadlineKind::Terminal,
+                );
+            }
+            (payload, metric_partition)
         };
         let changed = payload.is_some();
+        if changed {
+            sched_metrics::record_capacity_credit_operation(
+                &metric_partition,
+                sched_metrics::capacity_credit_outcome::CANCELLED,
+            );
+            sched_metrics::decrement_capacity_credit_active(&metric_partition);
+        }
         drop(payload);
         changed
     }
@@ -377,40 +556,94 @@ impl<P> CapacityCreditRegistry<P> {
         self.maintain_at(Instant::now())
     }
 
+    /// Reap expired credits without keeping the registry alive by itself.
+    /// Payloads are dropped by [`Self::maintain`] outside the registry lock.
+    pub fn spawn_reaper(self: &Arc<Self>, interval: Duration)
+    where
+        P: Send + 'static,
+    {
+        debug_assert!(!interval.is_zero());
+        let registry: Weak<Self> = Arc::downgrade(self);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "credit reaper holds only a weak registry reference and exits after shutdown"
+        )]
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(registry) = registry.upgrade() else {
+                    break;
+                };
+                registry.maintain();
+            }
+        });
+    }
+
     fn maintain_at(&self, now: Instant) -> usize {
         let mut dropped_payloads = Vec::new();
         let changed = {
             let mut inner = self.inner.lock();
             let mut expired = 0;
-            for record in inner.by_token.values_mut() {
-                if matches!(record.state, CreditState::Active(_)) && now >= record.expires_at {
-                    if let Some(payload) = transition_terminal(
-                        record,
-                        CreditState::Expired,
-                        now + self.terminal_retention,
-                    ) {
-                        dropped_payloads.push(payload);
-                        expired += 1;
+            let mut purged = 0;
+            while inner
+                .deadlines
+                .first_key_value()
+                .is_some_and(|((deadline, _), _)| *deadline <= now)
+            {
+                let Some(((_deadline, _), (token, kind))) = inner.deadlines.pop_first() else {
+                    break;
+                };
+                match kind {
+                    DeadlineKind::Active => {
+                        let terminal_until = now + self.terminal_retention;
+                        let payload = inner.by_token.get_mut(&token).and_then(|record| {
+                            if matches!(record.state, CreditState::Active(_))
+                                && now >= record.expires_at
+                            {
+                                let partition = Arc::clone(&record.binding.partition);
+                                transition_terminal(record, CreditState::Expired, terminal_until)
+                                    .map(|payload| (payload, partition))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((payload, partition)) = payload {
+                            dropped_payloads.push((payload, partition));
+                            expired += 1;
+                            schedule_deadline(
+                                &mut inner,
+                                terminal_until,
+                                token,
+                                DeadlineKind::Terminal,
+                            );
+                        }
+                    }
+                    DeadlineKind::Terminal => {
+                        let request_id = inner.by_token.get(&token).and_then(|record| {
+                            record
+                                .terminal_until
+                                .filter(|until| now >= *until)
+                                .map(|_| Arc::clone(&record.binding.request_id))
+                        });
+                        if let Some(request_id) = request_id {
+                            inner.by_token.remove(&token);
+                            inner.by_request.remove(&request_id);
+                            purged += 1;
+                        }
                     }
                 }
             }
-
-            let purge: Vec<_> = inner
-                .by_token
-                .iter()
-                .filter_map(|(token, record)| {
-                    record
-                        .terminal_until
-                        .filter(|until| now >= *until)
-                        .map(|_| (token.clone(), Arc::clone(&record.binding.request_id)))
-                })
-                .collect();
-            for (token, request_id) in &purge {
-                inner.by_token.remove(token);
-                inner.by_request.remove(request_id);
-            }
-            expired + purge.len()
+            expired + purged
         };
+        for (_, partition) in &dropped_payloads {
+            sched_metrics::record_capacity_credit_operation(
+                partition,
+                sched_metrics::capacity_credit_outcome::EXPIRED,
+            );
+            sched_metrics::decrement_capacity_credit_active(partition);
+        }
         drop(dropped_payloads);
         changed
     }
@@ -424,6 +657,46 @@ impl<P> CapacityCreditRegistry<P> {
             .values()
             .filter(|record| matches!(record.state, CreditState::Active(_)))
             .count()
+    }
+}
+
+fn record_capacity_credit_error(partition: &str, error: CapacityCreditError) {
+    let outcome = match error {
+        CapacityCreditError::InvalidToken | CapacityCreditError::InvalidBinding(_) => {
+            sched_metrics::capacity_credit_outcome::INVALID_BINDING
+        }
+        CapacityCreditError::WrongGeneration => {
+            sched_metrics::capacity_credit_outcome::WRONG_GENERATION
+        }
+        CapacityCreditError::RequestConflict => {
+            sched_metrics::capacity_credit_outcome::REQUEST_CONFLICT
+        }
+        CapacityCreditError::Unknown => sched_metrics::capacity_credit_outcome::UNKNOWN,
+        CapacityCreditError::BindingMismatch => {
+            sched_metrics::capacity_credit_outcome::BINDING_MISMATCH
+        }
+        CapacityCreditError::Expired => sched_metrics::capacity_credit_outcome::EXPIRED,
+        CapacityCreditError::Cancelled => sched_metrics::capacity_credit_outcome::CANCELLED,
+        CapacityCreditError::AlreadyRedeemed => sched_metrics::capacity_credit_outcome::REPLAY,
+        CapacityCreditError::NoCapacity => sched_metrics::capacity_credit_outcome::NO_CAPACITY,
+        CapacityCreditError::InternalState => sched_metrics::capacity_credit_outcome::UNKNOWN,
+    };
+    sched_metrics::record_capacity_credit_operation(partition, outcome);
+}
+
+fn schedule_deadline<P>(
+    inner: &mut RegistryInner<P>,
+    deadline: Instant,
+    token: CapacityCreditToken,
+    kind: DeadlineKind,
+) {
+    loop {
+        let id = inner.next_deadline_id;
+        inner.next_deadline_id = inner.next_deadline_id.wrapping_add(1);
+        if let Entry::Vacant(entry) = inner.deadlines.entry((deadline, id)) {
+            entry.insert((token, kind));
+            return;
+        }
     }
 }
 
@@ -510,6 +783,34 @@ mod tests {
             registry.issue(conflict, 3),
             Err(CapacityCreditError::RequestConflict)
         );
+    }
+
+    #[test]
+    fn payload_factory_runs_only_for_a_new_credit() {
+        let registry = registry();
+        let calls = AtomicUsize::new(0);
+        let first = registry
+            .issue_with(binding("request-1"), || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok("permit")
+            })
+            .unwrap();
+        let repeated = registry
+            .issue_with(binding("request-1"), || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(CapacityCreditError::NoCapacity)
+            })
+            .unwrap();
+        assert_eq!(first.token, repeated.token);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let denied = registry.issue_with(binding("request-2"), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err(CapacityCreditError::NoCapacity)
+        });
+        assert_eq!(denied, Err(CapacityCreditError::NoCapacity));
+        assert_eq!(registry.active_len(), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -610,6 +911,37 @@ mod tests {
         assert_eq!(registry.maintain_at(start + Duration::from_secs(2)), 1);
         assert!(unlocked.load(Ordering::Acquire));
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn background_reaper_releases_an_unredeemed_payload() {
+        let registry = Arc::new(
+            CapacityCreditRegistry::new(
+                "green-1",
+                Duration::from_millis(20),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        registry
+            .issue(
+                binding("expire-in-background"),
+                drop_probe(&registry, &unlocked, &drops),
+            )
+            .unwrap();
+        registry.spawn_reaper(Duration::from_millis(5));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reaper should release the payload after TTL");
+        assert!(unlocked.load(Ordering::Acquire));
+        assert_eq!(registry.active_len(), 0);
     }
 
     #[test]

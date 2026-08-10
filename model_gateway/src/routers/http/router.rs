@@ -38,7 +38,10 @@ use tracing::error;
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::{scheduler::ADMISSION_PARTITION_HEADER, TenantRequestMeta},
+    middleware::{
+        scheduler::{LocalAdaptiveRejection, ADMISSION_PARTITION_HEADER},
+        TenantRequestMeta,
+    },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -531,6 +534,7 @@ impl Router {
             {
                 response.headers_mut().insert(RETRY_AFTER, value);
             }
+            response.extensions_mut().insert(LocalAdaptiveRejection);
             return Err(Box::new(response));
         }
         Ok(Some(tracker))

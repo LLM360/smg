@@ -717,6 +717,14 @@ pub struct ServerConfig {
     pub webrtc_stun_server: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BuildAppError {
+    #[error("invalid tenant header configuration: {0}")]
+    InvalidHeader(#[from] InvalidHeaderName),
+    #[error("priority scheduler configuration failed: {0}")]
+    Scheduler(String),
+}
+
 /// Apply the request-admission layer to a protected route group.
 ///
 /// `AdmissionMode::Priority` installs the priority scheduler middleware
@@ -774,7 +782,7 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
-) -> Result<Router, InvalidHeaderName> {
+) -> Result<Router, BuildAppError> {
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -788,11 +796,22 @@ pub fn build_app(
 
     // Choose the admission path once at startup: priority scheduler when
     // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
-    let admission_mode = middleware::scheduler::AdmissionMode::from_config(
+    let adaptive_capacity_provider = app_state
+        .context
+        .router_config
+        .priority_scheduler_adaptive_capacity
+        .then(|| app_state.context.adaptive_admission.clone())
+        .flatten()
+        .map(|controller| {
+            controller as Arc<dyn middleware::scheduler::state::AdaptiveCapacityProvider>
+        });
+    let admission_mode = middleware::scheduler::AdmissionMode::try_from_config_with_adaptive(
         &app_state.context.router_config,
         app_state.context.worker_registry.clone(),
         app_state.context.rate_limiter.clone(),
-    );
+        adaptive_capacity_provider,
+    )
+    .map_err(BuildAppError::Scheduler)?;
 
     let protected_routes = with_admission_layer(
         Router::new()
@@ -894,7 +913,7 @@ pub fn build_app(
         app_state.clone(),
     )
     .route_layer(axum::middleware::from_fn_with_state(
-        tenant_resolution_state,
+        tenant_resolution_state.clone(),
         middleware::route_request_meta_middleware,
     ))
     .route_layer(axum::middleware::from_fn_with_state(
@@ -948,6 +967,36 @@ pub fn build_app(
                 .delete(delete_worker),
         );
 
+    // Capacity-credit issue/cancel is a separate internal service-key API.
+    // It accepts only the shared gateway key, never ordinary tenant keys.
+    // Tenant resolution still runs so the trusted proxy-injected user is the
+    // exact same canonical TenantKey used by inference settlement.
+    let capacity_credit_routes = match &admission_mode {
+        middleware::scheduler::AdmissionMode::Priority(scheduler_state)
+            if scheduler_state.capacity_credits().is_some() =>
+        {
+            Router::new()
+                .route(
+                    "/internal/capacity-credits",
+                    post(middleware::scheduler::issue_capacity_credit),
+                )
+                .route(
+                    "/internal/capacity-credits/{credit}",
+                    delete(middleware::scheduler::cancel_capacity_credit),
+                )
+                .layer(Extension(scheduler_state.clone()))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    tenant_resolution_state,
+                    middleware::route_request_meta_middleware,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    admin_auth_config.clone(),
+                    middleware::auth_middleware,
+                ))
+        }
+        _ => Router::new(),
+    };
+
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
     // If only tenant keys are configured (no shared `--api-key`), there's no
     // credential that should reach these routes — deny outright instead of
@@ -985,6 +1034,7 @@ pub fn build_app(
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
+        .merge(capacity_credit_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,

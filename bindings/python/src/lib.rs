@@ -511,6 +511,11 @@ struct Router {
     adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: u32,
     adaptive_admission_feedback_max_token_usage: f64,
     adaptive_admission_feedback_throughput_improvement_ratio: f64,
+    capacity_credit_generation: Option<String>,
+    capacity_credit_ttl_ms: u64,
+    capacity_credit_terminal_retention_secs: u64,
+    capacity_credit_required: bool,
+    priority_scheduler_adaptive_capacity: bool,
 }
 
 impl Router {
@@ -805,6 +810,11 @@ impl Router {
             .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
             .priority_scheduler_config(self.priority_scheduler_config.clone())
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .capacity_credit_generation(self.capacity_credit_generation.clone())
+            .capacity_credit_ttl_ms(self.capacity_credit_ttl_ms)
+            .capacity_credit_terminal_retention_secs(self.capacity_credit_terminal_retention_secs)
+            .capacity_credit_required(self.capacity_credit_required)
+            .priority_scheduler_adaptive_capacity(self.priority_scheduler_adaptive_capacity)
             .adaptive_admission(config::AdaptiveAdmissionConfig {
                 mode: adaptive_admission_mode,
                 strategy: adaptive_admission_strategy,
@@ -1055,6 +1065,11 @@ impl Router {
         adaptive_admission_feedback_max_waiting_requests_per_healthy_replica = 2,
         adaptive_admission_feedback_max_token_usage = 0.9,
         adaptive_admission_feedback_throughput_improvement_ratio = 0.02,
+        capacity_credit_generation = None,
+        capacity_credit_ttl_ms = 30000,
+        capacity_credit_terminal_retention_secs = 600,
+        capacity_credit_required = false,
+        priority_scheduler_adaptive_capacity = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1205,6 +1220,11 @@ impl Router {
         adaptive_admission_feedback_max_waiting_requests_per_healthy_replica: u32,
         adaptive_admission_feedback_max_token_usage: f64,
         adaptive_admission_feedback_throughput_improvement_ratio: f64,
+        capacity_credit_generation: Option<String>,
+        capacity_credit_ttl_ms: u64,
+        capacity_credit_terminal_retention_secs: u64,
+        capacity_credit_required: bool,
+        priority_scheduler_adaptive_capacity: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1369,6 +1389,11 @@ impl Router {
             adaptive_admission_feedback_max_waiting_requests_per_healthy_replica,
             adaptive_admission_feedback_max_token_usage,
             adaptive_admission_feedback_throughput_improvement_ratio,
+            capacity_credit_generation,
+            capacity_credit_ttl_ms,
+            capacity_credit_terminal_retention_secs,
+            capacity_credit_required,
+            priority_scheduler_adaptive_capacity,
         })
     }
 

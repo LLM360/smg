@@ -547,6 +547,28 @@ struct CliArgs {
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
 
+    /// Unique allocator generation that enables scheduler-backed capacity
+    /// credits. Omit to keep the protocol disabled.
+    #[arg(long, help_heading = "Priority Scheduler")]
+    capacity_credit_generation: Option<String>,
+
+    /// Lifetime in milliseconds of an unredeemed capacity credit.
+    #[arg(long, default_value_t = 30_000, help_heading = "Priority Scheduler")]
+    capacity_credit_ttl_ms: u64,
+
+    /// Retain terminal credit tombstones for replay protection.
+    #[arg(long, default_value_t = 600, help_heading = "Priority Scheduler")]
+    capacity_credit_terminal_retention_secs: u64,
+
+    /// Require every protected inference request to redeem a valid credit.
+    #[arg(long, help_heading = "Priority Scheduler")]
+    capacity_credit_required: bool,
+
+    /// Couple explicit scheduler partitions to enforced engine-feedback
+    /// capacity. Disabled by default.
+    #[arg(long, help_heading = "Priority Scheduler")]
+    priority_scheduler_adaptive_capacity: bool,
+
     // ==================== Adaptive Admission ====================
     /// Predictive token-work admission mode. Shadow mode learns and records
     /// hypothetical decisions without delaying or rejecting requests.
@@ -1611,6 +1633,11 @@ impl CliArgs {
             .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
             .priority_scheduler_config(self.priority_scheduler_config.clone())
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .capacity_credit_generation(self.capacity_credit_generation.clone())
+            .capacity_credit_ttl_ms(self.capacity_credit_ttl_ms)
+            .capacity_credit_terminal_retention_secs(self.capacity_credit_terminal_retention_secs)
+            .capacity_credit_required(self.capacity_credit_required)
+            .priority_scheduler_adaptive_capacity(self.priority_scheduler_adaptive_capacity)
             .adaptive_admission(AdaptiveAdmissionConfig {
                 mode: self.adaptive_admission_mode.into(),
                 strategy: self.adaptive_admission_strategy.into(),

@@ -8,7 +8,7 @@ use axum::{
 
 use super::PipelineStage;
 use crate::{
-    middleware::scheduler::ADMISSION_PARTITION_HEADER,
+    middleware::scheduler::{LocalAdaptiveRejection, ADMISSION_PARTITION_HEADER},
     routers::{
         error,
         grpc::{
@@ -186,6 +186,7 @@ fn rejection_response(retry_after_secs: u32) -> Response {
     if let Ok(value) = HeaderValue::from_str(&retry_after_secs.max(1).to_string()) {
         response.headers_mut().insert(RETRY_AFTER, value);
     }
+    response.extensions_mut().insert(LocalAdaptiveRejection);
     response
 }
 
@@ -236,5 +237,21 @@ impl PipelineStage for AdaptiveAdmissionStage {
 
     fn name(&self) -> &'static str {
         "AdaptiveAdmission"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_rejection_carries_internal_scheduler_marker() {
+        let response = rejection_response(3);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "3");
+        assert!(response
+            .extensions()
+            .get::<LocalAdaptiveRejection>()
+            .is_some());
     }
 }
