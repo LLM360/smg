@@ -8,7 +8,9 @@ use axum::{
 
 use super::PipelineStage;
 use crate::{
-    middleware::scheduler::{LocalAdaptiveRejection, ADMISSION_PARTITION_HEADER},
+    middleware::scheduler::{
+        LocalAdaptiveRejection, SchedulerAdmissionProof, ADMISSION_PARTITION_HEADER,
+    },
     routers::{
         error,
         grpc::{
@@ -16,7 +18,7 @@ use crate::{
                 PredictionFeatures, FLAG_MULTIPLE_COMPLETIONS, FLAG_REASONING, FLAG_STREAMING,
                 FLAG_STRUCTURED_OUTPUT, FLAG_TOOLS,
             },
-            context::{RequestContext, RequestType},
+            context::{PendingDistributionSeed, RequestContext, RequestType},
         },
     },
 };
@@ -162,6 +164,13 @@ impl GenerationShape {
     }
 }
 
+fn is_single_distribution_seed_sample(
+    shape: GenerationShape,
+    backend_request_count: usize,
+) -> bool {
+    backend_request_count == 1 && shape.flags & FLAG_MULTIPLE_COMPLETIONS == 0
+}
+
 fn multiplied_limit(per_completion: Option<u32>, multiplicity: u32) -> Option<u32> {
     per_completion.map(|limit| limit.saturating_mul(multiplicity))
 }
@@ -177,7 +186,7 @@ fn trusted_header(ctx: &RequestContext, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn rejection_response(retry_after_secs: u32) -> Response {
+pub(crate) fn rejection_response(retry_after_secs: u32) -> Response {
     let mut response = error::create_error(
         StatusCode::TOO_MANY_REQUESTS,
         "adaptive_admission_saturated",
@@ -229,6 +238,29 @@ impl PipelineStage for AdaptiveAdmissionStage {
             },
         );
         if tracker.should_reject() {
+            let can_try_distribution_seed =
+                matches!(
+                    tracker.rejection_reason(),
+                    Some("engine_waiting" | "running_limit")
+                ) && ctx.state.preparation.as_ref().is_some_and(|preparation| {
+                    is_single_distribution_seed_sample(shape, preparation.backend_request_count())
+                }) && ctx
+                    .input
+                    .tenant_request_meta
+                    .as_ref()
+                    .and_then(|meta| meta.extension::<SchedulerAdmissionProof>())
+                    .is_some();
+            if can_try_distribution_seed {
+                let Some(partition) = tracker.partition().map(str::to_string) else {
+                    return Err(rejection_response(tracker.retry_after_secs()));
+                };
+                ctx.state.pending_distribution_seed = Some(PendingDistributionSeed {
+                    partition,
+                    retry_after_secs: tracker.retry_after_secs(),
+                });
+                ctx.state.adaptive_request = Some(tracker);
+                return Ok(None);
+            }
             return Err(rejection_response(tracker.retry_after_secs()));
         }
         ctx.state.adaptive_request = Some(tracker);
@@ -242,7 +274,22 @@ impl PipelineStage for AdaptiveAdmissionStage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    #[test]
+    fn multiple_generate_samples_cannot_enter_distribution_seed_path() {
+        let request = serde_json::from_value(serde_json::json!({
+            "text": "hello",
+            "sampling_params": { "n": 2 }
+        }))
+        .unwrap();
+        let shape =
+            GenerationShape::for_request(&RequestType::Generate(Arc::new(request))).unwrap();
+        assert_ne!(shape.flags & FLAG_MULTIPLE_COMPLETIONS, 0);
+        assert!(!is_single_distribution_seed_sample(shape, 1));
+    }
 
     #[test]
     fn local_rejection_carries_internal_scheduler_marker() {

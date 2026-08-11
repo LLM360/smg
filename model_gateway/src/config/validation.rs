@@ -772,6 +772,17 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
+        if config.priority_scheduler_adaptive_capacity
+            && config
+                .adaptive_admission
+                .distribution_headroom_partition_seed_cap
+                > 0
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "distribution headroom requires a static scheduler ceiling; adaptive scheduler capacity may collapse before target selection"
+                    .to_string(),
+            });
+        }
 
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
@@ -864,6 +875,40 @@ impl ConfigValidator {
                 value: adaptive.feedback_throughput_improvement_ratio.to_string(),
                 reason: "Must be finite and in [0, 1]".to_string(),
             });
+        }
+        let mut distribution_partitions = std::collections::HashSet::new();
+        for partition in &adaptive.distribution_headroom_partitions {
+            if partition.is_empty() || partition.trim() != partition || partition.len() > 128 {
+                return Err(ConfigError::InvalidValue {
+                    field: "adaptive_admission.distribution_headroom_partitions".to_string(),
+                    value: partition.clone(),
+                    reason: "Partition names must be non-empty, unpadded, and at most 128 bytes"
+                        .to_string(),
+                });
+            }
+            if !distribution_partitions.insert(partition) {
+                return Err(ConfigError::InvalidValue {
+                    field: "adaptive_admission.distribution_headroom_partitions".to_string(),
+                    value: partition.clone(),
+                    reason: "Partition names must be unique exact matches".to_string(),
+                });
+            }
+        }
+        if adaptive.distribution_headroom_partition_seed_cap > 0 {
+            if adaptive.distribution_headroom_partitions.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "distribution headroom seed capacity requires a non-empty exact partition allowlist"
+                        .to_string(),
+                });
+            }
+            if adaptive.mode != AdaptiveAdmissionMode::Enforce
+                || adaptive.strategy != AdaptiveAdmissionStrategy::EngineFeedback
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "distribution headroom seed capacity requires adaptive admission mode=enforce and strategy=engine_feedback"
+                        .to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -2045,7 +2090,49 @@ mod tests {
         assert!(config.capacity_credit_generation.is_none());
         assert!(!config.capacity_credit_required);
         assert!(!config.priority_scheduler_adaptive_capacity);
+        assert!(config
+            .adaptive_admission
+            .distribution_headroom_partitions
+            .is_empty());
+        assert_eq!(
+            config
+                .adaptive_admission
+                .distribution_headroom_partition_seed_cap,
+            0
+        );
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn distribution_headroom_requires_exact_allowlist_and_enforced_feedback() {
+        let mut config = RouterConfig::default();
+        config.adaptive_admission.distribution_headroom_partitions = vec!["k3".to_string()];
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config
+            .adaptive_admission
+            .distribution_headroom_partition_seed_cap = 2;
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.adaptive_admission.mode = AdaptiveAdmissionMode::Enforce;
+        config.adaptive_admission.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.priority_scheduler_enabled = true;
+        config.priority_scheduler_adaptive_capacity = true;
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.priority_scheduler_adaptive_capacity = false;
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.adaptive_admission.distribution_headroom_partitions = vec![" k3".to_string()];
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.adaptive_admission.distribution_headroom_partitions =
+            vec!["k3".to_string(), "k3".to_string()];
+        assert!(ConfigValidator::validate(&config).is_err());
+        config
+            .adaptive_admission
+            .distribution_headroom_partitions
+            .clear();
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]

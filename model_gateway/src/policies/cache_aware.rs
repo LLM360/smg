@@ -60,7 +60,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -115,10 +115,77 @@ struct PrefixReplicationState {
     provisional_owner: String,
 }
 
+#[derive(Debug, Clone)]
+struct DistributionSeedPrefixState {
+    lease_id: u64,
+    active: bool,
+    last_transition: Instant,
+}
+
+/// One atomic per-prefix expansion claim. Ordinary cache-aware requests never
+/// observe or join this provisional target. Dropping the claim releases the
+/// active slot while retaining a conservative cooldown marker.
+#[derive(Debug)]
+struct DistributionSeedPrefixReservation {
+    state: Arc<DashMap<PrefixBudgetKey, DistributionSeedPrefixState>>,
+    key: PrefixBudgetKey,
+    lease_id: u64,
+}
+
+impl Drop for DistributionSeedPrefixReservation {
+    fn drop(&mut self) {
+        let Entry::Occupied(mut entry) = self.state.entry(self.key) else {
+            return;
+        };
+        if entry.get().lease_id != self.lease_id || !entry.get().active {
+            return;
+        }
+        let state = entry.get_mut();
+        state.active = false;
+        state.last_transition = Instant::now();
+    }
+}
+
 #[derive(Debug)]
 struct PrefixOwnership {
     key: PrefixBudgetKey,
     owners: Vec<usize>,
+}
+
+/// Routing-neutral worker capacity supplied by adaptive admission. Cache-aware
+/// routing may use it to choose a clean non-owner, but it cannot mint capacity
+/// or authorize dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeedWorkerHeadroom {
+    pub(crate) worker_url: Arc<str>,
+    pub(crate) worker_revision: u64,
+    pub(crate) issuable_slots: u16,
+}
+
+/// Opaque cache-policy plan for one owner-pressure recovery dispatch.
+///
+/// The target is not inserted into either prefix tree here. Only backend KV
+/// events may make it an authoritative owner after the dispatch succeeds.
+#[derive(Debug)]
+pub(crate) struct OwnerPressureDispatchPlan {
+    target_worker_url: Arc<str>,
+    target_worker_revision: u64,
+    expands_ownership: bool,
+    _prefix_reservation: Option<DistributionSeedPrefixReservation>,
+}
+
+impl OwnerPressureDispatchPlan {
+    pub(crate) fn target_worker_url(&self) -> &str {
+        &self.target_worker_url
+    }
+
+    pub(crate) fn target_worker_revision(&self) -> u64 {
+        self.target_worker_revision
+    }
+
+    pub(crate) fn expands_ownership(&self) -> bool {
+        self.expands_ownership
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +270,11 @@ pub struct CacheAwarePolicy {
     /// not the authoritative owner catalog, which always records every worker
     /// reported by the backend event stream.
     replication_state: Arc<DashMap<PrefixBudgetKey, PrefixReplicationState>>,
+    /// Exact per-prefix serialization for scheduler-authorized clean-peer
+    /// seeds. Kept separate from `replication_state` so ordinary requests
+    /// cannot join a seed before backend KV events establish ownership.
+    distribution_seed_state: Arc<DashMap<PrefixBudgetKey, DistributionSeedPrefixState>>,
+    next_distribution_seed_lease_id: AtomicU64,
     _replication_gc_task: Option<PeriodicTask>,
 }
 
@@ -228,6 +300,8 @@ impl CacheAwarePolicy {
         let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
         let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
         let replication_state = Arc::new(DashMap::<PrefixBudgetKey, PrefixReplicationState>::new());
+        let distribution_seed_state =
+            Arc::new(DashMap::<PrefixBudgetKey, DistributionSeedPrefixState>::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.eviction_interval_secs > 0 {
@@ -310,12 +384,18 @@ impl CacheAwarePolicy {
             && config.cache_owner_spill_cooldown_secs > 0
         {
             let state = Arc::clone(&replication_state);
+            let seed_state = Arc::clone(&distribution_seed_state);
             let cooldown = Duration::from_secs(config.cache_owner_spill_cooldown_secs);
             let retention = cooldown.saturating_mul(4).max(Duration::from_secs(60));
             Some(PeriodicTask::spawn(
                 config.cache_owner_spill_cooldown_secs.max(1),
                 "Prefix replication budget GC",
-                move || state.retain(|_, entry| entry.last_spill.elapsed() <= retention),
+                move || {
+                    state.retain(|_, entry| entry.last_spill.elapsed() <= retention);
+                    seed_state.retain(|_, entry| {
+                        entry.active || entry.last_transition.elapsed() <= retention
+                    });
+                },
             ))
         } else {
             None
@@ -332,6 +412,8 @@ impl CacheAwarePolicy {
             populate_hash_index: AtomicBool::new(false),
             engine_loads: RwLock::new(HashMap::new()),
             replication_state,
+            distribution_seed_state,
+            next_distribution_seed_lease_id: AtomicU64::new(0),
             _replication_gc_task: replication_gc_task,
         }
     }
@@ -1391,6 +1473,162 @@ impl CacheAwarePolicy {
             }
         }
         owners
+    }
+
+    fn try_acquire_distribution_seed_prefix(
+        &self,
+        key: PrefixBudgetKey,
+    ) -> Option<DistributionSeedPrefixReservation> {
+        let cooldown = Duration::from_secs(self.config.cache_owner_spill_cooldown_secs);
+        if cooldown.is_zero() {
+            return None;
+        }
+        let lease_id = self
+            .next_distribution_seed_lease_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let state = DistributionSeedPrefixState {
+            lease_id,
+            active: true,
+            last_transition: Instant::now(),
+        };
+        match self.distribution_seed_state.entry(key) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().active || entry.get().last_transition.elapsed() < cooldown {
+                    return None;
+                }
+                entry.insert(state);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+        }
+        Some(DistributionSeedPrefixReservation {
+            state: Arc::clone(&self.distribution_seed_state),
+            key,
+            lease_id,
+        })
+    }
+
+    /// Plan one exact clean-peer dispatch when every matching cache owner has
+    /// no issuable engine slot. This is a read-only policy decision: admission
+    /// still requires a scheduler proof plus a separately acquired headroom
+    /// lease, and worker selection must bind and revalidate the exact target.
+    pub(crate) fn owner_pressure_dispatch_plan(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        headroom: &[SeedWorkerHeadroom],
+    ) -> Option<OwnerPressureDispatchPlan> {
+        if !self.config.engine_load {
+            return None;
+        }
+
+        let tokens = info.tokens?;
+        let healthy_indices = super::get_healthy_worker_indices(workers);
+        // A seed may expand only ownership reported by the backend KV event
+        // index. The approximate trees and the normal routing path's
+        // provisional spill entry are deliberately excluded.
+        let monitor = self.kv_monitor.read();
+        let indexer = monitor.as_ref()?.get_indexer(model_id)?;
+        if indexer.current_size() == 0 {
+            return None;
+        }
+        let block_size = monitor
+            .as_ref()?
+            .block_size(model_id)
+            .unwrap_or(self.config.block_size);
+        let (known_owners, matched_blocks) =
+            Self::score_overlap_with_depth(workers, tokens, &healthy_indices, &indexer, block_size);
+        if matched_blocks == 0 {
+            return None;
+        }
+        let matched_tokens = matched_blocks.saturating_mul(block_size).min(tokens.len());
+        let prefix_key = PrefixBudgetKey {
+            model_hash: kv_index::hash_node_path(model_id),
+            prefix_hash: kv_index::hash_token_path(&tokens[..matched_tokens]),
+            kind: PrefixKind::Token,
+        };
+        if known_owners.is_empty() {
+            return None;
+        }
+
+        let eligible_owners =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &known_owners);
+        if eligible_owners.is_empty() {
+            return None;
+        }
+        let mut owner_capacity = Vec::with_capacity(eligible_owners.len());
+        for idx in eligible_owners {
+            let capacity = headroom.iter().find(|candidate| {
+                candidate.worker_url.as_ref() == workers[idx].url()
+                    && candidate.worker_revision == workers[idx].revision()
+            })?;
+            owner_capacity.push((idx, capacity.issuable_slots));
+        }
+        owner_capacity.sort_unstable_by(|(left_idx, left_slots), (right_idx, right_slots)| {
+            right_slots
+                .cmp(left_slots)
+                .then_with(|| workers[*left_idx].load().cmp(&workers[*right_idx].load()))
+                .then_with(|| workers[*left_idx].url().cmp(workers[*right_idx].url()))
+        });
+        if let Some(&(target_idx, _)) = owner_capacity
+            .first()
+            .filter(|(_, issuable_slots)| *issuable_slots > 0)
+        {
+            return Some(OwnerPressureDispatchPlan {
+                target_worker_url: Arc::from(workers[target_idx].url()),
+                target_worker_revision: workers[target_idx].revision(),
+                expands_ownership: false,
+                _prefix_reservation: None,
+            });
+        }
+
+        // Expanding ownership is more restrictive than rebalancing across
+        // existing authoritative owners. It requires the explicit owner cap
+        // and cooldown, and never overlaps a normal provisional spill.
+        if self.config.max_cached_owners_per_prefix == 0
+            || self.config.cache_owner_spill_cooldown_secs == 0
+            || known_owners.len() >= self.config.max_cached_owners_per_prefix
+            || self
+                .recent_provisional_owner(prefix_key, workers, &healthy_indices)
+                .is_some()
+        {
+            return None;
+        }
+
+        let non_owners: Vec<_> = healthy_indices
+            .into_iter()
+            .filter(|idx| !known_owners.contains(idx))
+            .collect();
+        let eligible_non_owners =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &non_owners);
+        let mut clean: Vec<_> = eligible_non_owners
+            .into_iter()
+            .filter_map(|idx| {
+                let capacity = headroom.iter().find(|candidate| {
+                    candidate.worker_url.as_ref() == workers[idx].url()
+                        && candidate.worker_revision == workers[idx].revision()
+                        && candidate.issuable_slots > 0
+                })?;
+                Some((idx, capacity.issuable_slots))
+            })
+            .collect();
+        clean.sort_unstable_by(|(left_idx, left_slots), (right_idx, right_slots)| {
+            right_slots
+                .cmp(left_slots)
+                .then_with(|| workers[*left_idx].load().cmp(&workers[*right_idx].load()))
+                .then_with(|| workers[*left_idx].url().cmp(workers[*right_idx].url()))
+        });
+        let (target_idx, _) = *clean.first()?;
+        let prefix_reservation = self.try_acquire_distribution_seed_prefix(prefix_key)?;
+        Some(OwnerPressureDispatchPlan {
+            target_worker_url: Arc::from(workers[target_idx].url()),
+            target_worker_revision: workers[target_idx].revision(),
+            expands_ownership: true,
+            _prefix_reservation: Some(prefix_reservation),
+        })
     }
 
     fn select_from_cached_owners(
@@ -3133,6 +3371,142 @@ mod tests {
             block_size: 4, // small block size for easy test setup
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn owner_pressure_seed_uses_only_authoritative_owners_and_does_not_mutate_them() {
+        let mut policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            engine_load: true,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+
+        let mut headroom: Vec<_> = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 0 { 0 } else { 38 },
+            })
+            .collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            ..Default::default()
+        };
+        let plan = policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .expect("one clean authoritative non-owner should be planned");
+        assert_eq!(plan.target_worker_url(), workers[1].url());
+        assert_eq!(plan.target_worker_revision(), workers[1].revision());
+        assert!(plan.expands_ownership());
+
+        let monitor = policy.kv_monitor.read();
+        let owners = CacheAwarePolicy::score_overlap(
+            &workers,
+            info.tokens.unwrap(),
+            &[0, 1, 2],
+            &monitor.as_ref().unwrap().get_indexer("unknown").unwrap(),
+            4,
+        );
+        assert_eq!(
+            owners,
+            vec![0],
+            "planning must not publish a provisional owner"
+        );
+        drop(monitor);
+
+        headroom[0].issuable_slots = 1;
+        let plan = policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .expect("an existing authoritative owner with headroom should be preferred");
+        assert_eq!(plan.target_worker_url(), workers[0].url());
+        assert!(!plan.expands_ownership());
+
+        policy.config.max_cached_owners_per_prefix = 0;
+        policy.config.cache_owner_spill_cooldown_secs = 0;
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_some());
+        headroom[0].issuable_slots = 0;
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_none());
+    }
+
+    #[test]
+    fn owner_pressure_seed_serializes_prefix_expansion_without_publishing_it() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            engine_load: true,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+        let headroom: Vec<_> = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 0 { 0 } else { 38 },
+            })
+            .collect();
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let key = PrefixBudgetKey {
+            model_hash: kv_index::hash_node_path("unknown"),
+            prefix_hash: kv_index::hash_token_path(&tokens),
+            kind: PrefixKind::Token,
+        };
+
+        let first = policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .expect("first clean-peer expansion should claim the prefix");
+        assert!(first.expands_ownership());
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_none());
+        assert!(
+            policy.replication_state.get(&key).is_none(),
+            "ordinary requests must not see or join a pending distribution seed"
+        );
+
+        drop(first);
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_none());
+        policy
+            .distribution_seed_state
+            .get_mut(&key)
+            .unwrap()
+            .last_transition = Instant::now() - Duration::from_secs(6);
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_some());
     }
 
     // -- score_overlap unit tests (scoring helper) --

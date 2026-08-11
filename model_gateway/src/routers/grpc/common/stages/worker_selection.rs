@@ -9,15 +9,20 @@ use axum::{
 };
 use tracing::{error, warn};
 
-use super::PipelineStage;
+use super::{adaptive_admission::rejection_response, PipelineStage};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
+    policies::{
+        LoadBalancingPolicy, PolicyRegistry, SeedWorkerHeadroom, SelectWorkerInfo, WorkerLeg,
+    },
     routers::{
         common::header_utils::worker_url_is_allowed,
         error,
         grpc::{
-            context::{EncodeWorkerAssignment, PolicyReservation, RequestContext, WorkerSelection},
+            context::{
+                DistributionSeedDispatchGuard, EncodeWorkerAssignment, PendingDistributionSeed,
+                PolicyReservation, RequestContext, WorkerSelection,
+            },
             multimodal,
         },
     },
@@ -71,6 +76,7 @@ impl WorkerSelectionStage {
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+        let pending_distribution_seed = ctx.state.pending_distribution_seed.take();
         let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
             error!(
                 function = "WorkerSelectionStage::execute",
@@ -93,85 +99,98 @@ impl PipelineStage for WorkerSelectionStage {
         let headers = ctx.input.headers.as_ref();
 
         let model_id = ctx.input.model_id.as_str();
-        let workers = match self.mode {
-            WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers) {
-                    Some((worker, reservation)) => {
-                        ctx.state.policy_reservation = reservation;
-                        WorkerSelection::Single { worker }
-                    }
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "Regular",
-                            model_id = %model_id,
-                            "No available workers for model"
-                        );
-                        return Err(error::model_not_found(model_id));
+        let workers = if let Some(pending) = pending_distribution_seed {
+            if self.mode != WorkerSelectionMode::Regular {
+                return Err(rejection_response(pending.retry_after_secs));
+            }
+            let Some((worker, guard)) =
+                self.select_distribution_seed(ctx, &pending, model_id, text, tokens, headers)
+            else {
+                return Err(rejection_response(pending.retry_after_secs));
+            };
+            ctx.state.distribution_seed_guard = Some(guard);
+            WorkerSelection::Single { worker }
+        } else {
+            match self.mode {
+                WorkerSelectionMode::Regular => {
+                    match self.select_single_worker(model_id, text, tokens, headers) {
+                        Some((worker, reservation)) => {
+                            ctx.state.policy_reservation = reservation;
+                            WorkerSelection::Single { worker }
+                        }
+                        None => {
+                            error!(
+                                function = "WorkerSelectionStage::execute",
+                                mode = "Regular",
+                                model_id = %model_id,
+                                "No available workers for model"
+                            );
+                            return Err(error::model_not_found(model_id));
+                        }
                     }
                 }
-            }
-            WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
-                        encode_assignments: None,
-                        prefill,
-                        decode,
-                        runtime_type,
-                    },
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "PrefillDecode",
-                            model_id = %model_id,
-                            "No available PD worker pairs for model"
-                        );
-                        return Err(error::model_not_found(model_id));
-                    }
-                }
-            }
-            WorkerSelectionMode::EncodePrefillDecode => {
-                let encode_item_hashes = match encode_item_hashes(intermediate) {
-                    Ok(hashes) => hashes,
-                    Err(err) => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            error = %err,
-                            "Failed to derive encode item routing hashes"
-                        );
-                        return Err(error::internal_error(
-                            "encode_routing_hash_failed",
-                            format!("Failed to derive encode routing hashes: {err}"),
-                        ));
-                    }
-                };
-                match self.select_encode_prefill_decode_workers(
-                    model_id,
-                    text,
-                    tokens,
-                    headers,
-                    &encode_item_hashes,
-                ) {
-                    Some((encode_assignments, prefill, decode, runtime_type)) => {
-                        WorkerSelection::Disaggregated {
-                            encode_assignments: if encode_assignments.is_empty() {
-                                None
-                            } else {
-                                Some(encode_assignments)
-                            },
+                WorkerSelectionMode::PrefillDecode => {
+                    match self.select_pd_pair(model_id, text, tokens, headers) {
+                        Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                            encode_assignments: None,
                             prefill,
                             decode,
                             runtime_type,
+                        },
+                        None => {
+                            error!(
+                                function = "WorkerSelectionStage::execute",
+                                mode = "PrefillDecode",
+                                model_id = %model_id,
+                                "No available PD worker pairs for model"
+                            );
+                            return Err(error::model_not_found(model_id));
                         }
                     }
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "EncodePrefillDecode",
-                            model_id = %model_id,
-                            "No available encode/prefill/decode worker set for model"
-                        );
-                        return Err(error::model_not_found(model_id));
+                }
+                WorkerSelectionMode::EncodePrefillDecode => {
+                    let encode_item_hashes = match encode_item_hashes(intermediate) {
+                        Ok(hashes) => hashes,
+                        Err(err) => {
+                            error!(
+                                function = "WorkerSelectionStage::execute",
+                                error = %err,
+                                "Failed to derive encode item routing hashes"
+                            );
+                            return Err(error::internal_error(
+                                "encode_routing_hash_failed",
+                                format!("Failed to derive encode routing hashes: {err}"),
+                            ));
+                        }
+                    };
+                    match self.select_encode_prefill_decode_workers(
+                        model_id,
+                        text,
+                        tokens,
+                        headers,
+                        &encode_item_hashes,
+                    ) {
+                        Some((encode_assignments, prefill, decode, runtime_type)) => {
+                            WorkerSelection::Disaggregated {
+                                encode_assignments: if encode_assignments.is_empty() {
+                                    None
+                                } else {
+                                    Some(encode_assignments)
+                                },
+                                prefill,
+                                decode,
+                                runtime_type,
+                            }
+                        }
+                        None => {
+                            error!(
+                                function = "WorkerSelectionStage::execute",
+                                mode = "EncodePrefillDecode",
+                                model_id = %model_id,
+                                "No available encode/prefill/decode worker set for model"
+                            );
+                            return Err(error::model_not_found(model_id));
+                        }
                     }
                 }
             }
@@ -222,6 +241,104 @@ fn worker_is_available_for_request(worker: &dyn Worker, headers: Option<&HeaderM
 }
 
 impl WorkerSelectionStage {
+    fn select_distribution_seed(
+        &self,
+        ctx: &RequestContext,
+        pending: &PendingDistributionSeed,
+        model_id: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<(Arc<dyn Worker>, DistributionSeedDispatchGuard)> {
+        let controller = ctx.components.adaptive_admission.as_ref()?;
+        let targets = controller.distribution_headroom_snapshot(&pending.partition, model_id);
+        if targets.is_empty() {
+            return None;
+        }
+
+        let workers: Vec<_> = self
+            .worker_registry
+            .get_workers_filtered(
+                Some(model_id),
+                Some(WorkerType::Regular),
+                Some(ConnectionMode::Grpc),
+                None,
+                false,
+            )
+            .into_iter()
+            .filter(|worker| worker_is_available_for_request(worker.as_ref(), headers))
+            .collect();
+        if workers.len() < 2 {
+            return None;
+        }
+
+        let info = SelectWorkerInfo {
+            request_text: text,
+            tokens,
+            headers,
+            hash_ring: self.worker_registry.get_hash_ring(model_id),
+            max_output_tokens: None,
+            reserve_work: false,
+            leg: WorkerLeg::Single,
+        };
+        let capacity: Vec<_> = targets
+            .iter()
+            .map(|target| SeedWorkerHeadroom {
+                worker_url: Arc::from(target.worker_url()),
+                worker_revision: target.worker_revision(),
+                issuable_slots: target.issuable_slots(),
+            })
+            .collect();
+        let plan = self
+            .policy_registry
+            .owner_pressure_dispatch_plan(model_id, &workers, &info, &capacity)?;
+        let target = targets.iter().find(|target| {
+            target.worker_url() == plan.target_worker_url()
+                && target.worker_revision() == plan.target_worker_revision()
+        })?;
+        let lease = controller.try_acquire_distribution_headroom(target)?;
+
+        let meta = ctx.input.tenant_request_meta.as_ref()?;
+        let proof = meta.extension::<crate::middleware::scheduler::SchedulerAdmissionProof>()?;
+        let claimed = proof
+            .try_claim(
+                meta.tenant_key(),
+                meta.request_charge_id(),
+                model_id,
+                &pending.partition,
+            )
+            .ok()?;
+
+        let selected = workers.into_iter().find(|worker| {
+            worker.url() == plan.target_worker_url()
+                && worker.revision() == plan.target_worker_revision()
+                && worker_is_available_for_request(worker.as_ref(), headers)
+        })?;
+        if !lease.verify() {
+            return None;
+        }
+
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_GRPC,
+            model_id,
+            if plan.expands_ownership() {
+                "cache_aware_distribution_seed"
+            } else {
+                "cache_aware_owner_rebalance"
+            },
+        );
+        Some((
+            selected,
+            DistributionSeedDispatchGuard {
+                headroom: lease,
+                _scheduler_proof: claimed,
+                _policy_plan: plan,
+                retry_after_secs: pending.retry_after_secs,
+            },
+        ))
+    }
+
     fn select_single_worker(
         &self,
         model_id: &str,

@@ -27,6 +27,7 @@ pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub(crate) use cache_aware::{OwnerPressureDispatchPlan, SeedWorkerHeadroom};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;

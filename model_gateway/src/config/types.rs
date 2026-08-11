@@ -150,6 +150,14 @@ pub struct AdaptiveAdmissionConfig {
     /// concurrency knee upward. Near-equal throughput may move it downward.
     #[serde(default = "default_feedback_throughput_improvement_ratio")]
     pub feedback_throughput_improvement_ratio: f64,
+    /// Exact admission-partition names allowed to expose clean-worker
+    /// distribution headroom. An empty allowlist keeps the feature disabled.
+    #[serde(default)]
+    pub distribution_headroom_partitions: Vec<String>,
+    /// Hard process-local ceiling on active distribution-headroom seed leases
+    /// in any allowlisted partition. Zero keeps the feature disabled.
+    #[serde(default)]
+    pub distribution_headroom_partition_seed_cap: u32,
 }
 
 impl Default for AdaptiveAdmissionConfig {
@@ -169,6 +177,8 @@ impl Default for AdaptiveAdmissionConfig {
                 default_feedback_max_waiting_requests_per_healthy_replica(),
             feedback_max_token_usage: default_feedback_max_token_usage(),
             feedback_throughput_improvement_ratio: default_feedback_throughput_improvement_ratio(),
+            distribution_headroom_partitions: Vec::new(),
+            distribution_headroom_partition_seed_cap: 0,
         }
     }
 }
