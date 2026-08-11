@@ -168,7 +168,7 @@ fn is_single_distribution_seed_sample(
     shape: GenerationShape,
     backend_request_count: usize,
 ) -> bool {
-    backend_request_count == 1 && shape.flags & FLAG_MULTIPLE_COMPLETIONS == 0
+    backend_request_count == 1 && shape.flags & (FLAG_MULTIPLE_COMPLETIONS | FLAG_STREAMING) == 0
 }
 
 fn multiplied_limit(per_completion: Option<u32>, multiplicity: u32) -> Option<u32> {
@@ -276,19 +276,129 @@ impl PipelineStage for AdaptiveAdmissionStage {
 mod tests {
     use std::sync::Arc;
 
+    use openai_protocol::{
+        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+        messages::CreateMessageRequest, responses::ResponsesRequest,
+    };
+
     use super::*;
 
-    #[test]
-    fn multiple_generate_samples_cannot_enter_distribution_seed_path() {
-        let request = serde_json::from_value(serde_json::json!({
+    fn chat_shape(n: u32) -> GenerationShape {
+        GenerationShape::for_request(&RequestType::Chat(Arc::new(ChatCompletionRequest {
+            n: Some(n),
+            ..Default::default()
+        })))
+        .unwrap()
+    }
+
+    fn generate_shape(n: u32) -> GenerationShape {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
             "text": "hello",
-            "sampling_params": { "n": 2 }
+            "sampling_params": { "n": n }
         }))
         .unwrap();
-        let shape =
-            GenerationShape::for_request(&RequestType::Generate(Arc::new(request))).unwrap();
-        assert_ne!(shape.flags & FLAG_MULTIPLE_COMPLETIONS, 0);
-        assert!(!is_single_distribution_seed_sample(shape, 1));
+        GenerationShape::for_request(&RequestType::Generate(Arc::new(request))).unwrap()
+    }
+
+    fn completion_shape(n: Option<u32>, best_of: Option<u32>) -> GenerationShape {
+        let mut value = serde_json::json!({
+            "model": "unknown",
+            "prompt": "hello"
+        });
+        if let Some(n) = n {
+            value["n"] = serde_json::json!(n);
+        }
+        if let Some(best_of) = best_of {
+            value["best_of"] = serde_json::json!(best_of);
+        }
+        let request: CompletionRequest = serde_json::from_value(value).unwrap();
+        GenerationShape::for_request(&RequestType::Completion(Arc::new(request))).unwrap()
+    }
+
+    #[test]
+    fn only_scalar_generation_can_enter_distribution_seed_path() {
+        let mut streaming_chat = chat_shape(1);
+        streaming_chat.flags |= FLAG_STREAMING;
+        let cases = [
+            ("scalar chat", chat_shape(1), 1, true),
+            ("streaming chat", streaming_chat, 1, false),
+            ("chat n", chat_shape(2), 1, false),
+            ("generate n", generate_shape(2), 1, false),
+            ("completion n", completion_shape(Some(2), None), 1, false),
+            (
+                "completion best_of",
+                completion_shape(Some(1), Some(2)),
+                1,
+                false,
+            ),
+            (
+                "multi-prompt completion fanout",
+                completion_shape(Some(1), None),
+                2,
+                false,
+            ),
+        ];
+
+        for (name, shape, backend_request_count, expected) in cases {
+            assert_eq!(
+                is_single_distribution_seed_sample(shape, backend_request_count),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_streaming_generation_endpoint_is_excluded_from_distribution_seeding() {
+        let requests = [
+            RequestType::Chat(Arc::new(ChatCompletionRequest {
+                stream: true,
+                ..Default::default()
+            })),
+            RequestType::Generate(Arc::new(
+                serde_json::from_value::<GenerateRequest>(serde_json::json!({
+                    "model": "unknown",
+                    "text": "hello",
+                    "stream": true,
+                }))
+                .unwrap(),
+            )),
+            RequestType::Completion(Arc::new(
+                serde_json::from_value::<CompletionRequest>(serde_json::json!({
+                    "model": "unknown",
+                    "prompt": "hello",
+                    "stream": true,
+                }))
+                .unwrap(),
+            )),
+            RequestType::Messages(Arc::new(
+                serde_json::from_value::<CreateMessageRequest>(serde_json::json!({
+                    "model": "unknown",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 16,
+                    "stream": true,
+                }))
+                .unwrap(),
+            )),
+            RequestType::Responses(Arc::new(
+                serde_json::from_value::<ResponsesRequest>(serde_json::json!({
+                    "model": "unknown",
+                    "input": "hello",
+                    "stream": true,
+                }))
+                .unwrap(),
+            )),
+        ];
+
+        for request in requests {
+            let shape = GenerationShape::for_request(&request).unwrap();
+            assert_ne!(shape.flags & FLAG_STREAMING, 0, "{}", shape.endpoint);
+            assert!(
+                !is_single_distribution_seed_sample(shape, 1),
+                "{} streaming request reached the seed path",
+                shape.endpoint
+            );
+        }
     }
 
     #[test]

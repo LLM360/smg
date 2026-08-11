@@ -18,7 +18,7 @@ use std::{
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use openai_protocol::worker::WorkerLoadResponse;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use tokio::sync::watch;
 
 use crate::{
@@ -543,6 +543,7 @@ struct DistributionWorkerTelemetry {
     worker_instance: Arc<dyn Worker>,
     worker_revision: u64,
     telemetry_revision: u64,
+    source_timestamp: Arc<str>,
     observed_at: Instant,
     running_requests: u64,
     waiting_requests: u64,
@@ -551,6 +552,10 @@ struct DistributionWorkerTelemetry {
 }
 
 impl DistributionWorkerTelemetry {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructs one immutable telemetry binding from registry and load identities"
+    )]
     fn from_load(
         partition: Arc<str>,
         worker_url: Arc<str>,
@@ -561,6 +566,10 @@ impl DistributionWorkerTelemetry {
         observed_at: Instant,
         load: &WorkerLoadResponse,
     ) -> Option<Self> {
+        let source_timestamp = load.timestamp.trim();
+        if source_timestamp.is_empty() {
+            return None;
+        }
         let rank_count = usize::try_from(load.dp_rank_count).ok()?;
         if rank_count == 0 || load.loads.len() != rank_count {
             return None;
@@ -593,6 +602,9 @@ impl DistributionWorkerTelemetry {
             {
                 return None;
             }
+            if rank.num_total_reqs != rank.num_running_reqs.checked_add(rank.num_waiting_reqs)? {
+                return None;
+            }
             running_requests = running_requests.checked_add(rank.num_running_reqs as u64)?;
             waiting_requests = waiting_requests.checked_add(rank.num_waiting_reqs as u64)?;
             max_running_requests =
@@ -610,6 +622,7 @@ impl DistributionWorkerTelemetry {
             worker_instance,
             worker_revision,
             telemetry_revision,
+            source_timestamp: Arc::from(source_timestamp),
             observed_at,
             running_requests,
             waiting_requests,
@@ -684,6 +697,51 @@ impl DistributionHeadroomTarget {
     pub(crate) fn issuable_slots(&self) -> u16 {
         self.issuable_slots
     }
+
+    pub(crate) fn matches_worker(&self, worker: &Arc<dyn Worker>) -> bool {
+        self.binding.worker_url.as_ref() == worker.url()
+            && self.binding.worker_revision == worker.revision()
+            && Arc::ptr_eq(&self.binding.worker_instance, worker)
+    }
+}
+
+/// Serializes the synchronous ordinary and distribution-seed selection
+/// critical sections. It is deliberately short-lived and never crosses an
+/// await point.
+pub(crate) struct DistributionSelectionGuard<'a> {
+    controller: &'a AdaptiveAdmissionController,
+    _guard: MutexGuard<'a, ()>,
+}
+
+#[derive(Debug)]
+struct OrdinaryPredispatchBinding {
+    partition: Arc<str>,
+    model: Arc<str>,
+    worker_id: WorkerId,
+    worker_instance: Arc<dyn Worker>,
+    worker_revision: u64,
+    claims: u64,
+}
+
+/// Exact ordinary-route claim held from worker selection until
+/// `WorkerLoadGuard` increments the selected worker's live load.
+#[derive(Debug)]
+pub(crate) struct OrdinaryDistributionDispatchGuard {
+    controller: Weak<AdaptiveAdmissionController>,
+    partition: Arc<str>,
+    model: Arc<str>,
+    worker_url: Arc<str>,
+    worker_id: WorkerId,
+    worker_instance: Arc<dyn Worker>,
+    worker_revision: u64,
+}
+
+impl Drop for OrdinaryDistributionDispatchGuard {
+    fn drop(&mut self) {
+        if let Some(controller) = self.controller.upgrade() {
+            controller.release_ordinary_distribution_target(self);
+        }
+    }
 }
 
 /// One process-local reservation of a clean worker's engine slot. The lease
@@ -727,6 +785,7 @@ struct WorkState {
     feedback_estimates: HashMap<String, FeedbackEstimate>,
     distribution_telemetry: HashMap<String, DistributionWorkerTelemetry>,
     active_distribution_leases: HashMap<String, DistributionHeadroomBinding>,
+    ordinary_predispatch_targets: HashMap<String, OrdinaryPredispatchBinding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -826,6 +885,7 @@ pub(crate) struct AdaptiveAdmissionController {
     registry: Arc<WorkerRegistry>,
     capacity_revision: watch::Sender<u64>,
     telemetry_revision: AtomicU64,
+    distribution_selection: Mutex<()>,
 }
 
 impl AdaptiveAdmissionController {
@@ -839,7 +899,15 @@ impl AdaptiveAdmissionController {
             registry,
             capacity_revision,
             telemetry_revision: AtomicU64::new(0),
+            distribution_selection: Mutex::new(()),
         })
+    }
+
+    pub(crate) fn lock_distribution_selection(&self) -> DistributionSelectionGuard<'_> {
+        DistributionSelectionGuard {
+            controller: self,
+            _guard: self.distribution_selection.lock(),
+        }
     }
 
     pub(crate) fn mode(&self) -> AdaptiveAdmissionMode {
@@ -954,6 +1022,23 @@ impl AdaptiveAdmissionController {
 
         let now = observed_at;
         let mut work = self.work.lock();
+        // The WorkerMonitor watch snapshot merges independently polled model
+        // groups. An unrelated fast poll therefore republishes unchanged K3
+        // entries. Preserve the original observation time and binding revision
+        // when the backend's per-response timestamp did not advance, so those
+        // republishes cannot keep stale distribution telemetry fresh.
+        for (url, telemetry) in &mut distribution_telemetry {
+            if let Some(previous) = work.distribution_telemetry.get(url) {
+                if telemetry.source_timestamp == previous.source_timestamp
+                    && telemetry.worker_id == previous.worker_id
+                    && Arc::ptr_eq(&telemetry.worker_instance, &previous.worker_instance)
+                    && telemetry.worker_revision == previous.worker_revision
+                {
+                    telemetry.observed_at = previous.observed_at;
+                    telemetry.telemetry_revision = previous.telemetry_revision;
+                }
+            }
+        }
         work.capacities
             .retain(|partition, _| partitions.contains_key(partition));
         work.feedback_estimates
@@ -1043,15 +1128,153 @@ impl AdaptiveAdmissionController {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
-    fn distribution_headroom_enabled(&self, partition: &str) -> bool {
+    pub(crate) fn distribution_headroom_enabled(&self, partition: &str) -> bool {
         self.config.mode == AdaptiveAdmissionMode::Enforce
             && self.config.strategy == AdaptiveAdmissionStrategy::EngineFeedback
-            && self.config.distribution_headroom_partition_seed_cap > 0
+            && self.config.distribution_headroom_partition_seed_cap == 1
             && self
                 .config
                 .distribution_headroom_partitions
                 .iter()
                 .any(|allowed| allowed == partition)
+    }
+
+    /// Exact targets currently reserved by in-flight distribution seeds for
+    /// this model/partition. Ordinary routing excludes these workers until the
+    /// request-lifetime lease is released, even if KV store events arrive
+    /// before the seed response completes.
+    pub(crate) fn active_distribution_targets(
+        &self,
+        partition: &str,
+        model: &str,
+    ) -> Vec<(Arc<str>, u64)> {
+        let work = self.work.lock();
+        work.active_distribution_leases
+            .values()
+            .filter(|binding| {
+                binding.partition.as_ref() == partition && binding.model.as_ref() == model
+            })
+            .map(|binding| (Arc::clone(&binding.worker_url), binding.worker_revision))
+            .collect()
+    }
+
+    pub(crate) fn distribution_target_is_active(
+        &self,
+        partition: &str,
+        model: &str,
+        worker_url: &str,
+        worker_revision: u64,
+    ) -> bool {
+        self.work
+            .lock()
+            .active_distribution_leases
+            .get(worker_url)
+            .is_some_and(|binding| {
+                binding.partition.as_ref() == partition
+                    && binding.model.as_ref() == model
+                    && binding.worker_revision == worker_revision
+            })
+    }
+
+    pub(crate) fn try_reserve_ordinary_distribution_target(
+        self: &Arc<Self>,
+        selection: &DistributionSelectionGuard<'_>,
+        partition: &str,
+        model: &str,
+        worker: &Arc<dyn Worker>,
+    ) -> Option<OrdinaryDistributionDispatchGuard> {
+        if !std::ptr::eq(self.as_ref(), selection.controller)
+            || !self.distribution_headroom_enabled(partition)
+            || self.registry.resolve_model_alias(model).is_some()
+        {
+            return None;
+        }
+        let worker_id = self.registry.get_id_by_url(worker.url())?;
+        let current = self.registry.get(&worker_id)?;
+        let worker_partition = current
+            .metadata()
+            .spec
+            .labels
+            .get(ADMISSION_PARTITION_LABEL)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| current.model_id());
+        if !Arc::ptr_eq(&current, worker)
+            || current.revision() != worker.revision()
+            || !current.is_available()
+            || worker_partition != partition
+            || !self
+                .registry
+                .get_by_model(model)
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, worker))
+        {
+            return None;
+        }
+
+        let mut work = self.work.lock();
+        if work.active_distribution_leases.contains_key(worker.url()) {
+            return None;
+        }
+        if let Some(binding) = work.ordinary_predispatch_targets.get_mut(worker.url()) {
+            if binding.partition.as_ref() != partition
+                || binding.model.as_ref() != model
+                || binding.worker_id != worker_id
+                || !Arc::ptr_eq(&binding.worker_instance, worker)
+                || binding.worker_revision != worker.revision()
+            {
+                return None;
+            }
+            binding.claims = binding.claims.checked_add(1)?;
+        } else {
+            work.ordinary_predispatch_targets.insert(
+                worker.url().to_string(),
+                OrdinaryPredispatchBinding {
+                    partition: Arc::from(partition),
+                    model: Arc::from(model),
+                    worker_id: worker_id.clone(),
+                    worker_instance: Arc::clone(worker),
+                    worker_revision: worker.revision(),
+                    claims: 1,
+                },
+            );
+        }
+        Some(OrdinaryDistributionDispatchGuard {
+            controller: Arc::downgrade(self),
+            partition: Arc::from(partition),
+            model: Arc::from(model),
+            worker_url: Arc::from(worker.url()),
+            worker_id,
+            worker_instance: Arc::clone(worker),
+            worker_revision: worker.revision(),
+        })
+    }
+
+    fn release_ordinary_distribution_target(&self, guard: &OrdinaryDistributionDispatchGuard) {
+        let mut work = self.work.lock();
+        let remove = {
+            let Some(binding) = work
+                .ordinary_predispatch_targets
+                .get_mut(guard.worker_url.as_ref())
+            else {
+                return;
+            };
+            if binding.partition != guard.partition
+                || binding.model != guard.model
+                || binding.worker_id != guard.worker_id
+                || !Arc::ptr_eq(&binding.worker_instance, &guard.worker_instance)
+                || binding.worker_revision != guard.worker_revision
+                || binding.claims == 0
+            {
+                return;
+            }
+            binding.claims -= 1;
+            binding.claims == 0
+        };
+        if remove {
+            work.ordinary_predispatch_targets
+                .remove(guard.worker_url.as_ref());
+        }
     }
 
     fn current_model_worker(
@@ -1162,9 +1385,17 @@ impl AdaptiveAdmissionController {
             }
             let active_target_leases =
                 u64::from(work.active_distribution_leases.contains_key(worker.url()));
-            let raw_issuable = telemetry.issuable_slots(worker.load(), active_target_leases);
+            let ordinary_predispatch = work
+                .ordinary_predispatch_targets
+                .get(worker.url())
+                .map_or(0, |binding| binding.claims);
+            let raw_issuable = telemetry.issuable_slots(
+                worker.load(),
+                active_target_leases.saturating_add(ordinary_predispatch),
+            );
             let issuable_slots = if partition_has_capacity
                 && active_target_leases == 0
+                && ordinary_predispatch == 0
                 && telemetry.is_clean(self.config.feedback_max_token_usage)
             {
                 raw_issuable
@@ -1185,10 +1416,14 @@ impl AdaptiveAdmissionController {
     /// separate decisions around this process-local capacity reservation.
     pub(crate) fn try_acquire_distribution_headroom(
         self: &Arc<Self>,
+        selection: &DistributionSelectionGuard<'_>,
         target: &DistributionHeadroomTarget,
     ) -> Option<DistributionHeadroomLease> {
         let binding = &target.binding;
-        if target.issuable_slots == 0 || !self.distribution_headroom_enabled(&binding.partition) {
+        if !std::ptr::eq(self.as_ref(), selection.controller)
+            || target.issuable_slots == 0
+            || !self.distribution_headroom_enabled(&binding.partition)
+        {
             return None;
         }
 
@@ -1199,6 +1434,9 @@ impl AdaptiveAdmissionController {
             >= u64::from(self.config.distribution_headroom_partition_seed_cap)
             || work
                 .active_distribution_leases
+                .contains_key(binding.worker_url.as_ref())
+            || work
+                .ordinary_predispatch_targets
                 .contains_key(binding.worker_url.as_ref())
         {
             return None;
@@ -1565,7 +1803,7 @@ impl AdaptiveCapacityProvider for AdaptiveAdmissionController {
             &load,
             work.feedback_estimates.get(partition),
         );
-        let ordinary_capacity = if !constraints.telemetry_usable {
+        if !constraints.telemetry_usable {
             static_capacity
         } else if constraints.pressure_reason.is_some() {
             0
@@ -1573,8 +1811,7 @@ impl AdaptiveCapacityProvider for AdaptiveAdmissionController {
             (running_limit.floor().clamp(0.0, f64::from(u16::MAX)) as u16).min(static_capacity)
         } else {
             static_capacity
-        };
-        ordinary_capacity
+        }
     }
 
     fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
@@ -1672,7 +1909,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
 
     fn config() -> AdaptiveAdmissionConfig {
         AdaptiveAdmissionConfig {
@@ -1748,12 +1985,29 @@ mod tests {
         controller: &AdaptiveAdmissionController,
         loads: impl IntoIterator<Item = (&'static str, WorkerLoadResponse)>,
     ) {
+        static TEST_LOAD_REVISION: AtomicU64 = AtomicU64::new(0);
         controller.update_loads(
             &loads
                 .into_iter()
-                .map(|(url, load)| (url.to_string(), load))
+                .map(|(url, mut load)| {
+                    if load.timestamp.is_empty() {
+                        load.timestamp = format!(
+                            "test-{}",
+                            TEST_LOAD_REVISION.fetch_add(1, Ordering::Relaxed)
+                        );
+                    }
+                    (url.to_string(), load)
+                })
                 .collect(),
         );
+    }
+
+    fn acquire_distribution_headroom(
+        controller: &Arc<AdaptiveAdmissionController>,
+        target: &DistributionHeadroomTarget,
+    ) -> Option<DistributionHeadroomLease> {
+        let selection = controller.lock_distribution_selection();
+        controller.try_acquire_distribution_headroom(&selection, target)
     }
 
     fn features(user: &str, prompt_tokens: u32, maximum: Option<u32>) -> PredictionFeatures {
@@ -2296,7 +2550,7 @@ mod tests {
         for _ in 0..5 {
             idle_b.increment_load();
         }
-        let controller = AdaptiveAdmissionController::new(distribution_config(2), registry);
+        let controller = AdaptiveAdmissionController::new(distribution_config(1), registry);
         update_worker_loads(
             &controller,
             [
@@ -2306,7 +2560,11 @@ mod tests {
             ],
         );
 
-        assert_eq!(controller.effective_capacity("k3", 512), 109);
+        assert_eq!(
+            controller.effective_capacity("k3", 512),
+            0,
+            "routing headroom must not mint untyped scheduler capacity"
+        );
         let targets = controller.distribution_headroom_snapshot("k3", "model");
         assert_eq!(targets.len(), 3);
         assert_eq!(targets[0].worker_url(), HOT);
@@ -2383,9 +2641,7 @@ mod tests {
             .into_iter()
             .find(|target| target.issuable_slots() > 0)
             .unwrap();
-        let lease = controller
-            .try_acquire_distribution_headroom(&target)
-            .unwrap();
+        let lease = acquire_distribution_headroom(&controller, &target).unwrap();
         assert_eq!(
             controller.effective_capacity("k3", 512),
             0,
@@ -2396,7 +2652,7 @@ mod tests {
     }
 
     #[test]
-    fn distribution_headroom_capacity_floor_requires_complete_strict_telemetry() {
+    fn distribution_headroom_does_not_reopen_capacity_with_incomplete_telemetry() {
         const HOT: &str = "grpc://incomplete-hot:30000";
         const MISSING: &str = "grpc://incomplete-missing:30000";
         let registry = Arc::new(WorkerRegistry::new());
@@ -2418,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn distribution_headroom_capacity_floor_is_default_off() {
+    fn distribution_headroom_does_not_reopen_capacity_when_disabled() {
         const HOT: &str = "grpc://off-hot:30000";
         const IDLE: &str = "grpc://off-idle:30000";
         let registry = Arc::new(WorkerRegistry::new());
@@ -2451,6 +2707,8 @@ mod tests {
             .distribution_headroom_snapshot("k3", "model")
             .is_empty());
 
+        let mut inconsistent_total = worker_load(&[(0, 1, 1, 0.1, 0.1, 16)]);
+        inconsistent_total.loads[0].num_total_reqs = 1;
         let malformed = [
             WorkerLoadResponse {
                 dp_rank_count: 2,
@@ -2461,6 +2719,7 @@ mod tests {
             worker_load(&[(0, -1, 0, 0.1, 0.1, 16)]),
             worker_load(&[(0, 0, 0, 0.1, 0.1, 0)]),
             worker_load(&[(0, 0, 0, f64::NAN, 0.1, 16)]),
+            inconsistent_total,
         ];
         for load in malformed {
             update_worker_loads(&controller, [(URL, load)]);
@@ -2483,6 +2742,25 @@ mod tests {
         assert!(controller
             .distribution_headroom_snapshot("k3", "model")
             .is_empty());
+
+        let mut unchanged = worker_load(&[(0, 0, 0, 0.1, 0.1, 16)]);
+        unchanged.timestamp = "fixed-backend-sample".to_string();
+        let unchanged_map = HashMap::from([(URL.to_string(), unchanged)]);
+        controller.update_loads(&unchanged_map);
+        controller
+            .work
+            .lock()
+            .distribution_telemetry
+            .get_mut(URL)
+            .unwrap()
+            .observed_at = Instant::now().checked_sub(Duration::from_secs(31)).unwrap();
+        controller.update_loads(&unchanged_map);
+        assert!(
+            controller
+                .distribution_headroom_snapshot("k3", "model")
+                .is_empty(),
+            "an unrelated watch update must not refresh an unchanged backend sample"
+        );
     }
 
     #[test]
@@ -2532,7 +2810,7 @@ mod tests {
         register_headroom_worker(&registry, A);
         register_headroom_worker(&registry, B);
         register_headroom_worker(&registry, C);
-        let controller = AdaptiveAdmissionController::new(distribution_config(2), registry);
+        let controller = AdaptiveAdmissionController::new(distribution_config(1), registry);
         update_worker_loads(
             &controller,
             [
@@ -2555,14 +2833,13 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    controller.try_acquire_distribution_headroom(&target)
+                    acquire_distribution_headroom(&controller, &target)
                 })
             })
             .collect();
         let claims: Vec<_> = claim_handles
             .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .flatten()
+            .filter_map(|handle| handle.join().unwrap())
             .collect();
         assert_eq!(claims.len(), 1);
         drop(claims);
@@ -2576,19 +2853,18 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    controller.try_acquire_distribution_headroom(&target)
+                    acquire_distribution_headroom(&controller, &target)
                 })
             })
             .collect();
         let leases: Vec<_> = lease_handles
             .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .flatten()
+            .filter_map(|handle| handle.join().unwrap())
             .collect();
-        assert_eq!(leases.len(), 2);
+        assert_eq!(leases.len(), 1);
         assert_eq!(
             AdaptiveAdmissionController::active_partition_leases(&controller.work.lock(), "k3"),
-            2
+            1
         );
     }
 
@@ -2604,28 +2880,106 @@ mod tests {
             .distribution_headroom_snapshot("k3", "model")
             .pop()
             .unwrap();
-        let lease = controller
-            .try_acquire_distribution_headroom(&target)
-            .unwrap();
+        let lease = acquire_distribution_headroom(&controller, &target).unwrap();
         assert!(lease.verify());
+        assert_eq!(
+            controller.active_distribution_targets("k3", "model"),
+            vec![(Arc::from(URL), target.worker_revision())]
+        );
+        assert!(controller.distribution_target_is_active(
+            "k3",
+            "model",
+            URL,
+            target.worker_revision()
+        ));
         let snapshot = controller.distribution_headroom_snapshot("k3", "model");
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].issuable_slots(), 0);
         drop(lease);
+        assert!(controller
+            .active_distribution_targets("k3", "model")
+            .is_empty());
+        assert!(!controller.distribution_target_is_active(
+            "k3",
+            "model",
+            URL,
+            target.worker_revision()
+        ));
         let target = controller
             .distribution_headroom_snapshot("k3", "model")
             .pop()
             .unwrap();
+        assert!(acquire_distribution_headroom(&controller, &target).is_some());
+    }
+
+    #[test]
+    fn ordinary_predispatch_claim_hands_off_to_worker_load_without_slot_gap() {
+        const URL: &str = "grpc://predispatch:30000";
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = register_headroom_worker(&registry, URL);
+        let controller = AdaptiveAdmissionController::new(distribution_config(1), registry);
+        update_worker_loads(&controller, [(URL, worker_load(&[(0, 0, 0, 0.1, 0.1, 1)]))]);
+
+        let target = controller
+            .distribution_headroom_snapshot("k3", "model")
+            .pop()
+            .unwrap();
+        let selection = controller.lock_distribution_selection();
+        let ordinary = controller
+            .try_reserve_ordinary_distribution_target(&selection, "k3", "model", &worker)
+            .unwrap();
+        drop(selection);
+        assert_eq!(
+            controller
+                .distribution_headroom_snapshot("k3", "model")
+                .pop()
+                .unwrap()
+                .issuable_slots(),
+            0
+        );
+        let seed_selection = controller.lock_distribution_selection();
         assert!(controller
-            .try_acquire_distribution_headroom(&target)
-            .is_some());
+            .try_acquire_distribution_headroom(&seed_selection, &target)
+            .is_none());
+        drop(seed_selection);
+
+        let load_guard = WorkerLoadGuard::new(Arc::clone(&worker), None);
+        drop(ordinary);
+        assert_eq!(
+            controller
+                .distribution_headroom_snapshot("k3", "model")
+                .pop()
+                .unwrap()
+                .issuable_slots(),
+            0,
+            "live worker load must cover the exact handoff after claim release"
+        );
+        drop(load_guard);
+        assert!(controller
+            .distribution_headroom_snapshot("k3", "model")
+            .pop()
+            .is_some_and(|candidate| candidate.issuable_slots() == 1));
+    }
+
+    #[test]
+    fn distribution_headroom_runtime_rejects_seed_caps_above_one() {
+        const URL: &str = "grpc://unsupported-cap:30000";
+        let registry = Arc::new(WorkerRegistry::new());
+        register_headroom_worker(&registry, URL);
+        let controller = AdaptiveAdmissionController::new(distribution_config(2), registry);
+        update_worker_loads(&controller, [(URL, worker_load(&[(0, 0, 0, 0.1, 0.1, 8)]))]);
+
+        assert!(!controller.distribution_headroom_enabled("k3"));
+        assert!(controller
+            .distribution_headroom_snapshot("k3", "model")
+            .is_empty());
     }
 
     #[test]
     fn distribution_headroom_revision_health_and_model_changes_fail_closed() {
         const URL: &str = "grpc://revision:30000";
         let registry = Arc::new(WorkerRegistry::new());
-        register_headroom_worker(&registry, URL);
+        let original = register_headroom_worker(&registry, URL);
         let worker_id = registry.get_id_by_url(URL).unwrap();
         let controller =
             AdaptiveAdmissionController::new(distribution_config(1), Arc::clone(&registry));
@@ -2639,6 +2993,7 @@ mod tests {
             .distribution_headroom_snapshot("k3", "model")
             .pop()
             .unwrap();
+        assert!(stale_target.matches_worker(&original));
         let replacement: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(URL)
                 .model(ModelCard::new("model").with_alias("model-alias"))
@@ -2649,19 +3004,16 @@ mod tests {
                 })
                 .build(),
         );
+        assert!(!stale_target.matches_worker(&replacement));
         assert!(registry.replace(&worker_id, replacement));
-        assert!(controller
-            .try_acquire_distribution_headroom(&stale_target)
-            .is_none());
+        assert!(acquire_distribution_headroom(&controller, &stale_target).is_none());
 
         update_worker_loads(&controller, [(URL, load.clone())]);
         let target = controller
             .distribution_headroom_snapshot("k3", "model")
             .pop()
             .unwrap();
-        let lease = controller
-            .try_acquire_distribution_headroom(&target)
-            .unwrap();
+        let lease = acquire_distribution_headroom(&controller, &target).unwrap();
         assert!(lease.verify());
         let second_replacement: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(URL)
@@ -2685,9 +3037,7 @@ mod tests {
             .distribution_headroom_snapshot("k3", "model")
             .pop()
             .unwrap();
-        let lease = controller
-            .try_acquire_distribution_headroom(&target)
-            .unwrap();
+        let lease = acquire_distribution_headroom(&controller, &target).unwrap();
         assert!(lease.verify());
         update_worker_loads(&controller, [(URL, load)]);
         assert!(
@@ -2708,9 +3058,7 @@ mod tests {
             .get_by_url(URL)
             .unwrap()
             .set_status(WorkerStatus::NotReady);
-        assert!(controller
-            .try_acquire_distribution_headroom(&target)
-            .is_none());
+        assert!(acquire_distribution_headroom(&controller, &target).is_none());
         assert!(!registry.get_by_url(URL).unwrap().is_available());
     }
 

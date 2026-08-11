@@ -895,6 +895,17 @@ impl ConfigValidator {
             }
         }
         if adaptive.distribution_headroom_partition_seed_cap > 0 {
+            if adaptive.distribution_headroom_partition_seed_cap != 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "adaptive_admission.distribution_headroom_partition_seed_cap"
+                        .to_string(),
+                    value: adaptive
+                        .distribution_headroom_partition_seed_cap
+                        .to_string(),
+                    reason: "Only a single in-flight seed per partition is currently supported"
+                        .to_string(),
+                });
+            }
             if adaptive.distribution_headroom_partitions.is_empty() {
                 return Err(ConfigError::ValidationFailed {
                     reason: "distribution headroom seed capacity requires a non-empty exact partition allowlist"
@@ -2111,11 +2122,19 @@ mod tests {
 
         config
             .adaptive_admission
-            .distribution_headroom_partition_seed_cap = 2;
+            .distribution_headroom_partition_seed_cap = 1;
         assert!(ConfigValidator::validate(&config).is_err());
         config.adaptive_admission.mode = AdaptiveAdmissionMode::Enforce;
         config.adaptive_admission.strategy = AdaptiveAdmissionStrategy::EngineFeedback;
         assert!(ConfigValidator::validate(&config).is_ok());
+
+        config
+            .adaptive_admission
+            .distribution_headroom_partition_seed_cap = 2;
+        assert!(ConfigValidator::validate(&config).is_err());
+        config
+            .adaptive_admission
+            .distribution_headroom_partition_seed_cap = 1;
 
         config.priority_scheduler_enabled = true;
         config.priority_scheduler_adaptive_capacity = true;

@@ -185,6 +185,10 @@ impl PipelineStage for RequestExecutionStage {
             policy_reservation,
             distribution_seed,
         ));
+        // `LoadGuards::scaled` has now incremented the selected worker's live
+        // load. Releasing the exact predispatch claim after that handoff makes
+        // the ordinary-selection-to-seed-acquisition transition gap-free.
+        drop(ctx.state.ordinary_distribution_guard.take());
 
         // Extract dispatch metadata for tracing span
         let dispatch = ctx.state.dispatch.as_ref();

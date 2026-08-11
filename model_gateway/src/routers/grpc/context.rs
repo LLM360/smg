@@ -4,6 +4,8 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
@@ -24,6 +26,7 @@ use tracing::debug;
 use super::{
     adaptive_admission::{
         AdaptiveAdmissionController, AdaptiveRequestTracker, DistributionHeadroomLease,
+        OrdinaryDistributionDispatchGuard,
     },
     client::GrpcClient,
     common::stages::encode::EncodeDispatchPlan,
@@ -188,6 +191,11 @@ pub(crate) struct ProcessingState {
     /// backend execution; every earlier failure releases both by `Drop`.
     pub distribution_seed_guard: Option<DistributionSeedDispatchGuard>,
 
+    /// Exact ordinary target claim held until request execution installs the
+    /// worker load guard. This closes the worker-selection-to-dispatch window
+    /// in which a clean-peer seed might otherwise reserve the same target.
+    pub ordinary_distribution_guard: Option<OrdinaryDistributionDispatchGuard>,
+
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
 
@@ -220,10 +228,19 @@ pub(crate) struct PendingDistributionSeed {
 
 #[derive(Debug)]
 pub(crate) struct DistributionSeedDispatchGuard {
-    pub(crate) headroom: DistributionHeadroomLease,
+    pub(crate) policy_plan: OwnerPressureDispatchPlan,
     pub(crate) _scheduler_proof: ClaimedSchedulerAdmissionProof,
-    pub(crate) _policy_plan: OwnerPressureDispatchPlan,
+    // Keep this field last. Rust drops fields in declaration order, so the
+    // prefix plan must enter cooldown before model-wide target suppression is
+    // released by the headroom lease.
+    pub(crate) headroom: DistributionHeadroomLease,
     pub(crate) retry_after_secs: u32,
+}
+
+impl DistributionSeedDispatchGuard {
+    fn commit_success(&mut self) {
+        self.policy_plan.commit_success();
+    }
 }
 
 /// Per-item bootstrap rendezvous info for prefill, plus the dispatch plan that
@@ -504,7 +521,7 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
         _policy_reservation: Option<PolicyReservation>,
-        _distribution_seed: Option<DistributionSeedDispatchGuard>,
+        distribution_seed: Option<DistributionSeedDispatchGuard>,
     },
     /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
     /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
@@ -517,11 +534,55 @@ pub(crate) enum LoadGuards {
     Batch {
         _guards: Vec<LoadGuards>,
         _policy_reservation: Option<PolicyReservation>,
-        _distribution_seed: Option<DistributionSeedDispatchGuard>,
+        distribution_seed: Option<DistributionSeedDispatchGuard>,
     },
+    /// Test-only terminal-success probe for the distribution-seed commit stage.
+    /// Production construction still requires the real scheduler proof, policy
+    /// reservation, and adaptive headroom lease.
+    #[cfg(test)]
+    TestDistributionSeed { committed: Arc<AtomicBool> },
 }
 
 impl LoadGuards {
+    pub(crate) fn has_distribution_seed(&self) -> bool {
+        match self {
+            Self::Single {
+                distribution_seed, ..
+            }
+            | Self::Batch {
+                distribution_seed, ..
+            } => distribution_seed.is_some(),
+            Self::Disaggregated { .. } => false,
+            #[cfg(test)]
+            Self::TestDistributionSeed { .. } => true,
+        }
+    }
+
+    pub(crate) fn commit_distribution_seed_success(&mut self) {
+        match self {
+            Self::Single {
+                distribution_seed, ..
+            }
+            | Self::Batch {
+                distribution_seed, ..
+            } => {
+                if let Some(seed) = distribution_seed {
+                    seed.commit_success();
+                }
+            }
+            Self::Disaggregated { .. } => {}
+            #[cfg(test)]
+            Self::TestDistributionSeed { committed } => {
+                committed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_distribution_seed(committed: Arc<AtomicBool>) -> Self {
+        Self::TestDistributionSeed { committed }
+    }
+
     pub fn new(
         selection: &WorkerSelection,
         headers: Option<&HeaderMap>,
@@ -532,7 +593,7 @@ impl LoadGuards {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::new(worker.clone(), headers),
                 _policy_reservation: policy_reservation,
-                _distribution_seed: distribution_seed,
+                distribution_seed,
             },
             WorkerSelection::Disaggregated {
                 prefill, decode, ..
@@ -563,7 +624,7 @@ impl LoadGuards {
                     .map(|_| Self::new(selection, headers, None, None))
                     .collect(),
                 _policy_reservation: policy_reservation,
-                _distribution_seed: distribution_seed,
+                distribution_seed,
             }
         }
     }

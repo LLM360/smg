@@ -11,14 +11,17 @@ use tracing::{error, warn};
 
 use super::{adaptive_admission::rejection_response, PipelineStage};
 use crate::{
+    middleware::scheduler::SchedulerAdmissionProof,
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        LoadBalancingPolicy, PolicyRegistry, SeedWorkerHeadroom, SelectWorkerInfo, WorkerLeg,
+        CacheAwarePolicy, CacheAwareSelection, DistributionProtectionSnapshot, LoadBalancingPolicy,
+        PolicyRegistry, SeedWorkerHeadroom, SelectWorkerInfo, WorkerLeg,
     },
     routers::{
         common::header_utils::worker_url_is_allowed,
         error,
         grpc::{
+            adaptive_admission::{AdaptiveAdmissionController, OrdinaryDistributionDispatchGuard},
             context::{
                 DistributionSeedDispatchGuard, EncodeWorkerAssignment, PendingDistributionSeed,
                 PolicyReservation, RequestContext, WorkerSelection,
@@ -33,6 +36,11 @@ use crate::{
 
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
+type SingleWorkerSelection = (
+    Arc<dyn Worker>,
+    Option<PolicyReservation>,
+    Option<OrdinaryDistributionDispatchGuard>,
+);
 
 /// Result type for EPD worker selection: (encode assignments, prefill, decode, runtime_type).
 type EncodePrefillDecodeWorkerSelection = (
@@ -99,6 +107,13 @@ impl PipelineStage for WorkerSelectionStage {
         let headers = ctx.input.headers.as_ref();
 
         let model_id = ctx.input.model_id.as_str();
+        let distribution_scope = ctx.state.adaptive_request.as_ref().and_then(|tracker| {
+            let partition = tracker.partition()?;
+            let controller = ctx.components.adaptive_admission.as_ref()?;
+            controller
+                .distribution_headroom_enabled(partition)
+                .then(|| (Arc::clone(controller), partition.to_string()))
+        });
         let workers = if let Some(pending) = pending_distribution_seed {
             if self.mode != WorkerSelectionMode::Regular {
                 return Err(rejection_response(pending.retry_after_secs));
@@ -113,9 +128,18 @@ impl PipelineStage for WorkerSelectionStage {
         } else {
             match self.mode {
                 WorkerSelectionMode::Regular => {
-                    match self.select_single_worker(model_id, text, tokens, headers) {
-                        Some((worker, reservation)) => {
+                    match self.select_single_worker(
+                        model_id,
+                        text,
+                        tokens,
+                        headers,
+                        distribution_scope
+                            .as_ref()
+                            .map(|(controller, partition)| (controller, partition.as_str())),
+                    )? {
+                        Some((worker, reservation, ordinary_distribution_guard)) => {
                             ctx.state.policy_reservation = reservation;
+                            ctx.state.ordinary_distribution_guard = ordinary_distribution_guard;
                             WorkerSelection::Single { worker }
                         }
                         None => {
@@ -251,11 +275,6 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
     ) -> Option<(Arc<dyn Worker>, DistributionSeedDispatchGuard)> {
         let controller = ctx.components.adaptive_admission.as_ref()?;
-        let targets = controller.distribution_headroom_snapshot(&pending.partition, model_id);
-        if targets.is_empty() {
-            return None;
-        }
-
         let workers: Vec<_> = self
             .worker_registry
             .get_workers_filtered(
@@ -266,7 +285,10 @@ impl WorkerSelectionStage {
                 false,
             )
             .into_iter()
-            .filter(|worker| worker_is_available_for_request(worker.as_ref(), headers))
+            // Header-excluded authoritative owners must remain visible to the
+            // cache-policy owner ceiling. SelectWorkerInfo applies the same
+            // headers only to actual target eligibility below.
+            .filter(|worker| worker.is_available())
             .collect();
         if workers.len() < 2 {
             return None;
@@ -281,6 +303,25 @@ impl WorkerSelectionStage {
             reserve_work: false,
             leg: WorkerLeg::Single,
         };
+        let meta = ctx.input.tenant_request_meta.as_ref()?;
+        let proof = meta.extension::<SchedulerAdmissionProof>()?;
+        let claimed = proof
+            .try_claim(
+                meta.tenant_key(),
+                meta.request_charge_id(),
+                model_id,
+                &pending.partition,
+            )
+            .ok()?;
+
+        // Claim scheduler authority before mutating policy cooldown or target
+        // capacity. The short controller lock then orders this seed selection
+        // against ordinary cache-aware selection without crossing an await.
+        let selection_guard = controller.lock_distribution_selection();
+        let targets = controller.distribution_headroom_snapshot(&pending.partition, model_id);
+        if targets.is_empty() {
+            return None;
+        }
         let capacity: Vec<_> = targets
             .iter()
             .map(|target| SeedWorkerHeadroom {
@@ -296,24 +337,15 @@ impl WorkerSelectionStage {
             target.worker_url() == plan.target_worker_url()
                 && target.worker_revision() == plan.target_worker_revision()
         })?;
-        let lease = controller.try_acquire_distribution_headroom(target)?;
-
-        let meta = ctx.input.tenant_request_meta.as_ref()?;
-        let proof = meta.extension::<crate::middleware::scheduler::SchedulerAdmissionProof>()?;
-        let claimed = proof
-            .try_claim(
-                meta.tenant_key(),
-                meta.request_charge_id(),
-                model_id,
-                &pending.partition,
-            )
-            .ok()?;
-
         let selected = workers.into_iter().find(|worker| {
             worker.url() == plan.target_worker_url()
                 && worker.revision() == plan.target_worker_revision()
                 && worker_is_available_for_request(worker.as_ref(), headers)
         })?;
+        if !target.matches_worker(&selected) {
+            return None;
+        }
+        let lease = controller.try_acquire_distribution_headroom(&selection_guard, target)?;
         if !lease.verify() {
             return None;
         }
@@ -333,19 +365,24 @@ impl WorkerSelectionStage {
             DistributionSeedDispatchGuard {
                 headroom: lease,
                 _scheduler_proof: claimed,
-                _policy_plan: plan,
+                policy_plan: plan,
                 retry_after_secs: pending.retry_after_secs,
             },
         ))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the pipeline contract returns an Axum Response on local rejection"
+    )]
     fn select_single_worker(
         &self,
         model_id: &str,
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Option<PolicyReservation>)> {
+        distribution_scope: Option<(&Arc<AdaptiveAdmissionController>, &str)>,
+    ) -> Result<Option<SingleWorkerSelection>, Response> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
             None
@@ -362,41 +399,180 @@ impl WorkerSelectionStage {
             false, // get all workers, we'll filter by is_available() next
         );
 
-        // Use into_iter() to take ownership of Arcs without cloning (avoids atomic inc/dec)
-        let available: Vec<Arc<dyn Worker>> = workers
-            .into_iter()
-            .filter(|w| worker_is_available_for_request(w.as_ref(), headers))
-            .collect();
-
-        if available.is_empty() {
-            return None;
-        }
-
         // Get the appropriate policy for this model
         let policy = self.policy_registry.get_policy_or_default(model_id);
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
+        // Distribution-enabled cache-aware routing must see header-excluded
+        // authoritative owners so its per-prefix claim can serialize any
+        // replacement. The policy itself enforces header eligibility. Active
+        // seed targets remain visible for ownership matching but are appended
+        // to the policy-only exclusion header until their request-lifetime
+        // headroom lease ends. This covers early/deeper KV store events and the
+        // routing-key override path without hiding the provisional owner.
+        // Other models retain the legacy prefilter.
+        let distribution_cache_aware = distribution_scope.and_then(|(controller, partition)| {
+            policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+                .map(|cache_aware| (controller, partition, cache_aware))
+        });
+        let active_targets =
+            distribution_cache_aware.map_or_else(Vec::new, |(controller, partition, _)| {
+                controller.active_distribution_targets(partition, model_id)
+            });
+        let distribution_protections = distribution_cache_aware.map_or_else(
+            DistributionProtectionSnapshot::default,
+            |(_, _, cache_aware)| cache_aware.distribution_protection_snapshot(model_id, tokens),
+        );
+        let serialize_distribution =
+            !active_targets.is_empty() || !distribution_protections.is_empty();
+        let policy_headers = if active_targets.is_empty() {
+            None
+        } else {
+            let mut merged = headers.cloned().unwrap_or_default();
+            let targeted_worker = merged
+                .get("x-smg-target-worker-url")
+                .and_then(|value| value.to_str().ok());
+            if targeted_worker.is_some_and(|targeted| {
+                active_targets
+                    .iter()
+                    .any(|(url, _)| url.as_ref() == targeted)
+            }) {
+                return Err(rejection_response(1));
+            }
+            let mut excluded = merged
+                .get("x-smg-excluded-worker-urls")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            for (url, _) in &active_targets {
+                if !excluded.is_empty() {
+                    excluded.push(',');
+                }
+                excluded.push_str(url);
+            }
+            let Ok(excluded) = HeaderValue::from_str(&excluded) else {
+                return Err(rejection_response(1));
+            };
+            merged.insert("x-smg-excluded-worker-urls", excluded);
+            Some(merged)
+        };
+        let effective_headers = policy_headers.as_ref().or(headers);
         let info = SelectWorkerInfo {
             request_text: text,
             tokens,
-            headers,
+            headers: effective_headers,
             hash_ring,
             max_output_tokens: None,
             reserve_work: true,
             leg: WorkerLeg::Single,
         };
+        let available: Vec<Arc<dyn Worker>> = workers
+            .into_iter()
+            .filter(|worker| {
+                if serialize_distribution {
+                    worker.is_available()
+                } else {
+                    worker_is_available_for_request(worker.as_ref(), headers)
+                }
+            })
+            .collect();
+
+        if available.is_empty() {
+            return if serialize_distribution {
+                Err(rejection_response(1))
+            } else {
+                Ok(None)
+            };
+        }
 
         // Select and reserve prompt/output work atomically. The returned guard
         // releases the reservation when the request finishes or any later
         // gRPC pipeline stage fails.
-        let (idx, reservation_cost) = self
-            .policy_registry
-            .select_worker_with_reservation(&policy, &available, &info)?;
-        let selected = available[idx].clone();
+        let selection = if serialize_distribution {
+            let Some((_, _, cache_aware)) = distribution_cache_aware else {
+                return Err(rejection_response(1));
+            };
+            match cache_aware.select_worker_decision_with_distribution_state(
+                &available,
+                &info,
+                &active_targets,
+                &distribution_protections,
+            ) {
+                CacheAwareSelection::Selected(index) => {
+                    Some((index, policy.reservation_cost(&info)))
+                }
+                CacheAwareSelection::Blocked => return Err(rejection_response(1)),
+                CacheAwareSelection::Unavailable => return Err(rejection_response(1)),
+            }
+        } else {
+            self.policy_registry
+                .select_worker_with_reservation(&policy, &available, &info)
+        };
+        let Some((idx, reservation_cost)) = selection else {
+            return Ok(None);
+        };
+        let Some(selected) = available.get(idx).cloned() else {
+            return Ok(None);
+        };
         let reservation = reservation_cost
             .map(|cost| PolicyReservation::new(policy.clone(), selected.url().to_string(), cost));
+        if !worker_url_is_allowed(headers, selected.url()) {
+            return Err(rejection_response(1));
+        }
+        // Cache hashing and ordinary policy selection stay outside the global
+        // controller lock. Only this final atomic snapshot check plus exact
+        // predispatch claim is serialized against the rare seed path.
+        let distribution_selection_guard = distribution_cache_aware
+            .map(|(controller, _, _)| controller.lock_distribution_selection());
+        if let Some((controller, partition)) = distribution_scope {
+            let protection_snapshot_unchanged =
+                distribution_cache_aware.is_some_and(|(_, _, cache_aware)| {
+                    cache_aware.distribution_protection_snapshot(model_id, tokens)
+                        == distribution_protections
+                });
+            let current_targets = controller.active_distribution_targets(partition, model_id);
+            let snapshot_unchanged = current_targets.len() == active_targets.len()
+                && current_targets.iter().all(|(url, revision)| {
+                    active_targets
+                        .iter()
+                        .any(|(snapshot_url, snapshot_revision)| {
+                            snapshot_url == url && snapshot_revision == revision
+                        })
+                });
+            if !protection_snapshot_unchanged || !snapshot_unchanged {
+                return Err(rejection_response(1));
+            }
+            if controller.distribution_target_is_active(
+                partition,
+                model_id,
+                selected.url(),
+                selected.revision(),
+            ) {
+                return Err(rejection_response(1));
+            }
+        }
+        let ordinary_distribution_guard =
+            if let (Some((controller, partition, _)), Some(selection_guard)) = (
+                distribution_cache_aware,
+                distribution_selection_guard.as_ref(),
+            ) {
+                Some(
+                    controller
+                        .try_reserve_ordinary_distribution_target(
+                            selection_guard,
+                            partition,
+                            model_id,
+                            &selected,
+                        )
+                        .ok_or_else(|| rejection_response(1))?,
+                )
+            } else {
+                None
+            };
 
         // Record worker selection metric
         Metrics::record_worker_selection(
@@ -406,7 +582,7 @@ impl WorkerSelectionStage {
             policy.name(),
         );
 
-        Some((selected, reservation))
+        Ok(Some((selected, reservation, ordinary_distribution_guard)))
     }
 
     fn select_pd_pair(
@@ -795,10 +971,27 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use std::collections::HashMap;
+
+    use axum::http::{header::RETRY_AFTER, StatusCode};
+    use kv_index::{
+        compute_content_hash, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
+    };
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse},
+    };
+    use tokio::sync::watch;
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::{
+        config::{
+            AdaptiveAdmissionConfig, AdaptiveAdmissionMode, AdaptiveAdmissionStrategy,
+            ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig,
+        },
+        middleware::scheduler::LocalAdaptiveRejection,
+        worker::{BasicWorkerBuilder, KvEventMonitor},
+    };
 
     fn ready_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -810,6 +1003,62 @@ mod tests {
                 })
                 .build(),
         )
+    }
+
+    fn stage_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("kimi-k3"))
+                .label("admission_partition", "k3")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    fn clean_headroom_load(timestamp: &str) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            timestamp: timestamp.to_string(),
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: 0,
+                num_waiting_reqs: 0,
+                num_total_reqs: 0,
+                token_usage: 0.1,
+                utilization: 0.1,
+                max_running_requests: 38,
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn assert_local_adaptive_rejection(result: Result<Option<SingleWorkerSelection>, Response>) {
+        let response = match result {
+            Err(response) => response,
+            Ok(_) => panic!(
+                "active seed B must block locally rather than route to sticky B or uncached C"
+            ),
+        };
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response
+                .extensions()
+                .get::<LocalAdaptiveRejection>()
+                .is_some(),
+            "the rejection must use the scheduler refund marker"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 
     #[test]
@@ -840,6 +1089,171 @@ mod tests {
         assert!(worker_is_available_for_request(
             reserved.as_ref(),
             Some(&private_headers)
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_distribution_seed_blocks_sticky_deeper_owner_after_header_filtering() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker_a = stage_worker("grpc://worker-a:30000");
+        let worker_b = stage_worker("grpc://worker-b:30000");
+        let worker_c = stage_worker("grpc://worker-c:30000");
+        for worker in [&worker_a, &worker_b, &worker_c] {
+            worker_registry
+                .register(Arc::clone(worker))
+                .expect("unique worker registration");
+        }
+
+        let policy_registry = Arc::new(PolicyRegistry::with_override(
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 10_000,
+                fallback_output_token_estimate: 4096,
+                block_size: 4,
+                engine_load: false,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                max_cached_owners_per_prefix: 8,
+                cache_owner_spill_cooldown_secs: 5,
+            },
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                assignment_mode: ManualAssignmentMode::MinLoad,
+                ..Default::default()
+            },
+        ));
+
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.set_block_size("kimi-k3", 4);
+        let indexer = Arc::new(PositionalIndexer::new(4));
+        let owner_a = indexer.intern_worker(worker_a.url()).unwrap();
+        let seed_b = indexer.intern_worker(worker_b.url()).unwrap();
+        let prefix_tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let owner_blocks: Vec<_> = prefix_tokens
+            .chunks(4)
+            .enumerate()
+            .map(|(index, tokens)| StoredBlock {
+                seq_hash: SequenceHash(index as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer
+            .apply_stored(owner_a, &owner_blocks, None, &mut WorkerBlockMap::default())
+            .unwrap();
+        monitor
+            .indexers
+            .insert("kimi-k3".to_string(), Arc::clone(&indexer));
+        policy_registry.set_kv_event_monitor(Some(monitor));
+
+        let policy = policy_registry.get_policy_or_default("kimi-k3");
+        let mut sticky_headers = HeaderMap::new();
+        sticky_headers.insert("x-smg-routing-key", "trajectory-1".parse().unwrap());
+        let sticky_info = SelectWorkerInfo {
+            tokens: Some(&prefix_tokens),
+            headers: Some(&sticky_headers),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy_registry.select_worker(&policy, &[Arc::clone(&worker_b)], &sticky_info),
+            Some(0),
+            "the routing key should first become sticky to worker B"
+        );
+        assert_eq!(
+            policy_registry.select_worker(
+                &policy,
+                &[
+                    Arc::clone(&worker_a),
+                    Arc::clone(&worker_b),
+                    Arc::clone(&worker_c),
+                ],
+                &sticky_info,
+            ),
+            Some(1),
+            "the routing-key override should still resolve to worker B"
+        );
+
+        let controller = AdaptiveAdmissionController::new(
+            AdaptiveAdmissionConfig {
+                mode: AdaptiveAdmissionMode::Enforce,
+                strategy: AdaptiveAdmissionStrategy::EngineFeedback,
+                distribution_headroom_partitions: vec!["k3".to_string()],
+                distribution_headroom_partition_seed_cap: 1,
+                ..Default::default()
+            },
+            Arc::clone(&worker_registry),
+        );
+        let loads = HashMap::from([
+            (
+                worker_a.url().to_string(),
+                clean_headroom_load("stage-worker-a"),
+            ),
+            (
+                worker_b.url().to_string(),
+                clean_headroom_load("stage-worker-b"),
+            ),
+            (
+                worker_c.url().to_string(),
+                clean_headroom_load("stage-worker-c"),
+            ),
+        ]);
+        let (_load_tx, load_rx) = watch::channel(loads);
+        controller.start_load_updates(load_rx);
+        let target_b = controller
+            .distribution_headroom_snapshot("k3", "kimi-k3")
+            .into_iter()
+            .find(|target| target.worker_url() == worker_b.url())
+            .expect("worker B should expose clean distribution headroom");
+        let seed_lease = {
+            let selection = controller.lock_distribution_selection();
+            controller
+                .try_acquire_distribution_headroom(&selection, &target_b)
+                .expect("worker B seed lease")
+        };
+        assert!(seed_lease.verify());
+
+        let request_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut request_headers = sticky_headers;
+        request_headers.insert(
+            "x-smg-excluded-worker-urls",
+            worker_a.url().parse().unwrap(),
+        );
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::Regular,
+        );
+        assert_local_adaptive_rejection(stage.select_single_worker(
+            "kimi-k3",
+            None,
+            Some(&request_tokens),
+            Some(&request_headers),
+            Some((&controller, "k3")),
+        ));
+
+        // The seed's store event can make B a deeper authoritative owner while
+        // its request is still in flight. The stage must continue to reject,
+        // even though the routing key is sticky to B and A is header-excluded.
+        let seed_blocks: Vec<_> = request_tokens
+            .chunks(4)
+            .enumerate()
+            .map(|(index, tokens)| StoredBlock {
+                seq_hash: SequenceHash(index as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer
+            .apply_stored(seed_b, &seed_blocks, None, &mut WorkerBlockMap::default())
+            .unwrap();
+
+        assert_local_adaptive_rejection(stage.select_single_worker(
+            "kimi-k3",
+            None,
+            Some(&request_tokens),
+            Some(&request_headers),
+            Some((&controller, "k3")),
         ));
     }
 }

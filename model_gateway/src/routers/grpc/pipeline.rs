@@ -281,6 +281,7 @@ impl RequestPipeline {
                         processor,
                         streaming_processor,
                     )),
+                    Box::new(DistributionSeedCommitStage),
                 ]);
                 stages
             }
@@ -310,6 +311,7 @@ impl RequestPipeline {
                         processor,
                         streaming_processor,
                     )),
+                    Box::new(DistributionSeedCommitStage),
                 ]);
                 stages
             }
@@ -340,6 +342,7 @@ impl RequestPipeline {
                         processor,
                         streaming_processor,
                     )),
+                    Box::new(DistributionSeedCommitStage),
                 ]);
                 stages
             }
@@ -364,6 +367,7 @@ impl RequestPipeline {
                     Box::new(DispatchMetadataStage),
                     Box::new(RequestExecutionStage::new()),
                     Box::new(harmony::stages::HarmonyResponseProcessingStage::new()),
+                    Box::new(DistributionSeedCommitStage),
                 ]
             }
             Endpoint::Embeddings => {
@@ -1246,6 +1250,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "ChatGenerateResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 REGULAR,
             ),
@@ -1259,6 +1264,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "ChatGenerateResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 PD,
             ),
@@ -1273,6 +1279,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "ChatGenerateResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 PD,
             ),
@@ -1286,6 +1293,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "MessageResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 REGULAR,
             ),
@@ -1299,6 +1307,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "MessageResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 PD,
             ),
@@ -1313,6 +1322,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "MessageResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 PD,
             ),
@@ -1326,6 +1336,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "CompletionResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 REGULAR,
             ),
@@ -1339,6 +1350,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "CompletionResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 PD,
             ),
@@ -1353,6 +1365,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "CompletionResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 PD,
             ),
@@ -1366,6 +1379,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "HarmonyResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 REGULAR,
             ),
@@ -1379,6 +1393,7 @@ mod build_parity_tests {
                     "DispatchMetadataStage",
                     "RequestExecutionStage",
                     "HarmonyResponseProcessingStage",
+                    "DistributionSeedCommitStage",
                 ]),
                 PD,
             ),
