@@ -241,9 +241,11 @@ impl PriorityScheduler {
     /// Immediately acquire one slot for an allocator-selected tenant.
     ///
     /// This never enters the scheduler queue. The external allocator owns
-    /// candidate ordering; SMG remains authoritative for the slot and for the
-    /// provisional output-token reservation settled by the response body.
-    pub(crate) fn acquire_for_tenant_profile(
+    /// candidate and priority ordering, so this path may borrow otherwise-idle
+    /// class reservations. SMG remains authoritative for the total live
+    /// capacity ceiling, the slot, and the provisional output-token reservation
+    /// settled by the response body.
+    pub(crate) fn acquire_external_credit_for_tenant_profile(
         self: &Arc<Self>,
         class: Class,
         request_id: RequestId,
@@ -251,16 +253,13 @@ impl PriorityScheduler {
         profile: FairShareProfile,
         estimated_output_tokens: u32,
     ) -> Option<SchedulerPermit> {
-        if !self.slot_pool.try_acquire(class) {
+        let ledger = self.fair_share.as_ref()?;
+        let scope_id = self.fair_share_scope?;
+        if !self.slot_pool.try_acquire(class)
+            && !self.slot_pool.try_acquire_ignoring_reservations(class)
+        {
             return None;
         }
-        let Some(ledger) = &self.fair_share else {
-            return Some(self.register_inflight(class, request_id, None));
-        };
-        let Some(scope_id) = self.fair_share_scope else {
-            self.slot_pool.release(class);
-            return None;
-        };
 
         ledger.register_waiter_in_profile(scope_id, &profile, &tenant, class);
         let candidates = [super::fair_share::FairShareCandidate {
@@ -294,6 +293,7 @@ impl PriorityScheduler {
             scheduler: Arc::clone(self),
             handle,
             fair_share_reservation,
+            admission_proof: None,
         }
     }
 
@@ -1092,6 +1092,7 @@ pub struct SchedulerPermit {
     scheduler: Arc<PriorityScheduler>,
     handle: Arc<InflightHandle>,
     fair_share_reservation: Option<FairShareReservation>,
+    admission_proof: Option<super::SchedulerAdmissionProof>,
 }
 
 impl SchedulerPermit {
@@ -1104,6 +1105,40 @@ impl SchedulerPermit {
     #[must_use]
     pub fn has_fair_share_reservation(&self) -> bool {
         self.fair_share_reservation.is_some()
+    }
+
+    /// Return the one-shot admission witness attached after an external
+    /// capacity credit is redeemed. Ordinary scheduler reservations do not
+    /// mint this proof.
+    #[must_use]
+    pub(crate) fn fair_share_admission_proof(&self) -> Option<super::SchedulerAdmissionProof> {
+        self.admission_proof.clone()
+    }
+
+    pub(super) fn attach_redeemed_capacity_credit_proof(
+        &mut self,
+        binding: &super::capacity_credit::CapacityCreditBinding,
+        route_request_id: uuid::Uuid,
+    ) -> bool {
+        let Some(reservation) = self.fair_share_reservation.as_ref() else {
+            return false;
+        };
+        if reservation.tenant() != binding.tenant() || self.admission_proof.is_some() {
+            return false;
+        }
+        self.admission_proof = Some(
+            super::SchedulerAdmissionProof::from_redeemed_capacity_credit(
+                binding,
+                route_request_id,
+            ),
+        );
+        true
+    }
+
+    fn revoke_admission_proof(&self) {
+        if let Some(proof) = &self.admission_proof {
+            proof.revoke();
+        }
     }
 
     /// Mark the first response byte. Called by [`super::body::SchedulerGuardBody`]
@@ -1137,6 +1172,7 @@ impl SchedulerPermit {
     }
 
     pub(crate) fn cancel_fair_share_reservation(&mut self) {
+        self.revoke_admission_proof();
         if let Some(reservation) = self.fair_share_reservation.take() {
             reservation.cancel();
         }
@@ -1156,6 +1192,7 @@ impl std::fmt::Debug for SchedulerPermit {
 
 impl Drop for SchedulerPermit {
     fn drop(&mut self) {
+        self.revoke_admission_proof();
         if let Some(reservation) = self.fair_share_reservation.take() {
             reservation.settle(None, SettlementKind::Interrupted);
         }
@@ -2130,6 +2167,37 @@ mod tests {
         SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
     }
 
+    fn fair_credit_borrow_settings() -> SchedulerSettings {
+        let mut classes = HashMap::new();
+        for class in Class::ALL {
+            let mut config = ClassConfig::default_for(class);
+            config.reserved_floor = match class {
+                Class::System => 4,
+                Class::Interactive => 35,
+                Class::Default | Class::Bulk => 0,
+            };
+            config.reserved_per_slot = 0.0;
+            config.queue_size = 16;
+            classes.insert(class, config);
+        }
+        let yaml = PrioritySchedulerYaml {
+            classes,
+            fair_share: Some(FairShareConfig {
+                default_weight: 1.0,
+                default_output_tokens: 10,
+                trust_output_token_estimate_header: false,
+                trust_request_model_header: false,
+                tenant_weights: HashMap::from([
+                    ("header:a".to_string(), 1.0),
+                    ("header:b".to_string(), 1.0),
+                ]),
+                model_profiles: HashMap::new(),
+            }),
+            ..Default::default()
+        };
+        SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
+    }
+
     #[tokio::test]
     async fn fair_share_free_slot_is_work_conserving_for_lone_user() {
         let settings = fair_settings();
@@ -2160,7 +2228,7 @@ mod tests {
         let scheduler = PriorityScheduler::new_with_fair_share(&settings, 1, Some(ledger)).unwrap();
 
         let permit = scheduler
-            .acquire_for_tenant_profile(
+            .acquire_external_credit_for_tenant_profile(
                 Class::Default,
                 rid("credit-a"),
                 TenantKey::new("header:a"),
@@ -2169,9 +2237,10 @@ mod tests {
             )
             .expect("allocator-selected tenant should acquire the free slot");
         assert!(permit.has_fair_share_reservation());
+        assert!(permit.fair_share_admission_proof().is_none());
         assert!(
             scheduler
-                .acquire_for_tenant_profile(
+                .acquire_external_credit_for_tenant_profile(
                     Class::Default,
                     rid("credit-b"),
                     TenantKey::new("header:b"),
@@ -2183,6 +2252,92 @@ mod tests {
         );
         let held = super::super::capacity_credit::HeldSchedulerPermit::new(permit);
         drop(held);
+        assert_eq!(scheduler.inflight_for_test(Class::Default), 0);
+    }
+
+    #[test]
+    fn allocator_selected_credit_borrows_unused_class_reservations() {
+        let settings = fair_credit_borrow_settings();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scheduler =
+            PriorityScheduler::new_with_fair_share(&settings, 200, Some(ledger)).unwrap();
+
+        let held: Vec<_> = (0..102)
+            .map(|index| {
+                scheduler
+                    .acquire_inflight(Class::Default, rid(&format!("existing-{index}")))
+                    .expect("the pre-shrink capacity should admit existing default work")
+            })
+            .collect();
+        scheduler.apply_new_capacity(138);
+
+        assert_eq!(scheduler.slot_pool.capacity(), 138);
+        assert_eq!(scheduler.slot_pool.reserved(Class::System), 4);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Interactive), 35);
+        assert_eq!(scheduler.inflight_for_test(Class::Default), 102);
+        assert!(
+            !scheduler.slot_pool.try_acquire(Class::Default),
+            "the ordinary priority guard must still protect higher-class reservations"
+        );
+
+        let mut permit = scheduler
+            .acquire_external_credit_for_tenant_profile(
+                Class::Default,
+                rid("borrowed-credit"),
+                TenantKey::new("header:a"),
+                FairShareProfile::Global,
+                10,
+            )
+            .expect("the allocator-selected credit should borrow one of 36 total idle slots");
+        assert!(permit.has_fair_share_reservation());
+        assert_eq!(scheduler.inflight_for_test(Class::Default), 103);
+
+        permit.settle_output_tokens(Some(10), SettlementKind::Observed);
+        drop(permit);
+        assert_eq!(scheduler.inflight_for_test(Class::Default), 102);
+        drop(held);
+        assert_eq!(scheduler.inflight_for_test(Class::Default), 0);
+    }
+
+    #[test]
+    fn cancelled_permit_clone_cannot_claim_admission_proof() {
+        let settings = fair_settings();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scheduler = PriorityScheduler::new_with_fair_share(&settings, 1, Some(ledger)).unwrap();
+        let mut permit = scheduler
+            .acquire_external_credit_for_tenant_profile(
+                Class::Default,
+                rid("cancelled-credit"),
+                TenantKey::new("header:a"),
+                FairShareProfile::Global,
+                10,
+            )
+            .unwrap();
+        let binding = super::super::capacity_credit::CapacityCreditBinding::new(
+            "green-1",
+            7,
+            "kimi-k3",
+            "kimi-k3",
+            TenantKey::new("header:a"),
+            "request-1",
+            10,
+        )
+        .unwrap();
+        let route_request_id = uuid::Uuid::now_v7();
+        assert!(permit.attach_redeemed_capacity_credit_proof(&binding, route_request_id));
+        let proof = permit.fair_share_admission_proof().unwrap();
+
+        permit.cancel_fair_share_reservation();
+        assert!(matches!(
+            proof.try_claim(
+                &TenantKey::new("header:a"),
+                route_request_id,
+                "kimi-k3",
+                "kimi-k3"
+            ),
+            Err(super::super::ProofError::Revoked)
+        ));
+        drop(permit);
         assert_eq!(scheduler.inflight_for_test(Class::Default), 0);
     }
 

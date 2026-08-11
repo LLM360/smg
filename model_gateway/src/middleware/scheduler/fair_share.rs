@@ -1210,6 +1210,10 @@ impl std::fmt::Debug for FairShareReservation {
 }
 
 impl FairShareReservation {
+    pub(crate) fn tenant(&self) -> &TenantKey {
+        &self.tenant
+    }
+
     pub fn settle(mut self, observed_output_tokens: Option<u32>, kind: SettlementKind) {
         self.ledger.settle_reservation(
             self.scope_id,

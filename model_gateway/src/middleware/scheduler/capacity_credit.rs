@@ -47,6 +47,19 @@ impl HeldSchedulerPermit {
             .take()
             .expect("held scheduler permit can be consumed only once")
     }
+
+    /// Bind a successfully redeemed credit to the held scheduler permit.
+    /// Returns false rather than minting a proof if the permit has no matching
+    /// fair-share reservation.
+    pub(crate) fn bind_redeemed_capacity_credit(
+        &mut self,
+        binding: &CapacityCreditBinding,
+        route_request_id: uuid::Uuid,
+    ) -> bool {
+        self.permit.as_mut().is_some_and(|permit| {
+            permit.attach_redeemed_capacity_credit_proof(binding, route_request_id)
+        })
+    }
 }
 
 impl fmt::Debug for HeldSchedulerPermit {
