@@ -967,7 +967,7 @@ pub fn build_app(
                 .delete(delete_worker),
         );
 
-    // Capacity-credit issue/cancel is a separate internal service-key API.
+    // Capacity-credit capabilities/issue/arm/cancel is a separate internal service-key API.
     // It accepts only the shared gateway key, never ordinary tenant keys.
     // Tenant resolution still runs so the trusted proxy-injected user is the
     // exact same canonical TenantKey used by inference settlement.
@@ -977,12 +977,20 @@ pub fn build_app(
         {
             Router::new()
                 .route(
+                    "/internal/capacity-credits/capabilities",
+                    get(middleware::scheduler::capacity_credit_capabilities),
+                )
+                .route(
                     "/internal/capacity-credits",
                     post(middleware::scheduler::issue_capacity_credit),
                 )
                 .route(
                     "/internal/capacity-credits/{credit}",
                     delete(middleware::scheduler::cancel_capacity_credit),
+                )
+                .route(
+                    "/internal/capacity-credits/{credit}/arm",
+                    post(middleware::scheduler::arm_capacity_credit),
                 )
                 .layer(Extension(scheduler_state.clone()))
                 .route_layer(axum::middleware::from_fn_with_state(

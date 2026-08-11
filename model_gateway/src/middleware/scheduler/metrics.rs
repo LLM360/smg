@@ -67,6 +67,9 @@ pub mod outcome {
 pub mod capacity_credit_outcome {
     pub const ISSUED: &str = "issued";
     pub const IDEMPOTENT_RETRY: &str = "idempotent_retry";
+    pub const ARMED: &str = "armed";
+    pub const ARM_IDEMPOTENT_RETRY: &str = "arm_idempotent_retry";
+    pub const ARM_REJECTED: &str = "arm_rejected";
     pub const REDEEMED: &str = "redeemed";
     pub const CANCELLED: &str = "cancelled";
     pub const EXPIRED: &str = "expired";

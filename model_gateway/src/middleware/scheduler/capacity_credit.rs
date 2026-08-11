@@ -22,6 +22,7 @@ use super::{metrics as sched_metrics, SchedulerPermit};
 use crate::tenant::TenantKey;
 
 const TOKEN_BYTES: usize = 32;
+const MAX_DISPATCH_ID_BYTES: usize = 128;
 
 /// Scheduler slot held between credit issue and redemption. If the credit is
 /// cancelled or expires before backend work starts, Drop cancels the
@@ -205,12 +206,31 @@ fn checked_label(name: &'static str, value: &str) -> Result<Arc<str>, CapacityCr
     Ok(Arc::from(value))
 }
 
+fn checked_dispatch_id(value: &str) -> Result<Arc<str>, CapacityCreditError> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > MAX_DISPATCH_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(CapacityCreditError::InvalidBinding("dispatch id"));
+    }
+    Ok(Arc::from(value))
+}
+
 /// Result of issuing a new or idempotently repeated active credit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssuedCapacityCredit {
     pub token: CapacityCreditToken,
     pub expires_at: Instant,
     pub newly_issued: bool,
+}
+
+/// Result of starting, or idempotently retrying, the bounded presentation
+/// window for an active unredeemed credit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArmedCapacityCredit {
+    pub expires_at: Instant,
+    pub newly_armed: bool,
 }
 
 /// Successfully redeemed credit and its caller-owned capacity payload.
@@ -239,6 +259,8 @@ pub enum CapacityCreditError {
     Expired,
     #[error("capacity credit was already redeemed")]
     AlreadyRedeemed,
+    #[error("capacity credit was armed by another dispatch")]
+    AlreadyArmed,
     #[error("capacity credit was cancelled")]
     Cancelled,
     #[error("capacity credit registry state is inconsistent")]
@@ -257,6 +279,7 @@ enum CreditState<P> {
 struct CreditRecord<P> {
     binding: CapacityCreditBinding,
     expires_at: Instant,
+    armed_by: Option<Arc<str>>,
     terminal_until: Option<Instant>,
     state: CreditState<P>,
 }
@@ -403,6 +426,7 @@ impl<P> CapacityCreditRegistry<P> {
                     CreditRecord {
                         binding,
                         expires_at,
+                        armed_by: None,
                         terminal_until: None,
                         state: CreditState::Active(payload),
                     },
@@ -429,6 +453,132 @@ impl<P> CapacityCreditRegistry<P> {
             ),
             Err(error) => record_capacity_credit_error(&metric_partition, *error),
         }
+        result
+    }
+
+    /// Start the bounded presentation window for a matching active credit.
+    ///
+    /// The first successful call replaces the issue-time deadline with one
+    /// fresh TTL while leaving the exact payload and immutable binding in
+    /// place. Exact retries return the same deadline and cannot extend it.
+    pub fn arm(
+        &self,
+        token: &CapacityCreditToken,
+        presented: &CapacityCreditBinding,
+        dispatch_id: &str,
+    ) -> Result<ArmedCapacityCredit, CapacityCreditError> {
+        self.arm_at(token, presented, dispatch_id, Instant::now())
+    }
+
+    fn arm_at(
+        &self,
+        token: &CapacityCreditToken,
+        presented: &CapacityCreditBinding,
+        dispatch_id: &str,
+        now: Instant,
+    ) -> Result<ArmedCapacityCredit, CapacityCreditError> {
+        let metric_partition = Arc::clone(&presented.partition);
+        let dispatch_id = match checked_dispatch_id(dispatch_id) {
+            Ok(dispatch_id) => dispatch_id,
+            Err(error) => {
+                sched_metrics::record_capacity_credit_operation(
+                    &metric_partition,
+                    sched_metrics::capacity_credit_outcome::ARM_REJECTED,
+                );
+                return Err(error);
+            }
+        };
+        if presented.generation.as_ref() != self.generation.as_ref() {
+            sched_metrics::record_capacity_credit_operation(
+                &metric_partition,
+                sched_metrics::capacity_credit_outcome::ARM_REJECTED,
+            );
+            return Err(CapacityCreditError::WrongGeneration);
+        }
+
+        let (result, expired_payload, metric_partition) = {
+            let mut inner = self.inner.lock();
+            let Some(record) = inner.by_token.get_mut(token) else {
+                sched_metrics::record_capacity_credit_operation(
+                    "unknown",
+                    sched_metrics::capacity_credit_outcome::ARM_REJECTED,
+                );
+                return Err(CapacityCreditError::Unknown);
+            };
+            let metric_partition = Arc::clone(&record.binding.partition);
+            let terminal_until = now + self.terminal_retention;
+            let mut expired_payload = None;
+            let result = if record.binding == *presented {
+                match record.state {
+                    CreditState::Active(_) if now >= record.expires_at => {
+                        expired_payload =
+                            transition_terminal(record, CreditState::Expired, terminal_until);
+                        if expired_payload.is_some() {
+                            schedule_deadline(
+                                &mut inner,
+                                terminal_until,
+                                token.clone(),
+                                DeadlineKind::Terminal,
+                            );
+                        }
+                        Err(CapacityCreditError::Expired)
+                    }
+                    CreditState::Active(_)
+                        if record.armed_by.as_deref() == Some(dispatch_id.as_ref()) =>
+                    {
+                        Ok(ArmedCapacityCredit {
+                            expires_at: record.expires_at,
+                            newly_armed: false,
+                        })
+                    }
+                    CreditState::Active(_) if record.armed_by.is_some() => {
+                        Err(CapacityCreditError::AlreadyArmed)
+                    }
+                    CreditState::Active(_) => {
+                        let expires_at = now + self.ttl;
+                        record.expires_at = expires_at;
+                        record.armed_by = Some(dispatch_id);
+                        schedule_deadline(
+                            &mut inner,
+                            expires_at,
+                            token.clone(),
+                            DeadlineKind::Active,
+                        );
+                        Ok(ArmedCapacityCredit {
+                            expires_at,
+                            newly_armed: true,
+                        })
+                    }
+                    CreditState::Redeemed => Err(CapacityCreditError::AlreadyRedeemed),
+                    CreditState::Cancelled => Err(CapacityCreditError::Cancelled),
+                    CreditState::Expired => Err(CapacityCreditError::Expired),
+                }
+            } else {
+                Err(CapacityCreditError::BindingMismatch)
+            };
+            (result, expired_payload, metric_partition)
+        };
+
+        if expired_payload.is_some() {
+            sched_metrics::decrement_capacity_credit_active(&metric_partition);
+        }
+        match &result {
+            Ok(armed) if armed.newly_armed => {
+                sched_metrics::record_capacity_credit_operation(
+                    &metric_partition,
+                    sched_metrics::capacity_credit_outcome::ARMED,
+                );
+            }
+            Ok(_) => sched_metrics::record_capacity_credit_operation(
+                &metric_partition,
+                sched_metrics::capacity_credit_outcome::ARM_IDEMPOTENT_RETRY,
+            ),
+            Err(_) => sched_metrics::record_capacity_credit_operation(
+                &metric_partition,
+                sched_metrics::capacity_credit_outcome::ARM_REJECTED,
+            ),
+        }
+        drop(expired_payload);
         result
     }
 
@@ -690,7 +840,9 @@ fn record_capacity_credit_error(partition: &str, error: CapacityCreditError) {
         }
         CapacityCreditError::Expired => sched_metrics::capacity_credit_outcome::EXPIRED,
         CapacityCreditError::Cancelled => sched_metrics::capacity_credit_outcome::CANCELLED,
-        CapacityCreditError::AlreadyRedeemed => sched_metrics::capacity_credit_outcome::REPLAY,
+        CapacityCreditError::AlreadyRedeemed | CapacityCreditError::AlreadyArmed => {
+            sched_metrics::capacity_credit_outcome::REPLAY
+        }
         CapacityCreditError::NoCapacity => sched_metrics::capacity_credit_outcome::NO_CAPACITY,
         CapacityCreditError::InternalState => sched_metrics::capacity_credit_outcome::UNKNOWN,
     };
@@ -866,6 +1018,193 @@ mod tests {
             .map(|thread| usize::from(thread.join().unwrap()))
             .sum::<usize>();
         assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn arm_resets_the_deadline_once_and_preserves_the_exact_payload() {
+        let registry = registry();
+        let start = Instant::now();
+        let expected = binding("request-1");
+        let issued = registry
+            .issue_at(expected.clone(), "held-permit", start)
+            .unwrap();
+        assert_eq!(issued.expires_at, start + Duration::from_secs(2));
+
+        let armed = registry
+            .arm_at(
+                &issued.token,
+                &expected,
+                "dispatch-1",
+                start + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(armed.newly_armed);
+        assert_eq!(armed.expires_at, start + Duration::from_secs(3));
+
+        let repeated = registry
+            .arm_at(
+                &issued.token,
+                &expected,
+                "dispatch-1",
+                start + Duration::from_millis(1_500),
+            )
+            .unwrap();
+        assert!(!repeated.newly_armed);
+        assert_eq!(repeated.expires_at, armed.expires_at);
+        assert_eq!(registry.maintain_at(start + Duration::from_secs(2)), 0);
+
+        let redeemed = registry
+            .redeem_at(
+                &issued.token,
+                &expected,
+                start + Duration::from_millis(2_500),
+            )
+            .unwrap();
+        assert_eq!(redeemed.payload, "held-permit");
+    }
+
+    #[test]
+    fn concurrent_arm_calls_have_one_transition_and_one_fixed_deadline() {
+        let registry = Arc::new(registry());
+        let expected = binding("request-1");
+        let issued = registry.issue(expected.clone(), "held-permit").unwrap();
+        let results = (0..16)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let token = issued.token.clone();
+                let expected = expected.clone();
+                std::thread::spawn(move || registry.arm(&token, &expected, "dispatch-1").unwrap())
+            })
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results.iter().filter(|result| result.newly_armed).count(),
+            1
+        );
+        assert!(results
+            .iter()
+            .all(|result| result.expires_at == results[0].expires_at));
+        let redeemed = registry.redeem(&issued.token, &expected).unwrap();
+        assert_eq!(redeemed.payload, "held-permit");
+    }
+
+    #[test]
+    fn concurrent_different_dispatches_have_one_winner_and_conflict_losers() {
+        let registry = Arc::new(registry());
+        let expected = binding("request-1");
+        let issued = registry.issue(expected.clone(), "held-permit").unwrap();
+        let results = (0..16)
+            .map(|index| {
+                let registry = Arc::clone(&registry);
+                let token = issued.token.clone();
+                let expected = expected.clone();
+                std::thread::spawn(move || {
+                    registry.arm(&token, &expected, &format!("dispatch-{index}"))
+                })
+            })
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| { matches!(result, Err(CapacityCreditError::AlreadyArmed)) })
+                .count(),
+            15
+        );
+        let redeemed = registry.redeem(&issued.token, &expected).unwrap();
+        assert_eq!(redeemed.payload, "held-permit");
+    }
+
+    #[test]
+    fn arm_fails_closed_for_wrong_binding_and_terminal_states() {
+        let registry = registry();
+        let start = Instant::now();
+
+        let expected = binding("binding");
+        let issued = registry.issue_at(expected.clone(), (), start).unwrap();
+        assert_eq!(
+            registry.arm_at(
+                &CapacityCreditToken::random(),
+                &expected,
+                "dispatch-1",
+                start,
+            ),
+            Err(CapacityCreditError::Unknown)
+        );
+        assert_eq!(
+            registry.arm_at(&issued.token, &expected, "", start),
+            Err(CapacityCreditError::InvalidBinding("dispatch id"))
+        );
+        assert_eq!(
+            registry.arm_at(&issued.token, &expected, &"x".repeat(129), start),
+            Err(CapacityCreditError::InvalidBinding("dispatch id"))
+        );
+        let mut wrong_generation = expected.clone();
+        wrong_generation.generation = Arc::from("blue-1");
+        assert_eq!(
+            registry.arm_at(&issued.token, &wrong_generation, "dispatch-1", start),
+            Err(CapacityCreditError::WrongGeneration)
+        );
+        let mut mismatch = expected.clone();
+        mismatch.estimated_output_tokens += 1;
+        assert_eq!(
+            registry.arm_at(&issued.token, &mismatch, "dispatch-1", start),
+            Err(CapacityCreditError::BindingMismatch)
+        );
+        assert!(registry
+            .arm_at(&issued.token, &expected, "dispatch-1", start)
+            .is_ok());
+        registry.redeem_at(&issued.token, &expected, start).unwrap();
+
+        let cancelled_binding = binding("cancelled");
+        let cancelled = registry
+            .issue_at(cancelled_binding.clone(), (), start)
+            .unwrap();
+        assert!(registry.cancel_at(&cancelled.token, start));
+        assert_eq!(
+            registry.arm_at(
+                &cancelled.token,
+                &cancelled_binding,
+                "dispatch-1",
+                start + Duration::from_secs(2),
+            ),
+            Err(CapacityCreditError::Cancelled)
+        );
+
+        let redeemed_binding = binding("redeemed");
+        let redeemed = registry
+            .issue_at(redeemed_binding.clone(), (), start)
+            .unwrap();
+        registry
+            .redeem_at(&redeemed.token, &redeemed_binding, start)
+            .unwrap();
+        assert_eq!(
+            registry.arm_at(
+                &redeemed.token,
+                &redeemed_binding,
+                "dispatch-1",
+                start + Duration::from_secs(2),
+            ),
+            Err(CapacityCreditError::AlreadyRedeemed)
+        );
+
+        let expired_binding = binding("expired");
+        let expired = registry
+            .issue_at(expired_binding.clone(), (), start)
+            .unwrap();
+        assert_eq!(
+            registry.arm_at(
+                &expired.token,
+                &expired_binding,
+                "dispatch-1",
+                start + Duration::from_secs(2),
+            ),
+            Err(CapacityCreditError::Expired)
+        );
+        assert_eq!(registry.active_len(), 0);
     }
 
     struct DropProbe {
