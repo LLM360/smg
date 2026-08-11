@@ -28,7 +28,7 @@ use super::{
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
     multimodal::MultimodalComponents,
-    pipeline::{Endpoint, PipelineDeps, RequestPipeline},
+    pipeline::{ChatInvocation, Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
 };
 use crate::{
@@ -527,7 +527,14 @@ impl GrpcRouter {
                 let tenant_meta = tenant_meta_cloned.clone();
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components, Some(tenant_meta))
+                        .execute_chat(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            ChatInvocation::Direct,
+                        )
                         .await
                 }
             },

@@ -60,6 +60,7 @@ use crate::{
                 streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter},
                 ResponsesContext,
             },
+            pipeline::ChatInvocation,
             utils,
         },
     },
@@ -94,6 +95,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             params.model_id,
             ctx.components.clone(),
             Some(params.tenant_request_meta),
+            ChatInvocation::ResponsesInternal,
         )
         .await;
 
@@ -582,6 +584,7 @@ async fn execute_tool_loop_streaming_internal(
                 params.model_id.clone(),
                 ctx.components.clone(),
                 Some(params.tenant_request_meta.clone()),
+                ChatInvocation::ResponsesInternal,
             )
             .await;
 
