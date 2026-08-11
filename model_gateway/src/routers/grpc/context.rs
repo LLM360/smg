@@ -60,6 +60,20 @@ pub(crate) struct RequestInput {
     /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
     pub tenant_request_meta: Option<TenantRequestMeta>,
+    /// Trusted pipeline-derived scope for the streaming distribution-seed path.
+    /// Protocol shape alone cannot distinguish direct Chat Completions from
+    /// internal Responses iterations or Harmony chat requests.
+    pub streaming_distribution_seed_scope: StreamingDistributionSeedScope,
+}
+
+/// Only a direct scalar streaming request through the Regular Chat Completions
+/// pipeline may use the streaming distribution-seed lifecycle. All other
+/// request construction paths default to `Ineligible`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum StreamingDistributionSeedScope {
+    #[default]
+    Ineligible,
+    DirectRegularChat,
 }
 
 /// Request type variants
@@ -517,6 +531,16 @@ pub(crate) struct DispatchMetadata {
 
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
+#[cfg(test)]
+pub(crate) struct TestLoadGuardsDropProbe(Arc<AtomicBool>);
+
+#[cfg(test)]
+impl Drop for TestLoadGuardsDropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
@@ -540,7 +564,10 @@ pub(crate) enum LoadGuards {
     /// Production construction still requires the real scheduler proof, policy
     /// reservation, and adaptive headroom lease.
     #[cfg(test)]
-    TestDistributionSeed { committed: Arc<AtomicBool> },
+    TestDistributionSeed {
+        committed: Arc<AtomicBool>,
+        _drop_probe: Option<TestLoadGuardsDropProbe>,
+    },
 }
 
 impl LoadGuards {
@@ -572,7 +599,7 @@ impl LoadGuards {
             }
             Self::Disaggregated { .. } => {}
             #[cfg(test)]
-            Self::TestDistributionSeed { committed } => {
+            Self::TestDistributionSeed { committed, .. } => {
                 committed.store(true, Ordering::Release);
             }
         }
@@ -580,7 +607,21 @@ impl LoadGuards {
 
     #[cfg(test)]
     pub(crate) fn test_distribution_seed(committed: Arc<AtomicBool>) -> Self {
-        Self::TestDistributionSeed { committed }
+        Self::TestDistributionSeed {
+            committed,
+            _drop_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_distribution_seed_lifecycle(
+        committed: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    ) -> Self {
+        Self::TestDistributionSeed {
+            committed,
+            _drop_probe: Some(TestLoadGuardsDropProbe(dropped)),
+        }
     }
 
     pub fn new(
@@ -681,6 +722,7 @@ impl RequestContext {
                 headers,
                 model_id,
                 tenant_request_meta: None,
+                streaming_distribution_seed_scope: StreamingDistributionSeedScope::Ineligible,
             },
             components,
             state: ProcessingState::default(),
@@ -693,8 +735,11 @@ impl RequestContext {
         headers: Option<HeaderMap>,
         model_id: String,
         components: Arc<SharedComponents>,
+        streaming_distribution_seed_scope: StreamingDistributionSeedScope,
     ) -> Self {
-        Self::new(RequestType::Chat(request), headers, model_id, components)
+        let mut ctx = Self::new(RequestType::Chat(request), headers, model_id, components);
+        ctx.input.streaming_distribution_seed_scope = streaming_distribution_seed_scope;
+        ctx
     }
 
     /// Create context for generate request

@@ -69,6 +69,29 @@ pub(crate) enum Endpoint {
     Classify,
 }
 
+/// Trusted origin of a chat-shaped pipeline invocation. The Responses API
+/// internally converts its iterations into Chat requests, so request shape is
+/// not sufficient to authorize the streaming distribution-seed path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatInvocation {
+    Direct,
+    ResponsesInternal,
+}
+
+impl ChatInvocation {
+    fn streaming_distribution_seed_scope(
+        self,
+        endpoint: Endpoint,
+        mode: Mode,
+    ) -> StreamingDistributionSeedScope {
+        if self == Self::Direct && endpoint == Endpoint::Chat && mode == Mode::Regular {
+            StreamingDistributionSeedScope::DirectRegularChat
+        } else {
+            StreamingDistributionSeedScope::Ineligible
+        }
+    }
+}
+
 /// Construction dependencies shared by every endpoint pipeline.
 ///
 /// The parser factories/overrides are consumed only by the chat/messages/harmony
@@ -193,6 +216,8 @@ pub(crate) struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
+    endpoint: Endpoint,
+    mode: Mode,
 }
 
 impl RequestPipeline {
@@ -413,6 +438,8 @@ impl RequestPipeline {
         Some(Self {
             stages: Arc::new(stages),
             backend_type: backend,
+            endpoint,
+            mode,
         })
     }
 
@@ -424,10 +451,17 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        invocation: ChatInvocation,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_chat(
+            request,
+            headers,
+            model_id,
+            components,
+            invocation.streaming_distribution_seed_scope(self.endpoint, self.mode),
+        );
         ctx.input.tenant_request_meta = tenant_request_meta;
         let model = ctx.input.model_id.clone();
 
@@ -997,7 +1031,13 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<ChatCompletionResponse, Response> {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_chat(
+            request,
+            headers,
+            model_id,
+            components,
+            StreamingDistributionSeedScope::Ineligible,
+        );
         ctx.input.tenant_request_meta = tenant_request_meta;
 
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1217,6 +1257,55 @@ impl RequestPipeline {
 mod build_parity_tests {
     use super::*;
     use crate::routers::grpc::mode::Mode;
+
+    #[test]
+    fn streaming_seed_scope_requires_direct_regular_chat_pipeline() {
+        let cases = [
+            (
+                "direct Regular Chat Completions",
+                ChatInvocation::Direct,
+                Endpoint::Chat,
+                Mode::Regular,
+                StreamingDistributionSeedScope::DirectRegularChat,
+            ),
+            (
+                "internal Regular Responses iteration",
+                ChatInvocation::ResponsesInternal,
+                Endpoint::Chat,
+                Mode::Regular,
+                StreamingDistributionSeedScope::Ineligible,
+            ),
+            (
+                "direct Harmony Chat",
+                ChatInvocation::Direct,
+                Endpoint::Harmony,
+                Mode::Regular,
+                StreamingDistributionSeedScope::Ineligible,
+            ),
+            (
+                "direct PD Chat",
+                ChatInvocation::Direct,
+                Endpoint::Chat,
+                Mode::PrefillDecode,
+                StreamingDistributionSeedScope::Ineligible,
+            ),
+            (
+                "direct EPD Chat",
+                ChatInvocation::Direct,
+                Endpoint::Chat,
+                Mode::EncodePrefillDecode,
+                StreamingDistributionSeedScope::Ineligible,
+            ),
+        ];
+
+        for (name, invocation, endpoint, mode, expected) in cases {
+            assert_eq!(
+                invocation.streaming_distribution_seed_scope(endpoint, mode),
+                expected,
+                "{name}"
+            );
+        }
+    }
 
     fn sigs(p: &RequestPipeline) -> Vec<String> {
         p.stages.iter().map(|s| s.signature()).collect()

@@ -18,7 +18,10 @@ use crate::{
                 PredictionFeatures, FLAG_MULTIPLE_COMPLETIONS, FLAG_REASONING, FLAG_STREAMING,
                 FLAG_STRUCTURED_OUTPUT, FLAG_TOOLS,
             },
-            context::{PendingDistributionSeed, RequestContext, RequestType},
+            context::{
+                PendingDistributionSeed, RequestContext, RequestType,
+                StreamingDistributionSeedScope,
+            },
         },
     },
 };
@@ -167,8 +170,14 @@ impl GenerationShape {
 fn is_single_distribution_seed_sample(
     shape: GenerationShape,
     backend_request_count: usize,
+    streaming_scope: StreamingDistributionSeedScope,
 ) -> bool {
-    backend_request_count == 1 && shape.flags & (FLAG_MULTIPLE_COMPLETIONS | FLAG_STREAMING) == 0
+    if backend_request_count != 1 || shape.flags & FLAG_MULTIPLE_COMPLETIONS != 0 {
+        return false;
+    }
+    shape.flags & FLAG_STREAMING == 0
+        || (shape.endpoint == "chat"
+            && streaming_scope == StreamingDistributionSeedScope::DirectRegularChat)
 }
 
 fn multiplied_limit(per_completion: Option<u32>, multiplicity: u32) -> Option<u32> {
@@ -243,7 +252,11 @@ impl PipelineStage for AdaptiveAdmissionStage {
                     tracker.rejection_reason(),
                     Some("engine_waiting" | "running_limit")
                 ) && ctx.state.preparation.as_ref().is_some_and(|preparation| {
-                    is_single_distribution_seed_sample(shape, preparation.backend_request_count())
+                    is_single_distribution_seed_sample(
+                        shape,
+                        preparation.backend_request_count(),
+                        ctx.input.streaming_distribution_seed_scope,
+                    )
                 }) && ctx
                     .input
                     .tenant_request_meta
@@ -316,12 +329,12 @@ mod tests {
     }
 
     #[test]
-    fn only_scalar_generation_can_enter_distribution_seed_path() {
+    fn scalar_generation_and_scalar_streaming_chat_can_enter_distribution_seed_path() {
         let mut streaming_chat = chat_shape(1);
         streaming_chat.flags |= FLAG_STREAMING;
         let cases = [
             ("scalar chat", chat_shape(1), 1, true),
-            ("streaming chat", streaming_chat, 1, false),
+            ("streaming chat", streaming_chat, 1, true),
             ("chat n", chat_shape(2), 1, false),
             ("generate n", generate_shape(2), 1, false),
             ("completion n", completion_shape(Some(2), None), 1, false),
@@ -341,7 +354,11 @@ mod tests {
 
         for (name, shape, backend_request_count, expected) in cases {
             assert_eq!(
-                is_single_distribution_seed_sample(shape, backend_request_count),
+                is_single_distribution_seed_sample(
+                    shape,
+                    backend_request_count,
+                    StreamingDistributionSeedScope::DirectRegularChat,
+                ),
                 expected,
                 "{name}"
             );
@@ -349,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn every_streaming_generation_endpoint_is_excluded_from_distribution_seeding() {
+    fn only_openai_chat_streaming_can_enter_distribution_seeding() {
         let requests = [
             RequestType::Chat(Arc::new(ChatCompletionRequest {
                 stream: true,
@@ -390,15 +407,63 @@ mod tests {
             )),
         ];
 
-        for request in requests {
+        for (index, request) in requests.into_iter().enumerate() {
             let shape = GenerationShape::for_request(&request).unwrap();
             assert_ne!(shape.flags & FLAG_STREAMING, 0, "{}", shape.endpoint);
-            assert!(
-                !is_single_distribution_seed_sample(shape, 1),
-                "{} streaming request reached the seed path",
+            assert_eq!(
+                is_single_distribution_seed_sample(
+                    shape,
+                    1,
+                    StreamingDistributionSeedScope::DirectRegularChat,
+                ),
+                index == 0,
+                "unexpected streaming seed eligibility for {}",
                 shape.endpoint
             );
         }
+    }
+
+    #[test]
+    fn streaming_chat_fanout_remains_excluded() {
+        let mut shape = chat_shape(2);
+        shape.flags |= FLAG_STREAMING;
+
+        assert!(!is_single_distribution_seed_sample(
+            shape,
+            1,
+            StreamingDistributionSeedScope::DirectRegularChat,
+        ));
+        let mut scalar = chat_shape(1);
+        scalar.flags |= FLAG_STREAMING;
+        assert!(!is_single_distribution_seed_sample(
+            scalar,
+            2,
+            StreamingDistributionSeedScope::DirectRegularChat,
+        ));
+    }
+
+    #[test]
+    fn streaming_chat_requires_direct_regular_chat_scope() {
+        let mut streaming_chat = chat_shape(1);
+        streaming_chat.flags |= FLAG_STREAMING;
+
+        assert!(is_single_distribution_seed_sample(
+            streaming_chat,
+            1,
+            StreamingDistributionSeedScope::DirectRegularChat,
+        ));
+        assert!(!is_single_distribution_seed_sample(
+            streaming_chat,
+            1,
+            StreamingDistributionSeedScope::Ineligible,
+        ));
+
+        let non_streaming_chat = chat_shape(1);
+        assert!(is_single_distribution_seed_sample(
+            non_streaming_chat,
+            1,
+            StreamingDistributionSeedScope::Ineligible,
+        ));
     }
 
     #[test]

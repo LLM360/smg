@@ -5,11 +5,16 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
-    sync::Arc,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
     time::Instant,
 };
 
-use axum::response::Response;
+use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use futures::future::try_join_all;
 use llm_tokenizer::{
@@ -47,7 +52,130 @@ use crate::{
             utils::message_utils,
         },
     },
+    worker::AttachedBody,
 };
+
+/// Result of fully processing one Chat Completions backend stream.
+///
+/// A clean transport EOF is not enough to commit a distribution seed. The
+/// backend must also have emitted its terminal `Complete` frame.
+struct ChatStreamOutcome {
+    completion_tokens: u32,
+    saw_backend_complete: bool,
+}
+
+/// Producer-only half of the streaming distribution-seed success witness.
+///
+/// This type and its mutator remain private to this module. The spawned stream
+/// producer may set it only after clean processing and a successful terminal
+/// `[DONE]` enqueue. The response body owns the read-only half.
+struct StreamingSeedProducerWitness {
+    complete: Arc<AtomicBool>,
+}
+
+struct StreamingSeedBodyWitness {
+    complete: Arc<AtomicBool>,
+}
+
+fn streaming_seed_witness_pair() -> (StreamingSeedProducerWitness, StreamingSeedBodyWitness) {
+    let complete = Arc::new(AtomicBool::new(false));
+    (
+        StreamingSeedProducerWitness {
+            complete: Arc::clone(&complete),
+        },
+        StreamingSeedBodyWitness { complete },
+    )
+}
+
+impl StreamingSeedProducerWitness {
+    fn mark_complete(self) {
+        self.complete.store(true, Ordering::Release);
+    }
+}
+
+impl StreamingSeedBodyWitness {
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+}
+
+/// Holds the real non-cloneable request guards until the client drains the SSE
+/// body. A seed succeeds only when the producer witness is set and the body is
+/// polled to a clean EOF. Every other path drops the guards uncommitted, which
+/// preserves the existing failure quarantine and headroom release behavior.
+struct StreamingDistributionSeedBody {
+    inner: Body,
+    load_guards: Option<context::LoadGuards>,
+    producer: StreamingSeedBodyWitness,
+}
+
+impl StreamingDistributionSeedBody {
+    fn wrap_response(
+        response: Response,
+        load_guards: context::LoadGuards,
+        producer: StreamingSeedBodyWitness,
+    ) -> Response {
+        debug_assert!(load_guards.has_distribution_seed());
+        let (parts, inner) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(Self {
+                inner,
+                load_guards: Some(load_guards),
+                producer,
+            }),
+        )
+    }
+
+    fn release_uncommitted(&mut self) {
+        drop(self.load_guards.take());
+    }
+}
+
+impl http_body::Body for StreamingDistributionSeedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                if this.producer.is_complete() {
+                    if let Some(guards) = this.load_guards.as_mut() {
+                        guards.commit_distribution_seed_success();
+                    }
+                }
+                this.release_uncommitted();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.release_uncommitted();
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // Keep the wrapper visibly open until `poll_frame(None)` performs the
+        // terminal commit decision. Hyper may otherwise observe the inner body
+        // as ended immediately after its final data frame and skip that poll.
+        self.load_guards.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if self.load_guards.is_some() {
+            // Do not expose the inner body's exact-zero hint before the clean
+            // EOF poll that settles the seed lifecycle.
+            http_body::SizeHint::default()
+        } else {
+            self.inner.size_hint()
+        }
+    }
+}
 
 /// One backend stream of a `/v1/completions` request. Batched requests fan
 /// out into several, each remapped by a prompt-major choice-index offset.
@@ -112,8 +240,12 @@ impl StreamingProcessor {
     /// - Background task spawning
     /// - SSE response building
     ///
-    /// Note: Caller should attach load guards to the returned response using
-    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
+    /// The supplied load guards are attached to the returned response. Seed
+    /// guards use the stricter producer-witness plus clean-body-EOF lifecycle.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps stream inputs, adaptive tracking, and request-lifetime guards explicit"
+    )]
     pub fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -122,10 +254,8 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
         adaptive_request: Option<AdaptiveRequestTracker>,
+        load_guards: Option<context::LoadGuards>,
     ) -> Response {
-        use bytes::Bytes;
-        use tokio::sync::mpsc;
-
         let stop_params = (
             chat_request.stop.clone(),
             chat_request.stop_token_ids.clone(),
@@ -136,6 +266,15 @@ impl StreamingProcessor {
 
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let has_distribution_seed = load_guards
+            .as_ref()
+            .is_some_and(context::LoadGuards::has_distribution_seed);
+        let (mut producer_witness, body_witness) = if has_distribution_seed {
+            let (producer, body) = streaming_seed_witness_pair();
+            (Some(producer), Some(body))
+        } else {
+            (None, None)
+        };
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -158,17 +297,12 @@ impl StreamingProcessor {
                             &tx,
                         )
                         .await;
-
-                    match result {
-                        Ok(tokens) => {
-                            if let Some(tracker) = adaptive_request {
-                                tracker.complete(tokens);
-                            }
-                        }
-                        Err(e) => utils::send_error_sse(&tx, &e, "internal_error"),
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    Self::finish_chat_stream(
+                        result,
+                        adaptive_request,
+                        &tx,
+                        producer_witness.take(),
+                    );
                 });
             }
             context::ExecutionResult::PrefillDecode {
@@ -195,17 +329,12 @@ impl StreamingProcessor {
                             pd_timing,
                         )
                         .await;
-
-                    match result {
-                        Ok(tokens) => {
-                            if let Some(tracker) = adaptive_request {
-                                tracker.complete(tokens);
-                            }
-                        }
-                        Err(e) => utils::send_error_sse(&tx, &e, "internal_error"),
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    Self::finish_chat_stream(
+                        result,
+                        adaptive_request,
+                        &tx,
+                        producer_witness.take(),
+                    );
                 });
             }
             context::ExecutionResult::Embedding { .. } => {
@@ -227,12 +356,48 @@ impl StreamingProcessor {
             }
         }
 
-        // Return SSE response
-        build_sse_response(rx)
+        let response = build_sse_response(rx);
+        match (load_guards, body_witness) {
+            (Some(guards), Some(witness)) => {
+                StreamingDistributionSeedBody::wrap_response(response, guards, witness)
+            }
+            (Some(guards), None) => AttachedBody::wrap_response(response, guards),
+            (None, None) => response,
+            (None, Some(_)) => {
+                debug_assert!(false, "streaming seed witness requires request load guards");
+                response
+            }
+        }
+    }
+
+    fn finish_chat_stream(
+        result: Result<ChatStreamOutcome, String>,
+        adaptive_request: Option<AdaptiveRequestTracker>,
+        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        producer_witness: Option<StreamingSeedProducerWitness>,
+    ) {
+        let saw_backend_complete = match result {
+            Ok(outcome) => {
+                if let Some(tracker) = adaptive_request {
+                    tracker.complete(outcome.completion_tokens);
+                }
+                outcome.saw_backend_complete
+            }
+            Err(error) => {
+                utils::send_error_sse(tx, &error, "internal_error");
+                false
+            }
+        };
+        let done_queued = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).is_ok();
+        if saw_backend_complete && done_queued {
+            if let Some(witness) = producer_witness {
+                witness.mark_complete();
+            }
+        }
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
-    pub async fn process_streaming_chunks(
+    async fn process_streaming_chunks(
         &self,
         grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
@@ -240,7 +405,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<u32, String> {
+    ) -> Result<ChatStreamOutcome, String> {
         self.process_streaming_chunks_inner(
             grpc_stream,
             dispatch,
@@ -266,7 +431,7 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: Option<context::PdTiming>,
-    ) -> Result<u32, String> {
+    ) -> Result<ChatStreamOutcome, String> {
         // Metrics timing
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -691,12 +856,15 @@ impl StreamingProcessor {
             output_tokens: total_completion as u64,
         });
 
-        Ok(total_completion)
+        Ok(ChatStreamOutcome {
+            completion_tokens: total_completion,
+            saw_backend_complete: !finish_reasons.is_empty(),
+        })
     }
 
     /// Process prefill/decode streaming chunks (prefill + decode) - PD mode
     #[expect(clippy::too_many_arguments)]
-    pub async fn process_prefill_decode_streaming_chunks(
+    async fn process_prefill_decode_streaming_chunks(
         &self,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -706,7 +874,7 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: context::PdTiming,
-    ) -> Result<u32, String> {
+    ) -> Result<ChatStreamOutcome, String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
         if original_request.logprobs {
             while let Some(response) = prefill_stream.next().await {
@@ -2975,7 +3143,10 @@ impl StreamingProcessor {
 
 #[cfg(test)]
 mod tests {
+    use http_body_util::BodyExt;
+
     use super::*;
+    use crate::routers::grpc::context::LoadGuards;
 
     #[test]
     fn completion_streaming_usage_includes_reasoning_tokens() {
@@ -2998,5 +3169,157 @@ mod tests {
                 .and_then(|details| details.reasoning_tokens),
             Some(3)
         );
+    }
+
+    fn lifecycle_guards() -> (LoadGuards, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let committed = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        (
+            LoadGuards::test_distribution_seed_lifecycle(
+                Arc::clone(&committed),
+                Arc::clone(&dropped),
+            ),
+            committed,
+            dropped,
+        )
+    }
+
+    #[tokio::test]
+    async fn clean_body_eof_with_producer_witness_commits_and_releases_seed_lease() {
+        let (producer, witness) = streaming_seed_witness_pair();
+        let (guards, committed, dropped) = lifecycle_guards();
+        let response = StreamingDistributionSeedBody::wrap_response(
+            Response::new(Body::from("data: final\n\n")),
+            guards,
+            witness,
+        );
+        let mut body = response.into_body();
+
+        assert!(body.frame().await.unwrap().unwrap().is_data());
+        assert!(!committed.load(Ordering::Acquire));
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(
+            !http_body::Body::is_end_stream(&body),
+            "the wrapper must force a clean EOF poll after the final data frame"
+        );
+        assert!(http_body::Body::size_hint(&body).upper().is_none());
+
+        producer.mark_complete();
+        assert!(body.frame().await.is_none());
+        assert!(committed.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(http_body::Body::is_end_stream(&body));
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_releases_seed_lease_without_commit() {
+        let (producer, witness) = streaming_seed_witness_pair();
+        let (guards, committed, dropped) = lifecycle_guards();
+        let response = StreamingDistributionSeedBody::wrap_response(
+            Response::new(Body::from("data: final\n\n")),
+            guards,
+            witness,
+        );
+
+        producer.mark_complete();
+        drop(response);
+
+        assert!(!committed.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn missing_complete_and_body_error_release_without_commit() {
+        let (_producer, witness) = streaming_seed_witness_pair();
+        let (guards, committed, dropped) = lifecycle_guards();
+        let response = StreamingDistributionSeedBody::wrap_response(
+            Response::new(Body::from("data: [DONE]\n\n")),
+            guards,
+            witness,
+        );
+        response.into_body().collect().await.unwrap();
+        assert!(!committed.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+
+        let (producer, witness) = streaming_seed_witness_pair();
+        let (guards, committed, dropped) = lifecycle_guards();
+        let stream =
+            futures::stream::iter([Err::<Bytes, io::Error>(io::Error::other("body failed"))]);
+        let response = StreamingDistributionSeedBody::wrap_response(
+            Response::new(Body::from_stream(stream)),
+            guards,
+            witness,
+        );
+        producer.mark_complete();
+        let mut body = response.into_body();
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(!committed.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(body.frame().await.is_none());
+        assert!(!committed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn producer_witness_requires_backend_complete_and_done_enqueue() {
+        let (producer, witness) = streaming_seed_witness_pair();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        StreamingProcessor::finish_chat_stream(
+            Ok(ChatStreamOutcome {
+                completion_tokens: 7,
+                saw_backend_complete: true,
+            }),
+            None,
+            &tx,
+            Some(producer),
+        );
+        assert!(
+            !witness.is_complete(),
+            "failed DONE enqueue must fail closed"
+        );
+
+        let (producer, witness) = streaming_seed_witness_pair();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        StreamingProcessor::finish_chat_stream(
+            Ok(ChatStreamOutcome {
+                completion_tokens: 7,
+                saw_backend_complete: false,
+            }),
+            None,
+            &tx,
+            Some(producer),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap(),
+            Bytes::from("data: [DONE]\n\n")
+        );
+        assert!(!witness.is_complete(), "missing Complete must fail closed");
+
+        let (producer, witness) = streaming_seed_witness_pair();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        StreamingProcessor::finish_chat_stream(
+            Err("processing failed".to_string()),
+            None,
+            &tx,
+            Some(producer),
+        );
+        assert!(!witness.is_complete(), "processing errors must fail closed");
+
+        let (producer, witness) = streaming_seed_witness_pair();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        StreamingProcessor::finish_chat_stream(
+            Ok(ChatStreamOutcome {
+                completion_tokens: 7,
+                saw_backend_complete: true,
+            }),
+            None,
+            &tx,
+            Some(producer),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap(),
+            Bytes::from("data: [DONE]\n\n")
+        );
+        assert!(witness.is_complete());
     }
 }
