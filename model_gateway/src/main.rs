@@ -631,6 +631,21 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.02, help_heading = "Adaptive Admission")]
     adaptive_admission_feedback_throughput_improvement_ratio: f64,
 
+    /// Exact admission partitions allowed to expose clean-worker distribution
+    /// headroom. Empty by default.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        help_heading = "Adaptive Admission"
+    )]
+    adaptive_admission_distribution_headroom_partitions: Vec<String>,
+
+    /// Hard process-local active seed-lease cap per allowlisted partition.
+    /// Zero disables distribution headroom.
+    #[arg(long, default_value_t = 0, help_heading = "Adaptive Admission")]
+    adaptive_admission_distribution_headroom_partition_seed_cap: u32,
+
     // ==================== Tenant Rate Limit ====================
     /// Enable per-tenant LLM token/request rate limiting. When unset
     /// (default), no rate limiter is constructed.
@@ -1654,6 +1669,11 @@ impl CliArgs {
                 feedback_max_token_usage: self.adaptive_admission_feedback_max_token_usage,
                 feedback_throughput_improvement_ratio: self
                     .adaptive_admission_feedback_throughput_improvement_ratio,
+                distribution_headroom_partitions: self
+                    .adaptive_admission_distribution_headroom_partitions
+                    .clone(),
+                distribution_headroom_partition_seed_cap: self
+                    .adaptive_admission_distribution_headroom_partition_seed_cap,
             })
             .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
@@ -2027,7 +2047,7 @@ mod tests {
     fn engine_feedback_admission_options_flow_into_router_config() {
         let cli = cli_args_from(&[
             "--adaptive-admission-mode",
-            "shadow",
+            "enforce",
             "--adaptive-admission-strategy",
             "engine-feedback",
             "--adaptive-admission-feedback-probe-requests-per-healthy-replica",
@@ -2038,11 +2058,15 @@ mod tests {
             "0.85",
             "--adaptive-admission-feedback-throughput-improvement-ratio",
             "0.03",
+            "--adaptive-admission-distribution-headroom-partitions",
+            "k3-prod,k3-canary",
+            "--adaptive-admission-distribution-headroom-partition-seed-cap",
+            "2",
         ]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         let adaptive = router_config.adaptive_admission;
-        assert_eq!(adaptive.mode, AdaptiveAdmissionMode::Shadow);
+        assert_eq!(adaptive.mode, AdaptiveAdmissionMode::Enforce);
         assert_eq!(adaptive.strategy, AdaptiveAdmissionStrategy::EngineFeedback);
         assert_eq!(adaptive.feedback_probe_requests_per_healthy_replica, 3);
         assert_eq!(
@@ -2051,6 +2075,11 @@ mod tests {
         );
         assert_eq!(adaptive.feedback_max_token_usage, 0.85);
         assert_eq!(adaptive.feedback_throughput_improvement_ratio, 0.03);
+        assert_eq!(
+            adaptive.distribution_headroom_partitions,
+            ["k3-prod", "k3-canary"]
+        );
+        assert_eq!(adaptive.distribution_headroom_partition_seed_cap, 2);
     }
 
     /// The multimodal transport flags must reach both `RouterConfig` and the

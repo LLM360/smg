@@ -7,7 +7,7 @@ use axum::response::Response;
 use futures::future::{join_all, try_join_all};
 use tracing::{debug, error, info_span, Instrument};
 
-use super::PipelineStage;
+use super::{adaptive_admission::rejection_response, PipelineStage};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
@@ -130,6 +130,11 @@ impl RequestExecutionStage {
 #[async_trait]
 impl PipelineStage for RequestExecutionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+        if let Some(seed) = ctx.state.distribution_seed_guard.as_ref() {
+            if !seed.headroom.verify() {
+                return Err(rejection_response(seed.retry_after_secs));
+            }
+        }
         let execution_plan = ctx.state.execution_plan.take().ok_or_else(|| {
             error!(
                 function = "RequestExecutionStage::execute",
@@ -172,12 +177,18 @@ impl PipelineStage for RequestExecutionStage {
             _ => 1,
         };
         let policy_reservation = ctx.state.policy_reservation.take();
+        let distribution_seed = ctx.state.distribution_seed_guard.take();
         ctx.state.load_guards = Some(LoadGuards::scaled(
             workers,
             ctx.input.headers.as_ref(),
             sub_requests,
             policy_reservation,
+            distribution_seed,
         ));
+        // `LoadGuards::scaled` has now incremented the selected worker's live
+        // load. Releasing the exact predispatch claim after that handoff makes
+        // the ordinary-selection-to-seed-acquisition transition gap-free.
+        drop(ctx.state.ordinary_distribution_guard.take());
 
         // Extract dispatch metadata for tracing span
         let dispatch = ctx.state.dispatch.as_ref();

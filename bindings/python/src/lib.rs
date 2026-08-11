@@ -516,6 +516,8 @@ struct Router {
     capacity_credit_terminal_retention_secs: u64,
     capacity_credit_required: bool,
     priority_scheduler_adaptive_capacity: bool,
+    adaptive_admission_distribution_headroom_partitions: Vec<String>,
+    adaptive_admission_distribution_headroom_partition_seed_cap: u32,
 }
 
 impl Router {
@@ -831,6 +833,11 @@ impl Router {
                 feedback_max_token_usage: self.adaptive_admission_feedback_max_token_usage,
                 feedback_throughput_improvement_ratio: self
                     .adaptive_admission_feedback_throughput_improvement_ratio,
+                distribution_headroom_partitions: self
+                    .adaptive_admission_distribution_headroom_partitions
+                    .clone(),
+                distribution_headroom_partition_seed_cap: self
+                    .adaptive_admission_distribution_headroom_partition_seed_cap,
             })
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
@@ -1070,6 +1077,8 @@ impl Router {
         capacity_credit_terminal_retention_secs = 600,
         capacity_credit_required = false,
         priority_scheduler_adaptive_capacity = false,
+        adaptive_admission_distribution_headroom_partitions = vec![],
+        adaptive_admission_distribution_headroom_partition_seed_cap = 0,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1225,6 +1234,8 @@ impl Router {
         capacity_credit_terminal_retention_secs: u64,
         capacity_credit_required: bool,
         priority_scheduler_adaptive_capacity: bool,
+        adaptive_admission_distribution_headroom_partitions: Vec<String>,
+        adaptive_admission_distribution_headroom_partition_seed_cap: u32,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1394,6 +1405,8 @@ impl Router {
             capacity_credit_terminal_retention_secs,
             capacity_credit_required,
             priority_scheduler_adaptive_capacity,
+            adaptive_admission_distribution_headroom_partitions,
+            adaptive_admission_distribution_headroom_partition_seed_cap,
         })
     }
 

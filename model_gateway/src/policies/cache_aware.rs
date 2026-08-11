@@ -60,7 +60,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -69,7 +69,7 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -87,6 +87,7 @@ use crate::{
 const ENGINE_LOAD_MAX_AGE: Duration = Duration::from_secs(30);
 const ENGINE_PRESSURE_SLACK: f64 = 0.10;
 const ENGINE_PRESSURE_HIGH_WATERMARK: f64 = 0.90;
+const MAX_DISTRIBUTION_PROTECTIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImbalanceReason {
@@ -94,6 +95,31 @@ enum ImbalanceReason {
     BackendSpread,
     ReservedWork,
     RequestCount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedOwnerDecision {
+    Selected(usize),
+    Blocked,
+    NoMatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheAwareSelection {
+    Selected(usize),
+    Blocked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DistributionProtectionSnapshot {
+    seeds: Vec<(DistributionSeedPhase, Arc<str>, u64)>,
+}
+
+impl DistributionProtectionSnapshot {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.seeds.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,16 +135,159 @@ struct PrefixBudgetKey {
     kind: PrefixKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DistributionSeedPhase {
+    Active,
+    SuccessCooldown,
+    FailureQuarantine,
+}
+
+#[derive(Debug, Clone)]
+enum PrefixReplicationKind {
+    Ordinary {
+        provisional_owner: String,
+    },
+    DistributionSeed {
+        lease_id: u64,
+        phase: DistributionSeedPhase,
+        target_worker_url: Arc<str>,
+        target_worker_revision: u64,
+        prefix_tokens: usize,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct PrefixReplicationState {
-    last_spill: Instant,
-    provisional_owner: String,
+    last_transition: Instant,
+    kind: PrefixReplicationKind,
+}
+
+/// One atomic per-prefix expansion claim. Ordinary cache-aware requests never
+/// observe or join this provisional target. Dropping the claim releases the
+/// active slot while retaining a conservative cooldown marker.
+#[derive(Debug)]
+struct DistributionSeedPrefixReservation {
+    state: Arc<DashMap<PrefixBudgetKey, PrefixReplicationState>>,
+    protections: Arc<DashMap<PrefixBudgetKey, PrefixReplicationState>>,
+    key: PrefixBudgetKey,
+    lease_id: u64,
+    completion: DistributionSeedCompletion,
+}
+
+impl Drop for DistributionSeedPrefixReservation {
+    fn drop(&mut self) {
+        let Entry::Occupied(mut entry) = self.state.entry(self.key) else {
+            return;
+        };
+        let PrefixReplicationKind::DistributionSeed {
+            lease_id,
+            phase,
+            target_worker_url,
+            target_worker_revision,
+            prefix_tokens,
+        } = &entry.get().kind
+        else {
+            return;
+        };
+        if *lease_id != self.lease_id || !matches!(phase, DistributionSeedPhase::Active) {
+            return;
+        }
+        let target_worker_url = Arc::clone(target_worker_url);
+        let target_worker_revision = *target_worker_revision;
+        let prefix_tokens = *prefix_tokens;
+        let phase = if self.completion.is_committed() {
+            DistributionSeedPhase::SuccessCooldown
+        } else {
+            DistributionSeedPhase::FailureQuarantine
+        };
+
+        let transitioned_at = Instant::now();
+        let kind = PrefixReplicationKind::DistributionSeed {
+            lease_id: self.lease_id,
+            phase,
+            target_worker_url,
+            target_worker_revision,
+            prefix_tokens,
+        };
+        let state = entry.get_mut();
+        state.last_transition = transitioned_at;
+        state.kind = kind.clone();
+        if let Some(mut protection) = self.protections.get_mut(&self.key) {
+            protection.last_transition = transitioned_at;
+            protection.kind = kind;
+        }
+    }
+}
+
+/// Shared one-shot success signal between the terminal commit stage and the
+/// cache-policy seed reservation. Only a fully processed backend completion
+/// may publish a seeded worker as ordinary cache ownership.
+#[derive(Debug, Clone)]
+pub(crate) struct DistributionSeedCompletion {
+    committed: Arc<AtomicBool>,
+}
+
+impl DistributionSeedCompletion {
+    fn new() -> Self {
+        Self {
+            committed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn commit(&self) {
+        self.committed.store(true, Ordering::Release);
+    }
+
+    fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
 struct PrefixOwnership {
     key: PrefixBudgetKey,
     owners: Vec<usize>,
+}
+
+/// Routing-neutral worker capacity supplied by adaptive admission. Cache-aware
+/// routing may use it to choose a clean non-owner, but it cannot mint capacity
+/// or authorize dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeedWorkerHeadroom {
+    pub(crate) worker_url: Arc<str>,
+    pub(crate) worker_revision: u64,
+    pub(crate) issuable_slots: u16,
+}
+
+/// Opaque cache-policy plan for one owner-pressure recovery dispatch.
+///
+/// The target is not inserted into either prefix tree here. Only backend KV
+/// events may make it an authoritative owner after the dispatch succeeds.
+#[derive(Debug)]
+pub(crate) struct OwnerPressureDispatchPlan {
+    target_worker_url: Arc<str>,
+    target_worker_revision: u64,
+    expands_ownership: bool,
+    completion: DistributionSeedCompletion,
+    _prefix_reservation: Option<DistributionSeedPrefixReservation>,
+}
+
+impl OwnerPressureDispatchPlan {
+    pub(crate) fn target_worker_url(&self) -> &str {
+        &self.target_worker_url
+    }
+
+    pub(crate) fn target_worker_revision(&self) -> u64 {
+        self.target_worker_revision
+    }
+
+    pub(crate) fn expands_ownership(&self) -> bool {
+        self.expands_ownership
+    }
+
+    pub(crate) fn commit_success(&mut self) {
+        self.completion.commit();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,8 +370,15 @@ pub struct CacheAwarePolicy {
     engine_loads: RwLock<HashMap<String, TimedWorkerLoad>>,
     /// Per-prefix replication throttle. This controls creation of new owners,
     /// not the authoritative owner catalog, which always records every worker
-    /// reported by the backend event stream.
+    /// reported by the backend event stream. Ordinary provisional owners and
+    /// scheduler-authorized distribution seeds share this map so they cannot
+    /// independently expand the same prefix.
     replication_state: Arc<DashMap<PrefixBudgetKey, PrefixReplicationState>>,
+    /// Seed-only descendant protections. This stays small and bounded so the
+    /// request hot path never scans the ordinary spill history.
+    distribution_protections: Arc<DashMap<PrefixBudgetKey, PrefixReplicationState>>,
+    distribution_protection_lock: Mutex<()>,
+    next_distribution_seed_lease_id: AtomicU64,
     _replication_gc_task: Option<PeriodicTask>,
 }
 
@@ -228,6 +404,8 @@ impl CacheAwarePolicy {
         let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
         let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
         let replication_state = Arc::new(DashMap::<PrefixBudgetKey, PrefixReplicationState>::new());
+        let distribution_protections =
+            Arc::new(DashMap::<PrefixBudgetKey, PrefixReplicationState>::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.eviction_interval_secs > 0 {
@@ -310,12 +488,32 @@ impl CacheAwarePolicy {
             && config.cache_owner_spill_cooldown_secs > 0
         {
             let state = Arc::clone(&replication_state);
+            let protections = Arc::clone(&distribution_protections);
             let cooldown = Duration::from_secs(config.cache_owner_spill_cooldown_secs);
             let retention = cooldown.saturating_mul(4).max(Duration::from_secs(60));
             Some(PeriodicTask::spawn(
                 config.cache_owner_spill_cooldown_secs.max(1),
                 "Prefix replication budget GC",
-                move || state.retain(|_, entry| entry.last_spill.elapsed() <= retention),
+                move || {
+                    state.retain(|_, entry| {
+                        matches!(
+                            &entry.kind,
+                            PrefixReplicationKind::DistributionSeed {
+                                phase: DistributionSeedPhase::Active,
+                                ..
+                            }
+                        ) || entry.last_transition.elapsed() <= retention
+                    });
+                    protections.retain(|_, entry| {
+                        matches!(
+                            &entry.kind,
+                            PrefixReplicationKind::DistributionSeed {
+                                phase: DistributionSeedPhase::Active,
+                                ..
+                            }
+                        ) || entry.last_transition.elapsed() <= cooldown
+                    });
+                },
             ))
         } else {
             None
@@ -332,6 +530,9 @@ impl CacheAwarePolicy {
             populate_hash_index: AtomicBool::new(false),
             engine_loads: RwLock::new(HashMap::new()),
             replication_state,
+            distribution_protections,
+            distribution_protection_lock: Mutex::new(()),
+            next_distribution_seed_lease_id: AtomicU64::new(0),
             _replication_gc_task: replication_gc_task,
         }
     }
@@ -1019,63 +1220,110 @@ impl TreeHandle for CacheAwarePolicy {
     }
 }
 
-impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+impl CacheAwarePolicy {
+    pub(crate) fn select_worker_decision(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> CacheAwareSelection {
+        self.select_worker_decision_with_active_targets(workers, info, &[])
+    }
+
+    pub(crate) fn select_worker_decision_with_active_targets(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        active_distribution_targets: &[(Arc<str>, u64)],
+    ) -> CacheAwareSelection {
+        let model_id = workers
+            .first()
+            .map_or("", |worker| normalize_model_key(worker.model_id()));
+        let protections = self.distribution_protection_snapshot(model_id, info.tokens);
+        self.select_worker_decision_with_distribution_state(
+            workers,
+            info,
+            active_distribution_targets,
+            &protections,
+        )
+    }
+
+    pub(crate) fn select_worker_decision_with_distribution_state(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        active_distribution_targets: &[(Arc<str>, u64)],
+        protections: &DistributionProtectionSnapshot,
+    ) -> CacheAwareSelection {
         let request_text = info.request_text;
         let request_tokens = info.tokens;
 
         // Single O(workers) gather: read each worker once via routing_state()
         // (status + load + processed under one ArcSwap guard), replacing the
         // former separate passes whose per-worker guard traffic dominated routing
-        // CPU at scale. Collects healthy indices and load min/max; cache-owner
-        // lookup is a hash-free scan over healthy_indices.
+        // CPU at scale. Cache-owner lookup is a hash-free scan over all healthy
+        // workers, while pressure/fallback considers only header-eligible
+        // workers so an excluded idle peer cannot suppress an allowed peer.
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
-        let mut min_load = usize::MAX;
-        let mut max_load = 0usize;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
             if state.healthy && state.can_execute {
                 healthy_indices.push(idx);
-                min_load = min_load.min(state.load);
-                max_load = max_load.max(state.load);
             }
         }
 
         if healthy_indices.is_empty() {
-            return None;
+            return CacheAwareSelection::Unavailable;
+        }
+        let selectable_indices =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &healthy_indices);
+        if selectable_indices.is_empty() {
+            return CacheAwareSelection::Unavailable;
+        }
+        let mut min_load = usize::MAX;
+        let mut max_load = 0usize;
+        for &idx in &selectable_indices {
+            let state = workers[idx].routing_state();
+            min_load = min_load.min(state.load);
+            max_load = max_load.max(state.load);
         }
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // The router pre-filters workers by model, so any healthy worker gives
         // us the model key before engine pressure narrows the candidate set.
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
-        let pressure_plan = self.engine_pressure_plan(workers, &healthy_indices);
+        let pressure_plan = self.engine_pressure_plan(workers, &selectable_indices);
 
         // Prefix ownership is evaluated before fleet-wide imbalance. This is
         // the critical locality invariant: a hot unrelated worker cannot make
         // a usable cached owner disappear. Only pressure on every matching
         // owner may create one controlled additional owner.
-        if let Some(selected_idx) = self.select_cached_owner_or_pressure_spill(
+        match self.select_cached_owner_or_pressure_spill(
             workers,
             info,
             &healthy_indices,
             model_id,
             pressure_plan.as_ref(),
+            active_distribution_targets,
+            protections,
         ) {
-            let result = if pressure_plan.is_some() {
-                "cached_owner_scoped"
-            } else {
-                "telemetry_fallback"
-            };
-            if self.config.engine_load {
-                Metrics::record_cache_aware_engine_decision(result);
+            CachedOwnerDecision::Selected(selected_idx) => {
+                let result = if pressure_plan.is_some() {
+                    "cached_owner_scoped"
+                } else {
+                    "telemetry_fallback"
+                };
+                if self.config.engine_load {
+                    Metrics::record_cache_aware_engine_decision(result);
+                }
+                return CacheAwareSelection::Selected(selected_idx);
             }
-            return Some(selected_idx);
+            CachedOwnerDecision::Blocked => return CacheAwareSelection::Blocked,
+            CachedOwnerDecision::NoMatch => {}
         }
 
         let selection_indices = match pressure_plan.as_ref() {
             Some(plan) => &plan.allowed_indices,
-            _ => &healthy_indices,
+            _ => &selectable_indices,
         };
 
         // Engine pressure is the outer safety filter. When it narrows the
@@ -1134,7 +1382,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 info,
                 model_id,
             )
-        }?;
+        };
+        let Some(selected_idx) = selected_idx else {
+            return CacheAwareSelection::Unavailable;
+        };
 
         if let Some(plan) = pressure_plan.as_ref() {
             let result = if plan.allowed_indices.len() == healthy_indices.len() {
@@ -1155,7 +1406,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             Metrics::record_cache_aware_engine_decision("telemetry_fallback");
         }
 
-        Some(selected_idx)
+        CacheAwareSelection::Selected(selected_idx)
+    }
+}
+
+impl LoadBalancingPolicy for CacheAwarePolicy {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        match self.select_worker_decision(workers, info) {
+            CacheAwareSelection::Selected(index) => Some(index),
+            CacheAwareSelection::Blocked | CacheAwareSelection::Unavailable => None,
+        }
     }
 
     fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
@@ -1393,6 +1653,231 @@ impl CacheAwarePolicy {
         owners
     }
 
+    fn try_acquire_distribution_seed_prefix(
+        &self,
+        key: PrefixBudgetKey,
+        target_worker_url: Arc<str>,
+        target_worker_revision: u64,
+        prefix_tokens: usize,
+        completion: DistributionSeedCompletion,
+    ) -> Option<DistributionSeedPrefixReservation> {
+        let cooldown = Duration::from_secs(self.config.cache_owner_spill_cooldown_secs);
+        if cooldown.is_zero() {
+            return None;
+        }
+        let _protection_guard = self.distribution_protection_lock.lock();
+        self.distribution_protections.retain(|_, entry| {
+            matches!(
+                &entry.kind,
+                PrefixReplicationKind::DistributionSeed {
+                    phase: DistributionSeedPhase::Active,
+                    ..
+                }
+            ) || entry.last_transition.elapsed() < cooldown
+        });
+        if self.distribution_protections.contains_key(&key)
+            || self.distribution_protections.len() >= MAX_DISTRIBUTION_PROTECTIONS
+        {
+            return None;
+        }
+        let lease_id = self
+            .next_distribution_seed_lease_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let state = PrefixReplicationState {
+            last_transition: Instant::now(),
+            kind: PrefixReplicationKind::DistributionSeed {
+                lease_id,
+                phase: DistributionSeedPhase::Active,
+                target_worker_url,
+                target_worker_revision,
+                prefix_tokens,
+            },
+        };
+        // Publish the conservative descendant protection before claiming the
+        // exact primary key. A reader may transiently over-block, but can never
+        // miss an in-progress seed and open a deeper owner. Roll back by exact
+        // lease id if the ordinary/shared primary claim wins.
+        self.distribution_protections.insert(key, state.clone());
+        let acquired = match self.replication_state.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let active_distribution_seed = matches!(
+                    &entry.get().kind,
+                    PrefixReplicationKind::DistributionSeed {
+                        phase: DistributionSeedPhase::Active,
+                        ..
+                    }
+                );
+                if active_distribution_seed || entry.get().last_transition.elapsed() < cooldown {
+                    false
+                } else {
+                    entry.insert(state.clone());
+                    true
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(state.clone());
+                true
+            }
+        };
+        if !acquired {
+            let owns_protection = self
+                .distribution_protections
+                .get(&key)
+                .is_some_and(|entry| {
+                    matches!(
+                        &entry.kind,
+                        PrefixReplicationKind::DistributionSeed {
+                            lease_id: current,
+                            ..
+                        } if *current == lease_id
+                    )
+                });
+            if owns_protection {
+                self.distribution_protections.remove(&key);
+            }
+            return None;
+        }
+        Some(DistributionSeedPrefixReservation {
+            state: Arc::clone(&self.replication_state),
+            protections: Arc::clone(&self.distribution_protections),
+            key,
+            lease_id,
+            completion,
+        })
+    }
+
+    /// Plan one exact clean-peer dispatch when every matching cache owner has
+    /// no issuable engine slot. This is a read-only policy decision: admission
+    /// still requires a scheduler proof plus a separately acquired headroom
+    /// lease, and worker selection must bind and revalidate the exact target.
+    pub(crate) fn owner_pressure_dispatch_plan(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        headroom: &[SeedWorkerHeadroom],
+    ) -> Option<OwnerPressureDispatchPlan> {
+        let tokens = info.tokens?;
+        if self.requires_distribution_serialization(model_id, Some(tokens)) {
+            return None;
+        }
+        let healthy_indices = super::get_healthy_worker_indices(workers);
+        // A seed may expand only ownership reported by the backend KV event
+        // index. The approximate trees and the normal routing path's
+        // provisional spill entry are deliberately excluded.
+        let monitor = self.kv_monitor.read();
+        let indexer = monitor.as_ref()?.get_indexer(model_id)?;
+        if indexer.current_size() == 0 {
+            return None;
+        }
+        let block_size = monitor
+            .as_ref()?
+            .block_size(model_id)
+            .unwrap_or(self.config.block_size);
+        let (known_owners, matched_blocks) =
+            Self::score_overlap_with_depth(workers, tokens, &healthy_indices, &indexer, block_size);
+        if matched_blocks == 0 {
+            return None;
+        }
+        let matched_tokens = matched_blocks.saturating_mul(block_size).min(tokens.len());
+        let prefix_key = PrefixBudgetKey {
+            model_hash: kv_index::hash_node_path(model_id),
+            prefix_hash: kv_index::hash_token_path(&tokens[..matched_tokens]),
+            kind: PrefixKind::Token,
+        };
+        if known_owners.is_empty() {
+            return None;
+        }
+
+        let eligible_owners =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &known_owners);
+        if eligible_owners.is_empty() {
+            return None;
+        }
+        let mut owner_capacity = Vec::with_capacity(eligible_owners.len());
+        for idx in eligible_owners {
+            let capacity = headroom.iter().find(|candidate| {
+                candidate.worker_url.as_ref() == workers[idx].url()
+                    && candidate.worker_revision == workers[idx].revision()
+            })?;
+            owner_capacity.push((idx, capacity.issuable_slots));
+        }
+        owner_capacity.sort_unstable_by(|(left_idx, left_slots), (right_idx, right_slots)| {
+            right_slots
+                .cmp(left_slots)
+                .then_with(|| workers[*left_idx].load().cmp(&workers[*right_idx].load()))
+                .then_with(|| workers[*left_idx].url().cmp(workers[*right_idx].url()))
+        });
+        if let Some(&(target_idx, _)) = owner_capacity
+            .first()
+            .filter(|(_, issuable_slots)| *issuable_slots > 0)
+        {
+            let completion = DistributionSeedCompletion::new();
+            return Some(OwnerPressureDispatchPlan {
+                target_worker_url: Arc::from(workers[target_idx].url()),
+                target_worker_revision: workers[target_idx].revision(),
+                expands_ownership: false,
+                completion,
+                _prefix_reservation: None,
+            });
+        }
+
+        // Expanding ownership is more restrictive than rebalancing across
+        // existing authoritative owners. It requires the explicit owner cap
+        // and cooldown, and never overlaps a normal provisional spill.
+        if self.config.max_cached_owners_per_prefix == 0
+            || self.config.cache_owner_spill_cooldown_secs == 0
+            || known_owners.len() >= self.config.max_cached_owners_per_prefix
+            || self
+                .recent_provisional_owner(prefix_key, workers, &healthy_indices)
+                .is_some()
+        {
+            return None;
+        }
+
+        let non_owners: Vec<_> = healthy_indices
+            .into_iter()
+            .filter(|idx| !known_owners.contains(idx))
+            .collect();
+        let eligible_non_owners =
+            SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &non_owners);
+        let mut clean: Vec<_> = eligible_non_owners
+            .into_iter()
+            .filter_map(|idx| {
+                let capacity = headroom.iter().find(|candidate| {
+                    candidate.worker_url.as_ref() == workers[idx].url()
+                        && candidate.worker_revision == workers[idx].revision()
+                        && candidate.issuable_slots > 0
+                })?;
+                Some((idx, capacity.issuable_slots))
+            })
+            .collect();
+        clean.sort_unstable_by(|(left_idx, left_slots), (right_idx, right_slots)| {
+            right_slots
+                .cmp(left_slots)
+                .then_with(|| workers[*left_idx].load().cmp(&workers[*right_idx].load()))
+                .then_with(|| workers[*left_idx].url().cmp(workers[*right_idx].url()))
+        });
+        let (target_idx, _) = *clean.first()?;
+        let target_worker_url: Arc<str> = Arc::from(workers[target_idx].url());
+        let completion = DistributionSeedCompletion::new();
+        let prefix_reservation = self.try_acquire_distribution_seed_prefix(
+            prefix_key,
+            Arc::clone(&target_worker_url),
+            workers[target_idx].revision(),
+            matched_tokens,
+            completion.clone(),
+        )?;
+        Some(OwnerPressureDispatchPlan {
+            target_worker_url,
+            target_worker_revision: workers[target_idx].revision(),
+            expands_ownership: true,
+            completion,
+            _prefix_reservation: Some(prefix_reservation),
+        })
+    }
+
     fn select_from_cached_owners(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1417,6 +1902,76 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Active seeds and recently failed seeds protect only descendants of the
+    /// exact token prefix they claimed. This closes transient owner-loss and
+    /// deeper-key races without stalling unrelated cold prefixes in the same
+    /// model.
+    pub(crate) fn distribution_protection_snapshot(
+        &self,
+        model_id: &str,
+        tokens: Option<&[u32]>,
+    ) -> DistributionProtectionSnapshot {
+        let Some(tokens) = tokens else {
+            return DistributionProtectionSnapshot::default();
+        };
+        let model_hash = kv_index::hash_node_path(model_id);
+        let cooldown = Duration::from_secs(self.config.cache_owner_spill_cooldown_secs);
+        let mut targets = Vec::new();
+        for entry in self.distribution_protections.iter() {
+            let key = *entry.key();
+            if key.kind != PrefixKind::Token || key.model_hash != model_hash {
+                continue;
+            }
+            let PrefixReplicationKind::DistributionSeed {
+                phase,
+                target_worker_url,
+                target_worker_revision,
+                prefix_tokens,
+                ..
+            } = &entry.kind
+            else {
+                continue;
+            };
+            if (!matches!(phase, DistributionSeedPhase::Active)
+                && (cooldown.is_zero() || entry.last_transition.elapsed() >= cooldown))
+                || *prefix_tokens == 0
+                || *prefix_tokens > tokens.len()
+                || kv_index::hash_token_path(&tokens[..*prefix_tokens]) != key.prefix_hash
+            {
+                continue;
+            }
+            targets.push((
+                *phase,
+                Arc::clone(target_worker_url),
+                *target_worker_revision,
+            ));
+        }
+        // DashMap iteration order is intentionally unspecified. Preserve every
+        // matching prefix protection, including multiple phases for the same
+        // target, then sort so the selection-time snapshot comparison is
+        // deterministic. In particular, a FailureQuarantine may never be
+        // discarded just because a SuccessCooldown for the same worker was
+        // observed first.
+        targets.sort_unstable_by(|left, right| {
+            left.1
+                .as_ref()
+                .cmp(right.1.as_ref())
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        DistributionProtectionSnapshot { seeds: targets }
+    }
+
+    pub(crate) fn requires_distribution_serialization(
+        &self,
+        model_id: &str,
+        tokens: Option<&[u32]>,
+    ) -> bool {
+        !self
+            .distribution_protection_snapshot(model_id, tokens)
+            .is_empty()
+    }
+
     /// Prefer the longest-prefix owners before applying fleet-wide imbalance.
     ///
     /// Existing owners are balanced by owner-local pressure and atomic reserved
@@ -1424,6 +1979,10 @@ impl CacheAwarePolicy {
     /// pressure high-water mark and the configured replication ceiling has not
     /// been reached. Concurrent spill requests coalesce on one provisional
     /// destination until backend cache events catch up.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps cache ownership, pressure, and distribution snapshots explicit"
+    )]
     fn select_cached_owner_or_pressure_spill(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1431,22 +1990,112 @@ impl CacheAwarePolicy {
         healthy_indices: &[usize],
         model_id: &str,
         pressure_plan: Option<&EnginePressurePlan>,
-    ) -> Option<usize> {
+        active_distribution_targets: &[(Arc<str>, u64)],
+        protections: &DistributionProtectionSnapshot,
+    ) -> CachedOwnerDecision {
         if self.config.max_cached_owners_per_prefix == 0 {
-            return None;
+            return CachedOwnerDecision::NoMatch;
         }
 
         let ownership = self.prefix_ownership(workers, info, healthy_indices, model_id);
         let known_owners = self.owners_with_provisional(&ownership, workers, healthy_indices);
         let owner_count = known_owners.len();
+        let protected_seeds = &protections.seeds;
+        if protected_seeds
+            .iter()
+            .any(|(phase, _, _)| matches!(phase, DistributionSeedPhase::FailureQuarantine))
+        {
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "failed_distribution_seed_block",
+                owner_count,
+            );
+            return CachedOwnerDecision::Blocked;
+        }
         if owner_count == 0 {
-            return None;
+            return if protected_seeds.is_empty() {
+                CachedOwnerDecision::NoMatch
+            } else {
+                Metrics::record_cache_aware_replication_decision(
+                    model_id,
+                    "distribution_seed_missing_owner_block",
+                    0,
+                );
+                CachedOwnerDecision::Blocked
+            };
         }
 
-        let eligible_owners =
+        let mut eligible_owners =
             SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &known_owners);
+        eligible_owners.retain(|idx| {
+            !protected_seeds.iter().any(|(phase, target, revision)| {
+                matches!(phase, DistributionSeedPhase::Active)
+                    && target.as_ref() == workers[*idx].url()
+                    && *revision == workers[*idx].revision()
+            })
+        });
+        if !active_distribution_targets.is_empty()
+            || protected_seeds
+                .iter()
+                .any(|(phase, _, _)| matches!(phase, DistributionSeedPhase::Active))
+        {
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "active_distribution_seed_hold",
+                owner_count,
+            );
+            return self
+                .select_from_cached_owners(workers, info, &eligible_owners, model_id)
+                .map_or(CachedOwnerDecision::Blocked, CachedOwnerDecision::Selected);
+        }
+        if protected_seeds
+            .iter()
+            .any(|(phase, _, _)| matches!(phase, DistributionSeedPhase::SuccessCooldown))
+        {
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                "successful_distribution_seed_cooldown_hold",
+                owner_count,
+            );
+            return self
+                .select_from_cached_owners(workers, info, &eligible_owners, model_id)
+                .map_or(CachedOwnerDecision::Blocked, CachedOwnerDecision::Selected);
+        }
         if eligible_owners.is_empty() {
-            return None;
+            let candidate_indices = pressure_plan
+                .map(|plan| plan.allowed_indices.as_slice())
+                .unwrap_or(healthy_indices);
+            let spill_candidates: Vec<_> = candidate_indices
+                .iter()
+                .copied()
+                .filter(|idx| !known_owners.contains(idx))
+                .collect();
+            let spill_candidates =
+                SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &spill_candidates);
+            let Some((selected, claimed_new_owner)) = self.select_or_join_replication_spill(
+                ownership.key,
+                workers,
+                info,
+                &spill_candidates,
+                model_id,
+            ) else {
+                Metrics::record_cache_aware_replication_decision(
+                    model_id,
+                    "seed_cooldown_excluded_owner_block",
+                    owner_count,
+                );
+                return CachedOwnerDecision::Blocked;
+            };
+            Metrics::record_cache_aware_replication_decision(
+                model_id,
+                if claimed_new_owner {
+                    "excluded_owner_spill"
+                } else {
+                    "excluded_owner_cooldown_hold"
+                },
+                owner_count,
+            );
+            return CachedOwnerDecision::Selected(selected);
         }
 
         let suitable_owners =
@@ -1457,13 +2106,17 @@ impl CacheAwarePolicy {
                 "cached_owner_hold",
                 owner_count,
             );
-            return self.select_from_cached_owners(workers, info, &suitable_owners, model_id);
+            return self
+                .select_from_cached_owners(workers, info, &suitable_owners, model_id)
+                .map_or(CachedOwnerDecision::NoMatch, CachedOwnerDecision::Selected);
         }
 
         let Some(plan) = pressure_plan else {
             // `suitable_cached_owners` only returns empty with a complete,
             // fresh pressure plan, but keep this fail-open guard explicit.
-            return self.select_from_cached_owners(workers, info, &eligible_owners, model_id);
+            return self
+                .select_from_cached_owners(workers, info, &eligible_owners, model_id)
+                .map_or(CachedOwnerDecision::NoMatch, CachedOwnerDecision::Selected);
         };
 
         if owner_count < self.config.max_cached_owners_per_prefix {
@@ -1479,20 +2132,29 @@ impl CacheAwarePolicy {
             let spill_candidates =
                 SizeAwarePowerOfTwoPolicy::eligible_candidates(workers, info, &spill_candidates);
             if !spill_candidates.is_empty() {
-                let (selected, claimed_new_owner) = self.select_or_join_replication_spill(
+                let Some((selected, claimed_new_owner)) = self.select_or_join_replication_spill(
                     ownership.key,
                     workers,
                     info,
                     &spill_candidates,
                     model_id,
-                )?;
+                ) else {
+                    Metrics::record_cache_aware_replication_decision(
+                        model_id,
+                        "seed_cooldown_owner_hold",
+                        owner_count,
+                    );
+                    return self
+                        .select_from_cached_owners(workers, info, &eligible_owners, model_id)
+                        .map_or(CachedOwnerDecision::Blocked, CachedOwnerDecision::Selected);
+                };
                 let result = if claimed_new_owner {
                     "owner_pressure_spill"
                 } else {
                     "spill_cooldown_hold"
                 };
                 Metrics::record_cache_aware_replication_decision(model_id, result, owner_count);
-                return Some(selected);
+                return CachedOwnerDecision::Selected(selected);
             }
         }
 
@@ -1500,10 +2162,13 @@ impl CacheAwarePolicy {
         // high-water mark, preserve affinity on the least-pressured owner. The
         // admission controller remains responsible for stopping new dispatch
         // when there is no safe capacity anywhere in the model pool.
-        let best_pressure = eligible_owners
+        let Some(best_pressure) = eligible_owners
             .iter()
             .map(|idx| plan.pressure_by_index[idx].pressure)
-            .min_by(f64::total_cmp)?;
+            .min_by(f64::total_cmp)
+        else {
+            return CachedOwnerDecision::NoMatch;
+        };
         let least_pressured: Vec<usize> = eligible_owners
             .iter()
             .copied()
@@ -1518,6 +2183,7 @@ impl CacheAwarePolicy {
         };
         Metrics::record_cache_aware_replication_decision(model_id, result, owner_count);
         self.select_from_cached_owners(workers, info, &least_pressured, model_id)
+            .map_or(CachedOwnerDecision::NoMatch, CachedOwnerDecision::Selected)
     }
 
     fn recent_provisional_owner(
@@ -1531,13 +2197,16 @@ impl CacheAwarePolicy {
             return None;
         }
         let state = self.replication_state.get(&key)?;
-        if state.last_spill.elapsed() >= cooldown {
+        if state.last_transition.elapsed() >= cooldown {
             return None;
         }
+        let PrefixReplicationKind::Ordinary { provisional_owner } = &state.kind else {
+            return None;
+        };
         candidate_indices
             .iter()
             .copied()
-            .find(|&idx| workers[idx].url() == state.provisional_owner)
+            .find(|&idx| workers[idx].url() == provisional_owner)
     }
 
     /// Atomically claim the next replication slot for a prefix. The first
@@ -1566,22 +2235,33 @@ impl CacheAwarePolicy {
 
         match self.replication_state.entry(key) {
             Entry::Occupied(mut entry) => {
-                let active = entry.get().last_spill.elapsed() < cooldown;
-                if active {
-                    let provisional_owner = entry.get().provisional_owner.as_str();
-                    if let Some(idx) = candidate_indices
-                        .iter()
-                        .copied()
-                        .find(|&idx| workers[idx].url() == provisional_owner)
-                    {
-                        drop(entry);
-                        let selected = self.fallback.select_least_loaded_from_candidates(
-                            workers,
-                            info,
-                            &[idx],
-                        )?;
-                        return Some((selected, false));
+                let within_cooldown = entry.get().last_transition.elapsed() < cooldown;
+                match &entry.get().kind {
+                    PrefixReplicationKind::DistributionSeed {
+                        phase: DistributionSeedPhase::Active,
+                        ..
+                    } => {
+                        return None;
                     }
+                    PrefixReplicationKind::DistributionSeed { .. } if within_cooldown => {
+                        return None;
+                    }
+                    PrefixReplicationKind::Ordinary { provisional_owner } if within_cooldown => {
+                        if let Some(idx) = candidate_indices
+                            .iter()
+                            .copied()
+                            .find(|&idx| workers[idx].url() == provisional_owner)
+                        {
+                            drop(entry);
+                            let selected = self.fallback.select_least_loaded_from_candidates(
+                                workers,
+                                info,
+                                &[idx],
+                            )?;
+                            return Some((selected, false));
+                        }
+                    }
+                    _ => {}
                 }
 
                 // An expired claim, or an active provisional owner excluded by
@@ -1589,8 +2269,10 @@ impl CacheAwarePolicy {
                 let selected =
                     self.select_worker_fallback(workers, info, candidate_indices, model_id)?;
                 entry.insert(PrefixReplicationState {
-                    last_spill: Instant::now(),
-                    provisional_owner: workers[selected].url().to_string(),
+                    last_transition: Instant::now(),
+                    kind: PrefixReplicationKind::Ordinary {
+                        provisional_owner: workers[selected].url().to_string(),
+                    },
                 });
                 Some((selected, true))
             }
@@ -1598,8 +2280,10 @@ impl CacheAwarePolicy {
                 let selected =
                     self.select_worker_fallback(workers, info, candidate_indices, model_id)?;
                 entry.insert(PrefixReplicationState {
-                    last_spill: Instant::now(),
-                    provisional_owner: workers[selected].url().to_string(),
+                    last_transition: Instant::now(),
+                    kind: PrefixReplicationKind::Ordinary {
+                        provisional_owner: workers[selected].url().to_string(),
+                    },
                 });
                 Some((selected, true))
             }
@@ -3133,6 +3817,854 @@ mod tests {
             block_size: 4, // small block size for easy test setup
             ..Default::default()
         }
+    }
+
+    type DistributionLifecycleFixture = (
+        CacheAwarePolicy,
+        Vec<Arc<dyn Worker>>,
+        Arc<PositionalIndexer>,
+        Vec<SeedWorkerHeadroom>,
+    );
+
+    fn distribution_lifecycle_fixture() -> DistributionLifecycleFixture {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        let headroom = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 0 { 0 } else { 38 },
+            })
+            .collect();
+        (policy, workers, indexer, headroom)
+    }
+
+    #[test]
+    fn owner_pressure_seed_does_not_require_global_engine_load_or_mutate_owners() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            engine_load: false,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+
+        let headroom: Vec<_> = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 0 { 0 } else { 38 },
+            })
+            .collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            ..Default::default()
+        };
+        let plan = policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .expect("one clean authoritative non-owner should be planned");
+        assert_eq!(plan.target_worker_url(), workers[1].url());
+        assert_eq!(plan.target_worker_revision(), workers[1].revision());
+        assert!(plan.expands_ownership());
+
+        let monitor = policy.kv_monitor.read();
+        let owners = CacheAwarePolicy::score_overlap(
+            &workers,
+            info.tokens.unwrap(),
+            &[0, 1, 2],
+            &monitor.as_ref().unwrap().get_indexer("unknown").unwrap(),
+            4,
+        );
+        assert_eq!(
+            owners,
+            vec![0],
+            "planning must not publish a provisional owner"
+        );
+        drop(monitor);
+
+        // Use a fresh prefix state for the existing-owner case. The clean-peer
+        // plan above intentionally keeps this exact prefix protected until its
+        // request completes and then through the configured cooldown.
+        let (mut policy, workers, _, mut headroom) = distribution_lifecycle_fixture();
+        policy.config.engine_load = false;
+        headroom[0].issuable_slots = 1;
+        let plan = policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .expect("an existing authoritative owner with headroom should be preferred");
+        assert_eq!(plan.target_worker_url(), workers[0].url());
+        assert!(!plan.expands_ownership());
+
+        policy.config.max_cached_owners_per_prefix = 0;
+        policy.config.cache_owner_spill_cooldown_secs = 0;
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_some());
+        headroom[0].issuable_slots = 0;
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_none());
+    }
+
+    #[test]
+    fn excluded_authoritative_owner_still_counts_toward_seed_owner_ceiling() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            max_cached_owners_per_prefix: 2,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        let second_owner = indexer.intern_worker(workers[1].url()).unwrap();
+        indexer
+            .apply_stored(
+                second_owner,
+                &[
+                    StoredBlock {
+                        seq_hash: SequenceHash(1),
+                        content_hash: compute_content_hash(&[1, 2, 3, 4]),
+                    },
+                    StoredBlock {
+                        seq_hash: SequenceHash(2),
+                        content_hash: compute_content_hash(&[5, 6, 7, 8]),
+                    },
+                ],
+                None,
+                &mut WorkerBlockMap::default(),
+            )
+            .unwrap();
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        let headroom = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 2 { 38 } else { 0 },
+            })
+            .collect::<Vec<_>>();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-excluded-worker-urls",
+            workers[0].url().parse().unwrap(),
+        );
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(policy
+            .owner_pressure_dispatch_plan(
+                "unknown",
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+                &headroom,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn owner_pressure_seed_serializes_prefix_expansion_without_publishing_it() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            engine_load: true,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), engine_load(0.99, 0.99, 64)),
+            (workers[1].url().to_string(), engine_load(0.10, 0.10, 0)),
+            (workers[2].url().to_string(), engine_load(0.10, 0.10, 0)),
+        ]));
+        let headroom: Vec<_> = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 0 { 0 } else { 38 },
+            })
+            .collect();
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let key = PrefixBudgetKey {
+            model_hash: kv_index::hash_node_path("unknown"),
+            prefix_hash: kv_index::hash_token_path(&tokens),
+            kind: PrefixKind::Token,
+        };
+
+        let first = policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .expect("first clean-peer expansion should claim the prefix");
+        assert!(first.expands_ownership());
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_none());
+        {
+            let state = policy.replication_state.get(&key).unwrap();
+            assert!(matches!(
+                &state.kind,
+                PrefixReplicationKind::DistributionSeed {
+                    phase: DistributionSeedPhase::Active,
+                    ..
+                }
+            ));
+        }
+        assert!(policy
+            .recent_provisional_owner(key, &workers, &[0, 1, 2])
+            .is_none());
+        assert!(policy
+            .select_or_join_replication_spill(key, &workers, &info, &[1, 2], "unknown")
+            .is_none());
+
+        let selected = policy
+            .select_worker(&workers, &info)
+            .expect("ordinary traffic should hold on an authoritative owner");
+        assert_eq!(selected, 0);
+        assert_eq!(
+            CacheAwarePolicy::score_overlap(&workers, &tokens, &[0, 1, 2], &indexer, 4),
+            vec![0],
+            "a pending seed must not publish a second cache owner"
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-excluded-worker-urls",
+            workers[0].url().parse().unwrap(),
+        );
+        assert!(policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .is_none());
+
+        drop(first);
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_none());
+        assert!(policy
+            .select_or_join_replication_spill(key, &workers, &info, &[1, 2], "unknown")
+            .is_none());
+        policy
+            .replication_state
+            .get_mut(&key)
+            .unwrap()
+            .last_transition = Instant::now() - Duration::from_secs(6);
+        policy
+            .distribution_protections
+            .get_mut(&key)
+            .unwrap()
+            .last_transition = Instant::now() - Duration::from_secs(6);
+        assert!(policy
+            .owner_pressure_dispatch_plan("unknown", &workers, &info, &headroom)
+            .is_some());
+    }
+
+    #[test]
+    fn active_seed_target_blocks_deeper_prefix_key_drift() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        let headroom: Vec<_> = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 0 { 0 } else { 38 },
+            })
+            .collect();
+        let source_tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let plan = policy
+            .owner_pressure_dispatch_plan(
+                "unknown",
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&source_tokens),
+                    ..Default::default()
+                },
+                &headroom,
+            )
+            .expect("initial seed should claim the source prefix");
+        assert_eq!(plan.target_worker_url(), workers[1].url());
+
+        let deeper_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let target_id = indexer.intern_worker(workers[1].url()).unwrap();
+        let blocks: Vec<_> = deeper_tokens
+            .chunks(4)
+            .enumerate()
+            .map(|(index, tokens)| StoredBlock {
+                seq_hash: SequenceHash(index as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer
+            .apply_stored(target_id, &blocks, None, &mut WorkerBlockMap::default())
+            .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-excluded-worker-urls",
+            workers[1].url().parse().unwrap(),
+        );
+        let active_targets = vec![(Arc::from(workers[1].url()), workers[1].revision())];
+        assert_eq!(
+            policy.select_worker_decision_with_active_targets(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&deeper_tokens),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+                &active_targets,
+            ),
+            CacheAwareSelection::Blocked
+        );
+        let deeper_key = PrefixBudgetKey {
+            model_hash: kv_index::hash_node_path("unknown"),
+            prefix_hash: kv_index::hash_token_path(&deeper_tokens),
+            kind: PrefixKind::Token,
+        };
+        assert!(
+            !policy.replication_state.contains_key(&deeper_key),
+            "a deeper seed-owned prefix must not create a third provisional owner"
+        );
+    }
+
+    #[test]
+    fn terminal_seed_result_controls_descendant_quarantine_and_success_cooldown() {
+        let source_tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let deeper_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let source_key = PrefixBudgetKey {
+            model_hash: kv_index::hash_node_path("unknown"),
+            prefix_hash: kv_index::hash_token_path(&source_tokens),
+            kind: PrefixKind::Token,
+        };
+
+        let (failed_policy, failed_workers, failed_indexer, failed_headroom) =
+            distribution_lifecycle_fixture();
+        let failed_plan = failed_policy
+            .owner_pressure_dispatch_plan(
+                "unknown",
+                &failed_workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&source_tokens),
+                    ..Default::default()
+                },
+                &failed_headroom,
+            )
+            .expect("failed seed fixture should acquire a clean target");
+        let failed_target = failed_plan.target_worker_url().to_string();
+        let failed_monitor = failed_policy.kv_monitor.read().as_ref().cloned().unwrap();
+        failed_monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::new(PositionalIndexer::new(4)));
+        assert_eq!(
+            failed_policy.select_worker_decision(
+                &failed_workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&deeper_tokens),
+                    ..Default::default()
+                },
+            ),
+            CacheAwareSelection::Blocked,
+            "transient owner loss must not escape an active ancestor seed"
+        );
+        failed_monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&failed_indexer));
+        let failed_target_id = failed_indexer.intern_worker(&failed_target).unwrap();
+        let deeper_blocks: Vec<_> = deeper_tokens
+            .chunks(4)
+            .enumerate()
+            .map(|(index, tokens)| StoredBlock {
+                seq_hash: SequenceHash(index as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        failed_indexer
+            .apply_stored(
+                failed_target_id,
+                &deeper_blocks,
+                None,
+                &mut WorkerBlockMap::default(),
+            )
+            .unwrap();
+        drop(failed_plan);
+        assert!(matches!(
+            &failed_policy
+                .distribution_protections
+                .get(&source_key)
+                .unwrap()
+                .kind,
+            PrefixReplicationKind::DistributionSeed {
+                phase: DistributionSeedPhase::FailureQuarantine,
+                ..
+            }
+        ));
+        let deeper_info = SelectWorkerInfo {
+            tokens: Some(&deeper_tokens),
+            ..Default::default()
+        };
+        assert_eq!(
+            failed_policy.select_worker_decision(&failed_workers, &deeper_info),
+            CacheAwareSelection::Blocked,
+            "an early KV event from a failed seed must not publish its target"
+        );
+        assert!(failed_policy
+            .owner_pressure_dispatch_plan(
+                "unknown",
+                &failed_workers,
+                &deeper_info,
+                &failed_headroom,
+            )
+            .is_none());
+        assert!(matches!(
+            failed_policy.select_worker_decision(
+                &failed_workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[91, 92, 93, 94]),
+                    ..Default::default()
+                },
+            ),
+            CacheAwareSelection::Selected(_)
+        ));
+
+        let (success_policy, success_workers, success_indexer, success_headroom) =
+            distribution_lifecycle_fixture();
+        let mut success_plan = success_policy
+            .owner_pressure_dispatch_plan(
+                "unknown",
+                &success_workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&source_tokens),
+                    ..Default::default()
+                },
+                &success_headroom,
+            )
+            .expect("successful seed fixture should acquire a clean target");
+        let success_target = success_plan.target_worker_url().to_string();
+        let success_target_index = success_workers
+            .iter()
+            .position(|worker| worker.url() == success_target)
+            .unwrap();
+        let success_target_id = success_indexer.intern_worker(&success_target).unwrap();
+        success_indexer
+            .apply_stored(
+                success_target_id,
+                &deeper_blocks,
+                None,
+                &mut WorkerBlockMap::default(),
+            )
+            .unwrap();
+        success_plan.commit_success();
+        success_plan.commit_success();
+        drop(success_plan);
+        assert!(matches!(
+            &success_policy
+                .distribution_protections
+                .get(&source_key)
+                .unwrap()
+                .kind,
+            PrefixReplicationKind::DistributionSeed {
+                phase: DistributionSeedPhase::SuccessCooldown,
+                ..
+            }
+        ));
+        assert_eq!(
+            success_policy.select_worker_decision(&success_workers, &deeper_info),
+            CacheAwareSelection::Selected(success_target_index),
+            "terminal success may expose the target only through authoritative KV events"
+        );
+        assert!(success_policy
+            .owner_pressure_dispatch_plan(
+                "unknown",
+                &success_workers,
+                &deeper_info,
+                &success_headroom,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn failure_quarantine_dominates_overlapping_success_for_same_target() {
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let (policy, workers, _, _) = distribution_lifecycle_fixture();
+        let model_hash = kv_index::hash_node_path("unknown");
+        let target_worker_url: Arc<str> = Arc::from(workers[0].url());
+        let target_worker_revision = workers[0].revision();
+        for (index, (prefix_tokens, phase)) in [
+            (4, DistributionSeedPhase::SuccessCooldown),
+            (8, DistributionSeedPhase::FailureQuarantine),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            policy.distribution_protections.insert(
+                PrefixBudgetKey {
+                    model_hash,
+                    prefix_hash: kv_index::hash_token_path(&tokens[..prefix_tokens]),
+                    kind: PrefixKind::Token,
+                },
+                PrefixReplicationState {
+                    last_transition: Instant::now(),
+                    kind: PrefixReplicationKind::DistributionSeed {
+                        lease_id: index as u64 + 1,
+                        phase,
+                        target_worker_url: Arc::clone(&target_worker_url),
+                        target_worker_revision,
+                        prefix_tokens,
+                    },
+                },
+            );
+        }
+
+        let snapshot = policy.distribution_protection_snapshot("unknown", Some(&tokens));
+        assert_eq!(snapshot.seeds.len(), 2);
+        assert!(snapshot
+            .seeds
+            .iter()
+            .any(|(phase, _, _)| matches!(phase, DistributionSeedPhase::FailureQuarantine)));
+        assert_eq!(
+            policy.select_worker_decision_with_distribution_state(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+                &[],
+                &snapshot,
+            ),
+            CacheAwareSelection::Blocked,
+            "a failed descendant must remain quarantined even when the same target has a successful ancestor"
+        );
+    }
+
+    #[test]
+    fn active_seed_blocks_ordinary_spill_when_existing_owner_moves_deeper() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            block_size: 4,
+            engine_load: true,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks(workers[0].url(), &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), engine_load(0.99, 0.99, 64)),
+            (workers[1].url().to_string(), engine_load(0.1, 0.1, 0)),
+            (workers[2].url().to_string(), engine_load(0.1, 0.1, 0)),
+        ]));
+        let headroom: Vec<_> = workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| SeedWorkerHeadroom {
+                worker_url: Arc::from(worker.url()),
+                worker_revision: worker.revision(),
+                issuable_slots: if index == 0 { 0 } else { 38 },
+            })
+            .collect();
+        let source_tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let plan = policy
+            .owner_pressure_dispatch_plan(
+                "unknown",
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&source_tokens),
+                    ..Default::default()
+                },
+                &headroom,
+            )
+            .expect("initial seed should claim the source prefix");
+        assert_eq!(plan.target_worker_url(), workers[1].url());
+
+        let deeper_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let owner_id = indexer.intern_worker(workers[0].url()).unwrap();
+        let blocks: Vec<_> = deeper_tokens
+            .chunks(4)
+            .enumerate()
+            .map(|(index, tokens)| StoredBlock {
+                seq_hash: SequenceHash(index as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer
+            .apply_stored(owner_id, &blocks, None, &mut WorkerBlockMap::default())
+            .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-excluded-worker-urls",
+            workers[1].url().parse().unwrap(),
+        );
+        let active_targets = vec![(Arc::from(workers[1].url()), workers[1].revision())];
+        assert_eq!(
+            policy.select_worker_decision_with_active_targets(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&deeper_tokens),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+                &active_targets,
+            ),
+            CacheAwareSelection::Selected(0),
+            "ordinary traffic must hold on the existing owner while a seed is active"
+        );
+        let deeper_key = PrefixBudgetKey {
+            model_hash: kv_index::hash_node_path("unknown"),
+            prefix_hash: kv_index::hash_token_path(&deeper_tokens),
+            kind: PrefixKind::Token,
+        };
+        assert!(!policy.replication_state.contains_key(&deeper_key));
+    }
+
+    #[test]
+    fn excluded_idle_worker_does_not_remove_the_only_selectable_peer() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            engine_load: true,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://idle:8000", "http://allowed:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), engine_load(0.1, 0.1, 0)),
+            (workers[1].url().to_string(), engine_load(0.8, 0.8, 0)),
+        ]));
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-smg-excluded-worker-urls",
+            workers[0].url().parse().unwrap(),
+        );
+
+        assert_eq!(
+            policy.select_worker_decision(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[1, 2, 3, 4]),
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            ),
+            CacheAwareSelection::Selected(1)
+        );
+    }
+
+    #[test]
+    fn ordinary_spill_blocks_distribution_seed_until_cooldown_expires() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let key = PrefixBudgetKey {
+            model_hash: 7,
+            prefix_hash: 11,
+            kind: PrefixKind::Token,
+        };
+        let info = SelectWorkerInfo {
+            tokens: Some(&[1, 2, 3, 4]),
+            ..Default::default()
+        };
+
+        assert!(policy
+            .select_or_join_replication_spill(key, &workers, &info, &[0, 1], "unknown")
+            .is_some());
+        assert!(policy
+            .try_acquire_distribution_seed_prefix(
+                key,
+                Arc::from(workers[1].url()),
+                workers[1].revision(),
+                4,
+                DistributionSeedCompletion::new(),
+            )
+            .is_none());
+        {
+            let state = policy.replication_state.get(&key).unwrap();
+            assert!(matches!(
+                &state.kind,
+                PrefixReplicationKind::Ordinary { .. }
+            ));
+        }
+
+        policy
+            .replication_state
+            .get_mut(&key)
+            .unwrap()
+            .last_transition = Instant::now() - Duration::from_secs(6);
+        assert!(policy
+            .try_acquire_distribution_seed_prefix(
+                key,
+                Arc::from(workers[1].url()),
+                workers[1].revision(),
+                4,
+                DistributionSeedCompletion::new(),
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn ordinary_spill_and_distribution_seed_race_has_one_winner() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: 2,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let info = SelectWorkerInfo {
+            tokens: Some(&[1, 2, 3, 4]),
+            ..Default::default()
+        };
+        let model_id = normalize_model_key(workers[0].model_id());
+
+        for prefix_hash in 0..32 {
+            let key = PrefixBudgetKey {
+                model_hash: 13,
+                prefix_hash,
+                kind: PrefixKind::Token,
+            };
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let (distribution_won, ordinary_won) = std::thread::scope(|scope| {
+                let distribution_start = Arc::clone(&start);
+                let distribution_policy = &policy;
+                let distribution_target = Arc::from(workers[1].url());
+                let distribution_revision = workers[1].revision();
+                let distribution = scope.spawn(move || {
+                    distribution_start.wait();
+                    distribution_policy
+                        .try_acquire_distribution_seed_prefix(
+                            key,
+                            distribution_target,
+                            distribution_revision,
+                            4,
+                            DistributionSeedCompletion::new(),
+                        )
+                        .is_some()
+                });
+                let ordinary_start = Arc::clone(&start);
+                let ordinary_policy = &policy;
+                let ordinary_workers = &workers;
+                let ordinary_info = &info;
+                let ordinary = scope.spawn(move || {
+                    ordinary_start.wait();
+                    ordinary_policy
+                        .select_or_join_replication_spill(
+                            key,
+                            ordinary_workers,
+                            ordinary_info,
+                            &[1],
+                            model_id,
+                        )
+                        .is_some()
+                });
+                (distribution.join().unwrap(), ordinary.join().unwrap())
+            });
+
+            assert_ne!(
+                distribution_won, ordinary_won,
+                "exactly one expansion path must claim a prefix"
+            );
+            let owners = policy.owners_with_provisional(
+                &PrefixOwnership {
+                    key,
+                    owners: vec![0],
+                },
+                &workers,
+                &[0, 1],
+            );
+            assert!(
+                owners.len() <= 2,
+                "the shared claim must preserve the per-prefix owner ceiling"
+            );
+        }
+
+        assert_eq!(policy.replication_state.len(), 32);
     }
 
     // -- score_overlap unit tests (scoring helper) --

@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo,
+    ManualPolicy, OwnerPressureDispatchPlan, PolicyFactory, SeedWorkerHeadroom, SelectWorkerInfo,
 };
 use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
@@ -318,6 +318,23 @@ impl PolicyRegistry {
     pub fn get_policy_or_default(&self, model_id: &str) -> Arc<dyn LoadBalancingPolicy> {
         self.get_policy(model_id)
             .unwrap_or_else(|| self.get_default_policy())
+    }
+
+    /// Ask only the active cache-aware policy for a read-only clean-peer plan.
+    /// Other policies fail closed, so a scheduler proof can never become a
+    /// policy-agnostic adaptive-admission bypass.
+    pub(crate) fn owner_pressure_dispatch_plan(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        headroom: &[SeedWorkerHeadroom],
+    ) -> Option<OwnerPressureDispatchPlan> {
+        let policy = self.get_policy_or_default(model_id);
+        policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()?
+            .owner_pressure_dispatch_plan(model_id, workers, info, headroom)
     }
 
     /// Determine policy for a new model

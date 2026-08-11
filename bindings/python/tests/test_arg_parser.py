@@ -72,6 +72,8 @@ class TestRouterArgs:
         assert args.adaptive_admission_feedback_max_waiting_requests_per_healthy_replica == 2
         assert args.adaptive_admission_feedback_max_token_usage == 0.9
         assert args.adaptive_admission_feedback_throughput_improvement_ratio == 0.02
+        assert args.adaptive_admission_distribution_headroom_partitions == []
+        assert args.adaptive_admission_distribution_headroom_partition_seed_cap == 0
 
     def test_parse_priority_scheduler_options(self):
         args = parse_router_args(
@@ -146,6 +148,11 @@ class TestRouterArgs:
                 "0.85",
                 "--adaptive-admission-feedback-throughput-improvement-ratio",
                 "0.03",
+                "--adaptive-admission-distribution-headroom-partitions",
+                "k3-prod",
+                "k3-canary",
+                "--adaptive-admission-distribution-headroom-partition-seed-cap",
+                "2",
             ]
         )
 
@@ -162,6 +169,11 @@ class TestRouterArgs:
         assert args.adaptive_admission_feedback_max_waiting_requests_per_healthy_replica == 4
         assert args.adaptive_admission_feedback_max_token_usage == 0.85
         assert args.adaptive_admission_feedback_throughput_improvement_ratio == 0.03
+        assert args.adaptive_admission_distribution_headroom_partitions == [
+            "k3-prod",
+            "k3-canary",
+        ]
+        assert args.adaptive_admission_distribution_headroom_partition_seed_cap == 2
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""

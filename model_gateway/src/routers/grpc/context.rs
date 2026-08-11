@@ -4,6 +4,8 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
@@ -22,7 +24,10 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::debug;
 
 use super::{
-    adaptive_admission::{AdaptiveAdmissionController, AdaptiveRequestTracker},
+    adaptive_admission::{
+        AdaptiveAdmissionController, AdaptiveRequestTracker, DistributionHeadroomLease,
+        OrdinaryDistributionDispatchGuard,
+    },
     client::GrpcClient,
     common::stages::encode::EncodeDispatchPlan,
     multimodal::{MultimodalComponents, MultimodalIntermediate},
@@ -32,8 +37,8 @@ use super::{
     },
 };
 use crate::{
-    middleware::TenantRequestMeta,
-    policies::LoadBalancingPolicy,
+    middleware::{scheduler::ClaimedSchedulerAdmissionProof, TenantRequestMeta},
+    policies::{LoadBalancingPolicy, OwnerPressureDispatchPlan},
     worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
@@ -176,6 +181,21 @@ pub(crate) struct ProcessingState {
     /// releases predicted outstanding work without training on a partial run.
     pub adaptive_request: Option<AdaptiveRequestTracker>,
 
+    /// An aggregate adaptive rejection that may proceed only through the
+    /// cache-aware, scheduler-authorized clean-peer recovery path in worker
+    /// selection. No ordinary policy selection is allowed while this is set.
+    pub pending_distribution_seed: Option<PendingDistributionSeed>,
+
+    /// Non-cloneable authorization and target-capacity guards for an exact
+    /// clean-peer dispatch. Moved into the request-lifetime load guard before
+    /// backend execution; every earlier failure releases both by `Drop`.
+    pub distribution_seed_guard: Option<DistributionSeedDispatchGuard>,
+
+    /// Exact ordinary target claim held until request execution installs the
+    /// worker load guard. This closes the worker-selection-to-dispatch window
+    /// in which a clean-peer seed might otherwise reserve the same target.
+    pub ordinary_distribution_guard: Option<OrdinaryDistributionDispatchGuard>,
+
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
 
@@ -198,6 +218,29 @@ pub(crate) struct ProcessingState {
 
     // Stage 6: Response processing state
     pub response: ResponseState,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingDistributionSeed {
+    pub(crate) partition: String,
+    pub(crate) retry_after_secs: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct DistributionSeedDispatchGuard {
+    pub(crate) policy_plan: OwnerPressureDispatchPlan,
+    pub(crate) _scheduler_proof: ClaimedSchedulerAdmissionProof,
+    // Keep this field last. Rust drops fields in declaration order, so the
+    // prefix plan must enter cooldown before model-wide target suppression is
+    // released by the headroom lease.
+    pub(crate) headroom: DistributionHeadroomLease,
+    pub(crate) retry_after_secs: u32,
+}
+
+impl DistributionSeedDispatchGuard {
+    fn commit_success(&mut self) {
+        self.policy_plan.commit_success();
+    }
 }
 
 /// Per-item bootstrap rendezvous info for prefill, plus the dispatch plan that
@@ -337,6 +380,16 @@ pub(crate) struct CompletionItem {
 }
 
 impl PreparationOutput {
+    /// Number of independent backend requests represented by this prepared
+    /// input. A single scheduler proof and headroom lease may never authorize
+    /// a batched completion fan-out.
+    pub(crate) fn backend_request_count(&self) -> usize {
+        match self {
+            Self::Completion { items, .. } => items.len(),
+            _ => 1,
+        }
+    }
+
     /// Total prompt tokens represented by this request. Completion batches
     /// sum every prompt because they fan out into independent backend work.
     pub fn total_token_count(&self) -> u32 {
@@ -468,6 +521,7 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
         _policy_reservation: Option<PolicyReservation>,
+        distribution_seed: Option<DistributionSeedDispatchGuard>,
     },
     /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
     /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
@@ -480,24 +534,72 @@ pub(crate) enum LoadGuards {
     Batch {
         _guards: Vec<LoadGuards>,
         _policy_reservation: Option<PolicyReservation>,
+        distribution_seed: Option<DistributionSeedDispatchGuard>,
     },
+    /// Test-only terminal-success probe for the distribution-seed commit stage.
+    /// Production construction still requires the real scheduler proof, policy
+    /// reservation, and adaptive headroom lease.
+    #[cfg(test)]
+    TestDistributionSeed { committed: Arc<AtomicBool> },
 }
 
 impl LoadGuards {
+    pub(crate) fn has_distribution_seed(&self) -> bool {
+        match self {
+            Self::Single {
+                distribution_seed, ..
+            }
+            | Self::Batch {
+                distribution_seed, ..
+            } => distribution_seed.is_some(),
+            Self::Disaggregated { .. } => false,
+            #[cfg(test)]
+            Self::TestDistributionSeed { .. } => true,
+        }
+    }
+
+    pub(crate) fn commit_distribution_seed_success(&mut self) {
+        match self {
+            Self::Single {
+                distribution_seed, ..
+            }
+            | Self::Batch {
+                distribution_seed, ..
+            } => {
+                if let Some(seed) = distribution_seed {
+                    seed.commit_success();
+                }
+            }
+            Self::Disaggregated { .. } => {}
+            #[cfg(test)]
+            Self::TestDistributionSeed { committed } => {
+                committed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_distribution_seed(committed: Arc<AtomicBool>) -> Self {
+        Self::TestDistributionSeed { committed }
+    }
+
     pub fn new(
         selection: &WorkerSelection,
         headers: Option<&HeaderMap>,
         policy_reservation: Option<PolicyReservation>,
+        distribution_seed: Option<DistributionSeedDispatchGuard>,
     ) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::new(worker.clone(), headers),
                 _policy_reservation: policy_reservation,
+                distribution_seed,
             },
             WorkerSelection::Disaggregated {
                 prefill, decode, ..
             } => {
                 debug_assert!(policy_reservation.is_none());
+                debug_assert!(distribution_seed.is_none());
                 LoadGuards::Disaggregated {
                     _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
                     _decode: WorkerLoadGuard::new(decode.clone(), headers),
@@ -512,15 +614,17 @@ impl LoadGuards {
         headers: Option<&HeaderMap>,
         count: usize,
         policy_reservation: Option<PolicyReservation>,
+        distribution_seed: Option<DistributionSeedDispatchGuard>,
     ) -> Self {
         if count <= 1 {
-            Self::new(selection, headers, policy_reservation)
+            Self::new(selection, headers, policy_reservation, distribution_seed)
         } else {
             Self::Batch {
                 _guards: (0..count)
-                    .map(|_| Self::new(selection, headers, None))
+                    .map(|_| Self::new(selection, headers, None, None))
                     .collect(),
                 _policy_reservation: policy_reservation,
+                distribution_seed,
             }
         }
     }
