@@ -20,8 +20,8 @@ use smg_auth::RequestId;
 
 use super::{
     capacity_credit::{
-        CapacityCreditBinding, CapacityCreditError, CapacityCreditToken, HeldSchedulerPermit,
-        IssuedCapacityCredit,
+        ArmedCapacityCredit, CapacityCreditBinding, CapacityCreditError, CapacityCreditToken,
+        HeldSchedulerPermit, IssuedCapacityCredit,
     },
     state::{SchedulerPartition, SchedulerState},
     Class,
@@ -50,12 +50,32 @@ pub(crate) struct IssueCapacityCreditRequest {
     pub estimated_output_tokens: u32,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmCapacityCreditRequest {
+    #[serde(flatten)]
+    pub binding: IssueCapacityCreditRequest,
+    pub dispatch_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct IssueCapacityCreditResponse {
     credit: String,
     generation: String,
     expires_in_ms: u64,
     newly_issued: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ArmCapacityCreditResponse {
+    generation: String,
+    dispatch_id: String,
+    expires_in_ms: u64,
+    newly_armed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CapacityCreditCapabilitiesResponse {
+    arm: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +193,79 @@ pub(crate) async fn cancel_capacity_credit(
     StatusCode::NO_CONTENT.into_response()
 }
 
+pub(crate) async fn capacity_credit_capabilities() -> Response {
+    (
+        StatusCode::OK,
+        Json(CapacityCreditCapabilitiesResponse { arm: "v1" }),
+    )
+        .into_response()
+}
+
+pub(crate) async fn arm_capacity_credit(
+    Extension(state): Extension<Arc<SchedulerState>>,
+    Extension(meta): Extension<RouteRequestMeta>,
+    Path(encoded): Path<String>,
+    Json(request): Json<ArmCapacityCreditRequest>,
+) -> Response {
+    let Some(registry) = state.capacity_credits() else {
+        return protocol_error(
+            StatusCode::NOT_FOUND,
+            "capacity_credits_disabled",
+            "capacity credits are disabled",
+            None,
+        );
+    };
+    let token = match CapacityCreditToken::parse(&encoded) {
+        Ok(token) => token,
+        Err(error) => return capacity_credit_error_response(error, None),
+    };
+    let binding_request = &request.binding;
+    let Some(partition) = state.partition_exact(binding_request.partition.trim()) else {
+        return protocol_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_partition",
+            "capacity credit names an unknown admission partition",
+            None,
+        );
+    };
+    let canonical_model = state.canonical_model(binding_request.model.trim());
+    let binding = match CapacityCreditBinding::new(
+        &binding_request.generation,
+        binding_request.policy_epoch,
+        partition.name.as_ref(),
+        canonical_model.as_ref(),
+        meta.tenant_key().clone(),
+        &binding_request.request_id,
+        binding_request.estimated_output_tokens,
+    ) {
+        Ok(binding) => binding,
+        Err(error) => return capacity_credit_error_response(error, None),
+    };
+    match registry.arm(&token, &binding, &request.dispatch_id) {
+        Ok(armed) => arm_response(&binding_request.generation, &request.dispatch_id, armed),
+        Err(error) => capacity_credit_error_response(error, None),
+    }
+}
+
+fn arm_response(generation: &str, dispatch_id: &str, armed: ArmedCapacityCredit) -> Response {
+    let expires_in_ms = armed
+        .expires_at
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    (
+        StatusCode::OK,
+        Json(ArmCapacityCreditResponse {
+            generation: generation.to_string(),
+            dispatch_id: dispatch_id.to_string(),
+            expires_in_ms,
+            newly_armed: armed.newly_armed,
+        }),
+    )
+        .into_response()
+}
+
 pub(crate) fn presented_capacity_credit(
     headers: &HeaderMap,
     tenant: &TenantKey,
@@ -275,6 +368,9 @@ pub(crate) fn capacity_credit_error_response(
         CapacityCreditError::AlreadyRedeemed => {
             (StatusCode::CONFLICT, "capacity_credit_already_redeemed")
         }
+        CapacityCreditError::AlreadyArmed => {
+            (StatusCode::CONFLICT, "capacity_credit_already_armed")
+        }
         CapacityCreditError::Cancelled => (StatusCode::CONFLICT, "capacity_credit_cancelled"),
         CapacityCreditError::InternalState => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -316,7 +412,13 @@ mod tests {
         time::Duration,
     };
 
-    use axum::{body::Body, http::Request, middleware::from_fn_with_state, routing::post, Router};
+    use axum::{
+        body::Body,
+        http::{header::AUTHORIZATION, Request},
+        middleware::from_fn_with_state,
+        routing::{get, post},
+        Router,
+    };
     use http_body_util::BodyExt;
     use tempfile::NamedTempFile;
     use tokio::sync::watch;
@@ -326,8 +428,9 @@ mod tests {
     use crate::{
         config::RouterConfig,
         middleware::{
+            auth_middleware,
             scheduler::{state::AdaptiveCapacityProvider, AdmissionMode},
-            TokenBucket,
+            AuthConfig, TokenBucket,
         },
         tenant::RouteRequestMeta,
         worker::{BasicWorkerBuilder, WorkerRegistry},
@@ -373,6 +476,13 @@ mod tests {
             model: "kimi-k3".to_string(),
             request_id: request_id.to_string(),
             estimated_output_tokens: 1_024,
+        }
+    }
+
+    fn arm_request(request_id: &str, dispatch_id: &str) -> ArmCapacityCreditRequest {
+        ArmCapacityCreditRequest {
+            binding: request(request_id),
+            dispatch_id: dispatch_id.to_string(),
         }
     }
 
@@ -576,6 +686,45 @@ default_admission_partition: kimi-k3
     }
 
     #[tokio::test]
+    async fn capabilities_are_exact_and_require_the_service_key() {
+        let app = Router::new()
+            .route(
+                "/internal/capacity-credits/capabilities",
+                get(capacity_credit_capabilities),
+            )
+            .route_layer(from_fn_with_state(
+                AuthConfig::new(Some("service-key".to_string())),
+                auth_middleware,
+            ));
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/internal/capacity-credits/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::get("/internal/capacity-credits/capabilities")
+                    .header(AUTHORIZATION, "Bearer service-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(authorized).await,
+            serde_json::json!({ "arm": "v1" })
+        );
+    }
+
+    #[tokio::test]
     async fn issue_is_idempotent_and_cancel_releases_capacity() {
         let (state, _yaml) = scheduler_state();
         let tenant = RouteRequestMeta::new(TenantKey::new("header:junu"));
@@ -618,6 +767,129 @@ default_admission_partition: kimi-k3
         )
         .await;
         assert_eq!(next.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn arm_is_binding_checked_idempotent_and_keeps_the_credit_redeemable() {
+        let (state, _yaml) = scheduler_state();
+        let tenant = TenantKey::new("header:junu");
+        let token = issue_token(&state, &tenant, "request-arm").await;
+
+        let mut mismatch = arm_request("request-arm", "dispatch-1");
+        mismatch.binding.estimated_output_tokens += 1;
+        let mismatch_response = arm_capacity_credit(
+            Extension(Arc::clone(&state)),
+            Extension(RouteRequestMeta::new(tenant.clone())),
+            Path(token.clone()),
+            Json(mismatch),
+        )
+        .await;
+        assert_eq!(mismatch_response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(mismatch_response).await["error"]["code"],
+            "capacity_credit_binding_mismatch"
+        );
+        assert_eq!(state.capacity_credits().unwrap().active_len(), 1);
+
+        let first = arm_capacity_credit(
+            Extension(Arc::clone(&state)),
+            Extension(RouteRequestMeta::new(tenant.clone())),
+            Path(token.clone()),
+            Json(arm_request("request-arm", "dispatch-1")),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_json = response_json(first).await;
+        assert_eq!(first_json["generation"], "green-1");
+        assert_eq!(first_json["dispatch_id"], "dispatch-1");
+        assert_eq!(first_json["newly_armed"], true);
+        assert!(first_json["expires_in_ms"].as_u64().unwrap() > 0);
+
+        let repeated = arm_capacity_credit(
+            Extension(Arc::clone(&state)),
+            Extension(RouteRequestMeta::new(tenant.clone())),
+            Path(token.clone()),
+            Json(arm_request("request-arm", "dispatch-1")),
+        )
+        .await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        let repeated_json = response_json(repeated).await;
+        assert_eq!(repeated_json["newly_armed"], false);
+        assert!(
+            repeated_json["expires_in_ms"].as_u64().unwrap()
+                <= first_json["expires_in_ms"].as_u64().unwrap()
+        );
+
+        let competing = arm_capacity_credit(
+            Extension(Arc::clone(&state)),
+            Extension(RouteRequestMeta::new(tenant.clone())),
+            Path(token.clone()),
+            Json(arm_request("request-arm", "dispatch-2")),
+        )
+        .await;
+        assert_eq!(competing.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(competing).await["error"]["code"],
+            "capacity_credit_already_armed"
+        );
+        assert_eq!(state.capacity_credits().unwrap().active_len(), 1);
+
+        let headers = inference_headers(&token, "request-arm");
+        let presented = presented_capacity_credit(&headers, &tenant, &state)
+            .unwrap()
+            .unwrap();
+        let redeemed = state
+            .capacity_credits()
+            .unwrap()
+            .redeem(&presented.token, &presented.binding)
+            .unwrap();
+        let permit = redeemed.payload.into_permit();
+        assert!(permit.has_fair_share_reservation());
+
+        let replay = arm_capacity_credit(
+            Extension(state),
+            Extension(RouteRequestMeta::new(tenant)),
+            Path(token),
+            Json(arm_request("request-arm", "dispatch-1")),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(replay).await["error"]["code"],
+            "capacity_credit_already_redeemed"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_rejects_wrong_generation_without_consuming_the_credit() {
+        let (state, _yaml) = scheduler_state();
+        let tenant = TenantKey::new("header:junu");
+        let token = issue_token(&state, &tenant, "request-arm").await;
+        let mut wrong_generation = arm_request("request-arm", "dispatch-1");
+        wrong_generation.binding.generation = "blue-1".to_string();
+
+        let response = arm_capacity_credit(
+            Extension(Arc::clone(&state)),
+            Extension(RouteRequestMeta::new(tenant.clone())),
+            Path(token.clone()),
+            Json(wrong_generation),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "capacity_credit_wrong_generation"
+        );
+        assert_eq!(state.capacity_credits().unwrap().active_len(), 1);
+
+        let response = arm_capacity_credit(
+            Extension(state),
+            Extension(RouteRequestMeta::new(tenant)),
+            Path(token),
+            Json(arm_request("request-arm", "dispatch-1")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

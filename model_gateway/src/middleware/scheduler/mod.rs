@@ -33,7 +33,10 @@ const _: fn(
     &str,
 ) -> Result<ClaimedSchedulerAdmissionProof, ProofError> = SchedulerAdmissionProof::try_claim;
 pub use body::SchedulerGuardBody;
-pub(crate) use capacity_credit_api::{cancel_capacity_credit, issue_capacity_credit};
+pub(crate) use capacity_credit_api::{
+    arm_capacity_credit, cancel_capacity_credit, capacity_credit_capabilities,
+    issue_capacity_credit,
+};
 pub use capacity_credit_api::{
     CAPACITY_CREDIT_GENERATION_HEADER, CAPACITY_CREDIT_HEADER, CAPACITY_CREDIT_POLICY_EPOCH_HEADER,
     CAPACITY_CREDIT_REQUEST_ID_HEADER,
