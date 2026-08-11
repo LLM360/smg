@@ -120,7 +120,7 @@ pub(crate) async fn issue_capacity_credit(
     let issued = registry.issue_with(binding, || {
         partition
             .scheduler
-            .acquire_for_tenant_profile(
+            .acquire_external_credit_for_tenant_profile(
                 Class::Default,
                 next_credit_admission_id(),
                 tenant,
@@ -487,6 +487,49 @@ default_admission_partition: kimi-k3
             .layer(Extension(RouteRequestMeta::new(tenant)))
     }
 
+    fn proof_inspection_app(state: Arc<SchedulerState>, tenant: TenantKey) -> Router {
+        Router::new()
+            .route(
+                "/",
+                post(|Extension(meta): Extension<RouteRequestMeta>| async move {
+                    let Some(proof) = meta
+                        .extension::<super::super::SchedulerAdmissionProof>()
+                        .cloned()
+                    else {
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    };
+                    if proof
+                        .try_claim(
+                            meta.tenant_key(),
+                            meta.request_charge_id(),
+                            "kimi-k3",
+                            "kimi-k3",
+                        )
+                        .is_err()
+                    {
+                        return StatusCode::FORBIDDEN;
+                    }
+                    if !matches!(
+                        proof.try_claim(
+                            meta.tenant_key(),
+                            meta.request_charge_id(),
+                            "kimi-k3",
+                            "kimi-k3",
+                        ),
+                        Err(super::super::ProofError::AlreadyClaimed)
+                    ) {
+                        return StatusCode::CONFLICT;
+                    }
+                    StatusCode::OK
+                }),
+            )
+            .route_layer(from_fn_with_state(
+                state,
+                super::super::priority_admission_middleware,
+            ))
+            .layer(Extension(RouteRequestMeta::new(tenant)))
+    }
+
     fn adaptive_rejection_app(state: Arc<SchedulerState>, tenant: TenantKey) -> Router {
         Router::new()
             .route(
@@ -592,12 +635,17 @@ default_admission_partition: kimi-k3
         let presented = presented_capacity_credit(&headers, &tenant, &state)
             .unwrap()
             .unwrap();
-        let redeemed = state
+        let mut redeemed = state
             .capacity_credits()
             .unwrap()
             .redeem(&presented.token, &presented.binding)
             .unwrap();
-        assert!(redeemed.payload.into_permit().has_fair_share_reservation());
+        assert!(redeemed
+            .payload
+            .bind_redeemed_capacity_credit(&redeemed.binding, uuid::Uuid::now_v7()));
+        let permit = redeemed.payload.into_permit();
+        assert!(permit.has_fair_share_reservation());
+        assert!(permit.fair_share_admission_proof().is_some());
         assert!(matches!(
             state
                 .capacity_credits()
@@ -605,6 +653,22 @@ default_admission_partition: kimi-k3
                 .redeem(&presented.token, &presented.binding),
             Err(CapacityCreditError::AlreadyRedeemed)
         ));
+    }
+
+    #[tokio::test]
+    async fn redeemed_credit_inserts_exact_one_shot_proof_into_tenant_metadata() {
+        let (state, _yaml) = scheduler_state();
+        let tenant = TenantKey::new("header:junu");
+        let token = issue_token(&state, &tenant, "request-proof").await;
+        let headers = inference_headers(&token, "request-proof");
+        let mut request = Request::post("/").body(Body::empty()).unwrap();
+        *request.headers_mut() = headers;
+
+        let response = proof_inspection_app(state, tenant)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

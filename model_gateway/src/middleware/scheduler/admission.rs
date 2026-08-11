@@ -16,7 +16,7 @@ use std::sync::{
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, Request},
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -156,6 +156,16 @@ async fn run_admitted_request(
     Metrics::record_http_admission_admitted();
     let active_guard = AdmissionActiveGuard::new();
     req.extensions_mut().insert(permit.cancel_token());
+    if let Some(proof) = permit.fair_share_admission_proof() {
+        let Some(meta) = req.extensions().get::<RouteRequestMeta>().cloned() else {
+            permit.cancel_fair_share_reservation();
+            Metrics::record_http_admission_rejected();
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return response;
+        };
+        req.extensions_mut().insert(meta.with_extension(proof));
+    }
     let mut response = next.run(req).await;
     // A local adaptive rejection happened before backend work began. Release
     // the held slot normally, but erase the provisional output-token charge so
@@ -201,19 +211,41 @@ pub async fn priority_admission_middleware(
         .get::<RouteRequestMeta>()
         .map(|m| m.tenant_key().clone())
         .unwrap_or_else(|| TenantKey::new("anonymous"));
+    let route_request_id = req
+        .extensions()
+        .get::<RouteRequestMeta>()
+        .map(RouteRequestMeta::request_charge_id);
 
     // A credit already owns a scheduler slot. Redeem it before the sibling
     // RPS check so any local rejection can drop the held permit immediately
     // instead of stranding capacity until the credit TTL expires.
     let held_credit = match presented_capacity_credit(req.headers(), &tenant, &state) {
         Ok(Some(presented)) => {
+            let Some(route_request_id) = route_request_id else {
+                Metrics::record_http_admission_rejected();
+                pending_guard.resolve();
+                return capacity_credit_error_response(CapacityCreditError::InternalState, None);
+            };
             let Some(registry) = state.capacity_credits() else {
                 Metrics::record_http_admission_rejected();
                 pending_guard.resolve();
                 return capacity_credit_error_response(CapacityCreditError::Unknown, None);
             };
             match registry.redeem(&presented.token, &presented.binding) {
-                Ok(redeemed) => Some((redeemed.payload, presented.partition)),
+                Ok(mut redeemed) => {
+                    if !redeemed
+                        .payload
+                        .bind_redeemed_capacity_credit(&redeemed.binding, route_request_id)
+                    {
+                        Metrics::record_http_admission_rejected();
+                        pending_guard.resolve();
+                        return capacity_credit_error_response(
+                            CapacityCreditError::InternalState,
+                            None,
+                        );
+                    }
+                    Some((redeemed.payload, presented.partition))
+                }
                 Err(error) => {
                     Metrics::record_http_admission_rejected();
                     pending_guard.resolve();

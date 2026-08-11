@@ -1,6 +1,7 @@
 //! Priority-aware admission scheduler.
 
 pub mod admission;
+mod admission_proof;
 pub mod body;
 pub mod capacity_credit;
 pub mod capacity_credit_api;
@@ -19,6 +20,18 @@ pub mod slots;
 pub mod state;
 
 pub use admission::priority_admission_middleware;
+pub(crate) use admission_proof::{
+    ClaimedSchedulerAdmissionProof, ProofError, SchedulerAdmissionProof,
+};
+// Compile-time assertion for the stacked adaptive target-binding seam. This
+// keeps the exact move-only claim API type-checked before its consumer lands.
+const _: fn(
+    &SchedulerAdmissionProof,
+    &crate::tenant::TenantKey,
+    uuid::Uuid,
+    &str,
+    &str,
+) -> Result<ClaimedSchedulerAdmissionProof, ProofError> = SchedulerAdmissionProof::try_claim;
 pub use body::SchedulerGuardBody;
 pub(crate) use capacity_credit_api::{cancel_capacity_credit, issue_capacity_credit};
 pub use capacity_credit_api::{
