@@ -10,9 +10,14 @@
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::FutureExt as _;
 use kv_index::{
     compute_content_hash, ApplyError, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
@@ -52,6 +57,13 @@ pub struct KvEventMonitor {
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
     block_sizes: Arc<DashMap<String, usize>>,
+    /// Workers whose current stream has applied at least one contiguous batch.
+    event_ready_workers: Arc<DashSet<String>>,
+    /// Per-worker seqlock generation. Odd means the index is being mutated;
+    /// certified readers accept a claim only across the same even generation.
+    event_generations: Arc<DashMap<String, u64>>,
+    /// Last successfully applied batch, bounding trust on heartbeatless streams.
+    event_last_batch: Arc<DashMap<String, Instant>>,
     /// Per-worker subscription handles: worker_url → subscription info.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove.
     worker_handles: Mutex<HashMap<String, WorkerSubscription>>,
@@ -78,8 +90,8 @@ enum StreamResult {
 
 #[derive(Debug, PartialEq, Eq)]
 enum BatchResult {
-    Stale,
     Applied,
+    EpochReset { previous: u64, received: u64 },
     GapRecovered { expected: u64, received: u64 },
 }
 
@@ -93,6 +105,9 @@ impl KvEventMonitor {
         Self {
             indexers: DashMap::new(),
             block_sizes: Arc::new(DashMap::new()),
+            event_ready_workers: Arc::new(DashSet::new()),
+            event_generations: Arc::new(DashMap::new()),
+            event_last_batch: Arc::new(DashMap::new()),
             worker_handles: Mutex::new(HashMap::new()),
             jump_size,
         }
@@ -138,6 +153,12 @@ impl KvEventMonitor {
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
         let block_sizes = Arc::clone(&self.block_sizes);
+        let event_ready_workers = Arc::clone(&self.event_ready_workers);
+        let event_generations = Arc::clone(&self.event_generations);
+        let event_last_batch = Arc::clone(&self.event_last_batch);
+        Self::begin_generation_mutation(&event_generations, &url);
+        event_ready_workers.remove(&url);
+        event_last_batch.remove(&url);
 
         info!(
             worker_url = %url,
@@ -155,19 +176,43 @@ impl KvEventMonitor {
                       handle is stored and graceful shutdown is sent on removal"
         )]
         let handle = tokio::spawn(async move {
+            let worker_id = match indexer.intern_worker(&task_url) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(
+                        worker_url = %task_url,
+                        error = %e,
+                        "Failed to intern worker; KV events disabled for this worker"
+                    );
+                    Metrics::record_kv_event_subscription_failure(&task_url, "intern_failed");
+                    return;
+                }
+            };
+            // Keep reverse membership outside the caught future so panic
+            // cleanup can remove every exact membership from the shared index.
+            let mut worker_blocks = WorkerBlockMap::default();
             // Catch panics here so they surface when they happen — a bare
             // JoinError would only be observed at worker removal, leaving the
             // index silently frozen for this worker until then.
             let result = std::panic::AssertUnwindSafe(Self::subscription_loop(
                 worker,
                 worker_url,
-                indexer,
+                Arc::clone(&indexer),
+                worker_id,
+                &mut worker_blocks,
                 block_sizes,
+                Arc::clone(&event_ready_workers),
+                Arc::clone(&event_generations),
+                Arc::clone(&event_last_batch),
                 loop_model_id,
                 shutdown_rx,
             ))
             .catch_unwind()
             .await;
+            Self::begin_generation_mutation(&event_generations, &task_url);
+            event_ready_workers.remove(&task_url);
+            event_last_batch.remove(&task_url);
+            indexer.remove_worker(worker_id, worker_blocks);
             if let Err(payload) = result {
                 let msg = payload
                     .downcast_ref::<&str>()
@@ -200,12 +245,10 @@ impl KvEventMonitor {
     /// Sends a graceful shutdown signal — the task cleans up its own
     /// `WorkerBlockMap` in the indexer before exiting.
     pub async fn on_worker_removed(&self, worker_url: &str) {
-        let subscription = {
-            let mut handles = self.worker_handles.lock().await;
-            handles.remove(worker_url)
-        };
-
-        let Some(sub) = subscription else {
+        // Serialize same-URL removal and re-add. The old task must finish
+        // clearing its worker ID before a replacement begins publishing.
+        let mut handles = self.worker_handles.lock().await;
+        let Some(sub) = handles.remove(worker_url) else {
             return;
         };
 
@@ -227,15 +270,15 @@ impl KvEventMonitor {
         // Must re-acquire lock after shutdown to avoid TOCTOU with concurrent
         // on_worker_added that may have added a new worker for the same model
         // between our first lock release and this point.
-        let should_remove_indexer = {
-            let handles = self.worker_handles.lock().await;
-            !handles.values().any(|other| other.model_id == sub.model_id)
-        };
+        let should_remove_indexer = !handles.values().any(|other| other.model_id == sub.model_id);
 
         if should_remove_indexer {
             self.indexers.remove(&sub.model_id);
             self.block_sizes.remove(&sub.model_id);
         }
+        Self::begin_generation_mutation(&self.event_generations, worker_url);
+        self.event_ready_workers.remove(worker_url);
+        self.event_last_batch.remove(worker_url);
     }
 
     /// Stop all subscriptions and clean up.
@@ -266,6 +309,9 @@ impl KvEventMonitor {
 
         self.indexers.clear();
         self.block_sizes.clear();
+        self.event_ready_workers.clear();
+        self.event_generations.clear();
+        self.event_last_batch.clear();
     }
 
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).
@@ -286,6 +332,61 @@ impl KvEventMonitor {
             .or_insert(block_size);
     }
 
+    /// Capture the even stream/index generation for a certified query.
+    pub fn certified_generation(&self, worker_url: &str, max_age: Duration) -> Option<u64> {
+        let generation = self.event_generations.get(worker_url).map(|entry| *entry)?;
+        let observed_at = self.event_last_batch.get(worker_url).map(|entry| *entry)?;
+        (generation.is_multiple_of(2)
+            && self.event_ready_workers.contains(worker_url)
+            && Instant::now().saturating_duration_since(observed_at) <= max_age)
+            .then_some(generation)
+    }
+
+    /// Verify a claim at the selection linearization point.
+    pub fn certified_generation_unchanged(
+        &self,
+        worker_url: &str,
+        generation: u64,
+        max_age: Duration,
+    ) -> bool {
+        generation.is_multiple_of(2)
+            && self.event_ready_workers.contains(worker_url)
+            && self
+                .event_last_batch
+                .get(worker_url)
+                .is_some_and(|observed| {
+                    Instant::now().saturating_duration_since(*observed) <= max_age
+                })
+            && self
+                .event_generations
+                .get(worker_url)
+                .is_some_and(|current| *current == generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_event_stream_ready_for_test(&self, worker_url: &str) {
+        Self::begin_generation_mutation(&self.event_generations, worker_url);
+        self.event_last_batch
+            .insert(worker_url.to_string(), Instant::now());
+        self.event_ready_workers.insert(worker_url.to_string());
+        Self::finish_generation_mutation(&self.event_generations, worker_url);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_event_stream_not_ready_for_test(&self, worker_url: &str) {
+        Self::begin_generation_mutation(&self.event_generations, worker_url);
+        self.event_ready_workers.remove(worker_url);
+        self.event_last_batch.remove(worker_url);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_event_stream_for_test(&self, worker_url: &str, age: Duration) {
+        self.event_last_batch.insert(
+            worker_url.to_string(),
+            Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+        );
+    }
+
     /// Check if any subscription is running.
     pub async fn is_running(&self) -> bool {
         !self.worker_handles.lock().await.is_empty()
@@ -299,6 +400,28 @@ impl KvEventMonitor {
         } else {
             model_id.to_string()
         }
+    }
+
+    fn begin_generation_mutation(generations: &DashMap<String, u64>, worker_url: &str) {
+        generations
+            .entry(worker_url.to_string())
+            .and_modify(|generation| {
+                if generation.is_multiple_of(2) {
+                    *generation = generation.wrapping_add(1);
+                }
+            })
+            .or_insert(1);
+    }
+
+    fn finish_generation_mutation(generations: &DashMap<String, u64>, worker_url: &str) {
+        generations
+            .entry(worker_url.to_string())
+            .and_modify(|generation| {
+                if !generation.is_multiple_of(2) {
+                    *generation = generation.wrapping_add(1);
+                }
+            })
+            .or_insert(2);
     }
 
     // -----------------------------------------------------------------------
@@ -345,29 +468,25 @@ impl KvEventMonitor {
     ///
     /// Owns the `WorkerBlockMap` for this worker and cleans it up on exit.
     /// Exits when `shutdown_rx` fires or the backend returns `Unimplemented`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the live stream task owns explicit per-worker certification state"
+    )]
     async fn subscription_loop(
         worker: Arc<dyn Worker>,
         worker_url: String,
         indexer: Arc<PositionalIndexer>,
+        worker_id: u32,
+        worker_blocks: &mut WorkerBlockMap,
         block_sizes: Arc<DashMap<String, usize>>,
+        event_ready_workers: Arc<DashSet<String>>,
+        event_generations: Arc<DashMap<String, u64>>,
+        event_last_batch: Arc<DashMap<String, Instant>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
-        let worker_id = match indexer.intern_worker(&worker_url) {
-            Ok(id) => id,
-            Err(e) => {
-                error!(
-                    worker_url = %worker_url,
-                    error = %e,
-                    "Failed to intern worker; KV events from this worker will \
-                     not feed cache-aware routing"
-                );
-                Metrics::record_kv_event_subscription_failure(&worker_url, "intern_failed");
-                return;
-            }
-        };
-        let mut worker_blocks = WorkerBlockMap::default();
         let mut last_seq: u64 = 0;
+        let mut seen_batch = false;
         let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
         let mut block_size_learned = false;
 
@@ -379,6 +498,16 @@ impl KvEventMonitor {
                     _ = &mut *$rx => true,
                 }
             };
+        }
+
+        macro_rules! invalidate_and_clear {
+            () => {{
+                Self::begin_generation_mutation(&event_generations, &worker_url);
+                event_ready_workers.remove(&worker_url);
+                event_last_batch.remove(&worker_url);
+                indexer.apply_cleared(worker_id, worker_blocks);
+                return;
+            }};
         }
 
         loop {
@@ -397,8 +526,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
-                        return;
+                        invalidate_and_clear!();
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                     continue;
@@ -414,8 +542,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
-                        return;
+                        invalidate_and_clear!();
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                     continue;
@@ -441,8 +568,7 @@ impl KvEventMonitor {
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker"
                         );
-                        indexer.remove_worker(worker_id, worker_blocks);
-                        return;
+                        invalidate_and_clear!();
                     }
                     warn!(
                         worker_url = %worker_url,
@@ -454,8 +580,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
-                        return;
+                        invalidate_and_clear!();
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                     continue;
@@ -468,13 +593,27 @@ impl KvEventMonitor {
             let stream_result = tokio::select! {
                 result = Self::process_stream(
                     stream, &worker_url, worker_id, &indexer,
-                    &mut worker_blocks, &mut last_seq, on_batch,
+                    worker_blocks, &mut last_seq, &mut seen_batch,
+                    &event_ready_workers, &event_generations, &event_last_batch,
+                    on_batch,
                 ) => result,
                 _ = &mut shutdown_rx => {
-                    indexer.remove_worker(worker_id, worker_blocks);
-                    return;
+                    invalidate_and_clear!();
                 }
             };
+            // Production KV subscriptions are live-only. A reconnect cannot
+            // prove that the engine process or publisher epoch stayed the
+            // same, so discard every old positive before subscribing again.
+            Self::begin_generation_mutation(&event_generations, &worker_url);
+            event_ready_workers.remove(&worker_url);
+            event_last_batch.remove(&worker_url);
+            Self::reset_stream_epoch(
+                &indexer,
+                worker_id,
+                worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+            );
 
             match stream_result {
                 StreamResult::Ended => {
@@ -490,8 +629,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
-                        return;
+                        invalidate_and_clear!();
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
@@ -507,8 +645,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
-                        return;
+                        invalidate_and_clear!();
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
@@ -521,6 +658,10 @@ impl KvEventMonitor {
     // -----------------------------------------------------------------------
 
     /// Process batches from a single stream connection.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the stream processor updates one explicit worker epoch atomically"
+    )]
     async fn process_stream(
         mut stream: tonic::Streaming<KvEventBatch>,
         worker_url: &str,
@@ -528,6 +669,10 @@ impl KvEventMonitor {
         indexer: &PositionalIndexer,
         worker_blocks: &mut WorkerBlockMap,
         last_seq: &mut u64,
+        seen_batch: &mut bool,
+        event_ready_workers: &DashSet<String>,
+        event_generations: &DashMap<String, u64>,
+        event_last_batch: &DashMap<String, Instant>,
         mut on_batch: impl FnMut(&KvEventBatch),
     ) -> StreamResult {
         use tokio_stream::StreamExt;
@@ -538,6 +683,7 @@ impl KvEventMonitor {
                 Err(e) => return StreamResult::Error(e.to_string()),
             };
 
+            Self::begin_generation_mutation(event_generations, worker_url);
             Self::process_batch(
                 &batch,
                 worker_url,
@@ -545,14 +691,22 @@ impl KvEventMonitor {
                 indexer,
                 worker_blocks,
                 last_seq,
+                seen_batch,
                 &mut on_batch,
             );
+            event_last_batch.insert(worker_url.to_string(), Instant::now());
+            event_ready_workers.insert(worker_url.to_string());
+            Self::finish_generation_mutation(event_generations, worker_url);
         }
 
         StreamResult::Ended
     }
 
     /// Apply one KV event batch, recovering live-only streams after a sequence gap.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "batch recovery mutates one explicit worker epoch and its test callback"
+    )]
     fn process_batch(
         batch: &KvEventBatch,
         worker_url: &str,
@@ -560,17 +714,32 @@ impl KvEventMonitor {
         indexer: &PositionalIndexer,
         worker_blocks: &mut WorkerBlockMap,
         last_seq: &mut u64,
+        seen_batch: &mut bool,
         on_batch: &mut impl FnMut(&KvEventBatch),
     ) -> BatchResult {
-        // Skip stale/duplicate batches (can occur after reconnect replay).
-        if *last_seq > 0 && batch.sequence_number <= *last_seq {
-            debug!(
+        // The production stream is live-only. A non-increasing sequence on an
+        // otherwise-connected bridge is an engine publisher epoch reset, not
+        // replay. Clear first so equal/lower restart collisions cannot retain
+        // stale positives.
+        if *seen_batch && batch.sequence_number <= *last_seq {
+            let previous = *last_seq;
+            warn!(
                 worker_url = %worker_url,
                 last_seq = *last_seq,
                 received = batch.sequence_number,
-                "Skipping stale KV event batch"
+                "KV publisher sequence reset; cleared stale cache state"
             );
-            return BatchResult::Stale;
+            indexer.apply_cleared(worker_id, worker_blocks);
+            for event in &batch.events {
+                Self::apply_event(event, worker_id, indexer, worker_blocks);
+            }
+            on_batch(batch);
+            *last_seq = batch.sequence_number;
+            *seen_batch = true;
+            return BatchResult::EpochReset {
+                previous,
+                received: batch.sequence_number,
+            };
         }
 
         // Some engine bridges expose a live-only event stream even though the
@@ -580,7 +749,7 @@ impl KvEventMonitor {
         // and resume from the first live batch instead. The approximate token tree
         // remains available while new event-driven ownership is learned.
         let expected = last_seq.saturating_add(1);
-        let gap = (*last_seq > 0 && batch.sequence_number > expected)
+        let gap = (*seen_batch && batch.sequence_number > expected)
             .then_some((expected, batch.sequence_number));
         if let Some((expected, received)) = gap {
             warn!(
@@ -593,16 +762,29 @@ impl KvEventMonitor {
             indexer.apply_cleared(worker_id, worker_blocks);
         }
 
-        on_batch(batch);
         for event in &batch.events {
             Self::apply_event(event, worker_id, indexer, worker_blocks);
         }
+        on_batch(batch);
         *last_seq = batch.sequence_number;
+        *seen_batch = true;
 
         match gap {
             Some((expected, received)) => BatchResult::GapRecovered { expected, received },
             None => BatchResult::Applied,
         }
+    }
+
+    fn reset_stream_epoch(
+        indexer: &PositionalIndexer,
+        worker_id: u32,
+        worker_blocks: &mut WorkerBlockMap,
+        last_seq: &mut u64,
+        seen_batch: &mut bool,
+    ) {
+        indexer.apply_cleared(worker_id, worker_blocks);
+        *last_seq = 0;
+        *seen_batch = false;
     }
 
     /// Apply a single KV cache event to the indexer.
@@ -643,14 +825,13 @@ impl KvEventMonitor {
         match indexer.apply_stored(worker_id, &blocks, parent_seq_hash, worker_blocks) {
             Ok(()) => {}
             Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound) => {
-                // Cold start or parent evicted — retry without parent to start a new chain.
-                if let Err(e) = indexer.apply_stored(worker_id, &blocks, None, worker_blocks) {
-                    warn!(
-                        worker_id = worker_id,
-                        error = %e,
-                        "Failed to apply stored event after fallback"
-                    );
-                }
+                // Re-rooting an orphan from a live-only cold start would put a
+                // child at position zero and manufacture a false prefix hit.
+                warn!(
+                    worker_id = worker_id,
+                    parent_block_hash = ?stored.parent_block_hash,
+                    "Skipped KV store event with unknown parent"
+                );
             }
         }
     }
@@ -816,12 +997,13 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_stored_fallback_on_worker_not_tracked() {
+    fn test_apply_stored_unknown_parent_never_becomes_false_root() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://new-worker:8000").unwrap();
         let mut wb = WorkerBlockMap::default();
 
-        // Pass parent_block_hash for an untracked worker — should fallback to no parent.
+        // A live-only stream may start with a child whose parent predates this
+        // gateway. It must not be re-rooted at position zero.
         let stored = KvBlocksStored {
             blocks: vec![KvBlock {
                 block_hash: 1,
@@ -833,7 +1015,8 @@ mod tests {
             parent_block_hash: Some(999),
         };
         KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(indexer.current_size(), 0);
+        assert!(wb.is_empty());
     }
 
     #[test]
@@ -901,6 +1084,7 @@ mod tests {
         let worker_id = indexer.intern_worker(worker_url).unwrap();
         let mut worker_blocks = WorkerBlockMap::default();
         let mut last_seq = 1;
+        let mut seen_batch = true;
 
         let stale = KvBlocksStored {
             blocks: vec![KvBlock {
@@ -941,6 +1125,7 @@ mod tests {
             &indexer,
             &mut worker_blocks,
             &mut last_seq,
+            &mut seen_batch,
             &mut |_| {},
         );
 
@@ -952,9 +1137,9 @@ mod tests {
             }
         );
         assert_eq!(last_seq, 3);
-        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(indexer.current_size(), 0);
         assert!(!worker_blocks.contains_key(&SequenceHash::from(1i64)));
-        assert!(worker_blocks.contains_key(&SequenceHash::from(2i64)));
+        assert!(!worker_blocks.contains_key(&SequenceHash::from(2i64)));
 
         let contiguous = KvEventBatch {
             sequence_number: 4,
@@ -969,7 +1154,7 @@ mod tests {
                         lora_id: None,
                         cache_level: None,
                     }],
-                    parent_block_hash: Some(2),
+                    parent_block_hash: None,
                 })),
             }],
             dp_rank: None,
@@ -981,13 +1166,199 @@ mod tests {
             &indexer,
             &mut worker_blocks,
             &mut last_seq,
+            &mut seen_batch,
             &mut |_| {},
         );
 
         assert_eq!(result, BatchResult::Applied);
         assert_eq!(last_seq, 4);
-        assert_eq!(indexer.current_size(), 2);
+        assert_eq!(indexer.current_size(), 1);
         assert!(worker_blocks.contains_key(&SequenceHash::from(3i64)));
+    }
+
+    #[test]
+    fn sequence_zero_then_gap_clears_old_positive() {
+        let indexer = PositionalIndexer::new(64);
+        let worker_url = "http://w1:8000";
+        let worker_id = indexer.intern_worker(worker_url).unwrap();
+        let mut worker_blocks = WorkerBlockMap::default();
+        let mut last_seq = 0;
+        let mut seen_batch = false;
+        let root = KvEventBatch {
+            sequence_number: 0,
+            timestamp: 0.0,
+            events: vec![KvCacheEvent {
+                event_id: 1,
+                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    blocks: vec![KvBlock {
+                        block_hash: 1,
+                        token_ids: vec![10, 20, 30, 40],
+                        block_size: 4,
+                        lora_id: None,
+                        cache_level: None,
+                    }],
+                    parent_block_hash: None,
+                })),
+            }],
+            dp_rank: None,
+        };
+        assert_eq!(
+            KvEventMonitor::process_batch(
+                &root,
+                worker_url,
+                worker_id,
+                &indexer,
+                &mut worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+                &mut |_| {},
+            ),
+            BatchResult::Applied
+        );
+        assert!(seen_batch);
+        assert_eq!(last_seq, 0);
+        assert_eq!(indexer.current_size(), 1);
+
+        // Missing sequence 1 may have removed that root. Sequence 2 must
+        // clear it even though the last observed value was the valid zero.
+        let jumped = KvEventBatch {
+            sequence_number: 2,
+            timestamp: 0.0,
+            events: Vec::new(),
+            dp_rank: None,
+        };
+        assert_eq!(
+            KvEventMonitor::process_batch(
+                &jumped,
+                worker_url,
+                worker_id,
+                &indexer,
+                &mut worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+                &mut |_| {},
+            ),
+            BatchResult::GapRecovered {
+                expected: 1,
+                received: 2,
+            }
+        );
+        assert_eq!(indexer.current_size(), 0);
+        assert!(worker_blocks.is_empty());
+    }
+
+    #[test]
+    fn equal_and_lower_sequence_resets_clear_old_positive() {
+        fn root_batch(sequence_number: u64, block_hash: i64) -> KvEventBatch {
+            KvEventBatch {
+                sequence_number,
+                timestamp: 0.0,
+                events: vec![KvCacheEvent {
+                    event_id: sequence_number,
+                    data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                        blocks: vec![KvBlock {
+                            block_hash,
+                            token_ids: vec![1, 2, 3, 4],
+                            block_size: 4,
+                            lora_id: None,
+                            cache_level: None,
+                        }],
+                        parent_block_hash: None,
+                    })),
+                }],
+                dp_rank: None,
+            }
+        }
+
+        for (old_sequence, reset_sequence) in [(0, 0), (5, 1)] {
+            let indexer = PositionalIndexer::new(64);
+            let worker_url = "http://w1:8000";
+            let worker_id = indexer.intern_worker(worker_url).unwrap();
+            let mut worker_blocks = WorkerBlockMap::default();
+            let mut last_seq = 0;
+            let mut seen_batch = false;
+            KvEventMonitor::process_batch(
+                &root_batch(old_sequence, 1),
+                worker_url,
+                worker_id,
+                &indexer,
+                &mut worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+                &mut |_| {},
+            );
+            assert_eq!(indexer.current_size(), 1);
+
+            let reset = KvEventBatch {
+                sequence_number: reset_sequence,
+                timestamp: 0.0,
+                events: Vec::new(),
+                dp_rank: None,
+            };
+            assert_eq!(
+                KvEventMonitor::process_batch(
+                    &reset,
+                    worker_url,
+                    worker_id,
+                    &indexer,
+                    &mut worker_blocks,
+                    &mut last_seq,
+                    &mut seen_batch,
+                    &mut |_| {},
+                ),
+                BatchResult::EpochReset {
+                    previous: old_sequence,
+                    received: reset_sequence,
+                }
+            );
+            assert_eq!(indexer.current_size(), 0);
+            assert!(worker_blocks.is_empty());
+        }
+    }
+
+    #[test]
+    fn reconnect_reset_clears_index_and_invalidates_generation() {
+        let monitor = KvEventMonitor::new(Some(4));
+        let indexer = PositionalIndexer::new(64);
+        let worker_url = "http://w1:8000";
+        let worker_id = indexer.intern_worker(worker_url).unwrap();
+        let mut worker_blocks = WorkerBlockMap::default();
+        indexer
+            .apply_stored(
+                worker_id,
+                &[StoredBlock {
+                    seq_hash: SequenceHash(1),
+                    content_hash: compute_content_hash(&[1, 2, 3, 4]),
+                }],
+                None,
+                &mut worker_blocks,
+            )
+            .unwrap();
+        monitor.mark_event_stream_ready_for_test(worker_url);
+        let generation = monitor
+            .certified_generation(worker_url, Duration::from_secs(30))
+            .unwrap();
+        let mut last_seq = 9;
+        let mut seen_batch = true;
+
+        monitor.mark_event_stream_not_ready_for_test(worker_url);
+        KvEventMonitor::reset_stream_epoch(
+            &indexer,
+            worker_id,
+            &mut worker_blocks,
+            &mut last_seq,
+            &mut seen_batch,
+        );
+
+        assert_eq!(indexer.current_size(), 0);
+        assert!(worker_blocks.is_empty());
+        assert_eq!(last_seq, 0);
+        assert!(!seen_batch);
+        assert!(!monitor.certified_generation_unchanged(
+            worker_url,
+            generation,
+            Duration::from_secs(30)
+        ));
     }
 
     #[test]
