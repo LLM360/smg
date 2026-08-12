@@ -374,6 +374,7 @@ impl LeastLoadPolicy {
 
     fn record_cache_decision(
         &self,
+        model_id: &str,
         result: &'static str,
         changed: bool,
         cache_savings_seconds: Option<f64>,
@@ -381,6 +382,7 @@ impl LeastLoadPolicy {
         counter!(
             "smg_least_load_cache_credit_decisions_total",
             "mode" => self.mode_label(),
+            "model" => model_id.to_string(),
             "result" => result,
             "changed" => if changed { "true" } else { "false" },
         )
@@ -389,15 +391,17 @@ impl LeastLoadPolicy {
             histogram!(
                 "smg_least_load_cache_savings_seconds",
                 "mode" => self.mode_label(),
+                "model" => model_id.to_string(),
             )
             .record(seconds);
         }
     }
 
-    fn record_cache_skip(&self, reason: CacheCreditSkipReason) {
+    fn record_cache_skip(&self, model_id: &str, reason: CacheCreditSkipReason) {
         counter!(
             "smg_least_load_cache_credit_skips_total",
             "mode" => self.mode_label(),
+            "model" => model_id.to_string(),
             "reason" => reason.as_label(),
         )
         .increment(1);
@@ -535,23 +539,23 @@ impl LeastLoadPolicy {
 
         let healthy = get_healthy_worker_indices(workers);
         if healthy.len() <= 1 {
-            self.record_cache_decision("fallback", false, None);
-            self.record_cache_skip(CacheCreditSkipReason::InsufficientWorkers);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::InsufficientWorkers);
             return self.fallback_legacy_with_cache_credit(workers, info);
         }
         let prepared = match self.prepare_cache_credit(workers, &healthy, info, model_id) {
             Ok(prepared) => prepared,
             Err(reason) => {
-                self.record_cache_decision("fallback", false, None);
-                self.record_cache_skip(reason);
+                self.record_cache_decision(model_id, "fallback", false, None);
+                self.record_cache_skip(model_id, reason);
                 return self.fallback_legacy_with_cache_credit(workers, info);
             }
         };
 
         let loads_guard = self.cached_loads.read().ok();
         let Some(loads) = loads_guard.as_deref() else {
-            self.record_cache_decision("fallback", false, None);
-            self.record_cache_skip(CacheCreditSkipReason::MissingLoad);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::MissingLoad);
             return self.fallback_legacy_with_cache_credit(workers, info);
         };
         if !healthy
@@ -559,8 +563,8 @@ impl LeastLoadPolicy {
             .any(|&idx| loads.contains_key(workers[idx].url()))
         {
             drop(loads_guard);
-            self.record_cache_decision("fallback", false, None);
-            self.record_cache_skip(CacheCreditSkipReason::MissingLoad);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::MissingLoad);
             return self.fallback_legacy_with_cache_credit(workers, info);
         }
 
@@ -607,8 +611,8 @@ impl LeastLoadPolicy {
         if certified == 0 {
             drop(inflight);
             drop(loads_guard);
-            self.record_cache_decision("fallback", false, None);
-            self.record_cache_skip(CacheCreditSkipReason::StaleKv);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::StaleKv);
             return self.fallback_legacy_with_cache_credit(workers, info);
         }
 
@@ -684,13 +688,13 @@ impl LeastLoadPolicy {
         drop(loads_guard);
 
         if skipped_missing_load {
-            self.record_cache_skip(CacheCreditSkipReason::MissingLoad);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::MissingLoad);
         }
         if stale_kv {
-            self.record_cache_skip(CacheCreditSkipReason::StaleKv);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::StaleKv);
         }
         if no_cached_prefix {
-            self.record_cache_skip(CacheCreditSkipReason::NoPrefix);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::NoPrefix);
         }
 
         let result = if certified == healthy.len() {
@@ -699,6 +703,7 @@ impl LeastLoadPolicy {
             "partial"
         };
         self.record_cache_decision(
+            model_id,
             result,
             cache_best != legacy_best,
             Some(cached_tokens[cache_best] as f64 / self.cache_prefill_throughput),

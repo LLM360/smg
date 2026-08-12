@@ -114,7 +114,8 @@ throughput `150/200/250` and cache prefill throughput `6000/8000/12000`. The
 `--least-load-mean-remaining-decode-tokens` option is retained for config
 compatibility but is not used by the bounded selector. Certified KV events
 expire after 30 seconds without a new batch because the live-only stream does
-not provide a heartbeat.
+not provide a heartbeat. Cache-credit decision, skip, and savings metrics carry
+a `model` label so each model's shadow behavior can be evaluated independently.
 
 ---
 
