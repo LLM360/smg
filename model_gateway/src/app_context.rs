@@ -678,28 +678,34 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create KV event monitor for event-driven cache-aware routing.
+    /// Create the shared KV event monitor for cache-informed routing.
     ///
     /// The monitor is created when the default or an explicit model policy is
-    /// cache_aware, regardless of connection mode. The monitor itself is cheap
-    /// (empty DashMaps) and stays dormant until workers are added. The
-    /// UpdatePoliciesStep gates subscriptions on `cache_aware && gRPC`, so HTTP
-    /// workers are never subscribed.
+    /// cache-aware or cache-credit least-load, regardless of connection mode.
+    /// The monitor itself is cheap (empty DashMaps) and stays dormant until
+    /// workers are added. UpdatePoliciesStep subscribes only gRPC workers whose
+    /// policy declares that it consumes KV events.
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
-        use crate::config::types::PolicyConfig;
+        use crate::config::types::{LeastLoadCacheMode, PolicyConfig};
 
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
-            || config
-                .model_policies
-                .values()
-                .any(|policy| matches!(policy, PolicyConfig::CacheAware { .. }));
+        let needs_kv_events = |policy: &PolicyConfig| {
+            matches!(policy, PolicyConfig::CacheAware { .. })
+                || matches!(
+                    policy,
+                    PolicyConfig::LeastLoad {
+                        cache_mode: LeastLoadCacheMode::Shadow | LeastLoadCacheMode::Enforce,
+                        ..
+                    }
+                )
+        };
+        let uses_kv_events =
+            needs_kv_events(&config.policy) || config.model_policies.values().any(needs_kv_events);
 
-        if is_cache_aware {
+        if uses_kv_events {
             let monitor = Arc::new(KvEventMonitor::new(None));
-            debug!("Created KV event monitor for event-driven cache-aware routing");
+            debug!("Created KV event monitor for cache-informed routing");
 
-            // Inject monitor into PolicyRegistry — propagates to default_policy
-            // and any other existing cache-aware policies.
+            // Inject the monitor into every existing policy that consumes KV events.
             if let Some(ref registry) = self.policy_registry {
                 registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
                 // Wire the backend load snapshot so cache-aware policies can use
@@ -738,7 +744,7 @@ impl Default for AppContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::PolicyConfig;
+    use crate::config::types::{LeastLoadCacheMode, PolicyConfig};
 
     fn config_with_policy(policy: PolicyConfig) -> RouterConfig {
         RouterConfig {
@@ -747,9 +753,8 @@ mod tests {
         }
     }
 
-    /// `with_kv_event_monitor` only creates a monitor for the cache-aware policy.
-    /// This run of the builder needs no storage or network, so it exercises the
-    /// real gating path rather than the predicate in isolation.
+    /// This builder path needs no storage or network, so it exercises the real
+    /// KV-monitor gating path rather than the predicate in isolation.
     fn kv_monitor_created_for(policy: PolicyConfig) -> bool {
         let config = config_with_policy(policy);
         AppContextBuilder::new()
@@ -811,6 +816,27 @@ mod tests {
             .with_kv_event_monitor(&config)
             .kv_event_monitor
             .is_some());
+    }
+
+    #[test]
+    fn test_least_load_cache_mode_controls_kv_event_monitor() {
+        let least_load = |cache_mode| PolicyConfig::LeastLoad {
+            load_check_interval_secs: 5,
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 1024,
+            default_throughput: 2000.0,
+            cache_mode,
+            cache_prefill_throughput: 8000.0,
+            mean_remaining_decode_tokens: 2048,
+        };
+
+        assert!(!kv_monitor_created_for(least_load(LeastLoadCacheMode::Off)));
+        assert!(kv_monitor_created_for(least_load(
+            LeastLoadCacheMode::Shadow
+        )));
+        assert!(kv_monitor_created_for(least_load(
+            LeastLoadCacheMode::Enforce
+        )));
     }
 
     #[test]

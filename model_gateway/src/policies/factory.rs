@@ -28,11 +28,17 @@ impl PolicyFactory {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
+                cache_mode,
+                cache_prefill_throughput,
+                mean_remaining_decode_tokens,
                 ..
-            } => Arc::new(LeastLoadPolicy::with_params(
+            } => Arc::new(LeastLoadPolicy::with_cache_params(
                 *kv_pressure_weight,
                 *mean_prefill_tokens,
                 *default_throughput,
+                *cache_mode,
+                *cache_prefill_throughput,
+                *mean_remaining_decode_tokens,
             )),
             PolicyConfig::CacheAware {
                 cache_threshold,

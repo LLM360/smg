@@ -1479,6 +1479,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
+    fn needs_kv_events(&self) -> bool {
+        true
+    }
+
+    fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
+        CacheAwarePolicy::set_kv_event_monitor(self, monitor);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

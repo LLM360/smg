@@ -74,7 +74,7 @@ Controls how requests are distributed across workers.
 |--------|------------|
 | Environment | - |
 | Default | `cache_aware` |
-| Values | `random`, `round_robin`, `cache_aware`, `power_of_two`, `prefix_hash`, `consistent_hashing`, `bucket`, `manual` |
+| Values | `random`, `round_robin`, `cache_aware`, `power_of_two`, `least_load`, `prefix_hash`, `consistent_hashing`, `bucket`, `manual` |
 
 **Policy Comparison**:
 
@@ -83,6 +83,7 @@ Controls how requests are distributed across workers.
 | `random` | Simple deployments | Poor | Fair |
 | `round_robin` | Uniform workloads | Poor | Good |
 | `power_of_two` | Variable workloads | Poor | Excellent |
+| `least_load` | K3 gRPC Chat | Optional | Excellent |
 | `cache_aware` | LLM inference | Excellent | Good |
 | `prefix_hash` | Consistent routing by prefix | Good | Good |
 | `consistent_hashing` | Session affinity via hash ring | Good | Good |
@@ -108,6 +109,15 @@ Controls how requests are distributed across workers.
 |--------|-------------|---------|
 | `--prefix-token-count` | Number of prefix tokens to use for hashing | `256` |
 | `--prefix-hash-load-factor` | Load factor threshold for rebalancing | `1.25` |
+
+### Least Load Policy Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--least-load-cache-mode` | Cache credit mode: `off`, `shadow`, or `enforce` | `off` |
+| `--least-load-cache-prefill-throughput` | Estimated prefill rate used to value certified cached tokens | `8000` |
+| `--least-load-mean-remaining-decode-tokens` | Decode occupancy estimate per running or waiting request | `2048` |
+| `--least-load-default-throughput` | Legacy fallback generation rate when the backend reports zero; calibrate explicitly for K3 | `2000` |
 
 ### Manual Policy Options
 

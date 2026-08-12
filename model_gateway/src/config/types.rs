@@ -629,6 +629,19 @@ impl Default for RoutingKeyOverrideConfig {
     }
 }
 
+/// Prefix-cache credit mode for the M2 K3 least-load rollout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeastLoadCacheMode {
+    /// Preserve the existing least-load policy exactly.
+    #[default]
+    Off,
+    /// Compute and report the hybrid choice, but dispatch the legacy choice.
+    Shadow,
+    /// Dispatch the hybrid least-load plus cache-credit choice.
+    Enforce,
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -706,6 +719,17 @@ pub enum PolicyConfig {
         /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
+        /// Prefix-cache credit is intentionally off unless explicitly enabled.
+        #[serde(default)]
+        cache_mode: LeastLoadCacheMode,
+        /// Estimated backend prefill rate used to convert certified cached
+        /// prompt tokens into seconds of saved work.
+        #[serde(default = "default_least_load_cache_prefill_throughput")]
+        cache_prefill_throughput: f64,
+        /// Mean remaining decode tokens used to price the running and waiting
+        /// request counts exposed by the M2 TokenSpeed load feed.
+        #[serde(default = "default_least_load_mean_remaining_decode")]
+        mean_remaining_decode_tokens: u32,
     },
 
     #[serde(rename = "bucket")]
@@ -802,6 +826,14 @@ fn default_least_load_mean_prefill() -> u32 {
 
 fn default_least_load_throughput() -> f64 {
     2000.0
+}
+
+fn default_least_load_cache_prefill_throughput() -> f64 {
+    8000.0
+}
+
+fn default_least_load_mean_remaining_decode() -> u32 {
+    2048
 }
 
 impl PolicyConfig {

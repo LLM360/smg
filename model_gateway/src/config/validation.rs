@@ -544,6 +544,9 @@ impl ConfigValidator {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
+                cache_prefill_throughput,
+                mean_remaining_decode_tokens,
+                ..
             } => {
                 if *load_check_interval_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -574,6 +577,22 @@ impl ConfigValidator {
                         field: "default_throughput".to_string(),
                         value: default_throughput.to_string(),
                         reason: "Must be finite and > 0.0".to_string(),
+                    });
+                }
+
+                if !cache_prefill_throughput.is_finite() || *cache_prefill_throughput <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_prefill_throughput".to_string(),
+                        value: cache_prefill_throughput.to_string(),
+                        reason: "Must be finite and > 0.0".to_string(),
+                    });
+                }
+
+                if *mean_remaining_decode_tokens == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "mean_remaining_decode_tokens".to_string(),
+                        value: mean_remaining_decode_tokens.to_string(),
+                        reason: "Must be > 0".to_string(),
                     });
                 }
             }
@@ -1355,6 +1374,40 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
+    fn least_load_policy(
+        cache_prefill_throughput: f64,
+        mean_remaining_decode_tokens: u32,
+    ) -> PolicyConfig {
+        PolicyConfig::LeastLoad {
+            load_check_interval_secs: 5,
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 1024,
+            default_throughput: 2000.0,
+            cache_mode: LeastLoadCacheMode::Shadow,
+            cache_prefill_throughput,
+            mean_remaining_decode_tokens,
+        }
+    }
+
+    #[test]
+    fn least_load_cache_parameters_must_be_positive() {
+        assert!(matches!(
+            ConfigValidator::validate_policy(&least_load_policy(0.0, 2048)),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "cache_prefill_throughput"
+        ));
+        assert!(matches!(
+            ConfigValidator::validate_policy(&least_load_policy(f64::NAN, 2048)),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "cache_prefill_throughput"
+        ));
+        assert!(matches!(
+            ConfigValidator::validate_policy(&least_load_policy(8000.0, 0)),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "mean_remaining_decode_tokens"
+        ));
+    }
+
     fn regular_mode_config() -> RouterConfig {
         RouterConfig::new(
             RoutingMode::Regular {
@@ -1926,6 +1979,9 @@ mod tests {
                     kv_pressure_weight: 0.15,
                     mean_prefill_tokens: 1024,
                     default_throughput: 2000.0,
+                    cache_mode: Default::default(),
+                    cache_prefill_throughput: 8000.0,
+                    mean_remaining_decode_tokens: 2048,
                 }),
                 prefill_policy: None,
                 decode_policy: None,

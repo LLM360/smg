@@ -130,11 +130,10 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 }
             }
 
-            // Start KV event subscription for gRPC workers with cache_aware policy
+            // Start one KV event subscription for gRPC policies that consume it.
             if let Some(ref monitor) = app_context.kv_event_monitor {
                 if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
-                    if policy.name() == "cache_aware"
-                        && *worker.connection_mode() == ConnectionMode::Grpc
+                    if policy.needs_kv_events() && *worker.connection_mode() == ConnectionMode::Grpc
                     {
                         monitor.on_worker_added(worker).await;
                     }

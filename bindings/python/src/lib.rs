@@ -608,6 +608,9 @@ impl Router {
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
+                    cache_mode: Default::default(),
+                    cache_prefill_throughput: 8000.0,
+                    mean_remaining_decode_tokens: 2048,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,

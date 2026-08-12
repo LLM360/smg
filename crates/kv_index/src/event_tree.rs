@@ -572,6 +572,51 @@ impl PositionalIndexer {
         self.jump_search_matches(content_hashes, early_exit)
     }
 
+    /// Exact positive-only prefix matcher for routing decisions.
+    ///
+    /// The general matcher has shortcuts that are useful for approximate
+    /// cache affinity. This variant checks the rolling prefix hash at every
+    /// position and never jumps across a removed middle block, so every
+    /// reported block belongs to the exact requested chain.
+    pub fn find_certified_matches(&self, content_hashes: &[ContentHash]) -> OverlapScores {
+        let mut scores = OverlapScores::default();
+        if content_hashes.is_empty() {
+            return scores;
+        }
+
+        let mut active: Vec<u32> = Vec::new();
+        let mut prefix_hash = SequenceHash(content_hashes[0].0);
+        for (position, &content_hash) in content_hashes.iter().enumerate() {
+            if position > 0 {
+                prefix_hash =
+                    SequenceHash(Self::compute_next_seq_hash(prefix_hash.0, content_hash.0));
+            }
+            let Some(entry) = self.index.get(&(position, content_hash)) else {
+                break;
+            };
+            let Some(workers) = entry.get(prefix_hash) else {
+                break;
+            };
+            if position == 0 {
+                active.extend(workers.iter().copied());
+            } else {
+                active.retain(|worker| workers.contains(worker));
+            }
+            if active.is_empty() {
+                break;
+            }
+            for &worker in &active {
+                scores.scores.insert(worker, (position + 1) as u32);
+            }
+        }
+        for &worker in scores.scores.keys() {
+            scores
+                .tree_sizes
+                .insert(worker, self.tree_sizes.load(worker));
+        }
+        scores
+    }
+
     // -----------------------------------------------------------------------
     // Internal: router prefix hash + jump search
     //
@@ -931,6 +976,44 @@ mod tests {
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(scores.scores.get(&w1), Some(&3));
         assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+    }
+
+    #[test]
+    fn certified_match_requires_the_exact_rolling_prefix_chain() {
+        let indexer = PositionalIndexer::new(64);
+        let w_ay = indexer.intern_worker("http://ay:8000").unwrap();
+        let w_bx = indexer.intern_worker("http://bx:8000").unwrap();
+        let mut ay = WorkerBlockMap::default();
+        let mut bx = WorkerBlockMap::default();
+        indexer
+            .apply_stored(w_ay, &make_blocks(&[10, 20]), None, &mut ay)
+            .unwrap();
+        indexer
+            .apply_stored(w_bx, &make_blocks(&[30, 40]), None, &mut bx)
+            .unwrap();
+
+        // The request takes its first block from one branch and its second
+        // block from another. Matching by (position, content) alone would be a
+        // false two-block hit; rolling-prefix equality must stop at the one
+        // genuinely shared root block.
+        let scores = indexer.find_certified_matches(&hashes(&[10, 40]));
+        assert_eq!(scores.scores.get(&w_ay), Some(&1));
+        assert!(!scores.scores.contains_key(&w_bx));
+    }
+
+    #[test]
+    fn certified_match_stops_at_a_removed_middle_block() {
+        let indexer = PositionalIndexer::new(64);
+        let worker = indexer.intern_worker("http://w:8000").unwrap();
+        let blocks = make_blocks(&(1..=130).collect::<Vec<_>>());
+        let mut worker_blocks = WorkerBlockMap::default();
+        indexer
+            .apply_stored(worker, &blocks, None, &mut worker_blocks)
+            .unwrap();
+        indexer.apply_removed(worker, &[blocks[64].seq_hash], &mut worker_blocks);
+
+        let scores = indexer.find_certified_matches(&hashes(&(1..=130).collect::<Vec<_>>()));
+        assert_eq!(scores.scores.get(&worker), Some(&64));
     }
 
     #[test]

@@ -14,8 +14,9 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, OwnerPressureDispatchPlan, PolicyFactory, SeedWorkerHeadroom, SelectWorkerInfo,
+    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LeastLoadPolicy, LoadBalancingPolicy,
+    ManualConfig, ManualPolicy, OwnerPressureDispatchPlan, PolicyFactory, SeedWorkerHeadroom,
+    SelectWorkerInfo,
 };
 use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
@@ -48,8 +49,8 @@ pub struct PolicyRegistry {
     /// Encode policy for EPD mode (set once at startup, lock-free reads via OnceLock)
     encode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
-    /// Optional KV event monitor for event-driven cache-aware routing.
-    /// When set, new CacheAwarePolicy instances are injected with this monitor.
+    /// Optional KV event monitor for policies that consume backend cache events.
+    /// When set, new eligible policy instances are injected with this monitor.
     kv_event_monitor: Arc<RwLock<Option<Arc<KvEventMonitor>>>>,
 
     /// Optional backend load-snapshot receiver from the `WorkerMonitor`. When
@@ -154,21 +155,46 @@ impl PolicyRegistry {
         Some((idx, policy.reservation_cost(info)))
     }
 
+    /// Narrow least-load cache-credit entry point. The gRPC worker-selection
+    /// stage calls this only for direct Regular scalar streaming Chat.
+    pub fn select_worker_with_reservation_cache_credit_chat(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        model_id: &str,
+    ) -> Option<(usize, Option<u64>)> {
+        if let Some(sticky) = self.routing_key_sticky.as_ref() {
+            if Self::routing_key_override_applies(policy.name())
+                && extract_routing_key(info.headers).is_some()
+            {
+                return sticky.select_worker(workers, info).map(|idx| (idx, None));
+            }
+        }
+
+        let idx = if let Some(least_load) = policy.as_any().downcast_ref::<LeastLoadPolicy>() {
+            least_load.select_worker_cache_credit_chat(workers, info, model_id)?
+        } else {
+            policy.select_worker(workers, info)?
+        };
+        Some((idx, policy.reservation_cost(info)))
+    }
+
     /// Policies that already honor `X-SMG-Routing-Key` keep their own handling; all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
         !matches!(name, "manual" | "consistent_hashing")
     }
 
-    /// Set KV event monitor (thread-safe, can be called after initialization).
-    /// Propagates to all existing cache-aware policies (including default, prefill, decode).
+    /// Set the KV event monitor (thread-safe, can be called after initialization).
+    /// Propagates to every existing policy that consumes KV events.
     pub fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
         {
             let mut guard = self.kv_event_monitor.write();
             guard.clone_from(&monitor);
         }
 
-        // Propagate to existing cache-aware policies so they don't miss the monitor.
+        // Propagate to existing KV-event consumers so they don't miss the monitor.
         // This covers the default_policy (created before the monitor was available)
         // and any model/PD policies that were already set up.
         Self::maybe_inject_monitor(&self.default_policy, monitor.as_ref());
@@ -186,13 +212,13 @@ impl PolicyRegistry {
         }
     }
 
-    /// Inject KV event monitor into a policy if it's cache-aware.
+    /// Inject KV event monitor into a policy if it consumes KV events.
     fn maybe_inject_monitor(
         policy: &Arc<dyn LoadBalancingPolicy>,
         monitor: Option<&Arc<KvEventMonitor>>,
     ) {
-        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-            cache_aware.set_kv_event_monitor(monitor.cloned());
+        if policy.needs_kv_events() {
+            policy.set_kv_event_monitor(monitor.cloned());
         }
     }
 

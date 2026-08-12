@@ -139,6 +139,14 @@ impl Default for PrometheusConfig {
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
 pub(crate) fn init_metrics() {
+    describe_counter!(
+        "smg_least_load_cache_credit_decisions_total",
+        "Least-load cache-credit decisions by mode, coverage result, and changed choice"
+    );
+    describe_histogram!(
+        "smg_least_load_cache_savings_seconds",
+        "Certified cached-prompt seconds saved by the hybrid-selected worker"
+    );
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",

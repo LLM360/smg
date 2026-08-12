@@ -1,13 +1,19 @@
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
+use kv_index::compute_request_content_hashes;
+use metrics::{counter, histogram};
 use openai_protocol::worker::WorkerLoadResponse;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
+use crate::{
+    config::LeastLoadCacheMode,
+    worker::{KvEventMonitor, Worker},
+};
 
 /// Default KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
 /// chosen commensurate with the expected-queue-wait term so the two add cleanly.
@@ -22,6 +28,28 @@ pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
 /// fleet its absolute value mainly sets the work-vs-barrier balance, so it
 /// co-tunes with `kv_pressure_weight`.
 pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
+pub const DEFAULT_CACHE_PREFILL_THROUGHPUT: f64 = 8000.0;
+pub const DEFAULT_MEAN_REMAINING_DECODE_TOKENS: u32 = 2048;
+
+/// The production TokenSpeed KV stream has no heartbeat. Do not use a
+/// positive ownership claim after a quiet stream has exceeded this bound.
+const CACHE_EVENT_MAX_AGE: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct PreparedCacheCredit {
+    monitor: Arc<KvEventMonitor>,
+    /// One entry per input worker. `Some` means the worker had a fresh,
+    /// certified stream at query time, even when its exact overlap is zero.
+    claims: Vec<Option<(u64, u64)>>,
+}
+
+#[derive(Debug, Default)]
+struct InflightState {
+    /// Legacy token credits for the worker actually dispatched.
+    legacy_tokens: HashMap<String, u64>,
+    /// Counterfactual (Shadow) or actual (Enforce) hybrid work credits.
+    hybrid_seconds: HashMap<String, f64>,
+}
 
 /// Least-(token-)work routing — route to the worker with the lowest estimated
 /// time-to-drain plus a convex KV-pressure barrier (argmin, lower is better):
@@ -83,7 +111,9 @@ pub struct LeastLoadPolicy {
     cached_loads: RwLock<HashMap<String, WorkerLoadResponse>>,
     /// In-flight token-work dispatched per worker since its last load poll
     /// (keyed by worker URL); reset when a fresh report arrives.
-    inflight_tokens: RwLock<HashMap<String, u64>>,
+    /// Both since-poll ledgers share one lock so routing and poll reset cannot
+    /// expose a half-updated legacy/hybrid state.
+    inflight: RwLock<InflightState>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
     /// Mean prefill length (tokens) for estimating in-flight token-work when a
@@ -92,6 +122,10 @@ pub struct LeastLoadPolicy {
     /// Fallback throughput (tokens/s) for the `/throughput` term when a backend
     /// reports no live `gen_throughput`.
     default_throughput: f64,
+    cache_mode: LeastLoadCacheMode,
+    cache_prefill_throughput: f64,
+    mean_remaining_decode_tokens: u32,
+    kv_event_monitor: RwLock<Option<Arc<KvEventMonitor>>>,
 }
 
 impl LeastLoadPolicy {
@@ -116,9 +150,27 @@ impl LeastLoadPolicy {
         mean_prefill_tokens: u32,
         default_throughput: f64,
     ) -> Self {
+        Self::with_cache_params(
+            kv_pressure_weight,
+            mean_prefill_tokens,
+            default_throughput,
+            LeastLoadCacheMode::Off,
+            DEFAULT_CACHE_PREFILL_THROUGHPUT,
+            DEFAULT_MEAN_REMAINING_DECODE_TOKENS,
+        )
+    }
+
+    pub fn with_cache_params(
+        kv_pressure_weight: f64,
+        mean_prefill_tokens: u32,
+        default_throughput: f64,
+        cache_mode: LeastLoadCacheMode,
+        cache_prefill_throughput: f64,
+        mean_remaining_decode_tokens: u32,
+    ) -> Self {
         Self {
             cached_loads: RwLock::new(HashMap::new()),
-            inflight_tokens: RwLock::new(HashMap::new()),
+            inflight: RwLock::new(InflightState::default()),
             kv_pressure_weight: if kv_pressure_weight.is_finite() && kv_pressure_weight >= 0.0 {
                 kv_pressure_weight
             } else {
@@ -130,6 +182,16 @@ impl LeastLoadPolicy {
             } else {
                 DEFAULT_THROUGHPUT
             },
+            cache_mode,
+            cache_prefill_throughput: if cache_prefill_throughput.is_finite()
+                && cache_prefill_throughput > 0.0
+            {
+                cache_prefill_throughput
+            } else {
+                DEFAULT_CACHE_PREFILL_THROUGHPUT
+            },
+            mean_remaining_decode_tokens: mean_remaining_decode_tokens.max(1),
+            kv_event_monitor: RwLock::new(None),
         }
     }
 
@@ -183,6 +245,468 @@ impl LeastLoadPolicy {
             .map(|t| t.len() as u64)
             .unwrap_or(self.mean_prefill_tokens as u64)
     }
+
+    /// The unchanged legacy selection and credit operation, with the caller
+    /// holding the combined since-poll state lock.
+    fn select_legacy_locked(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy: &[usize],
+        info: &SelectWorkerInfo<'_>,
+        loads: Option<&HashMap<String, WorkerLoadResponse>>,
+        inflight: &mut InflightState,
+    ) -> Option<usize> {
+        if healthy.is_empty() {
+            return None;
+        }
+        // Preserve the production fast path exactly: one worker is returned
+        // without a legacy since-poll credit or processed counter increment.
+        if healthy.len() == 1 {
+            return Some(healthy[0]);
+        }
+
+        let (tp_sum, tp_count) = healthy
+            .iter()
+            .filter_map(|&idx| loads.and_then(|loads| loads.get(workers[idx].url())))
+            .map(WorkerLoadResponse::total_gen_throughput)
+            .filter(|throughput| *throughput > 0.0)
+            .fold((0.0, 0u32), |(sum, count), throughput| {
+                (sum + throughput, count + 1)
+            });
+        let nominal_throughput = if tp_count > 0 {
+            tp_sum / tp_count as f64
+        } else {
+            self.default_throughput
+        };
+        let fleet_has_loads = loads.is_some_and(|loads| {
+            healthy
+                .iter()
+                .any(|&idx| loads.contains_key(workers[idx].url()))
+        });
+
+        let mut best = healthy[0];
+        let mut best_score = self.score(
+            &workers[best],
+            loads,
+            &inflight.legacy_tokens,
+            nominal_throughput,
+            fleet_has_loads,
+        );
+        for &idx in &healthy[1..] {
+            let score = self.score(
+                &workers[idx],
+                loads,
+                &inflight.legacy_tokens,
+                nominal_throughput,
+                fleet_has_loads,
+            );
+            if score < best_score {
+                best = idx;
+                best_score = score;
+            }
+        }
+
+        let request_tokens = self.request_tokens(info);
+        *inflight
+            .legacy_tokens
+            .entry(workers[best].url().to_string())
+            .or_insert(0) += request_tokens;
+        debug!(
+            "least_load selected {} (score {:.4}, in_flight {})",
+            workers[best].url(),
+            best_score,
+            workers[best].load()
+        );
+        workers[best].increment_processed();
+        Some(best)
+    }
+
+    pub fn cache_credit_enabled(&self) -> bool {
+        self.cache_mode != LeastLoadCacheMode::Off
+    }
+
+    pub fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
+        *self
+            .kv_event_monitor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = monitor;
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self.cache_mode {
+            LeastLoadCacheMode::Off => "off",
+            LeastLoadCacheMode::Shadow => "shadow",
+            LeastLoadCacheMode::Enforce => "enforce",
+        }
+    }
+
+    fn record_cache_decision(
+        &self,
+        result: &'static str,
+        changed: bool,
+        cache_savings_seconds: Option<f64>,
+    ) {
+        counter!(
+            "smg_least_load_cache_credit_decisions_total",
+            "mode" => self.mode_label(),
+            "result" => result,
+            "changed" => if changed { "true" } else { "false" },
+        )
+        .increment(1);
+        if let Some(seconds) = cache_savings_seconds {
+            histogram!(
+                "smg_least_load_cache_savings_seconds",
+                "mode" => self.mode_label(),
+            )
+            .record(seconds);
+        }
+    }
+
+    fn prepare_cache_credit(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy: &[usize],
+        info: &SelectWorkerInfo<'_>,
+        model_id: &str,
+    ) -> Option<PreparedCacheCredit> {
+        let tokens = info.tokens.filter(|tokens| !tokens.is_empty())?;
+
+        // KV events do not carry a model ID. Only the production K3 topology,
+        // where every candidate advertises exactly this one model, is safe.
+        if healthy.iter().any(|&idx| {
+            let models = workers[idx].models();
+            models.len() != 1 || !models[0].matches(model_id)
+        }) {
+            return None;
+        }
+
+        let monitor = self
+            .kv_event_monitor
+            .read()
+            .ok()?
+            .as_ref()
+            .map(Arc::clone)?;
+        let block_size = monitor.block_size(model_id).filter(|size| *size > 0)?;
+        let indexer = monitor.get_indexer(model_id)?;
+        let content_hashes = compute_request_content_hashes(tokens, block_size);
+        if content_hashes.is_empty() {
+            return None;
+        }
+
+        // Capture generations before the exact index query, then validate
+        // again after it. Unknown/disconnected workers remain safe zero-cache
+        // candidates, while at least one certified stream keeps routing active.
+        let mut generations = vec![None; workers.len()];
+        for &idx in healthy {
+            generations[idx] =
+                monitor.certified_generation(workers[idx].url(), CACHE_EVENT_MAX_AGE);
+        }
+        let scores = indexer.find_certified_matches(&content_hashes);
+        let mut claims = vec![None; workers.len()];
+        let mut certified = 0usize;
+        for &idx in healthy {
+            let Some(generation) = generations[idx] else {
+                continue;
+            };
+            let url = workers[idx].url();
+            let Some(worker_id) = indexer.worker_id(url) else {
+                continue;
+            };
+            if !monitor.certified_generation_unchanged(url, generation, CACHE_EVENT_MAX_AGE) {
+                continue;
+            }
+            let cached_blocks = scores.scores.get(&worker_id).copied().unwrap_or(0) as u64;
+            let cached_tokens = cached_blocks
+                .saturating_mul(block_size as u64)
+                .min(tokens.len() as u64);
+            claims[idx] = Some((generation, cached_tokens));
+            certified += 1;
+        }
+        (certified > 0).then_some(PreparedCacheCredit { monitor, claims })
+    }
+
+    fn occupancy_seconds(&self, load: &WorkerLoadResponse) -> Option<f64> {
+        let rank_count = usize::try_from(load.dp_rank_count).ok()?;
+        if rank_count == 0 || rank_count != load.loads.len() {
+            return None;
+        }
+        let mut requests = 0u64;
+        for rank in &load.loads {
+            if rank.num_running_reqs < 0
+                || rank.num_waiting_reqs < 0
+                || rank.num_waiting_uncached_tokens < 0
+            {
+                return None;
+            }
+            requests = requests
+                .checked_add(rank.num_running_reqs as u64)?
+                .checked_add(rank.num_waiting_reqs as u64)?;
+        }
+        let live_throughput = load.total_gen_throughput();
+        if !live_throughput.is_finite() || live_throughput < 0.0 {
+            return None;
+        }
+        let throughput = if live_throughput > 0.0 {
+            live_throughput
+        } else {
+            self.default_throughput
+        };
+        Some(requests as f64 * self.mean_remaining_decode_tokens as f64 / throughput)
+    }
+
+    fn effective_throughput(&self, load: Option<&WorkerLoadResponse>) -> f64 {
+        let live = load.map_or(0.0, WorkerLoadResponse::total_gen_throughput);
+        if live.is_finite() && live > 0.0 {
+            live
+        } else {
+            self.default_throughput
+        }
+    }
+
+    fn hybrid_base_seconds(
+        &self,
+        load: &WorkerLoadResponse,
+        since_poll_seconds: f64,
+    ) -> Option<f64> {
+        let occupancy = self.occupancy_seconds(load)?;
+        let queued_prefill =
+            load.total_waiting_uncached_tokens() as f64 / self.cache_prefill_throughput;
+        let k = load.effective_token_usage().clamp(0.0, 0.999);
+        Some(
+            queued_prefill
+                + occupancy
+                + since_poll_seconds
+                + self.kv_pressure_weight * k / (1.0 - k),
+        )
+    }
+
+    fn hybrid_request_seconds(
+        &self,
+        info: &SelectWorkerInfo<'_>,
+        cached_tokens: u64,
+        load: Option<&WorkerLoadResponse>,
+    ) -> f64 {
+        let prompt_tokens = self.request_tokens(info);
+        let uncached_prompt_tokens = prompt_tokens.saturating_sub(cached_tokens);
+        uncached_prompt_tokens as f64 / self.cache_prefill_throughput
+            + self.mean_remaining_decode_tokens as f64 / self.effective_throughput(load)
+    }
+
+    fn fallback_legacy_with_hybrid_credit(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        let healthy = get_healthy_worker_indices(workers);
+        let loads_guard = self.cached_loads.read().ok();
+        let loads = loads_guard.as_deref();
+        let mut inflight = self
+            .inflight
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selected = self.select_legacy_locked(workers, &healthy, info, loads, &mut inflight)?;
+        let seconds = self.hybrid_request_seconds(
+            info,
+            0,
+            loads.and_then(|loads| loads.get(workers[selected].url())),
+        );
+        *inflight
+            .hybrid_seconds
+            .entry(workers[selected].url().to_string())
+            .or_insert(0.0) += seconds;
+        Some(selected)
+    }
+
+    /// Narrow M2 rollout path: direct Regular single-model streaming gRPC Chat.
+    /// Every unavailable signal delegates to the unchanged legacy method.
+    pub fn select_worker_cache_credit_chat(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        model_id: &str,
+    ) -> Option<usize> {
+        if self.cache_mode == LeastLoadCacheMode::Off {
+            return self.select_worker(workers, info);
+        }
+
+        let healthy = get_healthy_worker_indices(workers);
+        if healthy.len() <= 1 {
+            self.record_cache_decision("fallback", false, None);
+            return self.fallback_legacy_with_hybrid_credit(workers, info);
+        }
+        let Some(prepared) = self.prepare_cache_credit(workers, &healthy, info, model_id) else {
+            self.record_cache_decision("fallback", false, None);
+            return self.fallback_legacy_with_hybrid_credit(workers, info);
+        };
+
+        let loads_guard = self.cached_loads.read().ok();
+        let Some(loads) = loads_guard.as_deref() else {
+            self.record_cache_decision("fallback", false, None);
+            return self.fallback_legacy_with_hybrid_credit(workers, info);
+        };
+        for &idx in &healthy {
+            let Some(load) = loads.get(workers[idx].url()) else {
+                drop(loads_guard);
+                self.record_cache_decision("fallback", false, None);
+                return self.fallback_legacy_with_hybrid_credit(workers, info);
+            };
+            if self.hybrid_base_seconds(load, 0.0).is_none() {
+                drop(loads_guard);
+                self.record_cache_decision("fallback", false, None);
+                return self.fallback_legacy_with_hybrid_credit(workers, info);
+            }
+        }
+
+        let (tp_sum, tp_count) = healthy
+            .iter()
+            .filter_map(|&idx| loads.get(workers[idx].url()))
+            .map(WorkerLoadResponse::total_gen_throughput)
+            .filter(|throughput| *throughput > 0.0)
+            .fold((0.0, 0u32), |(sum, count), throughput| {
+                (sum + throughput, count + 1)
+            });
+        let nominal_throughput = if tp_count > 0 {
+            tp_sum / tp_count as f64
+        } else {
+            self.default_throughput
+        };
+
+        let mut inflight = self
+            .inflight
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Revalidate after taking the selection lock. A disconnect, gap, or
+        // restart between hashing and this point converts that worker to a
+        // safe zero-cache candidate. If every stream changed, fall back.
+        let mut cached_tokens = vec![0u64; workers.len()];
+        let mut certified = 0usize;
+        for &idx in &healthy {
+            let Some((generation, tokens)) = prepared.claims[idx] else {
+                continue;
+            };
+            if prepared.monitor.certified_generation_unchanged(
+                workers[idx].url(),
+                generation,
+                CACHE_EVENT_MAX_AGE,
+            ) {
+                cached_tokens[idx] = tokens;
+                certified += 1;
+            }
+        }
+        if certified == 0 {
+            drop(inflight);
+            drop(loads_guard);
+            self.record_cache_decision("fallback", false, None);
+            return self.fallback_legacy_with_hybrid_credit(workers, info);
+        }
+
+        let legacy_score = |idx: usize| {
+            self.score(
+                &workers[idx],
+                Some(loads),
+                &inflight.legacy_tokens,
+                nominal_throughput,
+                true,
+            )
+        };
+        let hybrid_score = |idx: usize| {
+            let since_poll = inflight
+                .hybrid_seconds
+                .get(workers[idx].url())
+                .copied()
+                .unwrap_or(0.0);
+            loads
+                .get(workers[idx].url())
+                .and_then(|load| self.hybrid_base_seconds(load, since_poll))
+                .map_or(f64::INFINITY, |base| {
+                    base - cached_tokens[idx] as f64 / self.cache_prefill_throughput
+                })
+        };
+
+        let mut legacy_best = healthy[0];
+        let mut legacy_best_score = legacy_score(legacy_best);
+        let mut hybrid_best = healthy[0];
+        let mut hybrid_best_score = hybrid_score(hybrid_best);
+        for &idx in &healthy[1..] {
+            let legacy = legacy_score(idx);
+            if legacy < legacy_best_score {
+                legacy_best = idx;
+                legacy_best_score = legacy;
+            }
+            let hybrid = hybrid_score(idx);
+            if hybrid < hybrid_best_score {
+                hybrid_best = idx;
+                hybrid_best_score = hybrid;
+            }
+        }
+
+        let selected = if self.cache_mode == LeastLoadCacheMode::Enforce {
+            hybrid_best
+        } else {
+            legacy_best
+        };
+        // Preserve the legacy since-poll ledger for the worker actually
+        // dispatched in both modes. If KV certification disappears before the
+        // next poll, fallback sees every Enforce dispatch already in flight.
+        let req_tokens = self.request_tokens(info);
+        *inflight
+            .legacy_tokens
+            .entry(workers[selected].url().to_string())
+            .or_insert(0) += req_tokens;
+        let hybrid_request_seconds = self.hybrid_request_seconds(
+            info,
+            cached_tokens[hybrid_best],
+            loads.get(workers[hybrid_best].url()),
+        );
+        *inflight
+            .hybrid_seconds
+            .entry(workers[hybrid_best].url().to_string())
+            .or_insert(0.0) += hybrid_request_seconds;
+        drop(inflight);
+        drop(loads_guard);
+
+        let result = if certified == healthy.len() {
+            "complete"
+        } else {
+            "partial"
+        };
+        self.record_cache_decision(
+            result,
+            hybrid_best != legacy_best,
+            Some(cached_tokens[hybrid_best] as f64 / self.cache_prefill_throughput),
+        );
+        debug!(
+            "least_load cache credit selected {} (legacy {}, hybrid_score {:.4})",
+            workers[selected].url(),
+            workers[legacy_best].url(),
+            hybrid_best_score
+        );
+        workers[selected].increment_processed();
+        Some(selected)
+    }
+
+    fn apply_load_update(
+        &self,
+        loads: &HashMap<String, WorkerLoadResponse>,
+        worker_urls: Option<&[String]>,
+    ) {
+        if let Ok(mut cached) = self.cached_loads.write() {
+            if let Ok(mut inflight) = self.inflight.write() {
+                cached.extend(loads.iter().map(|(url, load)| (url.clone(), load.clone())));
+                if let Some(worker_urls) = worker_urls {
+                    cached.retain(|url, _| !worker_urls.contains(url) || loads.contains_key(url));
+                }
+                // A fresh snapshot already reflects work up to the poll. Only
+                // reported URLs retire credits; a missing URL is evicted from
+                // projected telemetry but keeps its conservative credits.
+                for url in loads.keys() {
+                    inflight.legacy_tokens.insert(url.clone(), 0);
+                    inflight.hybrid_seconds.insert(url.clone(), 0.0);
+                }
+            }
+        }
+    }
 }
 
 impl LoadBalancingPolicy for LeastLoadPolicy {
@@ -197,69 +721,11 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
 
         let loads_guard = self.cached_loads.read().ok();
         let loads = loads_guard.as_deref();
-
-        // Fleet-nominal throughput (mean of positive reports) stands in for a
-        // worker missing a fresh snapshot; `fleet_has_loads` distinguishes a
-        // partial gap (estimate that worker's drain time at the nominal rate)
-        // from a fully dark fleet (fall back to join-shortest-queue).
-        let (tp_sum, tp_count) = healthy
-            .iter()
-            .filter_map(|&i| loads.and_then(|m| m.get(workers[i].url())))
-            .map(|l| l.total_gen_throughput())
-            .filter(|t| *t > 0.0)
-            .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
-        let nominal_throughput = if tp_count > 0 {
-            tp_sum / tp_count as f64
-        } else {
-            self.default_throughput
-        };
-        let fleet_has_loads = loads
-            .map(|m| healthy.iter().any(|&i| m.contains_key(workers[i].url())))
-            .unwrap_or(false);
-
-        // Held across selection so the in-flight estimate stays consistent and
-        // the chosen worker can be credited before the guard is released.
         let mut inflight = self
-            .inflight_tokens
+            .inflight
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let mut best = healthy[0];
-        let mut best_score = self.score(
-            &workers[best],
-            loads,
-            &inflight,
-            nominal_throughput,
-            fleet_has_loads,
-        );
-        for &idx in &healthy[1..] {
-            let s = self.score(
-                &workers[idx],
-                loads,
-                &inflight,
-                nominal_throughput,
-                fleet_has_loads,
-            );
-            if s < best_score {
-                best = idx;
-                best_score = s;
-            }
-        }
-
-        // In-flight correction: credit the chosen worker with this request's
-        // token-work until its next poll refreshes the snapshot.
-        let req_tokens = self.request_tokens(info);
-        *inflight.entry(workers[best].url().to_string()).or_insert(0) += req_tokens;
-        drop(inflight);
-
-        debug!(
-            "least_load selected {} (score {:.4}, in_flight {})",
-            workers[best].url(),
-            best_score,
-            workers[best].load()
-        );
-        workers[best].increment_processed();
-        Some(best)
+        self.select_legacy_locked(workers, &healthy, info, loads, &mut inflight)
     }
 
     fn name(&self) -> &'static str {
@@ -267,28 +733,36 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
     }
 
     fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
-        if let Ok(mut cached) = self.cached_loads.write() {
-            cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-        // A fresh snapshot already reflects work up to the poll, so reset the
-        // since-poll in-flight estimate for the workers it covers.
-        if let Ok(mut inflight) = self.inflight_tokens.write() {
-            for url in loads.keys() {
-                inflight.insert(url.clone(), 0);
-            }
-        }
+        self.apply_load_update(loads, None);
+    }
+
+    fn update_loads_for_workers(
+        &self,
+        loads: &HashMap<String, WorkerLoadResponse>,
+        worker_urls: &[String],
+    ) {
+        self.apply_load_update(loads, Some(worker_urls));
     }
 
     fn needs_load_updates(&self) -> bool {
         true
     }
 
+    fn needs_kv_events(&self) -> bool {
+        self.cache_credit_enabled()
+    }
+
+    fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
+        LeastLoadPolicy::set_kv_event_monitor(self, monitor);
+    }
+
     fn remove_worker(&self, url: &str) {
         if let Ok(mut cached) = self.cached_loads.write() {
             cached.remove(url);
-        }
-        if let Ok(mut inflight) = self.inflight_tokens.write() {
-            inflight.remove(url);
+            if let Ok(mut inflight) = self.inflight.write() {
+                inflight.legacy_tokens.remove(url);
+                inflight.hybrid_seconds.remove(url);
+            }
         }
     }
 
@@ -305,7 +779,18 @@ impl Default for LeastLoadPolicy {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot};
+    use std::{
+        collections::HashSet,
+        sync::{mpsc, Arc as StdArc, Barrier},
+    };
+
+    use kv_index::{
+        compute_content_hash, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
+    };
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, SchedulerLoadSnapshot},
+    };
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, WorkerType};
@@ -351,6 +836,720 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    fn mk_model(url: &str, model_id: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new(model_id))
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    fn make_m2_load(running: i32, waiting: i32, gen_throughput: f64) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            timestamp: String::new(),
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: running,
+                num_waiting_reqs: waiting,
+                num_waiting_uncached_tokens: 0,
+                num_total_reqs: running.saturating_add(waiting),
+                gen_throughput,
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn cache_policy(
+        mode: LeastLoadCacheMode,
+        default_throughput: f64,
+        cache_prefill_throughput: f64,
+        mean_remaining_decode_tokens: u32,
+    ) -> LeastLoadPolicy {
+        LeastLoadPolicy::with_cache_params(
+            0.0,
+            1024,
+            default_throughput,
+            mode,
+            cache_prefill_throughput,
+            mean_remaining_decode_tokens,
+        )
+    }
+
+    fn certified_monitor(
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        block_size: usize,
+        ready: &[usize],
+        cached_owner: Option<(usize, &[u32])>,
+    ) -> Arc<KvEventMonitor> {
+        let monitor = Arc::new(KvEventMonitor::new(Some(block_size)));
+        monitor.set_block_size(model_id, block_size);
+        let indexer = Arc::new(PositionalIndexer::new(block_size));
+        let mut worker_ids = Vec::with_capacity(workers.len());
+        for worker in workers {
+            worker_ids.push(indexer.intern_worker(worker.url()).unwrap());
+        }
+        if let Some((owner, tokens)) = cached_owner {
+            let blocks: Vec<_> = tokens
+                .chunks(block_size)
+                .enumerate()
+                .map(|(position, block)| StoredBlock {
+                    seq_hash: SequenceHash(position as u64 + 1),
+                    content_hash: compute_content_hash(block),
+                })
+                .collect();
+            indexer
+                .apply_stored(
+                    worker_ids[owner],
+                    &blocks,
+                    None,
+                    &mut WorkerBlockMap::default(),
+                )
+                .unwrap();
+        }
+        monitor
+            .indexers
+            .insert(model_id.to_string(), Arc::clone(&indexer));
+        for &idx in ready {
+            monitor.mark_event_stream_ready_for_test(workers[idx].url());
+        }
+        monitor
+    }
+
+    #[test]
+    fn cache_credit_break_even_is_one_cached_prompt_second() {
+        fn choose(owner_waiting_tokens: i32) -> usize {
+            let model = "kimi-k3";
+            let tokens = vec![7u32; 1024];
+            let workers = vec![
+                mk_model("http://owner:8000", model),
+                mk_model("http://cold:8000", model),
+            ];
+            let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 1000.0, 1);
+            policy.set_kv_event_monitor(Some(certified_monitor(
+                model,
+                &workers,
+                16,
+                &[0, 1],
+                Some((0, &tokens)),
+            )));
+            let mut loads = HashMap::new();
+            loads.insert(
+                workers[0].url().to_string(),
+                make_load(owner_waiting_tokens, 0.0, 100.0),
+            );
+            loads.insert(workers[1].url().to_string(), make_load(0, 0.0, 100.0));
+            policy.update_loads(&loads);
+            policy
+                .select_worker_cache_credit_chat(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                    model,
+                )
+                .unwrap()
+        }
+
+        // 1024 cached tokens at 1000 prefill tok/s save 1.024 seconds.
+        // Live generation throughput is deliberately 100 tok/s, proving the
+        // queued prompt is divided by prefill, not generation, throughput.
+        assert_eq!(choose(1023), 0, "1.023s penalty keeps the cache owner");
+        assert_eq!(choose(1025), 1, "1.025s penalty spills to the cold peer");
+    }
+
+    #[test]
+    fn zero_ready_cache_streams_fall_back_to_exact_legacy_sequence() {
+        let model = "kimi-k3";
+        let tokens = vec![1u32; 128];
+        let legacy_workers = vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ];
+        let projected_workers = vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ];
+        let legacy = cache_policy(LeastLoadCacheMode::Off, 1000.0, 1000.0, 2048);
+        let projected = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 1000.0, 2048);
+        projected.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            &projected_workers,
+            16,
+            &[],
+            Some((0, &tokens)),
+        )));
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), make_m2_load(0, 0, 0.0));
+        loads.insert("http://b:8000".to_string(), make_m2_load(0, 0, 0.0));
+        legacy.update_loads(&loads);
+        projected.update_loads(&loads);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        let legacy_sequence: Vec<_> = (0..20)
+            .map(|_| legacy.select_worker(&legacy_workers, &info).unwrap())
+            .collect();
+        let projected_sequence: Vec<_> = (0..20)
+            .map(|_| {
+                projected
+                    .select_worker_cache_credit_chat(&projected_workers, &info, model)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(projected_sequence, legacy_sequence);
+        assert_eq!(
+            projected.inflight.read().unwrap().legacy_tokens,
+            legacy.inflight.read().unwrap().legacy_tokens
+        );
+    }
+
+    #[test]
+    fn stale_cache_streams_fall_back_to_exact_legacy_sequence() {
+        let model = "kimi-k3";
+        let tokens = vec![2u32; 128];
+        let legacy_workers = vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ];
+        let projected_workers = vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ];
+        let legacy = cache_policy(LeastLoadCacheMode::Off, 1000.0, 1000.0, 2048);
+        let projected = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 1000.0, 2048);
+        let monitor = certified_monitor(model, &projected_workers, 16, &[0, 1], Some((0, &tokens)));
+        for worker in &projected_workers {
+            monitor.age_event_stream_for_test(worker.url(), Duration::from_secs(31));
+        }
+        projected.set_kv_event_monitor(Some(monitor));
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), make_m2_load(0, 0, 0.0));
+        loads.insert("http://b:8000".to_string(), make_m2_load(0, 0, 0.0));
+        legacy.update_loads(&loads);
+        projected.update_loads(&loads);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        let legacy_sequence: Vec<_> = (0..20)
+            .map(|_| legacy.select_worker(&legacy_workers, &info).unwrap())
+            .collect();
+        let projected_sequence: Vec<_> = (0..20)
+            .map(|_| {
+                projected
+                    .select_worker_cache_credit_chat(&projected_workers, &info, model)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(projected_sequence, legacy_sequence);
+        assert_eq!(
+            projected.inflight.read().unwrap().legacy_tokens,
+            legacy.inflight.read().unwrap().legacy_tokens
+        );
+    }
+
+    #[test]
+    fn missing_current_group_load_evicts_stale_snapshot_and_falls_back() {
+        let model = "kimi-k3";
+        let tokens = vec![8u32; 128];
+        let workers = vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ];
+        let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 1000.0, 100);
+        policy.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            &workers,
+            16,
+            &[0, 1],
+            Some((0, &tokens)),
+        )));
+        let mut full = HashMap::new();
+        full.insert(workers[0].url().to_string(), make_m2_load(0, 0, 0.0));
+        full.insert(workers[1].url().to_string(), make_m2_load(0, 0, 0.0));
+        policy.update_loads(&full);
+
+        let group_urls = workers
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect::<Vec<_>>();
+        let only_a = HashMap::from([(workers[0].url().to_string(), make_m2_load(0, 0, 0.0))]);
+        policy.update_loads_for_workers(&only_a, &group_urls);
+        assert!(!policy
+            .cached_loads
+            .read()
+            .unwrap()
+            .contains_key(workers[1].url()));
+
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let chosen = policy
+            .select_worker_cache_credit_chat(&workers, &info, model)
+            .unwrap();
+        assert_eq!(
+            chosen, 0,
+            "legacy partial-load fallback chooses reporting A"
+        );
+    }
+
+    #[test]
+    fn shadow_keeps_exact_legacy_sequence_with_certified_cache() {
+        let model = "kimi-k3";
+        let tokens = vec![3u32; 1024];
+        let legacy_workers = vec![
+            mk_model("http://owner:8000", model),
+            mk_model("http://cold:8000", model),
+        ];
+        let shadow_workers = vec![
+            mk_model("http://owner:8000", model),
+            mk_model("http://cold:8000", model),
+        ];
+        let legacy = cache_policy(LeastLoadCacheMode::Off, 1000.0, 1000.0, 1);
+        let shadow = cache_policy(LeastLoadCacheMode::Shadow, 1000.0, 1000.0, 1);
+        shadow.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            &shadow_workers,
+            16,
+            &[0, 1],
+            Some((0, &tokens)),
+        )));
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://owner:8000".to_string(),
+            make_load(1023, 0.0, 1000.0),
+        );
+        loads.insert("http://cold:8000".to_string(), make_load(0, 0.0, 1000.0));
+        legacy.update_loads(&loads);
+        shadow.update_loads(&loads);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        let legacy_sequence: Vec<_> = (0..20)
+            .map(|_| legacy.select_worker(&legacy_workers, &info).unwrap())
+            .collect();
+        let shadow_sequence: Vec<_> = (0..20)
+            .map(|_| {
+                shadow
+                    .select_worker_cache_credit_chat(&shadow_workers, &info, model)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(shadow_sequence, legacy_sequence);
+        assert_eq!(
+            shadow.inflight.read().unwrap().legacy_tokens,
+            legacy.inflight.read().unwrap().legacy_tokens
+        );
+    }
+
+    #[test]
+    fn enforce_dispatches_remain_visible_after_kv_fallback() {
+        let model = "kimi-k3";
+        let tokens = vec![5u32; 1024];
+        let workers = vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ];
+        let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 1000.0, 100);
+        let monitor = certified_monitor(model, &workers, 16, &[0, 1], Some((0, &tokens)));
+        policy.set_kv_event_monitor(Some(Arc::clone(&monitor)));
+        let mut loads = HashMap::new();
+        loads.insert(workers[0].url().to_string(), make_m2_load(0, 0, 1000.0));
+        loads.insert(workers[1].url().to_string(), make_m2_load(0, 0, 1000.0));
+        policy.update_loads(&loads);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        let first = policy
+            .select_worker_cache_credit_chat(&workers, &info, model)
+            .unwrap();
+        assert_eq!(
+            policy.inflight.read().unwrap().legacy_tokens[workers[first].url()],
+            tokens.len() as u64
+        );
+        for worker in &workers {
+            monitor.mark_event_stream_not_ready_for_test(worker.url());
+        }
+        let second = policy
+            .select_worker_cache_credit_chat(&workers, &info, model)
+            .unwrap();
+        assert_ne!(
+            second, first,
+            "legacy fallback must see the Enforce dispatch"
+        );
+    }
+
+    #[test]
+    fn one_disconnected_peer_keeps_safe_partial_cache_credit() {
+        let model = "kimi-k3";
+        let tokens = vec![9u32; 1024];
+        let workers = vec![
+            mk_model("http://owner:8000", model),
+            mk_model("http://unknown:8000", model),
+        ];
+        let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 1000.0, 1);
+        policy.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            &workers,
+            16,
+            &[0],
+            Some((0, &tokens)),
+        )));
+        let mut loads = HashMap::new();
+        loads.insert(workers[0].url().to_string(), make_m2_load(0, 0, 0.0));
+        loads.insert(workers[1].url().to_string(), make_m2_load(0, 0, 0.0));
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker_cache_credit_chat(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+                model,
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn occupancy_uses_live_throughput_or_configured_fallback() {
+        let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 8000.0, 100);
+        assert_eq!(
+            policy.occupancy_seconds(&make_m2_load(1, 0, 100.0)),
+            Some(1.0)
+        );
+        assert_eq!(
+            policy.occupancy_seconds(&make_m2_load(1, 0, 0.0)),
+            Some(0.1)
+        );
+    }
+
+    #[test]
+    fn fully_cached_burst_still_waterfills_on_decode_seconds() {
+        let model = "kimi-k3";
+        let tokens = vec![77u32; 8192];
+        let workers = vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ];
+        let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 8000.0, 100);
+        let monitor = certified_monitor(model, &workers, 16, &[0, 1], Some((0, &tokens)));
+        let indexer = monitor.get_indexer(model).unwrap();
+        let worker_b = indexer.worker_id(workers[1].url()).unwrap();
+        let blocks: Vec<_> = tokens
+            .chunks(16)
+            .enumerate()
+            .map(|(position, block)| StoredBlock {
+                seq_hash: SequenceHash(position as u64 + 10_000),
+                content_hash: compute_content_hash(block),
+            })
+            .collect();
+        indexer
+            .apply_stored(worker_b, &blocks, None, &mut WorkerBlockMap::default())
+            .unwrap();
+        policy.set_kv_event_monitor(Some(monitor));
+        let mut loads = HashMap::new();
+        loads.insert(workers[0].url().to_string(), make_m2_load(0, 0, 1000.0));
+        loads.insert(workers[1].url().to_string(), make_m2_load(0, 0, 1000.0));
+        policy.update_loads(&loads);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+
+        let selections: Vec<_> = (0..20)
+            .map(|_| {
+                policy
+                    .select_worker_cache_credit_chat(&workers, &info, model)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(selections.iter().filter(|&&idx| idx == 0).count(), 10);
+        assert_eq!(selections.iter().filter(|&&idx| idx == 1).count(), 10);
+        let inflight = policy.inflight.read().unwrap();
+        assert_eq!(inflight.legacy_tokens.len(), 2);
+        assert!(inflight.legacy_tokens.values().all(|tokens| *tokens > 0));
+        assert!((inflight.hybrid_seconds[workers[0].url()] - 1.0).abs() < 1e-9);
+        assert!((inflight.hybrid_seconds[workers[1].url()] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fallback_and_certified_concurrency_keep_both_ledgers_aligned() {
+        let model = "kimi-k3";
+        let tokens = StdArc::new(vec![9u32; 100]);
+        let workers: StdArc<Vec<Arc<dyn Worker>>> = StdArc::new(vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ]);
+        let policy = StdArc::new(cache_policy(
+            LeastLoadCacheMode::Enforce,
+            1000.0,
+            1000.0,
+            100,
+        ));
+        policy.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            workers.as_slice(),
+            10,
+            &[0, 1],
+            None,
+        )));
+        let mut loads = HashMap::new();
+        loads.insert(workers[0].url().to_string(), make_m2_load(0, 0, 1000.0));
+        loads.insert(workers[1].url().to_string(), make_m2_load(0, 0, 1000.0));
+        policy.update_loads(&loads);
+
+        let start = StdArc::new(Barrier::new(17));
+        std::thread::scope(|scope| {
+            for thread_idx in 0..16 {
+                let policy = StdArc::clone(&policy);
+                let workers = StdArc::clone(&workers);
+                let tokens = StdArc::clone(&tokens);
+                let start = StdArc::clone(&start);
+                scope.spawn(move || {
+                    // The mismatched model takes the exact legacy fallback;
+                    // the matching model takes the certified hybrid path.
+                    let requested_model = if thread_idx % 2 == 0 { model } else { "other" };
+                    start.wait();
+                    for _ in 0..100 {
+                        policy
+                            .select_worker_cache_credit_chat(
+                                workers.as_slice(),
+                                &SelectWorkerInfo {
+                                    tokens: Some(tokens.as_slice()),
+                                    ..Default::default()
+                                },
+                                requested_model,
+                            )
+                            .unwrap();
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        let inflight = policy.inflight.read().unwrap();
+        for worker in workers.iter() {
+            let requests = inflight.legacy_tokens[worker.url()] / tokens.len() as u64;
+            let expected_seconds = requests as f64 * 0.2;
+            assert!(
+                (inflight.hybrid_seconds[worker.url()] - expected_seconds).abs() < 1e-9,
+                "legacy and hybrid credit must be one atomic routing decision"
+            );
+        }
+        let counts: Vec<_> = workers
+            .iter()
+            .map(|worker| inflight.legacy_tokens[worker.url()] / tokens.len() as u64)
+            .collect();
+        assert!(counts[0].abs_diff(counts[1]) <= 1);
+    }
+
+    #[test]
+    fn load_poll_reset_cannot_split_a_routing_credit() {
+        let model = "kimi-k3";
+        let tokens = StdArc::new(vec![11u32; 100]);
+        let workers: StdArc<Vec<Arc<dyn Worker>>> = StdArc::new(vec![
+            mk_model("http://a:8000", model),
+            mk_model("http://b:8000", model),
+        ]);
+        let policy = StdArc::new(cache_policy(
+            LeastLoadCacheMode::Enforce,
+            1000.0,
+            1000.0,
+            100,
+        ));
+        policy.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            workers.as_slice(),
+            10,
+            &[0, 1],
+            None,
+        )));
+        let mut loads = HashMap::new();
+        loads.insert(workers[0].url().to_string(), make_m2_load(0, 0, 1000.0));
+        loads.insert(workers[1].url().to_string(), make_m2_load(0, 0, 1000.0));
+        policy.update_loads(&loads);
+
+        // Freeze the shared ledger. The poll takes the load write lock and
+        // waits here, so a new route cannot observe the new snapshot until
+        // both ledgers have been reset.
+        let state_guard = policy.inflight.write().unwrap();
+        let poll_policy = StdArc::clone(&policy);
+        let poll_loads = loads.clone();
+        let poll = std::thread::spawn(move || poll_policy.update_loads(&poll_loads));
+        let mut poll_has_load_lock = false;
+        for _ in 0..10_000 {
+            if policy.cached_loads.try_read().is_err() {
+                poll_has_load_lock = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(poll_has_load_lock, "poll did not reach the reset barrier");
+
+        let (tx, rx) = mpsc::channel();
+        let route_policy = StdArc::clone(&policy);
+        let route_workers = StdArc::clone(&workers);
+        let route_tokens = StdArc::clone(&tokens);
+        let route = std::thread::spawn(move || {
+            let selected = route_policy
+                .select_worker_cache_credit_chat(
+                    route_workers.as_slice(),
+                    &SelectWorkerInfo {
+                        tokens: Some(route_tokens.as_slice()),
+                        ..Default::default()
+                    },
+                    model,
+                )
+                .unwrap();
+            tx.send(selected).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(state_guard);
+        poll.join().unwrap();
+        let selected = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        route.join().unwrap();
+
+        let inflight = policy.inflight.read().unwrap();
+        assert_eq!(inflight.legacy_tokens[workers[selected].url()], 100);
+        assert!((inflight.hybrid_seconds[workers[selected].url()] - 0.2).abs() < 1e-9);
+        let other = 1 - selected;
+        assert_eq!(inflight.legacy_tokens[workers[other].url()], 0);
+        assert_eq!(inflight.hybrid_seconds[workers[other].url()], 0.0);
+    }
+
+    #[test]
+    fn incident_regression_spreads_510_arrivals_across_all_50_idle_peers() {
+        let model = "kimi-k3";
+        let tokens = vec![42u32; 128];
+        let workers: Vec<_> = (0..51)
+            .map(|idx| mk_model(&format!("http://w{idx}:8000"), model))
+            .collect();
+        let policy = StdArc::new(cache_policy(
+            LeastLoadCacheMode::Enforce,
+            322.0,
+            8000.0,
+            2048,
+        ));
+        policy.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            &workers,
+            16,
+            &(0..51).collect::<Vec<_>>(),
+            None,
+        )));
+        let mut loads = HashMap::new();
+        for (idx, worker) in workers.iter().enumerate() {
+            loads.insert(
+                worker.url().to_string(),
+                if idx == 0 {
+                    // Exact M2 TokenSpeed shape: counts are populated, queued
+                    // prompt tokens and generation throughput are both zero.
+                    make_m2_load(38, 109, 0.0)
+                } else {
+                    make_m2_load(0, 0, 0.0)
+                },
+            );
+        }
+        policy.update_loads(&loads);
+
+        let workers = StdArc::new(workers);
+        let tokens = StdArc::new(tokens);
+        let start = StdArc::new(Barrier::new(52));
+        let selections = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..51 {
+                let policy = StdArc::clone(&policy);
+                let workers = StdArc::clone(&workers);
+                let tokens = StdArc::clone(&tokens);
+                let start = StdArc::clone(&start);
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    (0..10)
+                        .map(|_| {
+                            policy
+                                .select_worker_cache_credit_chat(
+                                    workers.as_slice(),
+                                    &SelectWorkerInfo {
+                                        tokens: Some(tokens.as_slice()),
+                                        ..Default::default()
+                                    },
+                                    model,
+                                )
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            start.wait();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(selections.len(), 510);
+        assert!(!selections.contains(&0), "the 38+109 hot owner must spill");
+        let selected: HashSet<_> = selections.iter().copied().collect();
+        assert_eq!(selected.len(), 50);
+        let mut counts = vec![0usize; 51];
+        for index in selections {
+            counts[index] += 1;
+        }
+        let peer_counts = &counts[1..];
+        assert_eq!(peer_counts.iter().min(), Some(&10));
+        assert_eq!(peer_counts.iter().max(), Some(&11));
+
+        let inflight = policy.inflight.read().unwrap();
+        assert!(inflight.hybrid_seconds.len() <= workers.len());
+        assert_eq!(
+            inflight
+                .hybrid_seconds
+                .values()
+                .filter(|seconds| **seconds > 0.0)
+                .count(),
+            50
+        );
+        assert_eq!(
+            inflight
+                .hybrid_seconds
+                .get(workers[0].url())
+                .copied()
+                .unwrap_or(0.0),
+            0.0
+        );
+        drop(inflight);
+        policy.update_loads(&loads);
+        assert!(policy
+            .inflight
+            .read()
+            .unwrap()
+            .hybrid_seconds
+            .values()
+            .all(|seconds| *seconds == 0.0));
+        policy.remove_worker(workers[50].url());
+        assert!(!policy
+            .inflight
+            .read()
+            .unwrap()
+            .hybrid_seconds
+            .contains_key(workers[50].url()));
     }
 
     #[test]
@@ -488,18 +1687,20 @@ mod tests {
             policy.select_worker(&workers, &info);
         }
         assert!(policy
-            .inflight_tokens
+            .inflight
             .read()
             .unwrap()
+            .legacy_tokens
             .values()
             .any(|&v| v > 0));
 
         // A fresh poll clears the since-poll estimate.
         policy.update_loads(&loads);
         assert!(policy
-            .inflight_tokens
+            .inflight
             .read()
             .unwrap()
+            .legacy_tokens
             .values()
             .all(|&v| v == 0));
     }

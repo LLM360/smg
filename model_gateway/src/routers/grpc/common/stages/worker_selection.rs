@@ -24,7 +24,8 @@ use crate::{
             adaptive_admission::{AdaptiveAdmissionController, OrdinaryDistributionDispatchGuard},
             context::{
                 DistributionSeedDispatchGuard, EncodeWorkerAssignment, PendingDistributionSeed,
-                PolicyReservation, RequestContext, WorkerSelection,
+                PolicyReservation, RequestContext, RequestType, StreamingDistributionSeedScope,
+                WorkerSelection,
             },
             multimodal,
         },
@@ -81,6 +82,21 @@ impl WorkerSelectionStage {
     }
 }
 
+fn is_cache_credit_chat_eligible(
+    mode: WorkerSelectionMode,
+    seed_scope: StreamingDistributionSeedScope,
+    backend_request_count: usize,
+    request_type: &RequestType,
+) -> bool {
+    mode == WorkerSelectionMode::Regular
+        && seed_scope == StreamingDistributionSeedScope::DirectRegularChat
+        && backend_request_count == 1
+        && matches!(
+            request_type,
+            RequestType::Chat(request) if request.stream && request.n.unwrap_or(1) == 1
+        )
+}
+
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
@@ -107,6 +123,12 @@ impl PipelineStage for WorkerSelectionStage {
         let headers = ctx.input.headers.as_ref();
 
         let model_id = ctx.input.model_id.as_str();
+        let cache_credit_chat_eligible = is_cache_credit_chat_eligible(
+            self.mode,
+            ctx.input.streaming_distribution_seed_scope,
+            prep.backend_request_count(),
+            &ctx.input.request_type,
+        );
         let distribution_scope = ctx.state.adaptive_request.as_ref().and_then(|tracker| {
             let partition = tracker.partition()?;
             let controller = ctx.components.adaptive_admission.as_ref()?;
@@ -136,6 +158,7 @@ impl PipelineStage for WorkerSelectionStage {
                         distribution_scope
                             .as_ref()
                             .map(|(controller, partition)| (controller, partition.as_str())),
+                        cache_credit_chat_eligible,
                     )? {
                         Some((worker, reservation, ordinary_distribution_guard)) => {
                             ctx.state.policy_reservation = reservation;
@@ -382,6 +405,7 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         distribution_scope: Option<(&Arc<AdaptiveAdmissionController>, &str)>,
+        cache_credit_chat_eligible: bool,
     ) -> Result<Option<SingleWorkerSelection>, Response> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -509,8 +533,15 @@ impl WorkerSelectionStage {
                 CacheAwareSelection::Unavailable => return Err(rejection_response(1)),
             }
         } else {
-            self.policy_registry
-                .select_worker_with_reservation(&policy, &available, &info)
+            if cache_credit_chat_eligible {
+                self.policy_registry
+                    .select_worker_with_reservation_cache_credit_chat(
+                        &policy, &available, &info, model_id,
+                    )
+            } else {
+                self.policy_registry
+                    .select_worker_with_reservation(&policy, &available, &info)
+            }
         };
         let Some((idx, reservation_cost)) = selection else {
             return Ok(None);
@@ -978,6 +1009,8 @@ mod tests {
         compute_content_hash, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
     };
     use openai_protocol::{
+        chat::ChatCompletionRequest,
+        generate::GenerateRequest,
         model_card::ModelCard,
         worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse},
     };
@@ -1059,6 +1092,86 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1")
         );
+    }
+
+    #[test]
+    fn cache_credit_is_limited_to_direct_scalar_streaming_regular_chat() {
+        let direct_streaming_chat = RequestType::Chat(Arc::new(ChatCompletionRequest {
+            stream: true,
+            ..Default::default()
+        }));
+        assert!(is_cache_credit_chat_eligible(
+            WorkerSelectionMode::Regular,
+            StreamingDistributionSeedScope::DirectRegularChat,
+            1,
+            &direct_streaming_chat,
+        ));
+
+        for (name, mode, scope, backend_request_count) in [
+            (
+                "PD mode",
+                WorkerSelectionMode::PrefillDecode,
+                StreamingDistributionSeedScope::DirectRegularChat,
+                1,
+            ),
+            (
+                "indirect chat",
+                WorkerSelectionMode::Regular,
+                StreamingDistributionSeedScope::Ineligible,
+                1,
+            ),
+            (
+                "backend fanout",
+                WorkerSelectionMode::Regular,
+                StreamingDistributionSeedScope::DirectRegularChat,
+                2,
+            ),
+        ] {
+            assert!(
+                !is_cache_credit_chat_eligible(
+                    mode,
+                    scope,
+                    backend_request_count,
+                    &direct_streaming_chat,
+                ),
+                "{name} must use legacy routing"
+            );
+        }
+
+        let non_streaming_chat = RequestType::Chat(Arc::new(ChatCompletionRequest::default()));
+        assert!(!is_cache_credit_chat_eligible(
+            WorkerSelectionMode::Regular,
+            StreamingDistributionSeedScope::DirectRegularChat,
+            1,
+            &non_streaming_chat,
+        ));
+
+        let multi_choice_chat = RequestType::Chat(Arc::new(ChatCompletionRequest {
+            stream: true,
+            n: Some(2),
+            ..Default::default()
+        }));
+        assert!(!is_cache_credit_chat_eligible(
+            WorkerSelectionMode::Regular,
+            StreamingDistributionSeedScope::DirectRegularChat,
+            1,
+            &multi_choice_chat,
+        ));
+
+        let streaming_generate = RequestType::Generate(Arc::new(
+            serde_json::from_value::<GenerateRequest>(serde_json::json!({
+                "model": "kimi-k3",
+                "text": "hello",
+                "stream": true,
+            }))
+            .unwrap(),
+        ));
+        assert!(!is_cache_credit_chat_eligible(
+            WorkerSelectionMode::Regular,
+            StreamingDistributionSeedScope::DirectRegularChat,
+            1,
+            &streaming_generate,
+        ));
     }
 
     #[test]
@@ -1231,6 +1344,7 @@ mod tests {
             Some(&request_tokens),
             Some(&request_headers),
             Some((&controller, "k3")),
+            false,
         ));
 
         // The seed's store event can make B a deeper authoritative owner while
@@ -1254,6 +1368,7 @@ mod tests {
             Some(&request_tokens),
             Some(&request_headers),
             Some((&controller, "k3")),
+            false,
         ));
     }
 }
