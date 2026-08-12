@@ -5,6 +5,7 @@ These tests focus on testing the router configuration logic in isolation,
 including validation of configuration parameters and their interactions.
 """
 
+import inspect
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -229,6 +230,35 @@ class TestRouterConfigValidation:
         assert kwargs["priority_scheduler_config"] == "/tmp/priority.yaml"
         assert kwargs["priority_scheduler_tenant_metric_top_n"] == 16
 
+    def test_least_load_cache_credit_config_is_forwarded_to_rust_router(self):
+        args = RouterArgs(
+            worker_urls=[],
+            policy="least_load",
+            least_load_cache_mode="shadow",
+            least_load_cache_prefill_throughput=12000.0,
+            least_load_mean_remaining_decode_tokens=4096,
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            from smg.router import Router
+
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["least_load_cache_mode"] == "shadow"
+        assert kwargs["least_load_cache_prefill_throughput"] == 12000.0
+        assert kwargs["least_load_mean_remaining_decode_tokens"] == 4096
+
+    def test_least_load_cache_credit_keeps_positional_compatibility(self):
+        from smg.router import _Router
+
+        parameters = list(inspect.signature(_Router).parameters)
+        assert parameters[-3:] == [
+            "least_load_cache_mode",
+            "least_load_cache_prefill_throughput",
+            "least_load_mean_remaining_decode_tokens",
+        ]
+
     def test_service_discovery_config_validation(self):
         """Test service discovery configuration validation."""
         # Valid service discovery config
@@ -361,10 +391,7 @@ class TestRouterConfigValidation:
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
-        assert (
-            policy_from_str("size_aware_power_of_two")
-            == PolicyType.SizeAwarePowerOfTwo
-        )
+        assert policy_from_str("size_aware_power_of_two") == PolicyType.SizeAwarePowerOfTwo
         assert policy_from_str("least_load") == PolicyType.LeastLoad
 
     def test_invalid_policy_enum_conversion(self):

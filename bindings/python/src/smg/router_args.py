@@ -72,6 +72,9 @@ class RouterArgs:
     least_load_kv_pressure_weight: float = 0.15
     least_load_default_throughput: float = 2000.0
     least_load_mean_prefill_tokens: int = 1024
+    least_load_cache_mode: str = "off"
+    least_load_cache_prefill_throughput: float = 8000.0
+    least_load_mean_remaining_decode_tokens: int = 2048
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -462,6 +465,31 @@ class RouterArgs:
             help=(
                 "Mean prefill tokens for least_load's in-flight estimate when a"
                 " request's token count is unknown at routing"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}least-load-cache-mode",
+            type=str,
+            choices=["off", "shadow", "enforce"],
+            default=RouterArgs.least_load_cache_mode,
+            help="Prefix-cache credit mode for the least_load policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}least-load-cache-prefill-throughput",
+            type=float,
+            default=RouterArgs.least_load_cache_prefill_throughput,
+            help=(
+                "Estimated prefill throughput (tokens/s) used to value certified"
+                " cached prompt tokens for least_load"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}least-load-mean-remaining-decode-tokens",
+            type=int,
+            default=RouterArgs.least_load_mean_remaining_decode_tokens,
+            help=(
+                "Mean remaining decode tokens charged for each running or waiting"
+                " request in least_load cache-credit scoring"
             ),
         )
         routing_group.add_argument(

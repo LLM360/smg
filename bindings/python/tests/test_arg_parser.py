@@ -26,6 +26,9 @@ class TestRouterArgs:
         assert args.output_token_estimate == 4096
         assert args.max_cached_owners_per_prefix == 0
         assert args.cache_owner_spill_cooldown_secs == 0
+        assert args.least_load_cache_mode == "off"
+        assert args.least_load_cache_prefill_throughput == 8000.0
+        assert args.least_load_mean_remaining_decode_tokens == 2048
         assert args.worker_urls == []
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
@@ -74,6 +77,22 @@ class TestRouterArgs:
         assert args.adaptive_admission_feedback_throughput_improvement_ratio == 0.02
         assert args.adaptive_admission_distribution_headroom_partitions == []
         assert args.adaptive_admission_distribution_headroom_partition_seed_cap == 0
+
+    def test_parse_least_load_cache_credit_options(self):
+        args = parse_router_args(
+            [
+                "--least-load-cache-mode",
+                "shadow",
+                "--least-load-cache-prefill-throughput",
+                "12000",
+                "--least-load-mean-remaining-decode-tokens",
+                "4096",
+            ]
+        )
+
+        assert args.least_load_cache_mode == "shadow"
+        assert args.least_load_cache_prefill_throughput == 12000.0
+        assert args.least_load_mean_remaining_decode_tokens == 4096
 
     def test_parse_priority_scheduler_options(self):
         args = parse_router_args(

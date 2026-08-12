@@ -518,6 +518,9 @@ struct Router {
     priority_scheduler_adaptive_capacity: bool,
     adaptive_admission_distribution_headroom_partitions: Vec<String>,
     adaptive_admission_distribution_headroom_partition_seed_cap: u32,
+    least_load_cache_mode: String,
+    least_load_cache_prefill_throughput: f64,
+    least_load_mean_remaining_decode_tokens: u32,
 }
 
 impl Router {
@@ -552,6 +555,21 @@ impl Router {
                 field: "assignment_mode".to_string(),
                 value: other.to_string(),
                 reason: "expected 'random', 'min_load', or 'min_group'".to_string(),
+            }),
+        }
+    }
+
+    fn parse_least_load_cache_mode(
+        &self,
+    ) -> Result<config::LeastLoadCacheMode, config::ConfigError> {
+        match self.least_load_cache_mode.as_str() {
+            "off" => Ok(config::LeastLoadCacheMode::Off),
+            "shadow" => Ok(config::LeastLoadCacheMode::Shadow),
+            "enforce" => Ok(config::LeastLoadCacheMode::Enforce),
+            other => Err(config::ConfigError::InvalidValue {
+                field: "least_load_cache_mode".to_string(),
+                value: other.to_string(),
+                reason: "expected 'off', 'shadow', or 'enforce'".to_string(),
             }),
         }
     }
@@ -608,9 +626,9 @@ impl Router {
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
-                    cache_mode: Default::default(),
-                    cache_prefill_throughput: 8000.0,
-                    mean_remaining_decode_tokens: 2048,
+                    cache_mode: self.parse_least_load_cache_mode()?,
+                    cache_prefill_throughput: self.least_load_cache_prefill_throughput,
+                    mean_remaining_decode_tokens: self.least_load_mean_remaining_decode_tokens,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -1046,7 +1064,7 @@ impl Router {
         mesh_advertise_host = None,
         drain_settle_secs = 5,
         enable_wasm = false,
-        // Appended last (not inserted mid-list) so every pre-existing
+        // Appended tail (not inserted mid-list) so every earlier
         // positional argument keeps its index for callers that construct
         // `_Router(...)` positionally. See the struct-field note above.
         health_check_port = None,
@@ -1082,6 +1100,10 @@ impl Router {
         priority_scheduler_adaptive_capacity = false,
         adaptive_admission_distribution_headroom_partitions = vec![],
         adaptive_admission_distribution_headroom_partition_seed_cap = 0,
+        // Keep new optional arguments at the end for positional compatibility.
+        least_load_cache_mode = String::from("off"),
+        least_load_cache_prefill_throughput = 8000.0,
+        least_load_mean_remaining_decode_tokens = 2048,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1204,7 +1226,7 @@ impl Router {
         mesh_advertise_host: Option<String>,
         drain_settle_secs: u64,
         enable_wasm: bool,
-        // Appended last to match the `#[pyo3(signature)]` order above and
+        // Appended tail to match the `#[pyo3(signature)]` order above and
         // preserve positional-argument compatibility.
         health_check_port: Option<u16>,
         routing_key_override: bool,
@@ -1239,6 +1261,10 @@ impl Router {
         priority_scheduler_adaptive_capacity: bool,
         adaptive_admission_distribution_headroom_partitions: Vec<String>,
         adaptive_admission_distribution_headroom_partition_seed_cap: u32,
+        // Keep new optional arguments at the end for positional compatibility.
+        least_load_cache_mode: String,
+        least_load_cache_prefill_throughput: f64,
+        least_load_mean_remaining_decode_tokens: u32,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1410,6 +1436,9 @@ impl Router {
             priority_scheduler_adaptive_capacity,
             adaptive_admission_distribution_headroom_partitions,
             adaptive_admission_distribution_headroom_partition_seed_cap,
+            least_load_cache_mode,
+            least_load_cache_prefill_throughput,
+            least_load_mean_remaining_decode_tokens,
         })
     }
 
