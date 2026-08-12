@@ -116,8 +116,8 @@ Controls how requests are distributed across workers.
 |--------|-------------|---------|
 | `--least-load-cache-mode` | Cache credit mode: `off`, `shadow`, or `enforce` | `off` |
 | `--least-load-cache-prefill-throughput` | Estimated prefill rate used to value certified cached tokens | `8000` |
-| `--least-load-mean-remaining-decode-tokens` | Decode occupancy estimate per running or waiting request | `2048` |
-| `--least-load-default-throughput` | Legacy fallback generation rate when the backend reports zero; calibrate explicitly for K3 | `2000` |
+| `--least-load-mean-remaining-decode-tokens` | Compatibility value from the original occupancy model; accepted but unused by the bounded selector | `2048` |
+| `--least-load-default-throughput` | Legacy fallback generation rate when the backend reports zero; calibrate explicitly for the model and fleet | `2000` |
 
 ### Manual Policy Options
 

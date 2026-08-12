@@ -629,16 +629,16 @@ impl Default for RoutingKeyOverrideConfig {
     }
 }
 
-/// Prefix-cache credit mode for the M2 K3 least-load rollout.
+/// Prefix-cache credit mode for direct single-model gRPC least-load routing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeastLoadCacheMode {
     /// Preserve the existing least-load policy exactly.
     #[default]
     Off,
-    /// Compute and report the hybrid choice, but dispatch the legacy choice.
+    /// Compute and report the bounded cache-aware choice, but dispatch legacy.
     Shadow,
-    /// Dispatch the hybrid least-load plus cache-credit choice.
+    /// Dispatch least-load with bounded certified-prefix cache credit.
     Enforce,
 }
 
@@ -726,8 +726,9 @@ pub enum PolicyConfig {
         /// prompt tokens into seconds of saved work.
         #[serde(default = "default_least_load_cache_prefill_throughput")]
         cache_prefill_throughput: f64,
-        /// Mean remaining decode tokens used to price the running and waiting
-        /// request counts exposed by the M2 TokenSpeed load feed.
+        /// Compatibility value retained for configs from the original
+        /// occupancy-based cache-credit rollout. The bounded selector does not
+        /// use it.
         #[serde(default = "default_least_load_mean_remaining_decode")]
         mean_remaining_decode_tokens: u32,
     },

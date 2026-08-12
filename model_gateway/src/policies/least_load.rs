@@ -47,8 +47,42 @@ struct PreparedCacheCredit {
 struct InflightState {
     /// Legacy token credits for the worker actually dispatched.
     legacy_tokens: HashMap<String, u64>,
-    /// Counterfactual (Shadow) or actual (Enforce) hybrid work credits.
-    hybrid_seconds: HashMap<String, f64>,
+    /// Counterfactual (Shadow) or actual (Enforce) bounded-policy credits.
+    /// These use the same token-work units as the legacy score.
+    cache_tokens: HashMap<String, u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CacheCreditSkipReason {
+    InsufficientWorkers,
+    MissingPromptTokens,
+    UnsupportedTopology,
+    MonitorUnavailable,
+    BlockSizeUnavailable,
+    IndexerUnavailable,
+    NoContentBlocks,
+    NoCertifiedStreams,
+    StaleKv,
+    MissingLoad,
+    NoPrefix,
+}
+
+impl CacheCreditSkipReason {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::InsufficientWorkers => "insufficient_workers",
+            Self::MissingPromptTokens => "missing_prompt_tokens",
+            Self::UnsupportedTopology => "unsupported_topology",
+            Self::MonitorUnavailable => "monitor_unavailable",
+            Self::BlockSizeUnavailable => "block_size_unavailable",
+            Self::IndexerUnavailable => "indexer_unavailable",
+            Self::NoContentBlocks => "no_content_blocks",
+            Self::NoCertifiedStreams => "no_certified_streams",
+            Self::StaleKv => "stale_kv",
+            Self::MissingLoad => "missing_load",
+            Self::NoPrefix => "no_prefix",
+        }
+    }
 }
 
 /// Least-(token-)work routing — route to the worker with the lowest estimated
@@ -112,7 +146,7 @@ pub struct LeastLoadPolicy {
     /// In-flight token-work dispatched per worker since its last load poll
     /// (keyed by worker URL); reset when a fresh report arrives.
     /// Both since-poll ledgers share one lock so routing and poll reset cannot
-    /// expose a half-updated legacy/hybrid state.
+    /// expose a half-updated legacy/cache-aware state.
     inflight: RwLock<InflightState>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
@@ -124,7 +158,6 @@ pub struct LeastLoadPolicy {
     default_throughput: f64,
     cache_mode: LeastLoadCacheMode,
     cache_prefill_throughput: f64,
-    mean_remaining_decode_tokens: u32,
     kv_event_monitor: RwLock<Option<Arc<KvEventMonitor>>>,
 }
 
@@ -166,7 +199,7 @@ impl LeastLoadPolicy {
         default_throughput: f64,
         cache_mode: LeastLoadCacheMode,
         cache_prefill_throughput: f64,
-        mean_remaining_decode_tokens: u32,
+        _mean_remaining_decode_tokens: u32,
     ) -> Self {
         Self {
             cached_loads: RwLock::new(HashMap::new()),
@@ -190,7 +223,6 @@ impl LeastLoadPolicy {
             } else {
                 DEFAULT_CACHE_PREFILL_THROUGHPUT
             },
-            mean_remaining_decode_tokens: mean_remaining_decode_tokens.max(1),
             kv_event_monitor: RwLock::new(None),
         }
     }
@@ -342,6 +374,7 @@ impl LeastLoadPolicy {
 
     fn record_cache_decision(
         &self,
+        model_id: &str,
         result: &'static str,
         changed: bool,
         cache_savings_seconds: Option<f64>,
@@ -349,6 +382,7 @@ impl LeastLoadPolicy {
         counter!(
             "smg_least_load_cache_credit_decisions_total",
             "mode" => self.mode_label(),
+            "model" => model_id.to_string(),
             "result" => result,
             "changed" => if changed { "true" } else { "false" },
         )
@@ -357,9 +391,20 @@ impl LeastLoadPolicy {
             histogram!(
                 "smg_least_load_cache_savings_seconds",
                 "mode" => self.mode_label(),
+                "model" => model_id.to_string(),
             )
             .record(seconds);
         }
+    }
+
+    fn record_cache_skip(&self, model_id: &str, reason: CacheCreditSkipReason) {
+        counter!(
+            "smg_least_load_cache_credit_skips_total",
+            "mode" => self.mode_label(),
+            "model" => model_id.to_string(),
+            "reason" => reason.as_label(),
+        )
+        .increment(1);
     }
 
     fn prepare_cache_credit(
@@ -368,29 +413,38 @@ impl LeastLoadPolicy {
         healthy: &[usize],
         info: &SelectWorkerInfo<'_>,
         model_id: &str,
-    ) -> Option<PreparedCacheCredit> {
-        let tokens = info.tokens.filter(|tokens| !tokens.is_empty())?;
+    ) -> Result<PreparedCacheCredit, CacheCreditSkipReason> {
+        let tokens = info
+            .tokens
+            .filter(|tokens| !tokens.is_empty())
+            .ok_or(CacheCreditSkipReason::MissingPromptTokens)?;
 
-        // KV events do not carry a model ID. Only the production K3 topology,
-        // where every candidate advertises exactly this one model, is safe.
+        // KV events do not carry a model ID. Cache credit is safe only when
+        // every candidate advertises exactly the requested single model.
         if healthy.iter().any(|&idx| {
             let models = workers[idx].models();
             models.len() != 1 || !models[0].matches(model_id)
         }) {
-            return None;
+            return Err(CacheCreditSkipReason::UnsupportedTopology);
         }
 
         let monitor = self
             .kv_event_monitor
             .read()
-            .ok()?
+            .map_err(|_| CacheCreditSkipReason::MonitorUnavailable)?
             .as_ref()
-            .map(Arc::clone)?;
-        let block_size = monitor.block_size(model_id).filter(|size| *size > 0)?;
-        let indexer = monitor.get_indexer(model_id)?;
+            .map(Arc::clone)
+            .ok_or(CacheCreditSkipReason::MonitorUnavailable)?;
+        let block_size = monitor
+            .block_size(model_id)
+            .filter(|size| *size > 0)
+            .ok_or(CacheCreditSkipReason::BlockSizeUnavailable)?;
+        let indexer = monitor
+            .get_indexer(model_id)
+            .ok_or(CacheCreditSkipReason::IndexerUnavailable)?;
         let content_hashes = compute_request_content_hashes(tokens, block_size);
         if content_hashes.is_empty() {
-            return None;
+            return Err(CacheCreditSkipReason::NoContentBlocks);
         }
 
         // Capture generations before the exact index query, then validate
@@ -422,77 +476,35 @@ impl LeastLoadPolicy {
             claims[idx] = Some((generation, cached_tokens));
             certified += 1;
         }
-        (certified > 0).then_some(PreparedCacheCredit { monitor, claims })
+        if certified == 0 {
+            return Err(CacheCreditSkipReason::NoCertifiedStreams);
+        }
+        Ok(PreparedCacheCredit { monitor, claims })
     }
 
-    fn occupancy_seconds(&self, load: &WorkerLoadResponse) -> Option<f64> {
-        let rank_count = usize::try_from(load.dp_rank_count).ok()?;
+    /// Cache credit requires a structurally valid direct load sample. A worker
+    /// without one still participates in ordinary least-load selection, but it
+    /// cannot receive a cache discount for this decision.
+    fn cache_load_usable(load: &WorkerLoadResponse) -> bool {
+        let Ok(rank_count) = usize::try_from(load.dp_rank_count) else {
+            return false;
+        };
         if rank_count == 0 || rank_count != load.loads.len() {
-            return None;
+            return false;
         }
-        let mut requests = 0u64;
         for rank in &load.loads {
             if rank.num_running_reqs < 0
                 || rank.num_waiting_reqs < 0
                 || rank.num_waiting_uncached_tokens < 0
             {
-                return None;
+                return false;
             }
-            requests = requests
-                .checked_add(rank.num_running_reqs as u64)?
-                .checked_add(rank.num_waiting_reqs as u64)?;
         }
         let live_throughput = load.total_gen_throughput();
-        if !live_throughput.is_finite() || live_throughput < 0.0 {
-            return None;
-        }
-        let throughput = if live_throughput > 0.0 {
-            live_throughput
-        } else {
-            self.default_throughput
-        };
-        Some(requests as f64 * self.mean_remaining_decode_tokens as f64 / throughput)
+        live_throughput.is_finite() && live_throughput >= 0.0
     }
 
-    fn effective_throughput(&self, load: Option<&WorkerLoadResponse>) -> f64 {
-        let live = load.map_or(0.0, WorkerLoadResponse::total_gen_throughput);
-        if live.is_finite() && live > 0.0 {
-            live
-        } else {
-            self.default_throughput
-        }
-    }
-
-    fn hybrid_base_seconds(
-        &self,
-        load: &WorkerLoadResponse,
-        since_poll_seconds: f64,
-    ) -> Option<f64> {
-        let occupancy = self.occupancy_seconds(load)?;
-        let queued_prefill =
-            load.total_waiting_uncached_tokens() as f64 / self.cache_prefill_throughput;
-        let k = load.effective_token_usage().clamp(0.0, 0.999);
-        Some(
-            queued_prefill
-                + occupancy
-                + since_poll_seconds
-                + self.kv_pressure_weight * k / (1.0 - k),
-        )
-    }
-
-    fn hybrid_request_seconds(
-        &self,
-        info: &SelectWorkerInfo<'_>,
-        cached_tokens: u64,
-        load: Option<&WorkerLoadResponse>,
-    ) -> f64 {
-        let prompt_tokens = self.request_tokens(info);
-        let uncached_prompt_tokens = prompt_tokens.saturating_sub(cached_tokens);
-        uncached_prompt_tokens as f64 / self.cache_prefill_throughput
-            + self.mean_remaining_decode_tokens as f64 / self.effective_throughput(load)
-    }
-
-    fn fallback_legacy_with_hybrid_credit(
+    fn fallback_legacy_with_cache_credit(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
@@ -505,19 +517,15 @@ impl LeastLoadPolicy {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let selected = self.select_legacy_locked(workers, &healthy, info, loads, &mut inflight)?;
-        let seconds = self.hybrid_request_seconds(
-            info,
-            0,
-            loads.and_then(|loads| loads.get(workers[selected].url())),
-        );
+        let request_tokens = self.request_tokens(info);
         *inflight
-            .hybrid_seconds
+            .cache_tokens
             .entry(workers[selected].url().to_string())
-            .or_insert(0.0) += seconds;
+            .or_insert(0) += request_tokens;
         Some(selected)
     }
 
-    /// Narrow M2 rollout path: direct Regular single-model streaming gRPC Chat.
+    /// Narrow rollout path: direct Regular single-model streaming gRPC Chat.
     /// Every unavailable signal delegates to the unchanged legacy method.
     pub fn select_worker_cache_credit_chat(
         &self,
@@ -531,30 +539,33 @@ impl LeastLoadPolicy {
 
         let healthy = get_healthy_worker_indices(workers);
         if healthy.len() <= 1 {
-            self.record_cache_decision("fallback", false, None);
-            return self.fallback_legacy_with_hybrid_credit(workers, info);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::InsufficientWorkers);
+            return self.fallback_legacy_with_cache_credit(workers, info);
         }
-        let Some(prepared) = self.prepare_cache_credit(workers, &healthy, info, model_id) else {
-            self.record_cache_decision("fallback", false, None);
-            return self.fallback_legacy_with_hybrid_credit(workers, info);
+        let prepared = match self.prepare_cache_credit(workers, &healthy, info, model_id) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                self.record_cache_decision(model_id, "fallback", false, None);
+                self.record_cache_skip(model_id, reason);
+                return self.fallback_legacy_with_cache_credit(workers, info);
+            }
         };
 
         let loads_guard = self.cached_loads.read().ok();
         let Some(loads) = loads_guard.as_deref() else {
-            self.record_cache_decision("fallback", false, None);
-            return self.fallback_legacy_with_hybrid_credit(workers, info);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::MissingLoad);
+            return self.fallback_legacy_with_cache_credit(workers, info);
         };
-        for &idx in &healthy {
-            let Some(load) = loads.get(workers[idx].url()) else {
-                drop(loads_guard);
-                self.record_cache_decision("fallback", false, None);
-                return self.fallback_legacy_with_hybrid_credit(workers, info);
-            };
-            if self.hybrid_base_seconds(load, 0.0).is_none() {
-                drop(loads_guard);
-                self.record_cache_decision("fallback", false, None);
-                return self.fallback_legacy_with_hybrid_credit(workers, info);
-            }
+        if !healthy
+            .iter()
+            .any(|&idx| loads.contains_key(workers[idx].url()))
+        {
+            drop(loads_guard);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::MissingLoad);
+            return self.fallback_legacy_with_cache_credit(workers, info);
         }
 
         let (tp_sum, tp_count) = healthy
@@ -581,6 +592,7 @@ impl LeastLoadPolicy {
         // safe zero-cache candidate. If every stream changed, fall back.
         let mut cached_tokens = vec![0u64; workers.len()];
         let mut certified = 0usize;
+        let mut stale_kv = false;
         for &idx in &healthy {
             let Some((generation, tokens)) = prepared.claims[idx] else {
                 continue;
@@ -592,13 +604,16 @@ impl LeastLoadPolicy {
             ) {
                 cached_tokens[idx] = tokens;
                 certified += 1;
+            } else {
+                stale_kv = true;
             }
         }
         if certified == 0 {
             drop(inflight);
             drop(loads_guard);
-            self.record_cache_decision("fallback", false, None);
-            return self.fallback_legacy_with_hybrid_credit(workers, info);
+            self.record_cache_decision(model_id, "fallback", false, None);
+            self.record_cache_skip(model_id, CacheCreditSkipReason::StaleKv);
+            return self.fallback_legacy_with_cache_credit(workers, info);
         }
 
         let legacy_score = |idx: usize| {
@@ -610,39 +625,42 @@ impl LeastLoadPolicy {
                 true,
             )
         };
-        let hybrid_score = |idx: usize| {
-            let since_poll = inflight
-                .hybrid_seconds
+        let cache_score = |idx: usize| {
+            let base = self.score(
+                &workers[idx],
+                Some(loads),
+                &inflight.cache_tokens,
+                nominal_throughput,
+                true,
+            );
+            let discount = loads
                 .get(workers[idx].url())
-                .copied()
-                .unwrap_or(0.0);
-            loads
-                .get(workers[idx].url())
-                .and_then(|load| self.hybrid_base_seconds(load, since_poll))
-                .map_or(f64::INFINITY, |base| {
-                    base - cached_tokens[idx] as f64 / self.cache_prefill_throughput
-                })
+                .filter(|load| Self::cache_load_usable(load))
+                .map_or(0.0, |_| {
+                    cached_tokens[idx] as f64 / self.cache_prefill_throughput
+                });
+            base - discount
         };
 
         let mut legacy_best = healthy[0];
         let mut legacy_best_score = legacy_score(legacy_best);
-        let mut hybrid_best = healthy[0];
-        let mut hybrid_best_score = hybrid_score(hybrid_best);
+        let mut cache_best = healthy[0];
+        let mut cache_best_score = cache_score(cache_best);
         for &idx in &healthy[1..] {
             let legacy = legacy_score(idx);
             if legacy < legacy_best_score {
                 legacy_best = idx;
                 legacy_best_score = legacy;
             }
-            let hybrid = hybrid_score(idx);
-            if hybrid < hybrid_best_score {
-                hybrid_best = idx;
-                hybrid_best_score = hybrid;
+            let cache = cache_score(idx);
+            if cache < cache_best_score {
+                cache_best = idx;
+                cache_best_score = cache;
             }
         }
 
         let selected = if self.cache_mode == LeastLoadCacheMode::Enforce {
-            hybrid_best
+            cache_best
         } else {
             legacy_best
         };
@@ -654,17 +672,30 @@ impl LeastLoadPolicy {
             .legacy_tokens
             .entry(workers[selected].url().to_string())
             .or_insert(0) += req_tokens;
-        let hybrid_request_seconds = self.hybrid_request_seconds(
-            info,
-            cached_tokens[hybrid_best],
-            loads.get(workers[hybrid_best].url()),
-        );
         *inflight
-            .hybrid_seconds
-            .entry(workers[hybrid_best].url().to_string())
-            .or_insert(0.0) += hybrid_request_seconds;
+            .cache_tokens
+            .entry(workers[cache_best].url().to_string())
+            .or_insert(0) += req_tokens;
+        let skipped_missing_load = healthy.iter().any(|&idx| {
+            prepared.claims[idx].is_some()
+                && match loads.get(workers[idx].url()) {
+                    Some(load) => !Self::cache_load_usable(load),
+                    None => true,
+                }
+        });
+        let no_cached_prefix = healthy.iter().all(|&idx| cached_tokens[idx] == 0);
         drop(inflight);
         drop(loads_guard);
+
+        if skipped_missing_load {
+            self.record_cache_skip(model_id, CacheCreditSkipReason::MissingLoad);
+        }
+        if stale_kv {
+            self.record_cache_skip(model_id, CacheCreditSkipReason::StaleKv);
+        }
+        if no_cached_prefix {
+            self.record_cache_skip(model_id, CacheCreditSkipReason::NoPrefix);
+        }
 
         let result = if certified == healthy.len() {
             "complete"
@@ -672,15 +703,16 @@ impl LeastLoadPolicy {
             "partial"
         };
         self.record_cache_decision(
+            model_id,
             result,
-            hybrid_best != legacy_best,
-            Some(cached_tokens[hybrid_best] as f64 / self.cache_prefill_throughput),
+            cache_best != legacy_best,
+            Some(cached_tokens[cache_best] as f64 / self.cache_prefill_throughput),
         );
         debug!(
-            "least_load cache credit selected {} (legacy {}, hybrid_score {:.4})",
+            "least_load cache credit selected {} (legacy {}, bounded_score {:.4})",
             workers[selected].url(),
             workers[legacy_best].url(),
-            hybrid_best_score
+            cache_best_score
         );
         workers[selected].increment_processed();
         Some(selected)
@@ -702,7 +734,7 @@ impl LeastLoadPolicy {
                 // projected telemetry but keeps its conservative credits.
                 for url in loads.keys() {
                     inflight.legacy_tokens.insert(url.clone(), 0);
-                    inflight.hybrid_seconds.insert(url.clone(), 0.0);
+                    inflight.cache_tokens.insert(url.clone(), 0);
                 }
             }
         }
@@ -761,7 +793,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             cached.remove(url);
             if let Ok(mut inflight) = self.inflight.write() {
                 inflight.legacy_tokens.remove(url);
-                inflight.hybrid_seconds.remove(url);
+                inflight.cache_tokens.remove(url);
             }
         }
     }
@@ -941,9 +973,9 @@ mod tests {
             let mut loads = HashMap::new();
             loads.insert(
                 workers[0].url().to_string(),
-                make_load(owner_waiting_tokens, 0.0, 100.0),
+                make_load(owner_waiting_tokens, 0.0, 1000.0),
             );
-            loads.insert(workers[1].url().to_string(), make_load(0, 0.0, 100.0));
+            loads.insert(workers[1].url().to_string(), make_load(0, 0.0, 1000.0));
             policy.update_loads(&loads);
             policy
                 .select_worker_cache_credit_chat(
@@ -958,8 +990,8 @@ mod tests {
         }
 
         // 1024 cached tokens at 1000 prefill tok/s save 1.024 seconds.
-        // Live generation throughput is deliberately 100 tok/s, proving the
-        // queued prompt is divided by prefill, not generation, throughput.
+        // The cache owner wins only while that saving covers its additional
+        // ordinary least-load queue cost.
         assert_eq!(choose(1023), 0, "1.023s penalty keeps the cache owner");
         assert_eq!(choose(1025), 1, "1.025s penalty spills to the cold peer");
     }
@@ -1100,7 +1132,44 @@ mod tests {
             .unwrap();
         assert_eq!(
             chosen, 0,
-            "legacy partial-load fallback chooses reporting A"
+            "the reporting cache owner remains eligible without a fleet-wide fallback"
+        );
+    }
+
+    #[test]
+    fn missing_load_excludes_only_that_worker_from_cache_credit() {
+        let model = "kimi-k3";
+        let tokens = vec![18u32; 8192];
+        let owner = mk_model("http://owner:8000", model);
+        let cold = mk_model("http://cold:8000", model);
+        for _ in 0..5 {
+            owner.increment_load();
+        }
+        let workers = vec![owner, cold];
+        let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 1000.0, 1);
+        policy.set_kv_event_monitor(Some(certified_monitor(
+            model,
+            &workers,
+            16,
+            &[0, 1],
+            Some((0, &tokens)),
+        )));
+        policy.update_loads(&HashMap::from([(
+            workers[1].url().to_string(),
+            make_m2_load(0, 0, 1000.0),
+        )]));
+
+        assert_eq!(
+            policy.select_worker_cache_credit_chat(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+                model,
+            ),
+            Some(1),
+            "an owner without direct load must not receive an 8.192 second cache discount"
         );
     }
 
@@ -1153,6 +1222,48 @@ mod tests {
             shadow.inflight.read().unwrap().legacy_tokens,
             legacy.inflight.read().unwrap().legacy_tokens
         );
+    }
+
+    #[test]
+    fn mean_remaining_decode_does_not_change_bounded_choice() {
+        fn choose(mean_remaining_decode_tokens: u32) -> usize {
+            let model = "kimi-k3";
+            let tokens = vec![19u32; 1024];
+            let workers = vec![
+                mk_model("http://owner:8000", model),
+                mk_model("http://cold:8000", model),
+            ];
+            let policy = cache_policy(
+                LeastLoadCacheMode::Enforce,
+                1000.0,
+                1000.0,
+                mean_remaining_decode_tokens,
+            );
+            policy.set_kv_event_monitor(Some(certified_monitor(
+                model,
+                &workers,
+                16,
+                &[0, 1],
+                Some((0, &tokens)),
+            )));
+            policy.update_loads(&HashMap::from([
+                (workers[0].url().to_string(), make_load(500, 0.0, 1000.0)),
+                (workers[1].url().to_string(), make_load(0, 0.0, 1000.0)),
+            ]));
+            policy
+                .select_worker_cache_credit_chat(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                    model,
+                )
+                .unwrap()
+        }
+
+        assert_eq!(choose(1), 0);
+        assert_eq!(choose(65_535), 0);
     }
 
     #[test]
@@ -1228,20 +1339,20 @@ mod tests {
     }
 
     #[test]
-    fn occupancy_uses_live_throughput_or_configured_fallback() {
-        let policy = cache_policy(LeastLoadCacheMode::Enforce, 1000.0, 8000.0, 100);
-        assert_eq!(
-            policy.occupancy_seconds(&make_m2_load(1, 0, 100.0)),
-            Some(1.0)
-        );
-        assert_eq!(
-            policy.occupancy_seconds(&make_m2_load(1, 0, 0.0)),
-            Some(0.1)
-        );
+    fn cache_credit_requires_a_usable_direct_load() {
+        assert!(LeastLoadPolicy::cache_load_usable(&make_m2_load(
+            1, 0, 100.0
+        )));
+        assert!(LeastLoadPolicy::cache_load_usable(&make_m2_load(1, 0, 0.0)));
+        assert!(!LeastLoadPolicy::cache_load_usable(&WorkerLoadResponse {
+            timestamp: String::new(),
+            dp_rank_count: 1,
+            loads: vec![],
+        }));
     }
 
     #[test]
-    fn fully_cached_burst_still_waterfills_on_decode_seconds() {
+    fn fully_cached_burst_still_waterfills_on_legacy_token_work() {
         let model = "kimi-k3";
         let tokens = vec![77u32; 8192];
         let workers = vec![
@@ -1285,8 +1396,8 @@ mod tests {
         let inflight = policy.inflight.read().unwrap();
         assert_eq!(inflight.legacy_tokens.len(), 2);
         assert!(inflight.legacy_tokens.values().all(|tokens| *tokens > 0));
-        assert!((inflight.hybrid_seconds[workers[0].url()] - 1.0).abs() < 1e-9);
-        assert!((inflight.hybrid_seconds[workers[1].url()] - 1.0).abs() < 1e-9);
+        assert_eq!(inflight.cache_tokens[workers[0].url()], 10 * 8192);
+        assert_eq!(inflight.cache_tokens[workers[1].url()], 10 * 8192);
     }
 
     #[test]
@@ -1346,11 +1457,10 @@ mod tests {
 
         let inflight = policy.inflight.read().unwrap();
         for worker in workers.iter() {
-            let requests = inflight.legacy_tokens[worker.url()] / tokens.len() as u64;
-            let expected_seconds = requests as f64 * 0.2;
-            assert!(
-                (inflight.hybrid_seconds[worker.url()] - expected_seconds).abs() < 1e-9,
-                "legacy and hybrid credit must be one atomic routing decision"
+            assert_eq!(
+                inflight.cache_tokens[worker.url()],
+                inflight.legacy_tokens[worker.url()],
+                "legacy and bounded credits must be one atomic routing decision"
             );
         }
         let counts: Vec<_> = workers
@@ -1428,14 +1538,14 @@ mod tests {
 
         let inflight = policy.inflight.read().unwrap();
         assert_eq!(inflight.legacy_tokens[workers[selected].url()], 100);
-        assert!((inflight.hybrid_seconds[workers[selected].url()] - 0.2).abs() < 1e-9);
+        assert_eq!(inflight.cache_tokens[workers[selected].url()], 100);
         let other = 1 - selected;
         assert_eq!(inflight.legacy_tokens[workers[other].url()], 0);
-        assert_eq!(inflight.hybrid_seconds[workers[other].url()], 0.0);
+        assert_eq!(inflight.cache_tokens[workers[other].url()], 0);
     }
 
     #[test]
-    fn incident_regression_spreads_510_arrivals_across_all_50_idle_peers() {
+    fn no_prefix_preserves_legacy_waterfill_across_all_workers() {
         let model = "kimi-k3";
         let tokens = vec![42u32; 128];
         let workers: Vec<_> = (0..51)
@@ -1505,34 +1615,23 @@ mod tests {
         });
 
         assert_eq!(selections.len(), 510);
-        assert!(!selections.contains(&0), "the 38+109 hot owner must spill");
         let selected: HashSet<_> = selections.iter().copied().collect();
-        assert_eq!(selected.len(), 50);
+        assert_eq!(selected.len(), 51);
         let mut counts = vec![0usize; 51];
         for index in selections {
             counts[index] += 1;
         }
-        let peer_counts = &counts[1..];
-        assert_eq!(peer_counts.iter().min(), Some(&10));
-        assert_eq!(peer_counts.iter().max(), Some(&11));
+        assert!(counts.iter().all(|count| *count == 10));
 
         let inflight = policy.inflight.read().unwrap();
-        assert!(inflight.hybrid_seconds.len() <= workers.len());
+        assert!(inflight.cache_tokens.len() <= workers.len());
         assert_eq!(
             inflight
-                .hybrid_seconds
+                .cache_tokens
                 .values()
-                .filter(|seconds| **seconds > 0.0)
+                .filter(|tokens| **tokens > 0)
                 .count(),
-            50
-        );
-        assert_eq!(
-            inflight
-                .hybrid_seconds
-                .get(workers[0].url())
-                .copied()
-                .unwrap_or(0.0),
-            0.0
+            51
         );
         drop(inflight);
         policy.update_loads(&loads);
@@ -1540,15 +1639,15 @@ mod tests {
             .inflight
             .read()
             .unwrap()
-            .hybrid_seconds
+            .cache_tokens
             .values()
-            .all(|seconds| *seconds == 0.0));
+            .all(|tokens| *tokens == 0));
         policy.remove_worker(workers[50].url());
         assert!(!policy
             .inflight
             .read()
             .unwrap()
-            .hybrid_seconds
+            .cache_tokens
             .contains_key(workers[50].url()));
     }
 
