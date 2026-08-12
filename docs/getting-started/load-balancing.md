@@ -74,27 +74,26 @@ Best for heterogeneous workers with varying response times.
 
 ---
 
-## Least Load Cache Credit (K3 gRPC Chat)
+## Least Load Cache Credit (single-model gRPC Chat)
 
 `least_load` normally routes by backend queue work plus work sent since the
 last load poll. Its optional cache credit is a narrow rollout feature for a
-single active gateway serving one K3 model through direct, scalar, streaming
+single active gateway serving one model through direct, scalar, streaming
 gRPC Chat Completions:
 
 ```text
-hybrid score = queued uncached prompt tokens / prefill throughput
-             + (running + waiting) * mean remaining decode / generation throughput
-             + hybrid work sent since the last load poll
-             + KV-pressure barrier
-             - certified cached prompt tokens / prefill throughput
+bounded score = existing least-load score
+              - certified cached prompt tokens / prefill throughput
 ```
 
-Positive live generation throughput is used when available. Otherwise the
-configured `--least-load-default-throughput` is used. The prefix term is a
-lower bound built only from contiguous KV events with an exact rolling-prefix
-match. A disconnected or unknown worker receives zero cache credit. Missing
-load data, no fresh certified KV stream, unsupported topology, and every other
-request path use the existing least-load selector unchanged.
+The ordinary least-load score remains the load authority. Cache ownership can
+change a choice only when the certified prefill saving covers the cached
+worker's additional least-load cost. The prefix term is a lower bound built
+only from contiguous KV events with an exact rolling-prefix match. A worker
+with missing load data, a disconnected stream, or unknown ownership receives
+zero cache credit while its healthy peers remain eligible. If the whole cache
+path is unavailable, unsupported, or stale, selection delegates to ordinary
+least-load unchanged.
 
 The feature defaults to `off`. Start with `shadow` to observe decisions without
 changing dispatch, then use `enforce` only after calibrating the fleet values:
@@ -104,17 +103,18 @@ smg \
   --policy least_load \
   --least-load-cache-mode shadow \
   --least-load-cache-prefill-throughput 8000 \
-  --least-load-mean-remaining-decode-tokens 2048 \
   --least-load-default-throughput 200
 ```
 
 The example values are the initial M2 calibration, not universal K3 constants.
 Calibrate them from the deployment's generation and prefill measurements. In
 particular, the legacy global generation fallback of `2000` tok/s is not a K3
-recommendation. The first M2 shadow sweep should cover generation fallback
-throughput `150/200/250`, cache prefill throughput `6000/8000/12000`, and mean
-remaining decode `1024/2048/4096`. Certified KV events expire after 30 seconds
-without a new batch because the live-only stream does not provide a heartbeat.
+recommendation. The first shadow sweep should cover generation fallback
+throughput `150/200/250` and cache prefill throughput `6000/8000/12000`. The
+`--least-load-mean-remaining-decode-tokens` option is retained for config
+compatibility but is not used by the bounded selector. Certified KV events
+expire after 30 seconds without a new batch because the live-only stream does
+not provide a heartbeat.
 
 ---
 

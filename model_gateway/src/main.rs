@@ -339,8 +339,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 8000.0, help_heading = "Routing Policy")]
     least_load_cache_prefill_throughput: f64,
 
-    /// Mean remaining decode tokens charged for each running or waiting
-    /// request in the least_load occupancy term.
+    /// Compatibility value for the original occupancy-based cache-credit
+    /// selector. Accepted but unused by the bounded selector.
     #[arg(long, default_value_t = 2048, help_heading = "Routing Policy")]
     least_load_mean_remaining_decode_tokens: u32,
 
