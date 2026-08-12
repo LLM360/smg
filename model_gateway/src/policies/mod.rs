@@ -7,7 +7,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use openai_protocol::worker::WorkerLoadResponse;
 
-use crate::worker::{HashRing, Worker};
+use crate::worker::{HashRing, KvEventMonitor, Worker};
 
 mod bucket;
 mod cache_aware;
@@ -110,6 +110,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn needs_load_updates(&self) -> bool {
         false
     }
+
+    /// Whether this policy consumes backend KV ownership events.
+    fn needs_kv_events(&self) -> bool {
+        false
+    }
+
+    /// Inject the shared KV event monitor when the policy needs it.
+    fn set_kv_event_monitor(&self, _monitor: Option<Arc<KvEventMonitor>>) {}
 
     /// Drop any cached per-worker state for a removed worker.
     ///

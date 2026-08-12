@@ -7,10 +7,10 @@ use smg::{
     config::{
         validate_mesh_server_name, AdaptiveAdmissionConfig, AdaptiveAdmissionMode,
         AdaptiveAdmissionStrategy, CircuitBreakerConfig, ConfigError, ConfigResult,
-        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig,
+        DiscoveryConfig, HealthCheckConfig, HistoryBackend, LeastLoadCacheMode,
+        ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
+        RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+        SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -328,6 +328,21 @@ struct CliArgs {
     /// token count is unknown at routing
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
+
+    /// Prefix-cache credit mode for least_load. Only direct Regular streaming
+    /// gRPC Chat requests are eligible; every other path remains legacy.
+    #[arg(long, default_value = "off", value_parser = ["off", "shadow", "enforce"], help_heading = "Routing Policy")]
+    least_load_cache_mode: String,
+
+    /// Estimated prefill throughput (tokens/s) used to value a certified
+    /// cached prompt for least_load cache credit.
+    #[arg(long, default_value_t = 8000.0, help_heading = "Routing Policy")]
+    least_load_cache_prefill_throughput: f64,
+
+    /// Mean remaining decode tokens charged for each running or waiting
+    /// request in the least_load occupancy term.
+    #[arg(long, default_value_t = 2048, help_heading = "Routing Policy")]
+    least_load_mean_remaining_decode_tokens: u32,
 
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -1266,6 +1281,13 @@ impl CliArgs {
                 kv_pressure_weight: self.least_load_kv_pressure_weight,
                 mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                 default_throughput: self.least_load_default_throughput,
+                cache_mode: match self.least_load_cache_mode.as_str() {
+                    "shadow" => LeastLoadCacheMode::Shadow,
+                    "enforce" => LeastLoadCacheMode::Enforce,
+                    _ => LeastLoadCacheMode::Off,
+                },
+                cache_prefill_throughput: self.least_load_cache_prefill_throughput,
+                mean_remaining_decode_tokens: self.least_load_mean_remaining_decode_tokens,
             },
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.balance_abs_threshold,
