@@ -38,9 +38,10 @@
     -------------------------------------------
     Restricts cached-owner candidates to workers within 10 percentage points of
     the least-pressured owner and below 90% pressure. Non-owner candidates use
-    the equivalent fleet-scoped guard for cold fallback. Pressure is the larger
-    of KV token usage and utilization; waiting requests break ties. Missing or
-    stale telemetry fails open to existing owners.
+    the equivalent fleet-scoped guard for cold fallback. Pressure is the largest
+    of KV token usage, utilization, and scheduler occupancy when every engine
+    reports a running-request cap for every DP rank. Missing, partial, or stale
+    telemetry fails open to existing owners.
 
     Configuration Parameters:
     ------------------------
@@ -547,7 +548,14 @@ impl CacheAwarePolicy {
         }
 
         let loads = self.engine_loads.read();
-        let mut pressure_by_index = HashMap::with_capacity(healthy_indices.len());
+        struct RawWorkerPressure {
+            idx: usize,
+            backend_pressure: f64,
+            scheduler_pressure: Option<f64>,
+            waiting_requests: i64,
+        }
+
+        let mut raw_pressure = Vec::with_capacity(healthy_indices.len());
 
         // Degrade the whole decision to legacy request-count routing unless all
         // candidates have comparable, fresh engine telemetry.
@@ -558,27 +566,66 @@ impl CacheAwarePolicy {
                 return None;
             }
 
-            let pressure = load
+            let backend_pressure = load
                 .response
                 .loads
                 .iter()
                 .map(|rank| rank.token_usage.max(rank.utilization))
                 .fold(0.0_f64, f64::max);
-            if !pressure.is_finite() || pressure < 0.0 {
+            if !backend_pressure.is_finite() || backend_pressure < 0.0 {
                 return None;
             }
+            let running_requests: i64 = load
+                .response
+                .loads
+                .iter()
+                .map(|rank| i64::from(rank.num_running_reqs.max(0)))
+                .sum();
             let waiting_requests = load
                 .response
                 .loads
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs.max(0)))
                 .sum();
+            let reported_max_running = load.response.loads.iter().try_fold(0_i64, |total, rank| {
+                let rank_cap = i64::from(rank.max_running_requests);
+                (rank_cap > 0).then(|| total.saturating_add(rank_cap))
+            });
+            let scheduler_pressure = reported_max_running.map(|max_running| {
+                (running_requests.saturating_add(waiting_requests) as f64 / max_running as f64)
+                    .clamp(0.0, 1.0)
+            });
+
+            raw_pressure.push(RawWorkerPressure {
+                idx,
+                backend_pressure,
+                scheduler_pressure,
+                waiting_requests,
+            });
+        }
+
+        // Scheduler counts and caps must be comparable across the entire
+        // candidate set. In particular, SGLang's Prometheus-only fallback can
+        // repeat request gauges for every TP rank while omitting the cap. A
+        // missing cap therefore disables scheduler occupancy for this decision
+        // instead of making that worker look artificially saturated.
+        let use_scheduler_pressure = raw_pressure
+            .iter()
+            .all(|load| load.scheduler_pressure.is_some());
+        let mut pressure_by_index = HashMap::with_capacity(raw_pressure.len());
+        for load in raw_pressure {
+            let pressure = if use_scheduler_pressure {
+                load.backend_pressure
+                    .max(load.scheduler_pressure.unwrap_or_default())
+            } else {
+                load.backend_pressure
+            };
 
             pressure_by_index.insert(
-                idx,
+                load.idx,
                 WorkerPressure {
                     pressure,
-                    waiting_requests,
+                    waiting_requests: load.waiting_requests,
                 },
             );
         }
@@ -2687,6 +2734,49 @@ mod tests {
         }
     }
 
+    fn engine_load_with_scheduler(
+        token_usage: f64,
+        utilization: f64,
+        running: i32,
+        waiting: i32,
+        max_running: i32,
+    ) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                token_usage,
+                utilization,
+                num_running_reqs: running,
+                num_waiting_reqs: waiting,
+                max_running_requests: max_running,
+                ..Default::default()
+            }],
+            dp_rank_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn engine_load_with_scheduler_ranks(ranks: &[(i32, i32, i32)]) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            loads: ranks
+                .iter()
+                .enumerate()
+                .map(
+                    |(dp_rank, &(running, waiting, max_running))| SchedulerLoadSnapshot {
+                        dp_rank: i32::try_from(dp_rank).unwrap(),
+                        token_usage: 0.10,
+                        utilization: 0.10,
+                        num_running_reqs: running,
+                        num_waiting_reqs: waiting,
+                        max_running_requests: max_running,
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+            dp_rank_count: i32::try_from(ranks.len()).unwrap(),
+            ..Default::default()
+        }
+    }
+
     fn two_workers() -> Vec<Arc<dyn Worker>> {
         vec![
             Arc::new(
@@ -2702,6 +2792,24 @@ mod tests {
                     .build(),
             ),
         ]
+    }
+
+    fn two_workers_with_max_running(max_running: u16) -> Vec<Arc<dyn Worker>> {
+        ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .labels(HashMap::from([(
+                            "max_running_requests".to_string(),
+                            max_running.to_string(),
+                        )]))
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
     }
 
     fn engine_aware_policy() -> CacheAwarePolicy {
@@ -2724,6 +2832,28 @@ mod tests {
             .get(model_id)
             .unwrap()
             .insert_text(text, workers[0].url());
+    }
+
+    fn scheduler_pressure_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            engine_load: true,
+            eviction_interval_secs: 0,
+            max_cached_owners_per_prefix: 8,
+            cache_owner_spill_cooldown_secs: 60,
+            ..Default::default()
+        })
+    }
+
+    fn select_text(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], text: &str) -> usize {
+        policy
+            .select_worker(
+                workers,
+                &SelectWorkerInfo {
+                    request_text: Some(text),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
     }
 
     #[test]
@@ -2770,6 +2900,194 @@ mod tests {
             )
             .unwrap();
         assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn scheduler_pressure_keeps_affinity_below_watermark() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 32, 1, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_spills_above_watermark() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 33, 1, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 1);
+        assert_eq!(policy.replication_state.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_pressure_sums_complete_rank_caps() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(17, 0, 37), (17, 0, 37)]),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(0, 0, 37), (0, 0, 37)]),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_ignores_metadata_cap_when_rank_caps_are_missing() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers_with_max_running(37);
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(17, 0, 0), (17, 0, 0)]),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(0, 0, 0), (0, 0, 0)]),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_ignores_partial_rank_caps() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers();
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(17, 0, 37), (17, 0, 0)]),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler_ranks(&[(0, 0, 37), (0, 0, 37)]),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_ignores_tp_duplicated_counts_without_snapshot_cap() {
+        let policy = scheduler_pressure_policy();
+        let workers = two_workers_with_max_running(37);
+        prime_worker_one_affinity(&policy, &workers, "shared prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 176, 32, 0),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.10, 0.10, 0, 0, 0),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "shared prefix");
+
+        assert_eq!(selected, 0);
+        assert!(policy.replication_state.is_empty());
+    }
+
+    #[test]
+    fn scheduler_pressure_uses_an_existing_suitable_owner_before_spilling() {
+        let policy = scheduler_pressure_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let model_id = normalize_model_key(workers[0].model_id());
+        let tree = policy.string_trees.get(model_id).unwrap().value().clone();
+        tree.insert_text("hot prefix", workers[0].url());
+        tree.insert_text("hot prefix", workers[1].url());
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 37, 116, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 20, 0, 37),
+            ),
+            (
+                "http://w3:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "hot prefix");
+
+        assert_eq!(selected, 1);
+        assert!(policy.replication_state.is_empty());
+        assert_eq!(tree.match_prefix_with_counts("hot prefix").tenants.len(), 2);
+    }
+
+    #[test]
+    fn scheduler_pressure_skips_a_saturated_spill_candidate() {
+        let policy = scheduler_pressure_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        prime_worker_one_affinity(&policy, &workers, "hot prefix");
+        policy.update_loads(&HashMap::from([
+            (
+                "http://w1:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 37, 116, 37),
+            ),
+            (
+                "http://w2:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 37, 0, 37),
+            ),
+            (
+                "http://w3:8000".to_string(),
+                engine_load_with_scheduler(0.20, 0.20, 0, 0, 37),
+            ),
+        ]));
+
+        let selected = select_text(&policy, &workers, "hot prefix");
+
+        assert_eq!(selected, 2);
     }
 
     #[test]
