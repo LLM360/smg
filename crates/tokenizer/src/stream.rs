@@ -114,3 +114,110 @@ impl DecodeStream {
         &self.all_token_ids
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tiktoken::{TiktokenModel, TiktokenTokenizer};
+
+    /// Emoji plus CJK sample: several multi-byte sequences across scripts.
+    const MULTIBYTE_TEXT: &str = "Hello 世界 😀 こんにちは 👍🏽!";
+
+    fn cl100k_tokenizer() -> Arc<dyn traits::Tokenizer> {
+        Arc::new(TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap())
+    }
+
+    fn encode_ids(tokenizer: &Arc<dyn traits::Tokenizer>, text: &str) -> Vec<TokenIdType> {
+        tokenizer
+            .encode(text, false)
+            .expect("encode must succeed")
+            .token_ids()
+            .to_vec()
+    }
+
+    /// Crate-boundary lock (LLM360/comet#3719): one token at a time, the
+    /// stream round-trips emoji+CJK exactly, and no emitted chunk ever
+    /// contains U+FFFD.
+    #[test]
+    fn test_multibyte_round_trip_single_token_steps() {
+        let tokenizer = cl100k_tokenizer();
+        let ids = encode_ids(&tokenizer, MULTIBYTE_TEXT);
+        assert!(ids.len() > 1);
+
+        let mut stream = DecodeStream::new(Arc::clone(&tokenizer), &[], true);
+        let mut emitted = String::new();
+        for &id in &ids {
+            if let Some(chunk) = stream.step(id).expect("decode step") {
+                assert!(
+                    !chunk.contains('\u{FFFD}'),
+                    "emitted chunk must not contain U+FFFD: {chunk:?}"
+                );
+                emitted.push_str(&chunk);
+            }
+        }
+        assert_eq!(stream.flush().expect("flush"), None);
+        assert_eq!(emitted, MULTIBYTE_TEXT);
+    }
+
+    /// Crate-boundary lock (LLM360/comet#3719): the same round trip through
+    /// two-token steps, the shape of the small /generate backend deltas.
+    #[test]
+    fn test_multibyte_round_trip_two_token_steps() {
+        let tokenizer = cl100k_tokenizer();
+        let ids = encode_ids(&tokenizer, MULTIBYTE_TEXT);
+
+        let mut stream = DecodeStream::new(Arc::clone(&tokenizer), &[], true);
+        let mut emitted = String::new();
+        for window in ids.chunks(2) {
+            for chunk in stream.step_batch(window).expect("decode step batch") {
+                assert!(
+                    !chunk.contains('\u{FFFD}'),
+                    "emitted chunk must not contain U+FFFD: {chunk:?}"
+                );
+                emitted.push_str(&chunk);
+            }
+        }
+        assert_eq!(stream.flush().expect("flush"), None);
+        assert_eq!(emitted, MULTIBYTE_TEXT);
+    }
+
+    /// Crate-boundary lock (LLM360/comet#3719): a truncated final sequence
+    /// (a simulated `max_new_tokens` cut inside a multi-byte character)
+    /// leaves the already emitted text untouched; the residual tail — the
+    /// deliberate lossy part — comes only from `flush()`.
+    #[test]
+    fn test_truncated_tail_leaves_emissions_and_flushes_lossy_tail() {
+        let tokenizer = cl100k_tokenizer();
+        let ids = encode_ids(&tokenizer, "分割😀");
+        let cut = (1..ids.len())
+            .rev()
+            .find(|&cut| {
+                tokenizer
+                    .decode(&ids[..cut], true)
+                    .expect("decode")
+                    .contains('\u{FFFD}')
+            })
+            .expect("some truncation of 分割😀 must end inside a character");
+
+        let mut stream = DecodeStream::new(Arc::clone(&tokenizer), &[], true);
+        let mut emitted = String::new();
+        for chunk in stream.step_batch(&ids[..cut]).expect("decode step batch") {
+            assert!(
+                !chunk.contains('\u{FFFD}'),
+                "emitted chunk must not contain U+FFFD: {chunk:?}"
+            );
+            emitted.push_str(&chunk);
+        }
+        assert!(
+            "分割😀".starts_with(&emitted),
+            "emitted text stays a prefix of the full text: {emitted:?}"
+        );
+
+        let tail = stream.flush().expect("flush");
+        let tail = tail.expect("flush emits the residual tail");
+        assert!(
+            tail.contains('\u{FFFD}'),
+            "the residual tail is deliberately lossy: {tail:?}"
+        );
+    }
+}

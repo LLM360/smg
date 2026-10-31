@@ -29,6 +29,28 @@ const CL100K_BASE_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N
 
 type Rank = u32;
 
+/// Why a tiktoken decode had to fall back to lossy UTF-8 output
+/// (LLM360/comet#3719).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LossyUtf8Cause {
+    /// The byte string ends with an incomplete UTF-8 prefix: a routine
+    /// stream split that the caller's incremental decoder completes once
+    /// the next token arrives.
+    TruncatedTail,
+    /// The bytes are invalid UTF-8 beyond a truncated tail: real data that
+    /// the operator must see.
+    InvalidBytes,
+}
+
+/// Classify the cause of a failed strict UTF-8 decode from the
+/// lossy-fallback bytes.
+fn classify_lossy_utf8(bytes: &[u8]) -> LossyUtf8Cause {
+    match std::str::from_utf8(bytes) {
+        Err(err) if err.error_len().is_none() => LossyUtf8Cause::TruncatedTail,
+        _ => LossyUtf8Cause::InvalidBytes,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tiktoken-specific config parsing (from tokenizer_config.json)
 // ---------------------------------------------------------------------------
@@ -480,11 +502,24 @@ impl Decoder for TiktokenTokenizer {
                     ._decode_native_and_split(token_ids.to_vec())
                     .flatten()
                     .collect();
-                tracing::warn!(
-                    error = %err,
-                    token_count = token_ids.len(),
-                    "tiktoken decode failed; returning lossy UTF-8 fallback"
-                );
+                // A truncated tail is a routine stream split that the caller's
+                // incremental decoder completes on the next token, so it is
+                // not a warning. Genuinely invalid bytes are real data and
+                // keep the warning (LLM360/comet#3719).
+                match classify_lossy_utf8(&bytes) {
+                    LossyUtf8Cause::TruncatedTail => tracing::debug!(
+                        error = %err,
+                        token_count = token_ids.len(),
+                        cause = "truncated_tail",
+                        "tiktoken decode failed; returning lossy UTF-8 fallback"
+                    ),
+                    LossyUtf8Cause::InvalidBytes => tracing::warn!(
+                        error = %err,
+                        token_count = token_ids.len(),
+                        cause = "invalid_bytes",
+                        "tiktoken decode failed; returning lossy UTF-8 fallback"
+                    ),
+                }
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
         }
@@ -850,5 +885,104 @@ mod tests {
             ids.contains(&100257),
             "Special token <|endoftext|> should be recognized as single token, got: {ids:?}"
         );
+    }
+
+    /// The production signature (LLM360/comet#3719): a byte string that ends
+    /// with an incomplete UTF-8 prefix — here one complete 3-byte character
+    /// plus the first byte of the next one ("incomplete utf-8 byte sequence
+    /// from index 3") — is a routine stream split, classified as a truncated
+    /// tail.
+    #[test]
+    fn test_classify_lossy_utf8_truncated_tail() {
+        let mut bytes = "世".as_bytes().to_vec();
+        bytes.push(0xF0); // first byte of "😀" (U+1F600)
+        assert_eq!(classify_lossy_utf8(&bytes), LossyUtf8Cause::TruncatedTail);
+    }
+
+    /// Bytes that are invalid UTF-8 beyond a truncated tail are real data,
+    /// not a stream split: the classification keeps them on the warning
+    /// path (LLM360/comet#3719).
+    #[test]
+    fn test_classify_lossy_utf8_invalid_bytes() {
+        // 0xFF can never appear in valid UTF-8.
+        assert_eq!(
+            classify_lossy_utf8(&[b'a', 0xFF, b'b']),
+            LossyUtf8Cause::InvalidBytes
+        );
+        // A bare continuation byte is invalid, too.
+        assert_eq!(classify_lossy_utf8(&[0x80]), LossyUtf8Cause::InvalidBytes);
+    }
+
+    /// The fallback keeps its lossy content unchanged for a truncated tail:
+    /// the truncated-tail classification only changes the log severity, not
+    /// the returned text (LLM360/comet#3719).
+    #[test]
+    fn test_decode_lossy_fallback_content_unchanged_for_truncated_tail() {
+        let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
+        let full_ids = tokenizer
+            .encode("世😀", false)
+            .unwrap()
+            .token_ids()
+            .to_vec();
+
+        // Find the chunk that decodes to the complete 3-byte character "世"
+        // plus a truncated prefix of "😀" (the production shape: a from_utf8
+        // error that ends in an incomplete UTF-8 prefix, "from index 3").
+        let split = (1..full_ids.len())
+            .find(|&split| {
+                let bytes: Vec<u8> = tokenizer
+                    .tokenizer
+                    ._decode_native_and_split(full_ids[..split].to_vec())
+                    .flatten()
+                    .collect();
+                bytes.starts_with("世".as_bytes())
+                    && matches!(std::str::from_utf8(&bytes), Err(e) if e.error_len().is_none())
+            })
+            .expect("a two-character-cl100k encoding must contain the production split shape");
+        let chunk = &full_ids[..split];
+
+        let bytes: Vec<u8> = tokenizer
+            .tokenizer
+            ._decode_native_and_split(chunk.to_vec())
+            .flatten()
+            .collect();
+        assert_eq!(
+            classify_lossy_utf8(&bytes),
+            LossyUtf8Cause::TruncatedTail,
+            "bytes: {bytes:02x?}"
+        );
+        let decoded = tokenizer.decode(chunk, false).unwrap();
+        assert_eq!(decoded, String::from_utf8_lossy(&bytes).into_owned());
+    }
+
+    /// The fallback keeps its lossy content unchanged for genuinely invalid
+    /// bytes (LLM360/comet#3719).
+    #[test]
+    fn test_decode_lossy_fallback_content_unchanged_for_invalid_bytes() {
+        let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
+        // Resolve the single-byte cl100k tokens for 'a', 0xF0, and 'b' so the
+        // concatenated bytes are invalid UTF-8 in the middle (0xF0 expects a
+        // continuation byte but 'b' follows).
+        let byte_token = |target: &[u8]| -> TokenIdType {
+            (0..100256)
+                .find(|&id| {
+                    tokenizer
+                        .tokenizer
+                        ._decode_native_and_split(vec![id])
+                        .flatten()
+                        .eq(target.iter().copied())
+                })
+                .unwrap_or_else(|| panic!("a single-byte cl100k token exists for {target:02x?}"))
+        };
+        let ids = [byte_token(b"a"), byte_token(&[0xF0]), byte_token(b"b")];
+        let bytes: Vec<u8> = tokenizer
+            .tokenizer
+            ._decode_native_and_split(ids.to_vec())
+            .flatten()
+            .collect();
+        assert_eq!(bytes, [b'a', 0xF0, b'b']);
+        assert_eq!(classify_lossy_utf8(&bytes), LossyUtf8Cause::InvalidBytes);
+        let decoded = tokenizer.decode(&ids, false).unwrap();
+        assert_eq!(decoded, String::from_utf8_lossy(&bytes).into_owned());
     }
 }
