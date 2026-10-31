@@ -13,6 +13,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    stream::DecodeStream,
     traits::Tokenizer,
 };
 use openai_protocol::{
@@ -61,6 +62,48 @@ struct GenerateStreamContext {
     return_logprob: bool,
     backend_type: &'static str,
     model: String,
+}
+
+/// Per-index incremental token decoders for the /generate streaming paths.
+///
+/// Backend chunks carry small token deltas that can split a multi-byte UTF-8
+/// character across two chunks. A stateless per-chunk decode corrupts the
+/// split character with U+FFFD in both chunks (LLM360/comet#3719); one
+/// `DecodeStream` per index holds the partial character back until it is
+/// complete, so the accumulated text equals a single full decode of all
+/// chunk tokens.
+#[derive(Default)]
+struct GenerateStreamDecoders {
+    streams: HashMap<u32, DecodeStream>,
+}
+
+impl GenerateStreamDecoders {
+    /// Push one chunk of delta token ids for `index` and return the newly
+    /// decoded text delta. The delta is empty when the chunk ends inside a
+    /// multi-byte character; decode errors keep the previous
+    /// `unwrap_or_default` behavior.
+    fn push(&mut self, tokenizer: &Arc<dyn Tokenizer>, index: u32, token_ids: &[u32]) -> String {
+        let stream = self
+            .streams
+            .entry(index)
+            .or_insert_with(|| DecodeStream::new(Arc::clone(tokenizer), &[], true));
+        stream
+            .step_batch(token_ids)
+            .map(|chunks| chunks.concat())
+            .unwrap_or_default()
+    }
+
+    /// Flush the decoder for `index` and return the residual text, if any.
+    ///
+    /// The residual is deliberately lossy only when generation truly ends
+    /// inside a multi-byte character (for example a `max_new_tokens` cut);
+    /// it joins the final accumulated text before the terminal SSE event.
+    fn flush(&mut self, index: u32) -> String {
+        self.streams
+            .get_mut(&index)
+            .and_then(|stream| stream.flush().ok().flatten())
+            .unwrap_or_default()
+    }
 }
 
 impl StreamingProcessor {
@@ -744,6 +787,7 @@ impl StreamingProcessor {
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut decoders = GenerateStreamDecoders::default();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -762,10 +806,11 @@ impl StreamingProcessor {
                     *completion_tokens += chunk.token_ids().len() as u32;
                     let current_completion_tokens = *completion_tokens;
 
-                    // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
-                    let chunk_text = tokenizer
-                        .decode(chunk.token_ids(), true)
-                        .unwrap_or_default();
+                    // Decode tokens to text through the per-index incremental
+                    // decoder, which holds back a multi-byte character that is
+                    // split across chunks until it is complete
+                    // (skip_special_tokens=true to handle newlines correctly)
+                    let chunk_text = decoders.push(&tokenizer, index, chunk.token_ids());
 
                     // Accumulate text for this index
                     let accumulated_text = accumulated_texts.entry(index).or_default();
@@ -796,8 +841,12 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete) => {
                     let index = complete.index();
+                    // Flush the incremental decoder so the residual tail
+                    // (deliberately lossy only on a true mid-character cut)
+                    // joins the final accumulated text
+                    let residual = decoders.flush(index);
                     let accumulated_text =
-                        accumulated_texts.get(&index).cloned().unwrap_or_default();
+                        accumulated_texts.get(&index).cloned().unwrap_or_default() + &residual;
                     let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
@@ -906,6 +955,7 @@ impl StreamingProcessor {
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut decoders = GenerateStreamDecoders::default();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -924,10 +974,10 @@ impl StreamingProcessor {
                     *completion_tokens += chunk.token_ids().len() as u32;
                     let current_completion_tokens = *completion_tokens;
 
-                    // Decode tokens to text
-                    let chunk_text = tokenizer
-                        .decode(chunk.token_ids(), true)
-                        .unwrap_or_default();
+                    // Decode tokens to text through the per-index incremental
+                    // decoder, which holds back a multi-byte character that is
+                    // split across chunks until it is complete
+                    let chunk_text = decoders.push(&tokenizer, index, chunk.token_ids());
 
                     // Accumulate text for this index
                     let accumulated_text = accumulated_texts.entry(index).or_default();
@@ -984,8 +1034,12 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete) => {
                     let index = complete.index();
+                    // Flush the incremental decoder so the residual tail
+                    // (deliberately lossy only on a true mid-character cut)
+                    // joins the final accumulated text
+                    let residual = decoders.flush(index);
                     let accumulated_text =
-                        accumulated_texts.get(&index).cloned().unwrap_or_default();
+                        accumulated_texts.get(&index).cloned().unwrap_or_default() + &residual;
 
                     // Use accumulated count (we tracked deltas from both backends)
                     let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
@@ -2687,5 +2741,156 @@ impl StreamingProcessor {
             buffer.extend_from_slice(error_msg.as_bytes());
         }
         buffer.extend_from_slice(b"\n\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use llm_tokenizer::tiktoken::{TiktokenModel, TiktokenTokenizer};
+
+    use super::*;
+
+    /// Emoji plus CJK sample: several multi-byte sequences across scripts.
+    const MULTIBYTE_TEXT: &str = "Hello 世界 😀 こんにちは 👍🏽!";
+
+    fn test_tokenizer() -> Arc<dyn Tokenizer> {
+        Arc::new(TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap())
+    }
+
+    fn encode(tokenizer: &Arc<dyn Tokenizer>, text: &str) -> Vec<u32> {
+        tokenizer
+            .encode(text, false)
+            .expect("encode must succeed")
+            .token_ids()
+            .to_vec()
+    }
+
+    /// A multi-byte string split across two chunks at every possible token
+    /// boundary must accumulate byte-identical to a single full decode of
+    /// all chunk tokens, and no emitted delta may contain U+FFFD.
+    ///
+    /// Regression for the stateless per-chunk decode in the /generate
+    /// streaming paths (LLM360/comet#3719).
+    #[test]
+    fn generate_decode_streams_multibyte_split_every_boundary() {
+        let tokenizer = test_tokenizer();
+        let ids = encode(&tokenizer, MULTIBYTE_TEXT);
+        assert!(ids.len() > 1);
+        let full_decode = tokenizer.decode(&ids, true).expect("full decode");
+        assert_eq!(full_decode, MULTIBYTE_TEXT);
+
+        for split in 1..ids.len() {
+            let mut decoders = GenerateStreamDecoders::default();
+            let mut text = decoders.push(&tokenizer, 0, &ids[..split]);
+            text.push_str(&decoders.push(&tokenizer, 0, &ids[split..]));
+            text.push_str(&decoders.flush(0));
+            assert_eq!(text, full_decode, "two-chunk split at token {split}");
+        }
+    }
+
+    /// The production failure shape: chunk 1 ends after one complete 3-byte
+    /// character plus the first byte-token of the next character
+    /// (`token_count=2`, "incomplete utf-8 byte sequence from index 3").
+    /// The stateless per-chunk decode corrupts both chunks with U+FFFD; the
+    /// per-index buffered decode must keep the text exact.
+    #[test]
+    fn generate_decode_streams_production_split_shape() {
+        let tokenizer = test_tokenizer();
+        // cl100k_base encodes 界😀 as [界][first byte-token of 😀][rest]: the
+        // two-token prefix is one complete 3-byte character plus a dangling
+        // byte-token, which a stateless decode corrupts at byte index 3.
+        const PRODUCTION_TEXT: &str = "界😀";
+        let ids = encode(&tokenizer, PRODUCTION_TEXT);
+        assert!(ids.len() >= 3);
+        assert_eq!(tokenizer.decode(&ids[..1], true).unwrap(), "界");
+
+        let (chunk1, chunk2) = (&ids[..2], &ids[2..]);
+        assert_eq!(
+            chunk1.len(),
+            2,
+            "the production chunk carries token_count=2"
+        );
+        // Defect evidence: the old stateless decode corrupts both chunks.
+        let lossy1 = tokenizer.decode(chunk1, true).expect("stateless decode");
+        let lossy2 = tokenizer.decode(chunk2, true).expect("stateless decode");
+        assert_eq!(lossy1, "界\u{FFFD}");
+        assert!(lossy2.contains('\u{FFFD}'), "chunk 2: {lossy2:?}");
+
+        // The buffered decode keeps the accumulated text exact.
+        let mut decoders = GenerateStreamDecoders::default();
+        let delta1 = decoders.push(&tokenizer, 0, chunk1);
+        let delta2 = decoders.push(&tokenizer, 0, chunk2);
+        assert!(!delta1.contains('\u{FFFD}'), "delta 1: {delta1:?}");
+        assert!(!delta2.contains('\u{FFFD}'), "delta 2: {delta2:?}");
+        let flushed = decoders.flush(0);
+        let text = format!("{delta1}{delta2}{flushed}");
+        assert_eq!(text, PRODUCTION_TEXT);
+    }
+
+    /// Per-index isolation: interleaved chunks for different indices keep
+    /// independent decode state (n>1 support).
+    #[test]
+    fn generate_decode_streams_per_index_isolation() {
+        let tokenizer = test_tokenizer();
+        let partial = encode(&tokenizer, "😀");
+        assert!(
+            partial.len() > 1,
+            "cl100k_base encodes 😀 to multiple tokens"
+        );
+        let latin = encode(&tokenizer, "bonjour");
+
+        let mut decoders = GenerateStreamDecoders::default();
+        // Open a split boundary on index 0, then complete index 1 first.
+        let held = decoders.push(&tokenizer, 0, &partial[..1]);
+        assert_eq!(held, "", "a partial character is held back, got {held:?}");
+        let text_b: String = [
+            decoders.push(&tokenizer, 1, &latin[..1]),
+            decoders.push(&tokenizer, 1, &latin[1..]),
+            decoders.flush(1),
+        ]
+        .concat();
+        let text_a: String = [
+            decoders.push(&tokenizer, 0, &partial[1..]),
+            decoders.flush(0),
+        ]
+        .concat();
+
+        assert_eq!(text_a, "😀");
+        assert_eq!(text_b, "bonjour");
+    }
+
+    /// A stream that ends inside a multi-byte character (for example a
+    /// `max_new_tokens` cut) keeps the already emitted text exact; the
+    /// deliberate lossy tail comes only from the final flush.
+    #[test]
+    fn generate_decode_streams_truncated_tail_only_from_flush() {
+        let tokenizer = test_tokenizer();
+        let ids = encode(&tokenizer, "分割😀");
+        let cut = (1..ids.len())
+            .rev()
+            .find(|&cut| {
+                tokenizer
+                    .decode(&ids[..cut], true)
+                    .expect("decode")
+                    .contains('\u{FFFD}')
+            })
+            .expect("some truncation of 分割😀 must end inside a character");
+
+        let mut decoders = GenerateStreamDecoders::default();
+        let emitted = decoders.push(&tokenizer, 0, &ids[..cut]);
+        assert!(
+            !emitted.contains('\u{FFFD}'),
+            "held-back deltas never contain U+FFFD: {emitted:?}"
+        );
+        assert!(
+            "分割😀".starts_with(&emitted),
+            "emitted text stays a prefix of the full text: {emitted:?}"
+        );
+        let tail = decoders.flush(0);
+        assert!(!tail.is_empty(), "flush emits the residual tail");
+        assert!(
+            tail.contains('\u{FFFD}'),
+            "the residual tail is deliberately lossy: {tail:?}"
+        );
     }
 }
