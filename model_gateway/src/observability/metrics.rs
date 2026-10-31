@@ -347,6 +347,11 @@ pub(crate) fn init_metrics() {
         "KV event sequence gaps recovered by clearing stale worker cache state and resuming the \
          live stream"
     );
+    describe_counter!(
+        "smg_kv_event_unknown_parent_skips_total",
+        "KV store events skipped on an unknown parent by worker, stream-epoch phase \
+         (rebuild, steady), and error (worker_not_tracked, parent_not_found)"
+    );
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
@@ -1386,6 +1391,25 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record a skipped KV store event whose parent is unknown to the shared
+    /// event index. `phase` bounds the stream-epoch classification
+    /// (`rebuild`, `steady`); `error` bounds the specific cause
+    /// (`worker_not_tracked`, `parent_not_found`).
+    pub fn record_kv_event_unknown_parent_skip(
+        worker_url: &str,
+        phase: &'static str,
+        error: &'static str,
+    ) {
+        let worker_interned = intern_string(worker_url);
+        counter!(
+            "smg_kv_event_unknown_parent_skips_total",
+            "worker" => worker_interned,
+            "phase" => phase,
+            "error" => error
+        )
+        .increment(1);
+    }
+
     // ========================================================================
     // Layer 3: Worker resilience metrics (circuit breaker)
     // ========================================================================
@@ -2316,6 +2340,48 @@ mod tests {
         assert!(
             rendered.contains("smg_pd_kv_transfer_failures_total 2"),
             "kv transfer failure counter wrong; rendered:\n{rendered}"
+        );
+    }
+
+    // ========================================================================
+    // KV event monitor metric tests
+    // ========================================================================
+
+    #[test]
+    fn test_record_kv_event_unknown_parent_skip_counts_by_phase_and_error() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_kv_event_unknown_parent_skip(
+                "http://w1:8000",
+                "rebuild",
+                "parent_not_found",
+            );
+            Metrics::record_kv_event_unknown_parent_skip(
+                "http://w1:8000",
+                "rebuild",
+                "parent_not_found",
+            );
+            Metrics::record_kv_event_unknown_parent_skip(
+                "http://w1:8000",
+                "steady",
+                "worker_not_tracked",
+            );
+        });
+        let counter_line = |phase: &str, error: &str, count: &str| {
+            rendered.lines().any(|line| {
+                line.starts_with("smg_kv_event_unknown_parent_skips_total{")
+                    && line.contains(r#"worker="http://w1:8000""#)
+                    && line.contains(&format!(r#"phase="{phase}""#))
+                    && line.contains(&format!(r#"error="{error}""#))
+                    && line.ends_with(&format!("}} {count}"))
+            })
+        };
+        assert!(
+            counter_line("rebuild", "parent_not_found", "2"),
+            "rebuild/parent_not_found counter wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            counter_line("steady", "worker_not_tracked", "1"),
+            "steady/worker_not_tracked counter wrong; rendered:\n{rendered}"
         );
     }
 }
