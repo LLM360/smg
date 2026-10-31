@@ -96,6 +96,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             ctx.components.clone(),
             Some(params.tenant_request_meta),
             ChatInvocation::ResponsesInternal,
+            None,
         )
         .await;
 
@@ -585,6 +586,7 @@ async fn execute_tool_loop_streaming_internal(
                 ctx.components.clone(),
                 Some(params.tenant_request_meta.clone()),
                 ChatInvocation::ResponsesInternal,
+                None,
             )
             .await;
 

@@ -444,6 +444,10 @@ impl RequestPipeline {
     }
 
     /// Execute the complete pipeline for a chat request
+    ///
+    /// `excluded_workers` carries the URLs of workers that failed with a
+    /// pre-engine transport error on earlier retry attempts of the same
+    /// client request; worker selection removes them from the candidate list.
     pub async fn execute_chat(
         &self,
         request: Arc<ChatCompletionRequest>,
@@ -452,6 +456,7 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         invocation: ChatInvocation,
+        excluded_workers: Option<Arc<std::collections::HashSet<String>>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
@@ -463,6 +468,7 @@ impl RequestPipeline {
             invocation.streaming_distribution_seed_scope(self.endpoint, self.mode),
         );
         ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.excluded_workers = excluded_workers;
         let model = ctx.input.model_id.clone();
 
         // Record request start
@@ -541,6 +547,10 @@ impl RequestPipeline {
     }
 
     /// Execute the complete pipeline for a generate request
+    ///
+    /// `excluded_workers` carries the URLs of workers that failed with a
+    /// pre-engine transport error on earlier retry attempts of the same
+    /// client request; worker selection removes them from the candidate list.
     pub async fn execute_generate(
         &self,
         request: Arc<GenerateRequest>,
@@ -548,11 +558,13 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        excluded_workers: Option<Arc<std::collections::HashSet<String>>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.excluded_workers = excluded_workers;
         let model_id = ctx.input.model_id.clone();
 
         // Record request start

@@ -318,6 +318,14 @@ pub(crate) fn init_metrics() {
         "Health check results by worker_type and result"
     );
     describe_counter!(
+        "smg_worker_terminal_failure_total",
+        "Workers that exhausted the health-check recovery budget and were left failed or removed, by model"
+    );
+    describe_gauge!(
+        "smg_worker_terminal_failure_last_seen_seconds",
+        "Unix epoch seconds when a worker's health-check recovery budget was last exhausted, by worker and model (0 = cleared on re-registration)"
+    );
+    describe_counter!(
         "smg_worker_selection_total",
         "Worker selection events by worker_type, connection_mode, model, policy"
     );
@@ -1238,6 +1246,43 @@ impl Metrics {
             "result" => result
         )
         .increment(1);
+    }
+
+    /// Record one worker whose health-check recovery budget is exhausted
+    /// (terminal failure: the worker is left failed or removed).
+    pub fn record_worker_terminal_failure(model_id: &str) {
+        counter!(
+            "smg_worker_terminal_failure_total",
+            "model" => intern_string(model_id)
+        )
+        .increment(1);
+    }
+
+    /// Mark the epoch-second when a worker's recovery budget was last
+    /// exhausted, so the terminal failure is machine-readable per worker.
+    pub fn set_worker_terminal_failure_last_seen(
+        worker_url: &str,
+        model_id: &str,
+        epoch_secs: u64,
+    ) {
+        gauge!(
+            "smg_worker_terminal_failure_last_seen_seconds",
+            "worker" => intern_string(worker_url),
+            "model" => intern_string(model_id)
+        )
+        .set(epoch_secs as f64);
+    }
+
+    /// Clear the terminal-failure marker for a worker that re-entered
+    /// service (re-registered or replaced) so recovered workers stop
+    /// alerting.
+    pub fn clear_worker_terminal_failure_last_seen(worker_url: &str, model_id: &str) {
+        gauge!(
+            "smg_worker_terminal_failure_last_seen_seconds",
+            "worker" => intern_string(worker_url),
+            "model" => intern_string(model_id)
+        )
+        .set(0.0);
     }
 
     /// Record worker selection

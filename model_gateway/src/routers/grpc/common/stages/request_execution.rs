@@ -11,6 +11,7 @@ use super::{adaptive_admission::rejection_response, PipelineStage};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
+        common::retry::PreEngineTransportFailure,
         error,
         grpc::{
             common::stages::encode::EncodeDispatchPlan,
@@ -411,10 +412,23 @@ impl RequestExecutionStage {
 
         let stream = result.map_err(|e| {
             error!(function = "execute_single", error = %e, "Failed to start generation");
-            e.to_http_error(
+            let mut response = e.to_http_error(
                 "start_generation_failed",
                 format!("Failed to start generation: {}", e.message()),
-            )
+            );
+            // Generation-stream acquisition happens before any token is
+            // produced: an `Unavailable` here means the worker could not
+            // start the request, so no engine work ran. Mark the failure as
+            // pre-engine transport so the retry loop excludes this worker
+            // and retries on another one (even for non-idempotent requests).
+            if e.code() == tonic::Code::Unavailable {
+                if let Some(url) = workers.single().map(|w| w.url().to_string()) {
+                    response
+                        .extensions_mut()
+                        .insert(PreEngineTransportFailure { worker_url: url });
+                }
+            }
+            response
         })?;
 
         Ok(ExecutionResult::Single { stream })

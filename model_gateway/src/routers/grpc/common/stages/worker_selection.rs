@@ -1,6 +1,6 @@
 //! Worker selection stage: Select appropriate worker(s) based on routing mode
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{
@@ -159,6 +159,7 @@ impl PipelineStage for WorkerSelectionStage {
                             .as_ref()
                             .map(|(controller, partition)| (controller, partition.as_str())),
                         cache_credit_chat_eligible,
+                        ctx.input.excluded_workers.as_deref(),
                     )? {
                         Some((worker, reservation, ordinary_distribution_guard)) => {
                             ctx.state.policy_reservation = reservation;
@@ -298,6 +299,7 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
     ) -> Option<(Arc<dyn Worker>, DistributionSeedDispatchGuard)> {
         let controller = ctx.components.adaptive_admission.as_ref()?;
+        let excluded = ctx.input.excluded_workers.as_deref();
         let workers: Vec<_> = self
             .worker_registry
             .get_workers_filtered(
@@ -311,7 +313,12 @@ impl WorkerSelectionStage {
             // Header-excluded authoritative owners must remain visible to the
             // cache-policy owner ceiling. SelectWorkerInfo applies the same
             // headers only to actual target eligibility below.
-            .filter(|worker| worker.is_available())
+            //
+            // Retry attempts of this request exclude workers that already
+            // failed with a pre-engine transport error.
+            .filter(|worker| {
+                worker.is_available() && !excluded.is_some_and(|set| set.contains(worker.url()))
+            })
             .collect();
         if workers.len() < 2 {
             return None;
@@ -406,6 +413,7 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         distribution_scope: Option<(&Arc<AdaptiveAdmissionController>, &str)>,
         cache_credit_chat_eligible: bool,
+        excluded: Option<&HashSet<String>>,
     ) -> Result<Option<SingleWorkerSelection>, Response> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -497,11 +505,14 @@ impl WorkerSelectionStage {
         let available: Vec<Arc<dyn Worker>> = workers
             .into_iter()
             .filter(|worker| {
-                if serialize_distribution {
+                let eligible = if serialize_distribution {
                     worker.is_available()
                 } else {
                     worker_is_available_for_request(worker.as_ref(), headers)
-                }
+                };
+                // Retry attempts of this request exclude workers that already
+                // failed with a pre-engine transport error.
+                eligible && !excluded.is_some_and(|set| set.contains(worker.url()))
             })
             .collect();
 
@@ -1345,6 +1356,7 @@ mod tests {
             Some(&request_headers),
             Some((&controller, "k3")),
             false,
+            None,
         ));
 
         // The seed's store event can make B a deeper authoritative owner while
@@ -1369,6 +1381,43 @@ mod tests {
             Some(&request_headers),
             Some((&controller, "k3")),
             false,
+            None,
         ));
+    }
+
+    #[test]
+    fn select_single_worker_skips_retry_excluded_workers() {
+        // A worker that failed with a pre-engine transport error on an
+        // earlier attempt is excluded from later attempts of the same
+        // request; with every worker excluded, no worker is selected.
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let worker_a = stage_worker("grpc://10.0.0.1:30000");
+        let worker_b = stage_worker("grpc://10.0.0.2:30000");
+        worker_registry.register(worker_a.clone()).unwrap();
+        worker_registry.register(worker_b.clone()).unwrap();
+
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::Regular,
+        );
+
+        let mut excluded = HashSet::new();
+        excluded.insert(worker_a.url().to_string());
+        let selection = stage
+            .select_single_worker("kimi-k3", None, None, None, None, false, Some(&excluded))
+            .expect("selection succeeds")
+            .expect("the non-excluded worker remains");
+        assert_eq!(selection.0.url(), worker_b.url());
+
+        excluded.insert(worker_b.url().to_string());
+        assert!(
+            stage
+                .select_single_worker("kimi-k3", None, None, None, None, false, Some(&excluded))
+                .expect("selection succeeds")
+                .is_none(),
+            "with every worker excluded, no worker is selected"
+        );
     }
 }

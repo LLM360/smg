@@ -1,4 +1,9 @@
-use std::{error::Error as _, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    error::Error as _,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -55,7 +60,10 @@ use crate::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
-            retry::{is_retryable_status, RetryExecutor},
+            retry::{
+                is_retryable_status, AttemptOutcome, AttemptOutcomeClass, NoWorkerAvailable,
+                PreEngineTransportFailure, RetryExecutor,
+            },
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -417,12 +425,17 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
+    ///
+    /// `excluded` holds worker URLs that failed on earlier attempts of the
+    /// same request; they are removed from the available-candidate list
+    /// before policy selection so a retry lands on a different worker.
     fn select_worker_for_model(
         &self,
         model_id: &str,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
         max_output_tokens: Option<u64>,
+        excluded: Option<&HashSet<String>>,
     ) -> Option<WorkerSelection> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
@@ -441,6 +454,7 @@ impl Router {
         let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
+            .filter(|w| !excluded.is_some_and(|set| set.contains(w.url())))
             .cloned()
             .collect();
         if available.is_empty() {
@@ -580,33 +594,64 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let mut response = RetryExecutor::execute_response_with_retry(
+        // Read-only routes that do not enqueue generation work are safe to
+        // re-execute; generation endpoints are retried only on pre-engine
+        // transport failures (see AttemptOutcome).
+        let idempotent = IDEMPOTENT_ROUTES.contains(&route);
+        // Workers that failed with a pre-engine transport error on earlier
+        // attempts; excluded from candidate selection on later attempts.
+        let excluded_workers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let mut response = RetryExecutor::execute_attempt_outcome_with_retry(
             retry_config,
             // operation per attempt
-            |_: u32| async {
-                let res = self
-                    .route_typed_request_once(
-                        headers,
-                        typed_req,
-                        route,
-                        model_id,
-                        canonical_model.as_deref(),
-                        is_stream,
-                        &text,
-                    )
-                    .await;
+            |_: u32| {
+                let excluded_snapshot = excluded_workers
+                    .lock()
+                    .expect("retry exclusion mutex poisoned")
+                    .clone();
+                let canonical_model = canonical_model.clone();
+                let text = text.clone();
+                async move {
+                    let res = self
+                        .route_typed_request_once(
+                            headers,
+                            typed_req,
+                            route,
+                            model_id,
+                            canonical_model.as_deref(),
+                            is_stream,
+                            &text,
+                            Some(&excluded_snapshot),
+                        )
+                        .await;
 
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                Metrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
+                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                    Metrics::record_router_upstream_response(
+                        metrics_labels::ROUTER_HTTP,
+                        res.status().as_u16(),
+                        extract_error_code_from_response(&res),
+                    );
 
-                res
+                    let outcome = attempt_outcome_from_response(&res, idempotent);
+                    (res, outcome)
+                }
             },
-            // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
+            // should_retry: pre-engine transport failures for any request,
+            // post-engine retryable statuses for idempotent requests only
+            |res, outcome, _attempt| outcome.is_retry_eligible(res.status()),
+            // on retry attempt: exclude the worker that failed pre-engine
+            {
+                let excluded_workers = Arc::clone(&excluded_workers);
+                move |outcome: &AttemptOutcome| {
+                    if let Some(worker_url) = outcome.worker_url.as_ref() {
+                        excluded_workers
+                            .lock()
+                            .expect("retry exclusion mutex poisoned")
+                            .insert(worker_url.clone());
+                    }
+                }
+            },
             // on_backoff hook
             |delay, attempt| {
                 // Layer 3 worker metrics
@@ -663,12 +708,14 @@ impl Router {
         canonical_model: Option<&str>,
         is_stream: bool,
         text: &str,
+        excluded: Option<&HashSet<String>>,
     ) -> Response {
         let selection = match self.select_worker_for_model(
             model_id,
             Some(text),
             headers,
             typed_req.max_output_tokens_for_routing().map(u64::from),
+            excluded,
         ) {
             Some(selection) => selection,
             None => {
@@ -688,10 +735,12 @@ impl Router {
                 return if total.is_empty() {
                     error::model_not_found(model_id)
                 } else {
-                    error::service_unavailable(
+                    let mut response = error::service_unavailable(
                         "no_available_workers",
                         "All workers are unavailable (circuit breaker open or unhealthy)",
-                    )
+                    );
+                    response.extensions_mut().insert(NoWorkerAvailable);
+                    response
                 };
             }
         };
@@ -1308,7 +1357,17 @@ impl Router {
                     e
                 );
 
-                return convert_reqwest_error(e);
+                // Classify the transport failure: connect/builder errors mean
+                // the request never reached the engine, so a retry on another
+                // worker is safe even for non-idempotent routes.
+                let pre_engine = e.is_connect() || e.is_builder();
+                let mut response = convert_reqwest_error(e);
+                if pre_engine {
+                    response.extensions_mut().insert(PreEngineTransportFailure {
+                        worker_url: worker.url().to_string(),
+                    });
+                }
+                return response;
             }
         };
 
@@ -1463,6 +1522,34 @@ fn build_transcription_form(
     }
 
     Ok(form)
+}
+
+/// Read-only routes that do not enqueue generation work; post-engine
+/// failures on these routes are idempotent and safe to retry.
+const IDEMPOTENT_ROUTES: &[&str] = &["/v1/embeddings", "/v1/classify", "/v1/rerank"];
+
+/// Build the attempt outcome from a finished attempt response.
+///
+/// Dispatch paths attach extension markers when the failure shape is
+/// known: a pre-engine transport failure (the request never reached the
+/// engine) or a selection failure (no available worker). Everything else
+/// is classified from the HTTP status.
+fn attempt_outcome_from_response(res: &Response, idempotent: bool) -> AttemptOutcome {
+    if let Some(marker) = res.extensions().get::<PreEngineTransportFailure>() {
+        return AttemptOutcome {
+            worker_url: Some(marker.worker_url.clone()),
+            class: AttemptOutcomeClass::PreEngineTransport,
+            idempotent,
+        };
+    }
+    if res.extensions().get::<NoWorkerAvailable>().is_some() {
+        return AttemptOutcome {
+            worker_url: None,
+            class: AttemptOutcomeClass::PreEngineTransport,
+            idempotent,
+        };
+    }
+    AttemptOutcome::from_status(res.status(), None, idempotent)
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
@@ -1811,13 +1898,15 @@ impl RouterTrait for Router {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
     use serde::Serialize;
 
     use super::*;
     use crate::{config::types::PolicyConfig, worker::BasicWorkerBuilder};
 
-    #[derive(Serialize)]
+    #[derive(Clone, Serialize)]
     struct TestGenerationRequest {
         stream: bool,
         n: u32,
@@ -1989,5 +2078,247 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    /// Loopback HTTP stub that answers POSTs on `route` with statuses drawn
+    /// in order from `statuses` (the last one repeats). Returns the base URL
+    /// and a hit counter so tests can count how many attempts arrived.
+    async fn start_status_stub(
+        route: &'static str,
+        statuses: Vec<StatusCode>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let statuses = Arc::new(statuses);
+        let app = axum::Router::new().route(
+            route,
+            axum::routing::post({
+                let hits = hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    let statuses = statuses.clone();
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        let status = statuses[n.min(statuses.len() - 1)];
+                        (status, Json(serde_json::json!({"ok": status.is_success()})))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Reserve a loopback port and immediately release it so connections
+    /// are refused: the worker is registered but unreachable.
+    fn dead_worker_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead port");
+        let addr = listener.local_addr().expect("dead port address");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    fn test_generation_request() -> TestGenerationRequest {
+        TestGenerationRequest {
+            stream: false,
+            n: 1,
+            max_tokens: 8,
+            tools: vec![],
+            response_format: serde_json::json!({}),
+            reasoning_effort: String::new(),
+        }
+    }
+
+    fn create_model_router(urls: &[&str]) -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        for url in urls {
+            let worker = BasicWorkerBuilder::new(*url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .model(ModelCard::new("test-model"))
+                .build();
+            worker_registry.register_or_replace(Arc::new(worker));
+        }
+
+        Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+            adaptive_admission: None,
+        }
+    }
+
+    #[test]
+    fn test_select_worker_for_model_skips_excluded_workers() {
+        let router = create_model_router(&["http://w1:1", "http://w2:2"]);
+        let mut excluded = HashSet::new();
+        excluded.insert("http://w1:1".to_string());
+
+        let selection = router
+            .select_worker_for_model("test-model", None, None, None, Some(&excluded))
+            .expect("the non-excluded worker remains selectable");
+        assert_eq!(selection.worker.url(), "http://w2:2");
+
+        excluded.insert("http://w2:2".to_string());
+        assert!(
+            router
+                .select_worker_for_model("test-model", None, None, None, Some(&excluded))
+                .is_none(),
+            "with every worker excluded, selection must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_typed_request_retries_pre_engine_failure_on_next_worker() {
+        // Worker 1 refuses connections (registration order + round-robin
+        // counter seed put it first); worker 2 serves the model normally.
+        let dead_url = dead_worker_url();
+        let (live_url, live_hits) =
+            start_status_stub("/v1/chat/completions", vec![StatusCode::OK]).await;
+        let router = create_model_router(&[&dead_url, &live_url]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                &test_generation_request(),
+                "/v1/chat/completions",
+                "test-model",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            live_hits.load(Ordering::SeqCst),
+            1,
+            "the retried attempt must land on the live worker exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_typed_request_no_retry_on_post_engine_500() {
+        // A non-idempotent generation route must not be retried after the
+        // engine answered: work may have run.
+        let (url, hits) = start_status_stub(
+            "/v1/chat/completions",
+            vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK],
+        )
+        .await;
+        let router = create_model_router(&[&url]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                &test_generation_request(),
+                "/v1/chat/completions",
+                "test-model",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "post-engine 500 on a non-idempotent route must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_typed_request_retries_idempotent_route_on_retryable_status() {
+        let (url, hits) = start_status_stub(
+            "/v1/embeddings",
+            vec![StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK],
+        )
+        .await;
+        let router = create_model_router(&[&url]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                &test_generation_request(),
+                "/v1/embeddings",
+                "test-model",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "retryable status on an idempotent route must be retried"
+        );
+    }
+
+    #[test]
+    fn test_attempt_outcome_classification_prefers_transport_markers() {
+        let mut res = Response::new(Body::empty());
+        *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        res.extensions_mut().insert(PreEngineTransportFailure {
+            worker_url: "http://w:1".to_string(),
+        });
+        let outcome = attempt_outcome_from_response(&res, false);
+        assert_eq!(outcome.class, AttemptOutcomeClass::PreEngineTransport);
+        assert_eq!(outcome.worker_url.as_deref(), Some("http://w:1"));
+        assert!(
+            outcome.is_retry_eligible(res.status()),
+            "pre-engine failure is eligible on any route"
+        );
+
+        let mut res = Response::new(Body::empty());
+        *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        res.extensions_mut().insert(NoWorkerAvailable);
+        let outcome = attempt_outcome_from_response(&res, false);
+        assert_eq!(outcome.class, AttemptOutcomeClass::PreEngineTransport);
+        assert!(outcome.worker_url.is_none());
+        assert!(
+            outcome.is_retry_eligible(res.status()),
+            "no-available-worker keeps the legacy 503 retry"
+        );
+    }
+
+    #[test]
+    fn test_attempt_outcome_classification_status_fallback() {
+        let res = {
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            res
+        };
+        assert!(
+            !attempt_outcome_from_response(&res, false).is_retry_eligible(res.status()),
+            "post-engine 500 is not eligible on a non-idempotent route"
+        );
+        assert!(
+            attempt_outcome_from_response(&res, true).is_retry_eligible(res.status()),
+            "post-engine 500 is eligible on an idempotent route"
+        );
+
+        let res = {
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::NOT_FOUND;
+            res
+        };
+        assert!(
+            !attempt_outcome_from_response(&res, true).is_retry_eligible(res.status()),
+            "non-retryable status is never eligible"
+        );
+
+        let res = Response::new(Body::empty());
+        assert!(
+            !attempt_outcome_from_response(&res, true).is_retry_eligible(res.status()),
+            "success is never retried"
+        );
     }
 }

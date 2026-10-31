@@ -1,4 +1,8 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -37,11 +41,73 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::retry::{is_retryable_status, RetryExecutor},
+        common::retry::{
+            is_retryable_status, AttemptOutcome, AttemptOutcomeClass, PreEngineTransportFailure,
+            RetryExecutor,
+        },
         error, RouterTrait,
     },
     worker::{ConnectionMode, WorkerRegistry, WorkerType},
 };
+
+/// Build the retry attempt outcome from a finished gRPC pipeline response.
+///
+/// The request-execution stage attaches a [`PreEngineTransportFailure`]
+/// extension when generation-stream acquisition failed on the worker; that
+/// failure ran no engine work, so the retry loop excludes the worker and
+/// retries on another one. Everything else is classified from the HTTP
+/// status (chat/generate requests are not idempotent).
+fn grpc_attempt_outcome(res: &Response) -> AttemptOutcome {
+    if let Some(marker) = res.extensions().get::<PreEngineTransportFailure>() {
+        return AttemptOutcome {
+            worker_url: Some(marker.worker_url.clone()),
+            class: AttemptOutcomeClass::PreEngineTransport,
+            idempotent: false,
+        };
+    }
+    AttemptOutcome::from_status(res.status(), None, false)
+}
+
+/// Retry predicate for chat/generate: a marked pre-engine transport failure
+/// always retries (no engine work ran); everything else follows the legacy
+/// status predicate so adaptive-admission 429 and distribution-seed
+/// rejections keep their retry behavior.
+fn grpc_should_retry(res: &Response, outcome: &AttemptOutcome) -> bool {
+    outcome.class == AttemptOutcomeClass::PreEngineTransport || is_retryable_status(res.status())
+}
+
+struct WorkerExclusion {
+    set: Mutex<HashSet<String>>,
+}
+
+impl WorkerExclusion {
+    fn new() -> Self {
+        Self {
+            set: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Snapshot the exclusion set for one retry attempt.
+    fn snapshot(&self) -> Arc<HashSet<String>> {
+        Arc::new(
+            self.set
+                .lock()
+                .expect("retry exclusion mutex poisoned")
+                .clone(),
+        )
+    }
+
+    /// Exclude a worker that failed with a pre-engine transport error so the
+    /// next attempt selects a different worker.
+    fn exclude_attempt(&self, outcome: &AttemptOutcome) {
+        if let Some(worker_url) = outcome.worker_url.as_ref() {
+            self.set
+                .lock()
+                .expect("retry exclusion mutex poisoned")
+                .insert(worker_url.clone());
+        }
+    }
+}
 
 const QWEN3_ASR_LANGUAGES: &[(&str, &str)] = &[
     ("ar", "Arabic"),
@@ -515,8 +581,11 @@ impl GrpcRouter {
         let tenant_meta_cloned = tenant_meta.clone();
 
         let retry_config = self.resolve_retry_config(model_id);
+        // Workers excluded after pre-engine transport failures on earlier
+        // attempts; worker selection removes them from the candidate list.
+        let exclusion = WorkerExclusion::new();
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_attempt_outcome_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -525,8 +594,9 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let excluded = exclusion.snapshot();
                 async move {
-                    pipeline
+                    let response = pipeline
                         .execute_chat(
                             request,
                             headers,
@@ -534,12 +604,17 @@ impl GrpcRouter {
                             components,
                             Some(tenant_meta),
                             ChatInvocation::Direct,
+                            Some(excluded),
                         )
-                        .await
+                        .await;
+                    let outcome = grpc_attempt_outcome(&response);
+                    (response, outcome)
                 }
             },
-            // Should retry: check if status is retryable
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: pre-engine transport failure or legacy status
+            |res, outcome, _attempt| grpc_should_retry(res, outcome),
+            // On retry: exclude the worker that failed pre-engine
+            |outcome| exclusion.exclude_attempt(outcome),
             // On backoff: record retry metrics
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_CHAT);
@@ -572,8 +647,11 @@ impl GrpcRouter {
         let pipeline = &self.pipeline;
 
         let retry_config = self.resolve_retry_config(model_id);
+        // Workers excluded after pre-engine transport failures on earlier
+        // attempts; worker selection removes them from the candidate list.
+        let exclusion = WorkerExclusion::new();
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_attempt_outcome_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -582,14 +660,26 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let excluded = exclusion.snapshot();
                 async move {
-                    pipeline
-                        .execute_generate(request, headers, model_id, components, Some(tenant_meta))
-                        .await
+                    let response = pipeline
+                        .execute_generate(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            Some(excluded),
+                        )
+                        .await;
+                    let outcome = grpc_attempt_outcome(&response);
+                    (response, outcome)
                 }
             },
-            // Should retry: check if status is retryable
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: pre-engine transport failure or legacy status
+            |res, outcome, _attempt| grpc_should_retry(res, outcome),
+            // On retry: exclude the worker that failed pre-engine
+            |outcome| exclusion.exclude_attempt(outcome),
             // On backoff: record retry metrics
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_GENERATE);
@@ -1490,5 +1580,70 @@ mod pd_tests {
             router.resolve_retry_config("unrelated-model").max_retries,
             default_retries
         );
+    }
+
+    #[test]
+    fn grpc_attempt_outcome_uses_pre_engine_marker_over_status() {
+        let mut res = Response::new(axum::body::Body::empty());
+        *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        res.extensions_mut().insert(PreEngineTransportFailure {
+            worker_url: "grpc://w:1".to_string(),
+        });
+
+        let outcome = grpc_attempt_outcome(&res);
+        assert_eq!(outcome.class, AttemptOutcomeClass::PreEngineTransport);
+        assert_eq!(outcome.worker_url.as_deref(), Some("grpc://w:1"));
+        assert!(!outcome.idempotent);
+        assert!(
+            grpc_should_retry(&res, &outcome),
+            "a marked pre-engine failure is retried even on a non-retryable-looking status"
+        );
+    }
+
+    #[test]
+    fn grpc_attempt_outcome_falls_back_to_status_classification() {
+        let mut res = Response::new(axum::body::Body::empty());
+        *res.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        let outcome = grpc_attempt_outcome(&res);
+        assert_eq!(outcome.class, AttemptOutcomeClass::PostEngineStatus);
+        assert!(outcome.worker_url.is_none());
+        assert!(
+            grpc_should_retry(&res, &outcome),
+            "unmarked 429 keeps the legacy admission retry behavior"
+        );
+
+        let mut res = Response::new(axum::body::Body::empty());
+        *res.status_mut() = StatusCode::BAD_REQUEST;
+        let outcome = grpc_attempt_outcome(&res);
+        assert!(
+            !grpc_should_retry(&res, &outcome),
+            "unmarked non-retryable status runs no retry"
+        );
+
+        let res = Response::new(axum::body::Body::empty());
+        let outcome = grpc_attempt_outcome(&res);
+        assert_eq!(outcome.class, AttemptOutcomeClass::Success);
+        assert!(!grpc_should_retry(&res, &outcome));
+    }
+
+    #[test]
+    fn worker_exclusion_excludes_only_marked_workers() {
+        let exclusion = WorkerExclusion::new();
+
+        let mut res = Response::new(axum::body::Body::empty());
+        *res.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        exclusion.exclude_attempt(&grpc_attempt_outcome(&res));
+        assert!(
+            exclusion.snapshot().is_empty(),
+            "an unmarked post-engine outcome excludes nothing"
+        );
+
+        let mut res = Response::new(axum::body::Body::empty());
+        *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        res.extensions_mut().insert(PreEngineTransportFailure {
+            worker_url: "grpc://w:1".to_string(),
+        });
+        exclusion.exclude_attempt(&grpc_attempt_outcome(&res));
+        assert!(exclusion.snapshot().contains("grpc://w:1"));
     }
 }

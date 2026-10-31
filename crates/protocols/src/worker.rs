@@ -404,6 +404,10 @@ fn default_drain_settle_secs() -> u64 {
     5
 }
 
+fn default_health_recovery_attempts() -> u32 {
+    3
+}
+
 // ── Health check config ─────────────────────────────────────────────
 
 /// Health check configuration shared across protocol and runtime layers.
@@ -435,6 +439,13 @@ pub struct HealthCheckConfig {
     /// to skip draining and remove immediately.
     #[serde(default = "default_drain_settle_secs")]
     pub drain_settle_secs: u64,
+
+    /// Number of probes a `Failed` worker is given to recover before it is
+    /// declared terminal: the removal job is submitted and the
+    /// `smg_worker_terminal_failure` metric fires. A successful probe inside
+    /// the budget returns the worker to `Pending` (default: 3).
+    #[serde(default = "default_health_recovery_attempts")]
+    pub recovery_attempts: u32,
 }
 
 impl Default for HealthCheckConfig {
@@ -446,6 +457,7 @@ impl Default for HealthCheckConfig {
             failure_threshold: default_health_failure_threshold(),
             disable_health_check: false,
             drain_settle_secs: default_drain_settle_secs(),
+            recovery_attempts: default_health_recovery_attempts(),
         }
     }
 }
@@ -953,6 +965,7 @@ impl HealthCheckUpdate {
                 .disable_health_check
                 .unwrap_or(existing.disable_health_check),
             drain_settle_secs: self.drain_settle_secs.unwrap_or(existing.drain_settle_secs),
+            recovery_attempts: existing.recovery_attempts,
         }
     }
 }
