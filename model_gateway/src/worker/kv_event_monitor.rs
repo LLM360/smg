@@ -45,6 +45,12 @@ const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 /// Maximum reconnection delay (caps exponential backoff).
 const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
 
+/// Aggregation window for per-worker unknown-parent skip summaries (log side only).
+///
+/// Matches the companion dedup window in comet issue #3716: the generic
+/// tracing-layer dedup then sees at most one line per window from this monitor.
+const ORPHAN_SKIP_WINDOW: Duration = Duration::from_secs(60);
+
 /// Manages per-worker KV cache event subscriptions.
 ///
 /// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
@@ -93,6 +99,176 @@ enum BatchResult {
     Applied,
     EpochReset { previous: u64, received: u64 },
     GapRecovered { expected: u64, received: u64 },
+}
+
+/// Cause of the per-worker clear that started the current stream epoch.
+///
+/// A stream epoch spans per-worker clears; every store event whose parent
+/// predates the clear is an orphan skip on a handled path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanSkipCause {
+    /// First stream epoch of the worker; no batch has been applied yet.
+    ColdStart,
+    /// The stream ended or errored and the subscription reconnected.
+    Reconnect,
+    /// A non-replayable sequence gap forced a stale-state clear.
+    SequenceGap,
+    /// A non-increasing publisher sequence reset the engine epoch.
+    EpochReset,
+    /// The engine sent an explicit `Cleared` event.
+    ClearedEvent,
+}
+
+impl OrphanSkipCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ColdStart => "cold_start",
+            Self::Reconnect => "reconnect",
+            Self::SequenceGap => "sequence_gap",
+            Self::EpochReset => "epoch_reset",
+            Self::ClearedEvent => "cleared_event",
+        }
+    }
+}
+
+/// Stream-epoch classification of unknown-parent skips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanSkipPhase {
+    /// No successful store applied since the last clear; expected recovery
+    /// volume on a handled path (aggregates at INFO).
+    Rebuild,
+    /// At least one store applied since the last clear; the sustained-drift
+    /// signal (aggregates at WARN).
+    Steady,
+}
+
+impl OrphanSkipPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebuild => "rebuild",
+            Self::Steady => "steady",
+        }
+    }
+}
+
+/// Metric label value for the apply error behind an unknown-parent skip.
+fn orphan_skip_error_kind(error: &ApplyError) -> &'static str {
+    match error {
+        ApplyError::WorkerNotTracked => "worker_not_tracked",
+        ApplyError::ParentBlockNotFound => "parent_not_found",
+    }
+}
+
+/// Per-window summary of unknown-parent skips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrphanSkipAggregate {
+    phase: OrphanSkipPhase,
+    count: u64,
+    worker_not_tracked: u64,
+    parent_not_found: u64,
+}
+
+/// Log decisions for one skipped unknown-parent store event.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OrphanSkipNotices {
+    /// Emit the bounded first-instance WARN for this stream epoch.
+    first_instance: bool,
+    /// One full 60s window closed on this event; emit its aggregate.
+    window_aggregate: Option<OrphanSkipAggregate>,
+}
+
+/// Per-worker tracker of unknown-parent store skips for one stream epoch.
+///
+/// Owned by the worker's subscription task; no shared state. Keeps the log
+/// surface bounded on a handled path: the counter carries per-event
+/// attribution, DEBUG carries per-event detail, one first-instance WARN per
+/// epoch announces each clear epoch, and one aggregate per
+/// [`ORPHAN_SKIP_WINDOW`] carries continuing volume.
+struct OrphanSkipTracker {
+    cause: OrphanSkipCause,
+    phase: OrphanSkipPhase,
+    first_notice_sent: bool,
+    pending: u64,
+    pending_worker_not_tracked: u64,
+    pending_parent_not_found: u64,
+    window_start: Option<Instant>,
+}
+
+impl Default for OrphanSkipTracker {
+    fn default() -> Self {
+        Self {
+            cause: OrphanSkipCause::ColdStart,
+            phase: OrphanSkipPhase::Rebuild,
+            first_notice_sent: false,
+            pending: 0,
+            pending_worker_not_tracked: 0,
+            pending_parent_not_found: 0,
+            window_start: None,
+        }
+    }
+}
+
+impl OrphanSkipTracker {
+    /// Start a fresh stream epoch after the worker's index state was cleared.
+    fn record_clear(&mut self, cause: OrphanSkipCause) {
+        *self = Self {
+            cause,
+            ..Self::default()
+        };
+    }
+
+    /// Note one successful `apply_stored`.
+    ///
+    /// The first success after a clear ends rebuild volume: the phase moves
+    /// to steady and pending rebuild aggregation resets. The first-instance
+    /// notice stays consumed for the rest of the epoch.
+    fn record_apply_success(&mut self) {
+        if self.phase == OrphanSkipPhase::Rebuild {
+            self.phase = OrphanSkipPhase::Steady;
+            self.pending = 0;
+            self.pending_worker_not_tracked = 0;
+            self.pending_parent_not_found = 0;
+            self.window_start = None;
+        }
+    }
+
+    /// Note one skipped unknown-parent store event at `now` (injectable for
+    /// deterministic tests) and return the log decisions for it.
+    fn record_skip(&mut self, error: &ApplyError, now: Instant) -> OrphanSkipNotices {
+        let notices = OrphanSkipNotices {
+            first_instance: !self.first_notice_sent,
+            window_aggregate: self.advance_window(now),
+        };
+        self.first_notice_sent = true;
+        self.pending += 1;
+        match error {
+            ApplyError::WorkerNotTracked => self.pending_worker_not_tracked += 1,
+            ApplyError::ParentBlockNotFound => self.pending_parent_not_found += 1,
+        }
+        if self.window_start.is_none() {
+            self.window_start = Some(now);
+        }
+        notices
+    }
+
+    /// Close a full window and return its aggregate, resetting its counters.
+    fn advance_window(&mut self, now: Instant) -> Option<OrphanSkipAggregate> {
+        let start = self.window_start?;
+        if now.saturating_duration_since(start) < ORPHAN_SKIP_WINDOW {
+            return None;
+        }
+        let aggregate = OrphanSkipAggregate {
+            phase: self.phase,
+            count: self.pending,
+            worker_not_tracked: self.pending_worker_not_tracked,
+            parent_not_found: self.pending_parent_not_found,
+        };
+        self.pending = 0;
+        self.pending_worker_not_tracked = 0;
+        self.pending_parent_not_found = 0;
+        self.window_start = None;
+        Some(aggregate)
+    }
 }
 
 impl KvEventMonitor {
@@ -489,6 +665,9 @@ impl KvEventMonitor {
         let mut seen_batch = false;
         let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
         let mut block_size_learned = false;
+        // Per-worker unknown-parent skip tracker, owned by this task. Starts
+        // in the cold-start rebuild epoch of the worker's first stream.
+        let mut orphan_skips = OrphanSkipTracker::default();
 
         /// Sleep with shutdown check. Returns `true` if shutdown was signaled.
         macro_rules! sleep_or_shutdown {
@@ -595,7 +774,7 @@ impl KvEventMonitor {
                     stream, &worker_url, worker_id, &indexer,
                     worker_blocks, &mut last_seq, &mut seen_batch,
                     &event_ready_workers, &event_generations, &event_last_batch,
-                    on_batch,
+                    &mut orphan_skips, on_batch,
                 ) => result,
                 _ = &mut shutdown_rx => {
                     invalidate_and_clear!();
@@ -613,6 +792,7 @@ impl KvEventMonitor {
                 worker_blocks,
                 &mut last_seq,
                 &mut seen_batch,
+                &mut orphan_skips,
             );
 
             match stream_result {
@@ -673,6 +853,7 @@ impl KvEventMonitor {
         event_ready_workers: &DashSet<String>,
         event_generations: &DashMap<String, u64>,
         event_last_batch: &DashMap<String, Instant>,
+        orphan_skips: &mut OrphanSkipTracker,
         mut on_batch: impl FnMut(&KvEventBatch),
     ) -> StreamResult {
         use tokio_stream::StreamExt;
@@ -692,6 +873,7 @@ impl KvEventMonitor {
                 worker_blocks,
                 last_seq,
                 seen_batch,
+                orphan_skips,
                 &mut on_batch,
             );
             event_last_batch.insert(worker_url.to_string(), Instant::now());
@@ -715,6 +897,7 @@ impl KvEventMonitor {
         worker_blocks: &mut WorkerBlockMap,
         last_seq: &mut u64,
         seen_batch: &mut bool,
+        orphan_skips: &mut OrphanSkipTracker,
         on_batch: &mut impl FnMut(&KvEventBatch),
     ) -> BatchResult {
         // The production stream is live-only. A non-increasing sequence on an
@@ -730,8 +913,16 @@ impl KvEventMonitor {
                 "KV publisher sequence reset; cleared stale cache state"
             );
             indexer.apply_cleared(worker_id, worker_blocks);
+            orphan_skips.record_clear(OrphanSkipCause::EpochReset);
             for event in &batch.events {
-                Self::apply_event(event, worker_id, indexer, worker_blocks);
+                Self::apply_event(
+                    event,
+                    worker_url,
+                    worker_id,
+                    indexer,
+                    worker_blocks,
+                    orphan_skips,
+                );
             }
             on_batch(batch);
             *last_seq = batch.sequence_number;
@@ -760,10 +951,18 @@ impl KvEventMonitor {
             );
             Metrics::record_kv_event_sequence_gap_recovery(worker_url);
             indexer.apply_cleared(worker_id, worker_blocks);
+            orphan_skips.record_clear(OrphanSkipCause::SequenceGap);
         }
 
         for event in &batch.events {
-            Self::apply_event(event, worker_id, indexer, worker_blocks);
+            Self::apply_event(
+                event,
+                worker_url,
+                worker_id,
+                indexer,
+                worker_blocks,
+                orphan_skips,
+            );
         }
         on_batch(batch);
         *last_seq = batch.sequence_number;
@@ -781,8 +980,10 @@ impl KvEventMonitor {
         worker_blocks: &mut WorkerBlockMap,
         last_seq: &mut u64,
         seen_batch: &mut bool,
+        orphan_skips: &mut OrphanSkipTracker,
     ) {
         indexer.apply_cleared(worker_id, worker_blocks);
+        orphan_skips.record_clear(OrphanSkipCause::Reconnect);
         *last_seq = 0;
         *seen_batch = false;
     }
@@ -790,9 +991,11 @@ impl KvEventMonitor {
     /// Apply a single KV cache event to the indexer.
     fn apply_event(
         event: &KvCacheEvent,
+        worker_url: &str,
         worker_id: u32,
         indexer: &PositionalIndexer,
         worker_blocks: &mut WorkerBlockMap,
+        orphan_skips: &mut OrphanSkipTracker,
     ) {
         let Some(ref data) = event.data else {
             return;
@@ -800,13 +1003,21 @@ impl KvEventMonitor {
 
         match data {
             kv_cache_event::Data::Stored(stored) => {
-                Self::apply_stored(stored, worker_id, indexer, worker_blocks);
+                Self::apply_stored(
+                    stored,
+                    worker_url,
+                    worker_id,
+                    indexer,
+                    worker_blocks,
+                    orphan_skips,
+                );
             }
             kv_cache_event::Data::Removed(removed) => {
                 Self::apply_removed(removed, worker_id, indexer, worker_blocks);
             }
             kv_cache_event::Data::Cleared(_) => {
                 indexer.apply_cleared(worker_id, worker_blocks);
+                orphan_skips.record_clear(OrphanSkipCause::ClearedEvent);
             }
         }
     }
@@ -814,24 +1025,76 @@ impl KvEventMonitor {
     /// Convert proto `KvBlocksStored` and apply to the indexer.
     fn apply_stored(
         stored: &KvBlocksStored,
+        worker_url: &str,
         worker_id: u32,
         indexer: &PositionalIndexer,
         worker_blocks: &mut WorkerBlockMap,
+        orphan_skips: &mut OrphanSkipTracker,
     ) {
         let blocks: Vec<StoredBlock> = stored.blocks.iter().map(convert_kv_block).collect();
 
         let parent_seq_hash = stored.parent_block_hash.map(SequenceHash::from);
 
         match indexer.apply_stored(worker_id, &blocks, parent_seq_hash, worker_blocks) {
-            Ok(()) => {}
-            Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound) => {
-                // Re-rooting an orphan from a live-only cold start would put a
+            Ok(()) => orphan_skips.record_apply_success(),
+            Err(error @ (ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound)) => {
+                // Skipping is the designed safe behavior on a handled path:
+                // re-rooting an orphan from a live-only cold start would put a
                 // child at position zero and manufacture a false prefix hit.
-                warn!(
+                // The counter carries per-event attribution and DEBUG carries
+                // per-event detail; the log surface stays bounded to one
+                // first-instance WARN per stream epoch plus one aggregate per
+                // 60s window per worker (INFO while the epoch rebuilds, WARN
+                // on steady drift — the only sustained WARNING from this path).
+                Metrics::record_kv_event_unknown_parent_skip(
+                    worker_url,
+                    orphan_skips.phase.as_str(),
+                    orphan_skip_error_kind(&error),
+                );
+                let notices = orphan_skips.record_skip(&error, Instant::now());
+                debug!(
+                    worker_url = %worker_url,
                     worker_id = worker_id,
                     parent_block_hash = ?stored.parent_block_hash,
+                    error = orphan_skip_error_kind(&error),
+                    phase = orphan_skips.phase.as_str(),
                     "Skipped KV store event with unknown parent"
                 );
+                if notices.first_instance {
+                    warn!(
+                        worker_url = %worker_url,
+                        worker_id = worker_id,
+                        parent_block_hash = ?stored.parent_block_hash,
+                        error = orphan_skip_error_kind(&error),
+                        "Skipped KV store event with unknown parent; \
+                         first in this stream epoch since {}",
+                        orphan_skips.cause.as_str()
+                    );
+                }
+                if let Some(aggregate) = notices.window_aggregate {
+                    match aggregate.phase {
+                        OrphanSkipPhase::Rebuild => info!(
+                            worker_url = %worker_url,
+                            cause = orphan_skips.cause.as_str(),
+                            skipped = aggregate.count,
+                            worker_not_tracked = aggregate.worker_not_tracked,
+                            parent_not_found = aggregate.parent_not_found,
+                            "Skipped {} orphan KV store events with unknown parents \
+                             in 60s window; stream epoch rebuilding",
+                            aggregate.count
+                        ),
+                        OrphanSkipPhase::Steady => warn!(
+                            worker_url = %worker_url,
+                            cause = orphan_skips.cause.as_str(),
+                            skipped = aggregate.count,
+                            worker_not_tracked = aggregate.worker_not_tracked,
+                            parent_not_found = aggregate.parent_not_found,
+                            "Skipped {} orphan KV store events with unknown parents \
+                             in 60s window; steady-phase unknown-parent drift",
+                            aggregate.count
+                        ),
+                    }
+                }
             }
         }
     }
@@ -884,6 +1147,8 @@ impl fmt::Debug for KvEventMonitor {
 
 #[cfg(test)]
 mod tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -960,7 +1225,15 @@ mod tests {
             parent_block_hash: None,
         };
 
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_stored(
+            &stored,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 2);
     }
 
@@ -980,7 +1253,15 @@ mod tests {
             }],
             parent_block_hash: None,
         };
-        KvEventMonitor::apply_stored(&stored1, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_stored(
+            &stored1,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
 
         let stored2 = KvBlocksStored {
             blocks: vec![KvBlock {
@@ -992,7 +1273,14 @@ mod tests {
             }],
             parent_block_hash: Some(1),
         };
-        KvEventMonitor::apply_stored(&stored2, w1, &indexer, &mut wb);
+        KvEventMonitor::apply_stored(
+            &stored2,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 2);
     }
 
@@ -1004,6 +1292,7 @@ mod tests {
 
         // A live-only stream may start with a child whose parent predates this
         // gateway. It must not be re-rooted at position zero.
+        let worker_url = "http://new-worker:8000";
         let stored = KvBlocksStored {
             blocks: vec![KvBlock {
                 block_hash: 1,
@@ -1014,9 +1303,298 @@ mod tests {
             }],
             parent_block_hash: Some(999),
         };
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_stored(
+            &stored,
+            worker_url,
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 0);
         assert!(wb.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphan-skip tracker: bounded notices per epoch and per 60s window
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_orphan_skip_tracker_first_instance_once_per_epoch() {
+        let t0 = Instant::now();
+        let mut tracker = OrphanSkipTracker::default();
+
+        let first = tracker.record_skip(&ApplyError::ParentBlockNotFound, t0);
+        assert!(first.first_instance);
+        assert!(first.window_aggregate.is_none());
+
+        let second =
+            tracker.record_skip(&ApplyError::WorkerNotTracked, t0 + Duration::from_secs(1));
+        assert!(!second.first_instance);
+        assert!(second.window_aggregate.is_none());
+        assert_eq!(tracker.cause, OrphanSkipCause::ColdStart);
+        assert_eq!(tracker.phase, OrphanSkipPhase::Rebuild);
+    }
+
+    #[test]
+    fn test_orphan_skip_tracker_window_rollover_emits_exactly_one_aggregate() {
+        let t0 = Instant::now();
+        let mut tracker = OrphanSkipTracker::default();
+
+        tracker.record_skip(&ApplyError::ParentBlockNotFound, t0);
+        tracker.record_skip(
+            &ApplyError::ParentBlockNotFound,
+            t0 + Duration::from_secs(30),
+        );
+
+        let step = ORPHAN_SKIP_WINDOW + Duration::from_secs(1);
+
+        let closed = tracker.record_skip(&ApplyError::WorkerNotTracked, t0 + step);
+        let aggregate = closed
+            .window_aggregate
+            .expect("a full 60s window closes exactly once on rollover");
+        assert!(!closed.first_instance);
+        assert_eq!(aggregate.phase, OrphanSkipPhase::Rebuild);
+        assert_eq!(aggregate.count, 2);
+        assert_eq!(aggregate.parent_not_found, 2);
+        assert_eq!(aggregate.worker_not_tracked, 0);
+
+        let next = tracker.record_skip(&ApplyError::WorkerNotTracked, t0 + 2 * step);
+        let aggregate = next
+            .window_aggregate
+            .expect("the second window closes after the rollover skip was re-windowed");
+        assert_eq!(aggregate.count, 1);
+        assert_eq!(aggregate.worker_not_tracked, 1);
+    }
+
+    #[test]
+    fn test_orphan_skip_tracker_rebuild_to_steady_on_first_success() {
+        let t0 = Instant::now();
+        let mut tracker = OrphanSkipTracker::default();
+
+        tracker.record_skip(&ApplyError::ParentBlockNotFound, t0);
+        tracker.record_apply_success();
+        assert_eq!(tracker.phase, OrphanSkipPhase::Steady);
+
+        let steady_skip =
+            tracker.record_skip(&ApplyError::WorkerNotTracked, t0 + Duration::from_secs(1));
+        // The first-instance notice stays consumed for the rest of this epoch,
+        // and the success reset pending rebuild aggregation.
+        assert!(!steady_skip.first_instance);
+        assert!(steady_skip.window_aggregate.is_none());
+
+        let closed = tracker.record_skip(
+            &ApplyError::WorkerNotTracked,
+            t0 + Duration::from_secs(1) + ORPHAN_SKIP_WINDOW + Duration::from_secs(1),
+        );
+        let aggregate = closed
+            .window_aggregate
+            .expect("the steady window closes after a full 60s of drift");
+        assert_eq!(aggregate.phase, OrphanSkipPhase::Steady);
+        assert_eq!(aggregate.count, 1);
+        assert_eq!(aggregate.worker_not_tracked, 1);
+    }
+
+    #[test]
+    fn test_orphan_skip_tracker_reset_on_clear_with_new_cause() {
+        let t0 = Instant::now();
+        let mut tracker = OrphanSkipTracker::default();
+
+        tracker.record_skip(&ApplyError::ParentBlockNotFound, t0);
+        tracker.record_clear(OrphanSkipCause::SequenceGap);
+
+        let new_epoch =
+            tracker.record_skip(&ApplyError::WorkerNotTracked, t0 + Duration::from_secs(1));
+        assert!(new_epoch.first_instance);
+        assert!(new_epoch.window_aggregate.is_none());
+        assert_eq!(tracker.cause, OrphanSkipCause::SequenceGap);
+        assert_eq!(tracker.phase, OrphanSkipPhase::Rebuild);
+
+        let closed = tracker.record_skip(
+            &ApplyError::WorkerNotTracked,
+            t0 + Duration::from_secs(1) + ORPHAN_SKIP_WINDOW + Duration::from_secs(1),
+        );
+        let aggregate = closed
+            .window_aggregate
+            .expect("the cleared window closes with only new-epoch skips");
+        assert_eq!(aggregate.count, 1);
+        assert_eq!(aggregate.worker_not_tracked, 1);
+        assert_eq!(aggregate.parent_not_found, 0);
+    }
+
+    #[test]
+    fn test_orphan_skip_tracker_clear_without_skips_emits_nothing() {
+        let t0 = Instant::now();
+        let mut tracker = OrphanSkipTracker::default();
+
+        tracker.record_skip(&ApplyError::ParentBlockNotFound, t0);
+        tracker.record_clear(OrphanSkipCause::ClearedEvent);
+        tracker.record_apply_success();
+
+        let lone_steady = tracker.record_skip(
+            &ApplyError::WorkerNotTracked,
+            t0 + ORPHAN_SKIP_WINDOW + Duration::from_secs(1),
+        );
+        // No stale aggregate survived the clear; the new epoch's first skip
+        // only consumes its first-instance notice and opens its own window.
+        assert!(lone_steady.first_instance);
+        assert!(lone_steady.window_aggregate.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphan-skip integration via process_batch: metrics, phase routing, and
+    // the false-root invariant across gap recovery
+    // -----------------------------------------------------------------------
+
+    fn stored_event(event_id: u64, block_hash: i64, parent: Option<i64>) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id,
+            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                blocks: vec![KvBlock {
+                    block_hash,
+                    token_ids: vec![1, 2, 3, 4],
+                    block_size: 4,
+                    lora_id: None,
+                    cache_level: None,
+                }],
+                parent_block_hash: parent,
+            })),
+        }
+    }
+
+    fn event_batch(sequence_number: u64, events: Vec<KvCacheEvent>) -> KvEventBatch {
+        KvEventBatch {
+            sequence_number,
+            timestamp: 0.0,
+            events,
+            dp_rank: None,
+        }
+    }
+
+    #[test]
+    fn test_process_batch_gap_orphans_then_root_store_ends_rebuild() {
+        let indexer = PositionalIndexer::new(64);
+        let worker_url = "http://w1:8000";
+        let worker_id = indexer.intern_worker(worker_url).unwrap();
+        let mut worker_blocks = WorkerBlockMap::default();
+        let mut orphan_skips = OrphanSkipTracker::default();
+        let mut last_seq = 0;
+        let mut seen_batch = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            // Batch 1 establishes one root (cold-start success → steady).
+            let applied = KvEventMonitor::process_batch(
+                &event_batch(1, vec![stored_event(1, 1, None)]),
+                worker_url,
+                worker_id,
+                &indexer,
+                &mut worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+                &mut orphan_skips,
+                &mut |_| {},
+            );
+            assert_eq!(applied, BatchResult::Applied);
+            assert_eq!(orphan_skips.phase, OrphanSkipPhase::Steady);
+
+            // A sequence gap clears the worker; two parented stores in the
+            // recovery batch are orphan skips in the rebuild phase. The
+            // first-instance notice is consumed exactly once.
+            let recovered = KvEventMonitor::process_batch(
+                &event_batch(
+                    4,
+                    vec![stored_event(2, 2, Some(999)), stored_event(3, 3, Some(999))],
+                ),
+                worker_url,
+                worker_id,
+                &indexer,
+                &mut worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+                &mut orphan_skips,
+                &mut |_| {},
+            );
+            assert_eq!(
+                recovered,
+                BatchResult::GapRecovered {
+                    expected: 2,
+                    received: 4
+                }
+            );
+            assert_eq!(orphan_skips.cause, OrphanSkipCause::SequenceGap);
+            assert_eq!(orphan_skips.phase, OrphanSkipPhase::Rebuild);
+            assert!(orphan_skips.first_notice_sent);
+            assert_eq!(orphan_skips.pending, 2);
+
+            // A root store re-establishes tracking and ends rebuild volume.
+            let applied = KvEventMonitor::process_batch(
+                &event_batch(5, vec![stored_event(4, 4, None)]),
+                worker_url,
+                worker_id,
+                &indexer,
+                &mut worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+                &mut orphan_skips,
+                &mut |_| {},
+            );
+            assert_eq!(applied, BatchResult::Applied);
+            assert_eq!(orphan_skips.phase, OrphanSkipPhase::Steady);
+            assert_eq!(orphan_skips.pending, 0);
+
+            // Orphan skips inside one short window produce no aggregate and
+            // no second first-instance notice; only the steady counter moves.
+            let applied = KvEventMonitor::process_batch(
+                &event_batch(6, vec![stored_event(5, 5, Some(999))]),
+                worker_url,
+                worker_id,
+                &indexer,
+                &mut worker_blocks,
+                &mut last_seq,
+                &mut seen_batch,
+                &mut orphan_skips,
+                &mut |_| {},
+            );
+            assert_eq!(applied, BatchResult::Applied);
+            assert_eq!(orphan_skips.pending, 1);
+
+            // The false-root invariant holds across the whole flow: orphan
+            // stores never manufactured index entries.
+            assert_eq!(indexer.current_size(), 1);
+            assert!(worker_blocks.contains_key(&SequenceHash::from(4i64)));
+            assert!(!worker_blocks.contains_key(&SequenceHash::from(2i64)));
+            assert!(!worker_blocks.contains_key(&SequenceHash::from(3i64)));
+            assert!(!worker_blocks.contains_key(&SequenceHash::from(5i64)));
+        });
+
+        let rendered = handle.render();
+        let counter_line = |phase: &str, error: &str, count: &str| {
+            rendered.lines().any(|line| {
+                line.starts_with("smg_kv_event_unknown_parent_skips_total{")
+                    && line.contains(&format!(r#"phase="{phase}""#))
+                    && line.contains(&format!(r#"error="{error}""#))
+                    && line.contains(&format!(r#"worker="{worker_url}""#))
+                    && line.ends_with(&format!("}} {count}"))
+            })
+        };
+        assert!(
+            counter_line("rebuild", "worker_not_tracked", "2"),
+            "two rebuild-phase orphan skips missing from the counter; rendered:\n{rendered}"
+        );
+        assert!(
+            counter_line("steady", "parent_not_found", "1"),
+            "one steady-phase orphan skip missing from the counter; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_kv_event_sequence_gap_recoveries_total{")
+                    && line.ends_with("} 1")
+            }),
+            "the gap recovery is the expected co-signal for attribution; rendered:\n{rendered}"
+        );
     }
 
     #[test]
@@ -1044,7 +1622,15 @@ mod tests {
             ],
             parent_block_hash: None,
         };
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_stored(
+            &stored,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
 
         let removed = KvBlocksRemoved {
             block_hashes: vec![2],
@@ -1070,7 +1656,15 @@ mod tests {
             }],
             parent_block_hash: None,
         };
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_stored(
+            &stored,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 1);
 
         indexer.apply_cleared(w1, &mut wb);
@@ -1096,7 +1690,15 @@ mod tests {
             }],
             parent_block_hash: None,
         };
-        KvEventMonitor::apply_stored(&stale, worker_id, &indexer, &mut worker_blocks);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_stored(
+            &stale,
+            worker_url,
+            worker_id,
+            &indexer,
+            &mut worker_blocks,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 1);
 
         let live = KvEventBatch {
@@ -1126,6 +1728,7 @@ mod tests {
             &mut worker_blocks,
             &mut last_seq,
             &mut seen_batch,
+            &mut orphan_skips,
             &mut |_| {},
         );
 
@@ -1167,6 +1770,7 @@ mod tests {
             &mut worker_blocks,
             &mut last_seq,
             &mut seen_batch,
+            &mut orphan_skips,
             &mut |_| {},
         );
 
@@ -1184,6 +1788,7 @@ mod tests {
         let mut worker_blocks = WorkerBlockMap::default();
         let mut last_seq = 0;
         let mut seen_batch = false;
+        let mut orphan_skips = OrphanSkipTracker::default();
         let root = KvEventBatch {
             sequence_number: 0,
             timestamp: 0.0,
@@ -1211,6 +1816,7 @@ mod tests {
                 &mut worker_blocks,
                 &mut last_seq,
                 &mut seen_batch,
+                &mut orphan_skips,
                 &mut |_| {},
             ),
             BatchResult::Applied
@@ -1236,6 +1842,7 @@ mod tests {
                 &mut worker_blocks,
                 &mut last_seq,
                 &mut seen_batch,
+                &mut orphan_skips,
                 &mut |_| {},
             ),
             BatchResult::GapRecovered {
@@ -1277,6 +1884,7 @@ mod tests {
             let mut worker_blocks = WorkerBlockMap::default();
             let mut last_seq = 0;
             let mut seen_batch = false;
+            let mut orphan_skips = OrphanSkipTracker::default();
             KvEventMonitor::process_batch(
                 &root_batch(old_sequence, 1),
                 worker_url,
@@ -1285,6 +1893,7 @@ mod tests {
                 &mut worker_blocks,
                 &mut last_seq,
                 &mut seen_batch,
+                &mut orphan_skips,
                 &mut |_| {},
             );
             assert_eq!(indexer.current_size(), 1);
@@ -1304,6 +1913,7 @@ mod tests {
                     &mut worker_blocks,
                     &mut last_seq,
                     &mut seen_batch,
+                    &mut orphan_skips,
                     &mut |_| {},
                 ),
                 BatchResult::EpochReset {
@@ -1342,12 +1952,14 @@ mod tests {
         let mut seen_batch = true;
 
         monitor.mark_event_stream_not_ready_for_test(worker_url);
+        let mut orphan_skips = OrphanSkipTracker::default();
         KvEventMonitor::reset_stream_epoch(
             &indexer,
             worker_id,
             &mut worker_blocks,
             &mut last_seq,
             &mut seen_batch,
+            &mut orphan_skips,
         );
 
         assert_eq!(indexer.current_size(), 0);
@@ -1380,7 +1992,15 @@ mod tests {
             })),
         };
 
-        KvEventMonitor::apply_event(&event, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_event(
+            &event,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 1);
     }
 
@@ -1403,7 +2023,15 @@ mod tests {
                 parent_block_hash: None,
             })),
         };
-        KvEventMonitor::apply_event(&stored_event, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_event(
+            &stored_event,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
 
         let removed_event = KvCacheEvent {
             event_id: 2,
@@ -1412,7 +2040,14 @@ mod tests {
                 cache_level: None,
             })),
         };
-        KvEventMonitor::apply_event(&removed_event, w1, &indexer, &mut wb);
+        KvEventMonitor::apply_event(
+            &removed_event,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 0);
     }
 
@@ -1422,6 +2057,7 @@ mod tests {
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerBlockMap::default();
 
+        let mut orphan_skips = OrphanSkipTracker::default();
         KvEventMonitor::apply_event(
             &KvCacheEvent {
                 event_id: 1,
@@ -1436,9 +2072,11 @@ mod tests {
                     parent_block_hash: None,
                 })),
             },
+            "http://w1:8000",
             w1,
             &indexer,
             &mut wb,
+            &mut orphan_skips,
         );
 
         // Clear
@@ -1449,9 +2087,11 @@ mod tests {
                     smg_grpc_client::common_proto::KvCacheCleared {},
                 )),
             },
+            "http://w1:8000",
             w1,
             &indexer,
             &mut wb,
+            &mut orphan_skips,
         );
         assert_eq!(indexer.current_size(), 0);
     }
@@ -1465,7 +2105,15 @@ mod tests {
             event_id: 1,
             data: None,
         };
-        KvEventMonitor::apply_event(&event, w1, &indexer, &mut wb);
+        let mut orphan_skips = OrphanSkipTracker::default();
+        KvEventMonitor::apply_event(
+            &event,
+            "http://w1:8000",
+            w1,
+            &indexer,
+            &mut wb,
+            &mut orphan_skips,
+        );
         assert_eq!(indexer.current_size(), 0);
     }
 
