@@ -952,9 +952,20 @@ pub struct HealthCheckConfig {
     /// remove immediately. Default: 5.
     #[serde(default = "default_drain_settle_secs")]
     pub drain_settle_secs: u64,
+    /// Consecutive failed health probes after which a worker transitions
+    /// to `Failed` from any non-terminal status and is evicted from the
+    /// routing table through the existing removal job. Default: 5.
+    #[serde(default = "default_evict_failure_threshold")]
+    pub evict_failure_threshold: u32,
 }
 
 fn default_drain_settle_secs() -> u64 {
+    5
+}
+
+/// Consecutive failed probes before a worker is evicted (`Failed`)
+/// from the routing table. Default: 5.
+fn default_evict_failure_threshold() -> u32 {
     5
 }
 
@@ -969,6 +980,7 @@ impl Default for HealthCheckConfig {
             disable_health_check: false,
             remove_unhealthy_workers: false,
             drain_settle_secs: default_drain_settle_secs(),
+            evict_failure_threshold: default_evict_failure_threshold(),
         }
     }
 }
@@ -983,6 +995,7 @@ impl HealthCheckConfig {
             failure_threshold: self.failure_threshold,
             disable_health_check: self.disable_health_check,
             drain_settle_secs: self.drain_settle_secs,
+            evict_failure_threshold: self.evict_failure_threshold,
         }
     }
 }

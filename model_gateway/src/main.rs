@@ -764,6 +764,13 @@ struct CliArgs {
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     drain_settle_secs: u64,
 
+    /// Consecutive failed health probes after which a worker is evicted
+    /// (marked `Failed`) from the routing table through the existing
+    /// removal job. Applies from any non-terminal status (Pending, Ready,
+    /// NotReady).
+    #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
+    health_evict_failure_threshold: u32,
+
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID or local path)
     #[arg(long, alias = "model", help_heading = "Tokenizer")]
@@ -1722,6 +1729,7 @@ impl CliArgs {
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: self.remove_unhealthy_workers,
                 drain_settle_secs: self.drain_settle_secs,
+                evict_failure_threshold: self.health_evict_failure_threshold,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,

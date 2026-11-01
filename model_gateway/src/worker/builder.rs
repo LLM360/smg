@@ -387,6 +387,7 @@ mod tests {
             success_threshold: 2,
             disable_health_check: false,
             drain_settle_secs: 5,
+            evict_failure_threshold: 5,
         };
 
         let cb_config = CircuitBreakerConfig {
@@ -470,6 +471,7 @@ mod tests {
             success_threshold: 3,
             disable_health_check: false,
             drain_settle_secs: 5,
+            evict_failure_threshold: 5,
         };
 
         let worker = BasicWorkerBuilder::new("http://localhost:8080")

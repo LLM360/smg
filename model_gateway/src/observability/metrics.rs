@@ -352,6 +352,16 @@ pub(crate) fn init_metrics() {
         "Number of routing entries in manual policy cache"
     );
 
+    // Layer 3: Worker eviction metrics (finite degradation policy)
+    describe_counter!(
+        "smg_worker_evictions_total",
+        "Health-probe evictions (worker transitions to Failed after the bounded eviction budget) by model"
+    );
+    describe_gauge!(
+        "smg_worker_last_eviction_info",
+        "Detail of the most recent health-probe eviction per worker and model; the value is always 1"
+    );
+
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
         "smg_worker_cb_state",
@@ -1384,6 +1394,39 @@ impl Metrics {
             "worker" => worker_interned
         )
         .increment(1);
+    }
+
+    /// Record one worker eviction from the health probe state machine.
+    /// Fires exactly once per transition to `Failed`, whatever its origin
+    /// (eviction budget, liveness multiple, or Pending probe cap).
+    pub fn record_worker_eviction(model_id: &str) {
+        let model = intern_string(model_id);
+        counter!(
+            "smg_worker_evictions_total",
+            "model" => model
+        )
+        .increment(1);
+    }
+
+    /// Update the last-eviction detail marker. The gauge value is always 1;
+    /// the labels carry the evidence (worker URL, model, observed
+    /// consecutive failures, and the configured eviction threshold).
+    pub fn set_last_worker_eviction_info(
+        worker_url: &str,
+        model_id: &str,
+        consecutive_failures: u32,
+        evict_failure_threshold: u32,
+    ) {
+        let worker_url_interned = intern_string(worker_url);
+        let model = intern_string(model_id);
+        gauge!(
+            "smg_worker_last_eviction_info",
+            "worker_url" => worker_url_interned,
+            "model" => model,
+            "consecutive_failures" => consecutive_failures.to_string(),
+            "evict_failure_threshold" => evict_failure_threshold.to_string()
+        )
+        .set(1.0);
     }
 
     // ========================================================================
