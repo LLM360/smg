@@ -396,6 +396,12 @@ fn default_health_failure_threshold() -> u32 {
     3
 }
 
+/// Number of consecutive failed health probes before a worker is evicted
+/// (marked `Failed`). Default: 5.
+fn default_evict_failure_threshold() -> u32 {
+    5
+}
+
 fn default_max_connection_attempts() -> u32 {
     20
 }
@@ -435,6 +441,14 @@ pub struct HealthCheckConfig {
     /// to skip draining and remove immediately.
     #[serde(default = "default_drain_settle_secs")]
     pub drain_settle_secs: u64,
+
+    /// Consecutive failed health probes after which the worker transitions
+    /// to `Failed` from any non-terminal status (finite degradation policy;
+    /// default: 5). Counted separately from `failure_threshold`, which
+    /// demotes `Ready` to `NotReady` (unroutable) and gates the liveness
+    /// and Pending-cap multiples below.
+    #[serde(default = "default_evict_failure_threshold")]
+    pub evict_failure_threshold: u32,
 }
 
 impl Default for HealthCheckConfig {
@@ -446,6 +460,7 @@ impl Default for HealthCheckConfig {
             failure_threshold: default_health_failure_threshold(),
             disable_health_check: false,
             drain_settle_secs: default_drain_settle_secs(),
+            evict_failure_threshold: default_evict_failure_threshold(),
         }
     }
 }
@@ -953,6 +968,9 @@ impl HealthCheckUpdate {
                 .disable_health_check
                 .unwrap_or(existing.disable_health_check),
             drain_settle_secs: self.drain_settle_secs.unwrap_or(existing.drain_settle_secs),
+            // No per-worker override today: the eviction budget always
+            // carries through from the existing (router-level) config.
+            evict_failure_threshold: existing.evict_failure_threshold,
         }
     }
 }

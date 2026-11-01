@@ -883,6 +883,11 @@ impl Router {
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: self.remove_unhealthy_workers,
                 drain_settle_secs: self.drain_settle_secs,
+                // No Python-facing arg today: keep the built-in default
+                // (5). Tune through the CLI
+                // (`--health-evict-failure-threshold`) or the config file.
+                evict_failure_threshold: config::HealthCheckConfig::default()
+                    .evict_failure_threshold,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,

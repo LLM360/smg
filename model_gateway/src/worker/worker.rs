@@ -253,6 +253,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Reset `consecutive_failures` to 0.
     fn consecutive_failures_reset(&self);
 
+    /// Read `consecutive_failures` (current failed-probe streak).
+    fn consecutive_failures(&self) -> usize;
+
     /// Increment `consecutive_successes` and return the new value.
     fn consecutive_successes_increment(&self) -> usize;
 
@@ -869,6 +872,10 @@ impl WorkerRuntime {
         self.consecutive_failures.store(0, Ordering::Release);
     }
 
+    pub fn consecutive_failures(&self) -> usize {
+        self.consecutive_failures.load(Ordering::Acquire)
+    }
+
     pub fn consecutive_successes_increment(&self) -> usize {
         self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -1073,6 +1080,10 @@ impl Worker for BasicWorker {
 
     fn consecutive_failures_reset(&self) {
         self.runtime.load().consecutive_failures_reset();
+    }
+
+    fn consecutive_failures(&self) -> usize {
+        self.runtime.load().consecutive_failures()
     }
 
     fn consecutive_successes_increment(&self) -> usize {
@@ -1514,6 +1525,7 @@ mod tests {
             success_threshold: 3,
             disable_health_check: true,
             drain_settle_secs: 5,
+            evict_failure_threshold: 5,
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
@@ -1634,6 +1646,7 @@ mod tests {
             success_threshold: 2,
             disable_health_check: false,
             drain_settle_secs: 5,
+            evict_failure_threshold: 5,
         };
 
         use crate::worker::BasicWorkerBuilder;

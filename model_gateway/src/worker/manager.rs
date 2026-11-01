@@ -481,15 +481,18 @@ async fn apply_probe_completion(
         },
     );
 
-    let Some(((), transition)) =
+    let Some((observed_consecutive_failures, transition)) =
         registry.apply_if_revision(&worker_id, expected_revision, |current_worker| {
             if launched_status == WorkerStatus::Pending {
                 current_worker.total_pending_probes_increment();
             }
-            (
-                (),
-                compute_next_status(current_worker, probe_ok, &health_config),
-            )
+            let failures_before = current_worker.consecutive_failures();
+            let next = compute_next_status(current_worker, probe_ok, &health_config);
+            // The transition reset the counter inside compute_next_status,
+            // so reconstruct the count that was observed for this probe: a
+            // failed probe adds one to the incoming streak; a successful
+            // probe observes zero (its streak was reset before evaluation).
+            (if probe_ok { 0 } else { failures_before + 1 }, next)
         })
     else {
         debug!(
@@ -508,6 +511,26 @@ async fn apply_probe_completion(
             "Worker status transition"
         );
         if new == WorkerStatus::Failed {
+            // Machine-readable eviction signal (LLM360/comet#3718): exactly
+            // one counter increment and one info update per eviction, for
+            // every Failed origin (the evict_failure_threshold budget, the
+            // liveness multiple, or the Pending probe cap). Fires even when
+            // removal is skipped for mesh-imported workers.
+            Metrics::record_worker_eviction(worker.model_id());
+            Metrics::set_last_worker_eviction_info(
+                worker.url(),
+                worker.model_id(),
+                observed_consecutive_failures as u32,
+                health_config.evict_failure_threshold,
+            );
+            error!(
+                worker_url = %worker.url(),
+                model = %worker.model_id(),
+                ?old,
+                consecutive_failures = observed_consecutive_failures,
+                evict_failure_threshold = health_config.evict_failure_threshold,
+                "Worker evicted after consecutive health-probe failures"
+            );
             if let Some(jq) = job_queue {
                 submit_removal_job(
                     registry,
@@ -589,12 +612,20 @@ fn schedule_worker_at(
 /// a transition is needed, `None` if the worker stays in its current state.
 ///
 /// State machine rules:
+///   - Finite degradation policy: `evict_failure_threshold` consecutive
+///     failed probes evict the worker (→ Failed) from any non-terminal
+///     status (Pending, Ready, NotReady). Checked before the staged rules;
+///     the staged transitions and their failure-counter resets stay
+///     unchanged, so a Ready worker demotes at `failure_threshold` and the
+///     remaining budget then counts inside NotReady.
 ///   - Pending → Ready on `success_threshold` consecutive successes
 ///   - Pending → Failed on `max_pending_probes` (10 × failure_threshold) total
 ///   - NotReady → Ready on `success_threshold` consecutive successes
-///   - NotReady → Failed on `liveness_failure_threshold` (3 × failure_threshold)
+///   - NotReady → Failed on `liveness_failure_threshold` (3 × failure_threshold);
+///     stays in effect as a lower bound when `evict_failure_threshold` is
+///     configured larger
 ///   - Ready → NotReady on `failure_threshold` consecutive failures
-///   - Failed: terminal (handled outside this function — no transitions)
+///   - Failed | Draining: terminal for this machine (no transitions)
 fn compute_next_status(
     worker: &Arc<dyn Worker>,
     probe_ok: bool,
@@ -608,6 +639,10 @@ fn compute_next_status(
     let liveness_threshold = failure_threshold * 3;
     // Pending cap: prevent misconfigured URLs from sitting in Pending forever.
     let max_pending_probes = failure_threshold * 10;
+    // Finite degradation policy: a bounded consecutive-failure budget that
+    // evicts the worker from the routing table, independent of the staged
+    // readiness/liveness multiples (LLM360/comet#3718).
+    let evict_failure_threshold = health_config.evict_failure_threshold as usize;
 
     if probe_ok {
         worker.consecutive_failures_reset();
@@ -638,6 +673,18 @@ fn compute_next_status(
     } else {
         worker.consecutive_successes_reset();
         let failures = worker.consecutive_failures_increment();
+
+        // Finite degradation policy first: N consecutive failed probes
+        // evict the worker from every non-terminal status. Draining stays
+        // terminal (owned by the discovery drain timer).
+        if !matches!(
+            current_status,
+            WorkerStatus::Failed | WorkerStatus::Draining
+        ) && failures >= evict_failure_threshold
+        {
+            worker.consecutive_failures_reset();
+            return Some(WorkerStatus::Failed);
+        }
 
         match current_status {
             WorkerStatus::Ready => {
@@ -1057,6 +1104,29 @@ mod tests {
                     check_interval_secs: 1,
                     disable_health_check: false,
                     drain_settle_secs: 0,
+                    evict_failure_threshold: 5,
+                })
+                .build(),
+        )
+    }
+
+    fn make_worker_with_evict_threshold(
+        url: &str,
+        success_threshold: u32,
+        failure_threshold: u32,
+        evict_failure_threshold: u32,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    success_threshold,
+                    failure_threshold,
+                    timeout_secs: 1,
+                    check_interval_secs: 1,
+                    disable_health_check: false,
+                    drain_settle_secs: 0,
+                    evict_failure_threshold,
                 })
                 .build(),
         )
@@ -1146,6 +1216,14 @@ mod tests {
     }
 
     fn cfg(success_threshold: u32, failure_threshold: u32) -> HealthCheckConfig {
+        cfg_evict(success_threshold, failure_threshold, 5)
+    }
+
+    fn cfg_evict(
+        success_threshold: u32,
+        failure_threshold: u32,
+        evict_failure_threshold: u32,
+    ) -> HealthCheckConfig {
         HealthCheckConfig {
             success_threshold,
             failure_threshold,
@@ -1153,6 +1231,7 @@ mod tests {
             check_interval_secs: 1,
             disable_health_check: false,
             drain_settle_secs: 0,
+            evict_failure_threshold,
         }
     }
 
@@ -1220,10 +1299,13 @@ mod tests {
         let worker = make_worker("http://w:1", 2, 3);
         worker.set_status(WorkerStatus::NotReady);
 
-        // liveness_threshold = 3 × failure_threshold = 9
+        // liveness_threshold = 3 × failure_threshold = 9. The evict
+        // threshold sits one above it, so the staged liveness rule stays
+        // the tighter bound and still fires first (LLM360/comet#3718).
+        let config = cfg_evict(2, 3, 10);
         for i in 1..9 {
             assert_eq!(
-                compute_next_status(&worker, false, &cfg(2, 3)),
+                compute_next_status(&worker, false, &config),
                 None,
                 "iteration {i}"
             );
@@ -1231,26 +1313,29 @@ mod tests {
 
         // 9th consecutive failure → Failed
         assert_eq!(
-            compute_next_status(&worker, false, &cfg(2, 3)),
+            compute_next_status(&worker, false, &config),
             Some(WorkerStatus::Failed)
         );
     }
 
     #[test]
     fn test_state_machine_pending_to_failed_after_max_pending_probes() {
+        // max_pending_probes = 10 × failure_threshold = 30. The evict
+        // threshold sits above the cap, so the 10x Pending-total backstop
+        // fires first on a flapping-candidate worker (LLM360/comet#3718).
         let worker = make_worker("http://w:1", 2, 3);
-        // max_pending_probes = 10 × failure_threshold = 30
+        let config = cfg_evict(2, 3, 40);
 
         // Simulate 30 failed probes — increment counter manually since the
         // loop usually does this before calling compute_next_status.
         for _ in 0..29 {
             worker.total_pending_probes_increment();
-            assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+            assert_eq!(compute_next_status(&worker, false, &config), None);
         }
         worker.total_pending_probes_increment();
         // 30th: Pending → Failed
         assert_eq!(
-            compute_next_status(&worker, false, &cfg(2, 3)),
+            compute_next_status(&worker, false, &config),
             Some(WorkerStatus::Failed)
         );
     }
@@ -1322,7 +1407,308 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    // ---------------------------------------------------------------
+    // Finite degradation policy: bounded evict_failure_threshold
+    // (LLM360/comet#3718)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_state_machine_evict_threshold_evicts_pending_worker() {
+        // N consecutive failed probes evict a Pending worker — the worker
+        // no longer waits for the 10x Pending total-attempts cap.
+        let worker = make_worker("http://w:1", 2, 3);
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        let config = cfg_evict(2, 3, 5);
+
+        for _ in 0..4 {
+            worker.total_pending_probes_increment();
+            assert_eq!(compute_next_status(&worker, false, &config), None);
+        }
+        worker.total_pending_probes_increment();
+        assert_eq!(
+            compute_next_status(&worker, false, &config),
+            Some(WorkerStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn test_state_machine_evict_threshold_evicts_ready_worker() {
+        // A Ready worker still demotes to NotReady at failure_threshold
+        // (staged rule unchanged, consecutive counter resets there); the
+        // eviction budget then counts N fresh failures inside NotReady,
+        // ahead of the 3x liveness multiple.
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Ready);
+        let config = cfg_evict(2, 3, 5);
+
+        assert_eq!(compute_next_status(&worker, false, &config), None);
+        assert_eq!(compute_next_status(&worker, false, &config), None);
+        assert_eq!(
+            compute_next_status(&worker, false, &config),
+            Some(WorkerStatus::NotReady)
+        );
+        // The probe loop applies the returned transition; mirror that here.
+        worker.set_status(WorkerStatus::NotReady);
+
+        for i in 1..5 {
+            assert_eq!(
+                compute_next_status(&worker, false, &config),
+                None,
+                "iteration {i}"
+            );
+        }
+        assert_eq!(
+            compute_next_status(&worker, false, &config),
+            Some(WorkerStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn test_state_machine_success_before_evict_threshold_resets_streak() {
+        // A success before the worker reaches N consecutive failures
+        // resets the streak; no eviction follows.
+        let worker = make_worker("http://w:1", 2, 3);
+        let config = cfg_evict(2, 3, 5);
+
+        for _ in 0..4 {
+            worker.total_pending_probes_increment();
+            assert_eq!(compute_next_status(&worker, false, &config), None);
+        }
+        // One success (below success_threshold) — streak resets.
+        assert_eq!(compute_next_status(&worker, true, &config), None);
+        for i in 1..5 {
+            worker.total_pending_probes_increment();
+            assert_eq!(
+                compute_next_status(&worker, false, &config),
+                None,
+                "iteration {i}"
+            );
+        }
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+    }
+
+    #[test]
+    fn test_state_machine_evict_threshold_smaller_than_failure_threshold_wins() {
+        // With N < failure_threshold the eviction gate fires before the
+        // staged Ready → NotReady demotion.
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Ready);
+        let config = cfg_evict(2, 3, 2);
+
+        assert_eq!(compute_next_status(&worker, false, &config), None);
+        assert_eq!(
+            compute_next_status(&worker, false, &config),
+            Some(WorkerStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn test_state_machine_draining_ignores_evict_threshold() {
+        // Draining stays terminal for the health state machine: the drain
+        // timer owns removal, even past N consecutive failures.
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Draining);
+        let config = cfg_evict(2, 3, 2);
+
+        for i in 1..6 {
+            assert_eq!(
+                compute_next_status(&worker, false, &config),
+                None,
+                "iteration {i}"
+            );
+        }
+        assert_eq!(worker.status(), WorkerStatus::Draining);
+    }
+
+    /// Drive one failed probe through `apply_probe_completion` against a
+    /// worker in `registry`. Job queue is `None` (removal submission is
+    /// not under test), so the apply is synchronous inside `block_on`.
+    fn apply_failing_probe(
+        registry: &Arc<WorkerRegistry>,
+        worker: &Arc<dyn Worker>,
+        worker_id: &WorkerId,
+    ) -> ProbeApplyResult {
+        let completion = ProbeCompletion {
+            worker_id: worker_id.clone(),
+            worker: worker.clone(),
+            expected_revision: worker.revision(),
+            launched_status: worker.status(),
+            health_config: worker.metadata().health_config.clone(),
+            probe_result: Err(WorkerError::HealthCheckFailed {
+                url: worker.url().to_string(),
+                reason: "test probe failure".to_string(),
+            }),
+        };
+        futures::executor::block_on(apply_probe_completion(registry, completion, None))
+    }
+
+    /// Render `/metrics` text for signals recorded inside `f`, the same
+    /// scrape output the production endpoint serves.
+    fn render_metrics(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    #[test]
+    fn test_eviction_signal_fires_exactly_once_per_eviction() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker_with_evict_threshold("http://w-evict:1", 2, 3, 5);
+        let model = worker.model_id().to_string();
+        let worker_id = registry.register(worker.clone()).unwrap();
+
+        let rendered = render_metrics(|| {
+            for i in 1..5 {
+                assert!(
+                    matches!(
+                        apply_failing_probe(&registry, &worker, &worker_id),
+                        ProbeApplyResult::Applied(None)
+                    ),
+                    "probe {i} must not transition"
+                );
+            }
+            // 5th consecutive failure: one eviction (Pending → Failed).
+            assert!(matches!(
+                apply_failing_probe(&registry, &worker, &worker_id),
+                ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Failed)))
+            ));
+            // Failed is terminal: a further probe is a no-op — no signal.
+            assert!(matches!(
+                apply_failing_probe(&registry, &worker, &worker_id),
+                ProbeApplyResult::Applied(None)
+            ));
+        });
+
+        let counter_line = rendered
+            .lines()
+            .find(|l| l.starts_with("smg_worker_evictions_total{"))
+            .unwrap_or_else(|| panic!("eviction counter missing; rendered:\n{rendered}"));
+        assert!(
+            counter_line.contains(&format!("model=\"{model}\"")),
+            "counter carries the model label: {counter_line}"
+        );
+        assert!(
+            counter_line.ends_with(" 1"),
+            "exactly one counter increment per eviction: {counter_line}"
+        );
+
+        let info_line = rendered
+            .lines()
+            .find(|l| l.starts_with("smg_worker_last_eviction_info{"))
+            .unwrap_or_else(|| panic!("last-eviction info missing; rendered:\n{rendered}"));
+        for label in [
+            "worker_url=\"http://w-evict:1\"".to_string(),
+            format!("model=\"{model}\""),
+            "consecutive_failures=\"5\"".to_string(),
+            "evict_failure_threshold=\"5\"".to_string(),
+        ] {
+            assert!(
+                info_line.contains(&label),
+                "info missing {label}: {info_line}"
+            );
+        }
+        assert!(
+            info_line.ends_with(" 1"),
+            "info gauge set to 1: {info_line}"
+        );
+    }
+
+    #[test]
+    fn test_eviction_signal_fires_once_on_liveness_path() {
+        // Eviction through the pre-existing liveness multiple (the bounded
+        // eviction budget configured higher) emits the same single signal.
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker_with_evict_threshold("http://w-liveness:1", 2, 1, 100);
+        let worker_id = registry.register(worker.clone()).unwrap();
+        worker.set_status(WorkerStatus::NotReady);
+        // liveness = failure_threshold (1) x 3 = 3 consecutive failures.
+
+        let rendered = render_metrics(|| {
+            for i in 1..3 {
+                assert!(
+                    matches!(
+                        apply_failing_probe(&registry, &worker, &worker_id),
+                        ProbeApplyResult::Applied(None)
+                    ),
+                    "probe {i} must not transition"
+                );
+            }
+            assert!(matches!(
+                apply_failing_probe(&registry, &worker, &worker_id),
+                ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Failed)))
+            ));
+        });
+
+        let counter_line = rendered
+            .lines()
+            .find(|l| l.starts_with("smg_worker_evictions_total{"))
+            .unwrap_or_else(|| panic!("eviction counter missing; rendered:\n{rendered}"));
+        assert!(
+            counter_line.ends_with(" 1"),
+            "exactly one counter increment on the liveness path: {counter_line}"
+        );
+    }
+
+    #[test]
+    fn test_eviction_signal_fires_for_mesh_worker_while_registration_stays() {
+        // Mesh-imported workers keep the owner-managed exemption: the
+        // registration is not removed, but the eviction signal still fires.
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: "http://remote-evict:1".to_string(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+        });
+        let worker_id = registry.get_id_by_url("http://remote-evict:1").unwrap();
+        let worker = registry
+            .get(&worker_id)
+            .expect("mesh-imported worker registered");
+        let model = worker.model_id().to_string();
+
+        // Default health config: eviction budget 5 (plus the staged
+        // demotion, so a Ready import needs at most 3 + 5 probes).
+        let rendered = render_metrics(|| {
+            let mut evicted = false;
+            for _ in 1..=10 {
+                if matches!(
+                    apply_failing_probe(&registry, &worker, &worker_id),
+                    ProbeApplyResult::Applied(Some((_, WorkerStatus::Failed)))
+                ) {
+                    evicted = true;
+                    break;
+                }
+            }
+            assert!(evicted, "mesh worker never transitioned to Failed");
+        });
+
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("smg_worker_evictions_total{")),
+            "eviction counter must fire for a mesh worker; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("smg_worker_last_eviction_info{")
+                    && l.contains(&format!("model=\"{model}\""))),
+            "last-eviction info carries the model; rendered:\n{rendered}"
+        );
+        assert!(
+            registry.get(&worker_id).is_some(),
+            "mesh-imported worker stays registered (owner-managed exemption)"
+        );
+        assert!(
+            !should_remove_failed(&registry, &worker_id),
+            "mesh-imported workers are not removal candidates"
+        );
+    }
+
     async fn test_removal_candidate_strips_dp_rank_suffix() {
         // Regression test: a DP-aware worker is registered under
         // "{base}@{rank}", but the removal workflow prefix-matches
