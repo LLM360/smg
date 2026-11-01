@@ -1094,20 +1094,7 @@ mod tests {
     use crate::worker::{BasicWorkerBuilder, Worker, WorkerError, WorkerRegistry, WorkerType};
 
     fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .health_config(HealthCheckConfig {
-                    success_threshold,
-                    failure_threshold,
-                    timeout_secs: 1,
-                    check_interval_secs: 1,
-                    disable_health_check: false,
-                    drain_settle_secs: 0,
-                    evict_failure_threshold: 5,
-                })
-                .build(),
-        )
+        make_worker_with_evict_threshold(url, success_threshold, failure_threshold, 5)
     }
 
     fn make_worker_with_evict_threshold(
