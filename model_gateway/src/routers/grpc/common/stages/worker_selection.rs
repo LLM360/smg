@@ -18,7 +18,7 @@ use crate::{
         PolicyRegistry, SeedWorkerHeadroom, SelectWorkerInfo, WorkerLeg,
     },
     routers::{
-        common::header_utils::worker_url_is_allowed,
+        common::{header_utils::worker_url_is_allowed, retry::NoWorkerAvailable},
         error,
         grpc::{
             adaptive_admission::{AdaptiveAdmissionController, OrdinaryDistributionDispatchGuard},
@@ -78,6 +78,41 @@ impl WorkerSelectionStage {
             worker_registry,
             policy_registry,
             mode,
+        }
+    }
+
+    /// Build the no-selection error response for this selection mode.
+    ///
+    /// A model with no registered gRPC workers is genuinely absent and
+    /// answers 404 `model_not_found`. A model with registered workers whose
+    /// selectable pool is transiently empty (unhealthy, circuit-open, or
+    /// retry-excluded) answers 503 `no_available_workers` carrying the
+    /// [`NoWorkerAvailable`] marker, so the retry loop classifies the
+    /// attempt as pre-engine and consumes the configured budget before the
+    /// terminal 503 — the same signal the HTTP router produces for its
+    /// emptied-pool case.
+    fn no_selection_response(&self, model_id: &str, worker_type: Option<WorkerType>) -> Response {
+        let model_filter = if model_id == UNKNOWN_MODEL_ID {
+            None
+        } else {
+            Some(model_id)
+        };
+        let registered = self.worker_registry.get_workers_filtered(
+            model_filter,
+            worker_type,
+            Some(ConnectionMode::Grpc),
+            None,  // any runtime type
+            false, // registered workers, regardless of availability
+        );
+        if registered.is_empty() {
+            error::model_not_found(model_id)
+        } else {
+            let mut response = error::service_unavailable(
+                "no_available_workers",
+                "All workers are unavailable (circuit breaker open, unhealthy, or excluded)",
+            );
+            response.extensions_mut().insert(NoWorkerAvailable);
+            response
         }
     }
 }
@@ -173,7 +208,9 @@ impl PipelineStage for WorkerSelectionStage {
                                 model_id = %model_id,
                                 "No available workers for model"
                             );
-                            return Err(error::model_not_found(model_id));
+                            return Err(
+                                self.no_selection_response(model_id, Some(WorkerType::Regular))
+                            );
                         }
                     }
                 }
@@ -192,7 +229,7 @@ impl PipelineStage for WorkerSelectionStage {
                                 model_id = %model_id,
                                 "No available PD worker pairs for model"
                             );
-                            return Err(error::model_not_found(model_id));
+                            return Err(self.no_selection_response(model_id, None));
                         }
                     }
                 }
@@ -1418,6 +1455,84 @@ mod tests {
                 .expect("selection succeeds")
                 .is_none(),
             "with every worker excluded, no worker is selected"
+        );
+    }
+
+    #[test]
+    fn regular_arm_distinguishes_workerless_model_from_emptied_pool() {
+        // Base parity: a model with no registered gRPC workers is a 404
+        // model_not_found. A model with registered workers whose selectable
+        // pool is transiently empty (unhealthy or retry-excluded) is a 503
+        // no_available_workers that carries the NoWorkerAvailable marker,
+        // so the retry loop treats the attempt as pre-engine and consumes
+        // the configured budget before the terminal 503.
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            worker_registry.clone(),
+            policy_registry,
+            WorkerSelectionMode::Regular,
+        );
+
+        let response = stage.no_selection_response("kimi-k3", Some(WorkerType::Regular));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.extensions().get::<NoWorkerAvailable>().is_none());
+
+        worker_registry
+            .register(stage_worker("grpc://10.0.0.1:30000"))
+            .unwrap();
+        let response = stage.no_selection_response("kimi-k3", Some(WorkerType::Regular));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.extensions().get::<NoWorkerAvailable>().is_some(),
+            "an emptied pool of registered workers carries the pre-engine marker"
+        );
+
+        let response = stage.no_selection_response("ghost-model", Some(WorkerType::Regular));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn pd_arm_distinguishes_workerless_model_from_emptied_pool() {
+        // Same distinction on the PD arm: 404 only for a genuinely
+        // worker-less model, 503 + NoWorkerAvailable when prefill/decode
+        // workers are registered but none are selectable.
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            worker_registry.clone(),
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let response = stage.no_selection_response("kimi-k3", None);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.extensions().get::<NoWorkerAvailable>().is_none());
+
+        for (url, worker_type) in [
+            ("grpc://10.0.0.1:30000", WorkerType::Prefill),
+            ("grpc://10.0.0.2:30000", WorkerType::Decode),
+        ] {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("kimi-k3"))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        let response = stage.no_selection_response("kimi-k3", None);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.extensions().get::<NoWorkerAvailable>().is_some(),
+            "an emptied PD pool of registered workers carries the pre-engine marker"
         );
     }
 }

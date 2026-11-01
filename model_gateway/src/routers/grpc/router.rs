@@ -42,8 +42,8 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::retry::{
-            is_retryable_status, AttemptOutcome, AttemptOutcomeClass, PreEngineTransportFailure,
-            RetryExecutor,
+            is_retryable_status, AttemptOutcome, AttemptOutcomeClass, NoWorkerAvailable,
+            PreEngineTransportFailure, RetryExecutor,
         },
         error, RouterTrait,
     },
@@ -55,12 +55,23 @@ use crate::{
 /// The request-execution stage attaches a [`PreEngineTransportFailure`]
 /// extension when generation-stream acquisition failed on the worker; that
 /// failure ran no engine work, so the retry loop excludes the worker and
-/// retries on another one. Everything else is classified from the HTTP
-/// status (chat/generate requests are not idempotent).
+/// retries on another one. The selection stage attaches a
+/// [`NoWorkerAvailable`] marker when the model has registered workers but
+/// none are selectable; that attempt also ran no engine work and consumes
+/// the configured budget before the terminal 503. Everything else is
+/// classified from the HTTP status (chat/generate requests are not
+/// idempotent).
 fn grpc_attempt_outcome(res: &Response) -> AttemptOutcome {
     if let Some(marker) = res.extensions().get::<PreEngineTransportFailure>() {
         return AttemptOutcome {
             worker_url: Some(marker.worker_url.clone()),
+            class: AttemptOutcomeClass::PreEngineTransport,
+            idempotent: false,
+        };
+    }
+    if res.extensions().get::<NoWorkerAvailable>().is_some() {
+        return AttemptOutcome {
+            worker_url: None,
             class: AttemptOutcomeClass::PreEngineTransport,
             idempotent: false,
         };
@@ -1597,6 +1608,26 @@ mod pd_tests {
         assert!(
             grpc_should_retry(&res, &outcome),
             "a marked pre-engine failure is retried even on a non-retryable-looking status"
+        );
+    }
+
+    #[test]
+    fn grpc_attempt_outcome_treats_no_worker_available_as_pre_engine() {
+        // A transiently emptied selection pool (503 no_available_workers
+        // with the NoWorkerAvailable marker) ran no engine work: the retry
+        // loop treats the attempt as pre-engine and consumes the configured
+        // budget before the terminal 503, exactly like the HTTP router's
+        // emptied-pool case.
+        let mut res = Response::new(axum::body::Body::empty());
+        *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        res.extensions_mut().insert(NoWorkerAvailable);
+
+        let outcome = grpc_attempt_outcome(&res);
+        assert_eq!(outcome.class, AttemptOutcomeClass::PreEngineTransport);
+        assert!(outcome.worker_url.is_none());
+        assert!(
+            grpc_should_retry(&res, &outcome),
+            "a no-available-workers response retries within the configured budget"
         );
     }
 

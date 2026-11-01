@@ -102,6 +102,14 @@ acquired). No engine work ran, so the retry is safe for any request on
 any route. The router excludes the failed worker from later attempts of
 the same request.
 
+An emptied worker pool counts as a pre-engine failure too. When no worker
+of a known model is selectable (unhealthy, circuit breaker open, or
+excluded), the router answers 503 Service Unavailable
+(`no_available_workers`), retries within the configured budget, and
+returns the terminal 503 when the budget is exhausted. The router returns
+404 `model_not_found` only when the model has no registered workers at
+all.
+
 **Post-engine status failure.** The engine answered with one of these
 status codes, so engine work may have run. The router retries these only
 for the idempotent routes `/v1/embeddings`, `/v1/classify`, and
