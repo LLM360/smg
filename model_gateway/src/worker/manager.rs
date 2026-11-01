@@ -1709,6 +1709,7 @@ mod tests {
         );
     }
 
+    #[tokio::test]
     async fn test_removal_candidate_strips_dp_rank_suffix() {
         // Regression test: a DP-aware worker is registered under
         // "{base}@{rank}", but the removal workflow prefix-matches
