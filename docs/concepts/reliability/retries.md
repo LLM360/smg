@@ -92,9 +92,28 @@ Without jitter, if multiple requests fail simultaneously, they all retry at exac
 
 ---
 
-## Retryable Status Codes
+## Retryable Failures
 
-SMG automatically retries requests that fail with these status codes:
+SMG retries two kinds of failure, with different rules:
+
+**Pre-engine transport failure.** The request never reached the engine
+(connection refused, request build failure, generation stream not
+acquired). No engine work ran, so the retry is safe for any request on
+any route. The router excludes the failed worker from later attempts of
+the same request.
+
+An emptied worker pool counts as a pre-engine failure too. When no worker
+of a known model is selectable (unhealthy, circuit breaker open, or
+excluded), the router answers 503 Service Unavailable
+(`no_available_workers`), retries within the configured budget, and
+returns the terminal 503 when the budget is exhausted. The router returns
+404 `model_not_found` only when the model has no registered workers at
+all.
+
+**Post-engine status failure.** The engine answered with one of these
+status codes, so engine work may have run. The router retries these only
+for the idempotent routes `/v1/embeddings`, `/v1/classify`, and
+`/v1/rerank`:
 
 | Code | Meaning | Why Retryable |
 |------|---------|---------------|
@@ -105,7 +124,12 @@ SMG automatically retries requests that fail with these status codes:
 | `503` | Service Unavailable | Service temporarily down |
 | `504` | Gateway Timeout | Upstream timeout |
 
-Requests with other status codes (e.g., 400 Bad Request, 401 Unauthorized) are **not retried** because they would likely fail again.
+Requests with other status codes (e.g., 400 Bad Request, 401
+Unauthorized) are **not retried** because they would likely fail again.
+On generation routes such as `/generate` and `/v1/chat/completions`, a
+retryable status that reaches the engine is also **not retried**: the
+engine may already have produced tokens, so re-execution is not
+side-effect free.
 
 ---
 

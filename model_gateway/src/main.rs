@@ -764,6 +764,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     drain_settle_secs: u64,
 
+    /// Number of probes a `Failed` worker is given to recover before it is
+    /// declared terminal: the removal job is submitted and the
+    /// `smg_worker_terminal_failure` metric fires. A successful probe inside
+    /// the budget returns the worker to `Pending`. Set to `0` to keep the
+    /// previous behavior (immediate terminal signal on first schedule).
+    #[arg(long, default_value_t = 3, help_heading = "Health Checks")]
+    health_recovery_attempts: u32,
+
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID or local path)
     #[arg(long, alias = "model", help_heading = "Tokenizer")]
@@ -1722,6 +1730,7 @@ impl CliArgs {
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: self.remove_unhealthy_workers,
                 drain_settle_secs: self.drain_settle_secs,
+                recovery_attempts: self.health_recovery_attempts,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,

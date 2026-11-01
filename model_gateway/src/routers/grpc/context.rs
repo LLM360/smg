@@ -6,7 +6,7 @@
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::http::HeaderMap;
 use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry};
@@ -64,6 +64,10 @@ pub(crate) struct RequestInput {
     /// Protocol shape alone cannot distinguish direct Chat Completions from
     /// internal Responses iterations or Harmony chat requests.
     pub streaming_distribution_seed_scope: StreamingDistributionSeedScope,
+    /// Workers that failed with a pre-engine transport error on earlier
+    /// retry attempts of this request; worker selection removes them from
+    /// the candidate list so a retry lands on a different worker.
+    pub excluded_workers: Option<Arc<HashSet<String>>>,
 }
 
 /// Only a direct scalar streaming request through the Regular Chat Completions
@@ -723,6 +727,7 @@ impl RequestContext {
                 model_id,
                 tenant_request_meta: None,
                 streaming_distribution_seed_scope: StreamingDistributionSeedScope::Ineligible,
+                excluded_workers: None,
             },
             components,
             state: ProcessingState::default(),

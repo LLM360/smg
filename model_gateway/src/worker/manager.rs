@@ -263,6 +263,11 @@ async fn run_health_loop(
 ) {
     let mut probes: ProbeFutures = FuturesUnordered::new();
     let mut in_flight: HashSet<WorkerId> = HashSet::new();
+    // Bounded recovery bookkeeping for Failed workers: probes already used
+    // against the `recovery_attempts` budget, and workers whose terminal
+    // failure was already signaled (exactly-once terminal notification).
+    let mut recovery_attempts: HashMap<WorkerId, u32> = HashMap::new();
+    let mut terminally_signaled: HashSet<WorkerId> = HashSet::new();
 
     loop {
         let now = tokio::time::Instant::now();
@@ -272,6 +277,8 @@ async fn run_health_loop(
             &mut next_check,
             &mut in_flight,
             &mut probes,
+            &mut recovery_attempts,
+            &mut terminally_signaled,
             now,
         );
         for removal in removals {
@@ -297,17 +304,27 @@ async fn run_health_loop(
             Some(completion) = probes.next(), if !probes.is_empty() => {
                 let worker_id = completion.worker_id.clone();
                 in_flight.remove(&worker_id);
-                if matches!(
-                    apply_probe_completion(&registry, completion, job_queue.as_ref()).await,
-                    ProbeApplyResult::Applied(Some((_, WorkerStatus::Failed)))
-                ) {
-                    next_check.remove(&worker_id);
+                if let ProbeApplyResult::Applied(Some((
+                    WorkerStatus::Failed,
+                    WorkerStatus::Pending,
+                ))) = apply_probe_completion(&registry, completion).await
+                {
+                    // Recovered inside the bounded recovery budget: the
+                    // worker re-entered the health state machine. Reset its
+                    // recovery bookkeeping.
+                    recovery_attempts.remove(&worker_id);
                 }
             }
             () = tokio::time::sleep_until(sleep_until) => {}
             event = events_rx.recv() => {
                 match event {
                     Ok(WorkerEvent::Registered { worker_id, worker }) => {
+                        recovery_attempts.remove(&worker_id);
+                        terminally_signaled.remove(&worker_id);
+                        Metrics::clear_worker_terminal_failure_last_seen(
+                            worker.url(),
+                            worker.model_id(),
+                        );
                         schedule_worker_at(
                             &mut next_check,
                             worker_id,
@@ -319,9 +336,17 @@ async fn run_health_loop(
                         );
                     }
                     Ok(WorkerEvent::Removed { worker_id, .. }) => {
+                        recovery_attempts.remove(&worker_id);
+                        terminally_signaled.remove(&worker_id);
                         next_check.remove(&worker_id);
                     }
                     Ok(WorkerEvent::Replaced { worker_id, new, .. }) => {
+                        recovery_attempts.remove(&worker_id);
+                        terminally_signaled.remove(&worker_id);
+                        Metrics::clear_worker_terminal_failure_last_seen(
+                            new.url(),
+                            new.model_id(),
+                        );
                         schedule_worker_at(
                             &mut next_check,
                             worker_id,
@@ -357,7 +382,10 @@ async fn run_health_loop(
 }
 
 /// Side-effect-free startup reconcile: rebuild the schedule from the
-/// current registry snapshot without publishing new events or removals.
+/// current registry snapshot without publishing new events. Failed workers
+/// stay scheduled: the running loop gives them the bounded recovery budget
+/// before the terminal signal, so a worker that was failed before a router
+/// restart still gets its recovery probes instead of an instant removal.
 fn reconcile_from_registry(
     registry: &Arc<WorkerRegistry>,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
@@ -375,6 +403,8 @@ fn queue_due_probes(
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     in_flight: &mut HashSet<WorkerId>,
     probes: &mut ProbeFutures,
+    recovery_attempts: &mut HashMap<WorkerId, u32>,
+    terminally_signaled: &mut HashSet<WorkerId>,
     now: tokio::time::Instant,
 ) -> Vec<RemovalCandidate> {
     let capacity = MAX_CONCURRENT_HEALTH_PROBES.saturating_sub(in_flight.len());
@@ -405,15 +435,32 @@ fn queue_due_probes(
         let launched_status = worker.status();
         let expected_revision = worker.revision();
         if launched_status == WorkerStatus::Failed {
-            next_check.remove(&worker_id);
-            if config.remove_unhealthy {
-                removals.push(RemovalCandidate {
-                    worker_id: worker_id.clone(),
-                    url: worker.base_url().to_string(),
-                    expected_revision,
-                });
+            // Bounded recovery: a Failed worker stays registered (unroutable)
+            // and is given `recovery_attempts` more probes so a restarted
+            // engine re-enters service without manual action. When the
+            // budget is exhausted, the failure is terminal: emit the
+            // machine-readable terminal signal exactly once and route the
+            // worker to the existing removal path.
+            let budget = health_config.recovery_attempts;
+            let used = recovery_attempts.entry(worker_id.clone()).or_insert(0);
+            if *used >= budget {
+                next_check.remove(&worker_id);
+                if !terminally_signaled.contains(&worker_id) {
+                    emit_worker_terminal_failure(&worker_id, worker.as_ref(), budget);
+                    terminally_signaled.insert(worker_id.clone());
+                    if config.remove_unhealthy {
+                        removals.push(RemovalCandidate {
+                            worker_id: worker_id.clone(),
+                            url: worker.base_url().to_string(),
+                            expected_revision,
+                        });
+                    }
+                }
+                continue;
             }
-            continue;
+            *used += 1;
+            // Fall through: keep probing the Failed worker against the
+            // recovery budget.
         }
         if launched_status == WorkerStatus::Draining {
             // Drain is owned by the worker_removal workflow's
@@ -447,10 +494,33 @@ fn queue_due_probes(
     removals
 }
 
+/// Emit the machine-readable terminal-failure signal for a worker whose
+/// bounded recovery budget is exhausted: a structured error log with the
+/// model, worker URL, and failure evidence, plus the
+/// `smg_worker_terminal_failure` Prometheus counter/gauge pair.
+fn emit_worker_terminal_failure(worker_id: &WorkerId, worker: &dyn Worker, budget: u32) {
+    let model_id = worker.model_id().to_string();
+    error!(
+        worker_id = %worker_id.as_str(),
+        worker_url = %worker.url(),
+        model = %model_id,
+        recovery_attempts = budget,
+        "Worker recovery budget exhausted; worker failure is terminal"
+    );
+    Metrics::record_worker_terminal_failure(&model_id);
+    Metrics::set_worker_terminal_failure_last_seen(
+        worker.url(),
+        &model_id,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+}
+
 async fn apply_probe_completion(
     registry: &Arc<WorkerRegistry>,
     completion: ProbeCompletion,
-    job_queue: Option<&Arc<JobQueue>>,
 ) -> ProbeApplyResult {
     let ProbeCompletion {
         worker_id,
@@ -500,25 +570,13 @@ async fn apply_probe_completion(
         return ProbeApplyResult::Stale;
     };
 
-    if let Some((old, new)) = transition {
+    if let Some((old, new)) = &transition {
         debug!(
             worker_url = %worker.url(),
             ?old,
             ?new,
             "Worker status transition"
         );
-        if new == WorkerStatus::Failed {
-            if let Some(jq) = job_queue {
-                submit_removal_job(
-                    registry,
-                    &worker_id,
-                    worker.base_url(),
-                    expected_revision,
-                    jq,
-                )
-                .await;
-            }
-        }
     }
 
     ProbeApplyResult::Applied(transition)
@@ -540,12 +598,6 @@ fn schedule_descriptor_at(
     immediate: bool,
 ) {
     if descriptor.disable_health_check {
-        next_check.remove(&descriptor.worker_id);
-        return;
-    }
-    if descriptor.status == WorkerStatus::Failed {
-        // Startup reconcile and lagged rebuild must be side-effect-free:
-        // do not reschedule already-failed workers for probing or removal.
         next_check.remove(&descriptor.worker_id);
         return;
     }
@@ -594,7 +646,9 @@ fn schedule_worker_at(
 ///   - NotReady → Ready on `success_threshold` consecutive successes
 ///   - NotReady → Failed on `liveness_failure_threshold` (3 × failure_threshold)
 ///   - Ready → NotReady on `failure_threshold` consecutive failures
-///   - Failed: terminal (handled outside this function — no transitions)
+///   - Failed → Pending on a successful probe inside the bounded recovery
+///     budget (budget accounting lives in `queue_due_probes`); a failed
+///     probe leaves the worker Failed
 fn compute_next_status(
     worker: &Arc<dyn Worker>,
     probe_ok: bool,
@@ -612,6 +666,15 @@ fn compute_next_status(
     if probe_ok {
         worker.consecutive_failures_reset();
         let successes = worker.consecutive_successes_increment();
+
+        if current_status == WorkerStatus::Failed {
+            // Recovered inside the bounded recovery budget: re-enter the
+            // health state machine at Pending with clean counters. The
+            // existing thresholds drive the worker back to Ready.
+            worker.consecutive_successes_reset();
+            worker.total_pending_probes_reset();
+            return Some(WorkerStatus::Pending);
+        }
 
         if matches!(
             current_status,
@@ -659,9 +722,11 @@ fn compute_next_status(
                 }
             }
             WorkerStatus::Failed | WorkerStatus::Draining => {
-                // Terminal for the health-state machine. Failed is removed
-                // by `--remove-unhealthy-workers`; Draining is removed by
-                // the discovery drain timer once in-flight requests settle.
+                // Failed workers stay Failed on a failed recovery probe
+                // (removal and the terminal signal live in
+                // `queue_due_probes` once the recovery budget is
+                // exhausted). Draining is removed by the discovery drain
+                // timer once in-flight requests settle.
             }
         }
 
@@ -1057,6 +1122,7 @@ mod tests {
                     check_interval_secs: 1,
                     disable_health_check: false,
                     drain_settle_secs: 0,
+                    recovery_attempts: 3,
                 })
                 .build(),
         )
@@ -1153,6 +1219,7 @@ mod tests {
             check_interval_secs: 1,
             disable_health_check: false,
             drain_settle_secs: 0,
+            recovery_attempts: 3,
         }
     }
 
@@ -1273,17 +1340,40 @@ mod tests {
     }
 
     #[test]
-    fn test_state_machine_failed_is_terminal() {
+    fn test_state_machine_failed_recovers_to_pending_on_success_probe() {
+        // Bounded recovery: a Failed worker that answers a probe beside the
+        // recovery budget re-enters the state machine at Pending with clean
+        // counters; the normal thresholds then drive it back to Ready.
         let worker = make_worker("http://w:1", 2, 3);
         worker.set_status(WorkerStatus::Failed);
 
-        // Successful probes don't recover Failed.
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
-        assert_eq!(worker.status(), WorkerStatus::Failed);
+        assert_eq!(
+            compute_next_status(&worker, true, &cfg(2, 3)),
+            Some(WorkerStatus::Pending)
+        );
+        assert_eq!(worker.total_pending_probes(), 0);
 
-        // Failed probes don't transition Failed anywhere either.
+        // Back at Pending (the health loop applies the transition), the
+        // success threshold drives the worker to Ready with the regular
+        // ladder.
+        worker.set_status(WorkerStatus::Pending);
+        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, true, &cfg(2, 3)),
+            Some(WorkerStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn test_state_machine_failed_stays_failed_on_failed_probe() {
+        // A failed recovery probe consumes budget in `queue_due_probes`;
+        // the state machine itself does not move.
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Failed);
+
         assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        assert_eq!(worker.status(), WorkerStatus::Failed);
     }
 
     #[test]
@@ -1333,7 +1423,10 @@ mod tests {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://10.130.99.80:30000")
                 .worker_type(WorkerType::Regular)
-                .health_config(cfg(2, 3))
+                .health_config(HealthCheckConfig {
+                    recovery_attempts: 0,
+                    ..cfg(2, 3)
+                })
                 .dp_config(1, 4)
                 .build(),
         );
@@ -1345,6 +1438,8 @@ mod tests {
         next_check.insert(worker_id, tokio::time::Instant::now());
         let mut in_flight = HashSet::new();
         let mut probes: ProbeFutures = FuturesUnordered::new();
+        let mut recovery_attempts = HashMap::new();
+        let mut terminally_signaled = HashSet::new();
 
         let removals = queue_due_probes(
             &registry,
@@ -1355,6 +1450,8 @@ mod tests {
             &mut next_check,
             &mut in_flight,
             &mut probes,
+            &mut recovery_attempts,
+            &mut terminally_signaled,
             tokio::time::Instant::now(),
         );
 
@@ -1363,7 +1460,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_from_registry_skips_failed_workers_on_bootstrap() {
+    fn test_reconcile_from_registry_schedules_failed_workers_on_bootstrap() {
+        // Failed workers stay scheduled: the running loop gives them the
+        // bounded recovery budget before the terminal signal, so a worker
+        // that failed before a router restart still gets its recovery
+        // probes instead of an instant removal.
         let registry = Arc::new(WorkerRegistry::new());
         let failed_worker = make_worker("http://failed:1", 2, 3);
         failed_worker.set_status(WorkerStatus::Failed);
@@ -1380,8 +1481,8 @@ mod tests {
         );
 
         assert!(
-            !next_check.contains_key(&failed_id),
-            "bootstrap reconcile must not reschedule failed workers"
+            next_check.contains_key(&failed_id),
+            "bootstrap reconcile must schedule failed workers for recovery probing"
         );
     }
 
@@ -1477,12 +1578,139 @@ mod tests {
         assert_eq!(current.status(), WorkerStatus::Ready);
         assert_eq!(current.revision(), expected_revision + 1);
 
-        let result = apply_probe_completion(&registry, completion, None).await;
+        let result = apply_probe_completion(&registry, completion).await;
         assert!(matches!(result, ProbeApplyResult::Stale));
         assert_eq!(
             registry.get(&worker_id).unwrap().status(),
             WorkerStatus::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_probe_success_returns_failed_worker_to_pending() {
+        // Bounded recovery: a Failed worker that answers a probe inside
+        // the recovery budget re-enters the state machine at Pending
+        // (budget accounting happens in `queue_due_probes`; the state
+        // machine turns the successful probe into Failed → Pending).
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Failed);
+        let expected_revision = worker.revision();
+        let worker_id = registry.register(worker.clone()).unwrap();
+
+        let completion = ProbeCompletion {
+            worker_id: worker_id.clone(),
+            worker,
+            expected_revision,
+            launched_status: WorkerStatus::Failed,
+            health_config: cfg(2, 3),
+            probe_result: Ok(()),
+        };
+
+        let result = apply_probe_completion(&registry, completion).await;
+        assert!(matches!(
+            result,
+            ProbeApplyResult::Applied(Some((WorkerStatus::Failed, WorkerStatus::Pending)))
+        ));
+        assert_eq!(
+            registry.get(&worker_id).unwrap().status(),
+            WorkerStatus::Pending
+        );
+    }
+
+    #[test]
+    fn test_recovery_budget_exhaustion_signals_terminal_once_and_removes() {
+        // The recovery budget is per failure episode. Exhaustion emits the
+        // terminal signal exactly once and hands the worker to the removal
+        // path; afterwards the worker is no longer scheduled.
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:1")
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    recovery_attempts: 2,
+                    ..cfg(2, 3)
+                })
+                .build(),
+        );
+        worker.set_status(WorkerStatus::Failed);
+        let worker_id = registry.register(worker).unwrap();
+
+        let config = WorkerManagerConfig {
+            default_check_interval_secs: 5,
+            remove_unhealthy: true,
+        };
+        let mut next_check = HashMap::new();
+        let mut in_flight = HashSet::new();
+        let mut probes: ProbeFutures = FuturesUnordered::new();
+        let mut recovery_attempts = HashMap::new();
+        let mut terminally_signaled = HashSet::new();
+
+        // Recovery probe 1 of 2: budget available, worker is probed.
+        next_check.insert(worker_id.clone(), tokio::time::Instant::now());
+        let removals = queue_due_probes(
+            &registry,
+            &config,
+            &mut next_check,
+            &mut in_flight,
+            &mut probes,
+            &mut recovery_attempts,
+            &mut terminally_signaled,
+            tokio::time::Instant::now(),
+        );
+        assert!(removals.is_empty());
+        assert_eq!(recovery_attempts.get(&worker_id), Some(&1));
+        assert!(in_flight.contains(&worker_id));
+
+        // Recovery probe 2 of 2: the last budgeted probe.
+        in_flight.remove(&worker_id);
+        next_check.insert(worker_id.clone(), tokio::time::Instant::now());
+        let removals = queue_due_probes(
+            &registry,
+            &config,
+            &mut next_check,
+            &mut in_flight,
+            &mut probes,
+            &mut recovery_attempts,
+            &mut terminally_signaled,
+            tokio::time::Instant::now(),
+        );
+        assert!(removals.is_empty());
+        assert_eq!(recovery_attempts.get(&worker_id), Some(&2));
+
+        // Probe 3 would exceed the budget: terminal signal, removal
+        // candidate, no further scheduling.
+        in_flight.remove(&worker_id);
+        next_check.insert(worker_id.clone(), tokio::time::Instant::now());
+        let removals = queue_due_probes(
+            &registry,
+            &config,
+            &mut next_check,
+            &mut in_flight,
+            &mut probes,
+            &mut recovery_attempts,
+            &mut terminally_signaled,
+            tokio::time::Instant::now(),
+        );
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0].worker_id, worker_id);
+        assert!(terminally_signaled.contains(&worker_id));
+        assert!(!next_check.contains_key(&worker_id));
+
+        // The terminal signal fires exactly once: a repeated pass yields
+        // no further removal work.
+        next_check.insert(worker_id.clone(), tokio::time::Instant::now());
+        let removals = queue_due_probes(
+            &registry,
+            &config,
+            &mut next_check,
+            &mut in_flight,
+            &mut probes,
+            &mut recovery_attempts,
+            &mut terminally_signaled,
+            tokio::time::Instant::now(),
+        );
+        assert!(removals.is_empty());
     }
 
     /// Spawn a loopback HTTP server stubbing the engine admin endpoints,

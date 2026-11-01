@@ -81,7 +81,7 @@ SMG sends periodic HTTP requests to each worker's health endpoint:
 | **Pending** | Freshly registered, not yet verified | No requests |
 | **Ready** | Passing health checks | Receives requests |
 | **NotReady** | Consecutive probe failures reached the readiness threshold | No requests |
-| **Failed** | Consecutive failures reached the liveness threshold, or `Pending` ran out of probe attempts | Terminal — receives no requests and is not probed further |
+| **Failed** | Consecutive failures reached the liveness threshold, or `Pending` ran out of probe attempts | No requests; probed up to `--health-recovery-attempts` more times for bounded recovery, then terminal |
 
 The `smg_worker_health` gauge collapses these to `1` (Ready) and `0` (anything else), so existing dashboards continue to work.
 
@@ -97,7 +97,23 @@ The `smg_worker_health` gauge collapses these to `1` (Ready) and `0` (anything e
 
 **NotReady → Failed**: When consecutive failures reach `3 × --health-failure-threshold` (the liveness threshold — analogous to a Kubernetes liveness probe, tolerating longer outages than the readiness threshold).
 
-**Failed is terminal**: Successful probes do not recover a `Failed` worker. A failed worker is removed via `--remove-unhealthy-workers` or requires manual re-registration.
+**Failed → Pending (bounded recovery)**: A `Failed` worker stays
+registered and receives up to `--health-recovery-attempts` more probes
+(default `3`). A successful probe inside this budget returns the worker
+to `Pending`, so a restarted engine re-enters service through the normal
+`Pending → Ready` verification. Bootstrap reconcile keeps `Failed`
+workers scheduled so a worker that failed before a router restart still
+receives its recovery probes.
+
+**Terminal failure**: When the recovery budget is exhausted, the failure
+is terminal exactly once: the router logs a structured terminal-failure
+error with the worker URL, model, and failure evidence, and records the
+`smg_worker_terminal_failure_total` counter and the
+`smg_worker_terminal_failure_last_seen_seconds` gauge (per worker and
+model, cleared to `0` when the worker re-registers). With
+`--remove-unhealthy-workers` the removal job is then submitted. Set
+`--health-recovery-attempts 0` to restore the previous immediate
+terminal behavior.
 
 ---
 
@@ -123,7 +139,8 @@ smg \
 | `--health-check-timeout-secs` | `5` | Timeout for each health check request |
 | `--health-check-endpoint` | `/health` | Endpoint path for health checks |
 | `--disable-health-check` | `false` | Disable background health checks |
-| `--remove-unhealthy-workers` | `false` | Submit a removal job when a worker reaches the terminal `Failed` state |
+| `--remove-unhealthy-workers` | `false` | Submit a removal job when a worker's failure becomes terminal after the recovery budget is exhausted |
+| `--health-recovery-attempts` | `3` | Probes a `Failed` worker is given to recover before its failure is declared terminal (`0` = immediate terminal, the previous behavior) |
 
 ---
 

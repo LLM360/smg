@@ -50,6 +50,92 @@ pub enum RetryError {
     MaxRetriesExceeded,
 }
 
+/// Classification of one retry attempt's outcome.
+///
+/// The class tells the retry loop whether a failure reached the engine at
+/// all. Only a pre-engine transport failure is safe to retry for every
+/// request; a post-engine failure may have executed work, so it is safe to
+/// retry only for idempotent requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOutcomeClass {
+    /// The request never reached the engine (connection refused, request
+    /// build failure, generation stream not acquired). No engine work ran,
+    /// so a retry is safe for any request.
+    PreEngineTransport,
+    /// The engine (or an upstream after the engine) answered with an HTTP
+    /// status. Engine work may have run.
+    PostEngineStatus,
+    /// The request succeeded.
+    Success,
+}
+
+/// The outcome of one retry attempt, reported by the operation closure.
+#[derive(Debug, Clone)]
+pub struct AttemptOutcome {
+    /// The worker this attempt was dispatched to, when one was selected.
+    /// Used by callers to exclude failed workers from later attempts.
+    pub worker_url: Option<String>,
+    pub class: AttemptOutcomeClass,
+    /// Whether the request is idempotent (re-execution is side-effect free).
+    pub idempotent: bool,
+}
+
+impl AttemptOutcome {
+    /// Classify a completed attempt from its HTTP status.
+    ///
+    /// Callers that can distinguish pre-engine transport failures from
+    /// post-engine statuses override the class after this constructor.
+    pub fn from_status(status: StatusCode, worker_url: Option<String>, idempotent: bool) -> Self {
+        let class = if status.is_success() {
+            AttemptOutcomeClass::Success
+        } else {
+            AttemptOutcomeClass::PostEngineStatus
+        };
+        Self {
+            worker_url,
+            class,
+            idempotent,
+        }
+    }
+
+    /// Retry eligibility for this outcome.
+    ///
+    /// - Pre-engine transport failure: retry-eligible for any request; no
+    ///   engine work ran.
+    /// - Post-engine failure: retry-eligible only for an idempotent request
+    ///   with a retryable status.
+    /// - Success: never retried.
+    pub fn is_retry_eligible(&self, status: StatusCode) -> bool {
+        match self.class {
+            AttemptOutcomeClass::PreEngineTransport => true,
+            AttemptOutcomeClass::PostEngineStatus => self.idempotent && is_retryable_status(status),
+            AttemptOutcomeClass::Success => false,
+        }
+    }
+}
+
+/// Optional marker attached as an axum response extension when an attempt
+/// failed before the request reached the engine.
+///
+/// Dispatch paths that can observe the failure before engine execution
+/// (HTTP connect/builder errors, gRPC generation-stream acquisition)
+/// attach this marker so the retry loop can classify the attempt as
+/// [`AttemptOutcomeClass::PreEngineTransport`] and exclude the worker from
+/// later attempts.
+#[derive(Debug, Clone)]
+pub struct PreEngineTransportFailure {
+    pub worker_url: String,
+}
+
+/// Optional marker attached as an axum response extension when no worker
+/// could be selected for an attempt (all candidates unavailable or excluded).
+///
+/// Classified as [`AttemptOutcomeClass::PreEngineTransport`] with no worker
+/// URL: nothing was dispatched, so a retry is safe and preserves the legacy
+/// retry behavior for transient no-available-worker responses.
+#[derive(Debug, Clone, Copy)]
+pub struct NoWorkerAvailable;
+
 /// A thin async retry executor for generic operations.
 #[derive(Debug, Clone, Default)]
 pub struct RetryExecutor;
@@ -139,6 +225,76 @@ impl RetryExecutor {
                 on_exhausted();
                 return response;
             }
+
+            let next_attempt = attempt + 1;
+            let delay = BackoffCalculator::calculate_delay(config, attempt);
+            debug!(
+                attempt = attempt,
+                next_attempt = next_attempt,
+                delay_ms = delay.as_millis() as u64,
+                "Retry backoff"
+            );
+            on_backoff(delay, next_attempt);
+            tokio::time::sleep(delay).await;
+
+            attempt = next_attempt;
+        }
+    }
+
+    /// Execute an operation with retries and attempt-outcome eligibility.
+    ///
+    /// Same loop, bounds, and backoff as [`Self::execute_response_with_retry`],
+    /// but each attempt also reports an [`AttemptOutcome`]:
+    /// - `operation(attempt)`: perform one attempt and return the `Response`
+    ///   with the attempt's outcome. Per-attempt bookkeeping stays inside
+    ///   this closure.
+    /// - `should_retry(&response, &outcome, attempt)`: decide whether this
+    ///   attempt is retried (see [`AttemptOutcome::is_retry_eligible`] for
+    ///   the shared eligibility rule).
+    /// - `on_retry_attempt(&outcome)`: called when a retry proceeds. Use
+    ///   this to exclude the failed worker from later attempts.
+    /// - `on_backoff(delay, next_attempt)` and `on_exhausted()` behave as in
+    ///   [`Self::execute_response_with_retry`].
+    pub async fn execute_attempt_outcome_with_retry<
+        Op,
+        Fut,
+        ShouldRetry,
+        OnRetryAttempt,
+        OnBackoff,
+        OnExhausted,
+    >(
+        config: &RetryConfig,
+        mut operation: Op,
+        should_retry: ShouldRetry,
+        mut on_retry_attempt: OnRetryAttempt,
+        on_backoff: OnBackoff,
+        mut on_exhausted: OnExhausted,
+    ) -> Response
+    where
+        Op: FnMut(u32) -> Fut,
+        Fut: std::future::Future<Output = (Response, AttemptOutcome)>,
+        ShouldRetry: Fn(&Response, &AttemptOutcome, u32) -> bool,
+        OnRetryAttempt: FnMut(&AttemptOutcome),
+        OnBackoff: Fn(Duration, u32),
+        OnExhausted: FnMut(),
+    {
+        let max = config.max_retries.max(1);
+
+        let mut attempt: u32 = 0;
+        loop {
+            let (response, outcome) = operation(attempt).await;
+            let is_last = attempt + 1 >= max;
+
+            if !should_retry(&response, &outcome, attempt) {
+                return response;
+            }
+
+            if is_last {
+                on_exhausted();
+                return response;
+            }
+
+            on_retry_attempt(&outcome);
 
             let next_attempt = attempt + 1;
             let delay = BackoffCalculator::calculate_delay(config, attempt);
@@ -391,6 +547,196 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries);
         assert_eq!(backoffs.load(Ordering::Relaxed), cfg.max_retries - 1);
+        assert_eq!(exhausted.load(Ordering::Relaxed), 1);
+    }
+
+    fn outcome(
+        class: AttemptOutcomeClass,
+        worker_url: Option<&str>,
+        idempotent: bool,
+    ) -> AttemptOutcome {
+        AttemptOutcome {
+            worker_url: worker_url.map(ToOwned::to_owned),
+            class,
+            idempotent,
+        }
+    }
+
+    #[test]
+    fn test_attempt_outcome_is_retry_eligible() {
+        // A pre-engine transport failure is eligible for any request, even a
+        // non-idempotent one with a non-retryable status mapping.
+        assert!(
+            outcome(AttemptOutcomeClass::PreEngineTransport, Some("w1"), false)
+                .is_retry_eligible(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(
+            outcome(AttemptOutcomeClass::PreEngineTransport, Some("w1"), true)
+                .is_retry_eligible(StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        // A post-engine failure is eligible only for an idempotent request
+        // with a retryable status.
+        assert!(
+            outcome(AttemptOutcomeClass::PostEngineStatus, Some("w1"), true)
+                .is_retry_eligible(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(
+            !outcome(AttemptOutcomeClass::PostEngineStatus, Some("w1"), true)
+                .is_retry_eligible(StatusCode::BAD_REQUEST)
+        );
+        assert!(
+            !outcome(AttemptOutcomeClass::PostEngineStatus, Some("w1"), false)
+                .is_retry_eligible(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+
+        // Success is never retried.
+        assert!(!outcome(AttemptOutcomeClass::Success, Some("w1"), true)
+            .is_retry_eligible(StatusCode::OK));
+    }
+
+    #[test]
+    fn test_attempt_outcome_from_status_defaults_to_post_engine() {
+        let failed = AttemptOutcome::from_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("w1".to_string()),
+            false,
+        );
+        assert_eq!(failed.class, AttemptOutcomeClass::PostEngineStatus);
+        assert!(!failed.is_retry_eligible(StatusCode::INTERNAL_SERVER_ERROR));
+
+        let ok = AttemptOutcome::from_status(StatusCode::OK, Some("w1".to_string()), true);
+        assert_eq!(ok.class, AttemptOutcomeClass::Success);
+    }
+
+    #[tokio::test]
+    async fn test_execute_attempt_outcome_pre_engine_retries_and_reports_each_attempt() {
+        let cfg = base_retry_config();
+        let calls = Arc::new(AtomicU32::new(0));
+        let retried_workers: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exhausted = Arc::new(AtomicU32::new(0));
+
+        let response = RetryExecutor::execute_attempt_outcome_with_retry(
+            &cfg,
+            {
+                let calls = calls.clone();
+                move |_attempt| {
+                    let n = calls.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        if n + 1 < cfg.max_retries.max(1) {
+                            (
+                                (StatusCode::INTERNAL_SERVER_ERROR, "fail").into_response(),
+                                outcome(
+                                    AttemptOutcomeClass::PreEngineTransport,
+                                    Some("w-dead"),
+                                    false,
+                                ),
+                            )
+                        } else {
+                            (
+                                (StatusCode::OK, "ok").into_response(),
+                                outcome(AttemptOutcomeClass::Success, Some("w-live"), false),
+                            )
+                        }
+                    }
+                }
+            },
+            |res, outcome, _attempt| outcome.is_retry_eligible(res.status()),
+            {
+                let retried_workers = retried_workers.clone();
+                move |outcome: &AttemptOutcome| {
+                    retried_workers
+                        .lock()
+                        .expect("poisoned")
+                        .push(outcome.worker_url.clone());
+                }
+            },
+            |_delay, _next_attempt| {},
+            {
+                let exhausted = exhausted.clone();
+                move || {
+                    exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries.max(1));
+        // Every failed pre-engine attempt is reported so the caller can
+        // exclude the dead worker on the next attempt.
+        assert_eq!(
+            *retried_workers.lock().expect("poisoned"),
+            vec![Some("w-dead".to_string()); (cfg.max_retries.max(1) - 1) as usize]
+        );
+        assert_eq!(exhausted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_execute_attempt_outcome_post_engine_non_idempotent_is_not_retried() {
+        let cfg = base_retry_config();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let response = RetryExecutor::execute_attempt_outcome_with_retry(
+            &cfg,
+            {
+                let calls = calls.clone();
+                move |_attempt| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        (
+                            (StatusCode::INTERNAL_SERVER_ERROR, "fail").into_response(),
+                            outcome(AttemptOutcomeClass::PostEngineStatus, Some("w1"), false),
+                        )
+                    }
+                }
+            },
+            |res, outcome, _attempt| outcome.is_retry_eligible(res.status()),
+            |_outcome| {},
+            |_delay, _next_attempt| {},
+            || {},
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_attempt_outcome_exhaustion_calls_existing_hook() {
+        let cfg = base_retry_config();
+        let calls = Arc::new(AtomicU32::new(0));
+        let exhausted = Arc::new(AtomicU32::new(0));
+
+        let response = RetryExecutor::execute_attempt_outcome_with_retry(
+            &cfg,
+            {
+                let calls = calls.clone();
+                move |_attempt| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        (
+                            (StatusCode::INTERNAL_SERVER_ERROR, "fail").into_response(),
+                            outcome(AttemptOutcomeClass::PreEngineTransport, Some("w1"), false),
+                        )
+                    }
+                }
+            },
+            |res, outcome, _attempt| outcome.is_retry_eligible(res.status()),
+            |_outcome| {},
+            |_delay, _next_attempt| {},
+            {
+                let exhausted = exhausted.clone();
+                move || {
+                    exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries.max(1));
         assert_eq!(exhausted.load(Ordering::Relaxed), 1);
     }
 }
