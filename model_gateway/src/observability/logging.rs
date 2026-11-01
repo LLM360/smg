@@ -12,7 +12,7 @@ use tracing_subscriber::{
     fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
-use super::otel_trace::get_otel_layer;
+use super::{dedup::DedupLayer, otel_trace::get_otel_layer};
 use crate::config::TraceConfig;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -140,7 +140,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         EnvFilter::new(filter_string)
     });
 
-    let mut layers = Vec::with_capacity(3);
+    let mut fmt_layers = Vec::with_capacity(2);
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_ansi(config.colorize)
@@ -154,7 +154,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         stdout_layer.boxed()
     };
 
-    layers.push(stdout_layer);
+    fmt_layers.push(stdout_layer);
 
     let mut file_guard = None;
 
@@ -191,9 +191,16 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
             file_layer.boxed()
         };
 
-        layers.push(file_layer);
+        fmt_layers.push(file_layer);
     }
 
+    let mut layers = Vec::with_capacity(2);
+
+    // The local fmt layers sit inside the dedup wrapper: repeated signatures
+    // emit first instance per one-minute window, then one count summary.
+    layers.push(DedupLayer::new(fmt_layers).boxed());
+
+    // The OTEL layer stays outside the dedup wrapper.
     if let Some(otel_layer_config) = &otel_layer_config {
         if otel_layer_config.enable_trace {
             match get_otel_layer() {
