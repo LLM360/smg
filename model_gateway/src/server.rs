@@ -2220,10 +2220,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
 
-    metrics::Metrics::initialize_http_admission(
-        config.router_config.max_concurrent_requests,
-        config.router_config.queue_size,
-    );
     // The mesh listener's port against the others: the mesh configuration is
     // not part of `RouterConfig`, so the validator cannot see it, and this is
     // the one place the CLI, the Python binding and a library caller all pass.
@@ -2367,6 +2363,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
         metrics::init_startup_series();
+        // The admission series (process start, zero counters, limit and
+        // queue capacity) are written after the recorder is installed: a
+        // gauge set before it lands in the no-op recorder and is lost. The
+        // priority scheduler's sampler replaces the limit with the sum of
+        // its partitions on its first tick.
+        metrics::Metrics::initialize_http_admission(
+            config.router_config.max_concurrent_requests,
+            config.router_config.queue_size,
+        );
         // Under Symphony the series of a request no table reads exist at zero
         // from the start; a table's own follow its model's first registration.
         if config.router_config.parser == ParserChoice::Symphony {
