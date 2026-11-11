@@ -1214,6 +1214,12 @@ impl CliArgs {
             .priority_scheduler_tenant_metric_top_n(
                 self.serving.priority_scheduler_tenant_metric_top_n,
             )
+            .capacity_credit_generation(self.serving.capacity_credit_generation.clone())
+            .capacity_credit_ttl_ms(self.serving.capacity_credit_ttl_ms)
+            .capacity_credit_terminal_retention_secs(
+                self.serving.capacity_credit_terminal_retention_secs,
+            )
+            .capacity_credit_required(self.serving.capacity_credit_required)
             .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
             .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
@@ -1276,6 +1282,7 @@ impl CliArgs {
                     .then(|| Self::parse_selector(&self.serving.storage_context_headers)),
             )
             .trust_tenant_header(self.serving.trust_tenant_header)
+            .prefer_trusted_tenant_header(self.serving.prefer_trusted_tenant_header)
             .tenant_header_name(&self.serving.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.serving.rate_limit_tokens_per_second)
             .max_background_responses(self.serving.max_background_responses)

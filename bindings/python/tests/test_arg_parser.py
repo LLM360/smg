@@ -629,6 +629,74 @@ class TestBackendChoices:
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
 
+    def test_parse_priority_scheduler_capacity_credit_options(self):
+        args = parse_router_args(
+            [
+                "--priority-scheduler-enabled",
+                "--capacity-credit-generation",
+                "green-1",
+                "--capacity-credit-ttl-ms",
+                "45000",
+                "--capacity-credit-terminal-retention-secs",
+                "900",
+                "--capacity-credit-required",
+            ]
+        )
+
+        assert args.priority_scheduler_enabled is True
+        assert args.capacity_credit_generation == "green-1"
+        assert args.capacity_credit_ttl_ms == 45_000
+        assert args.capacity_credit_terminal_retention_secs == 900
+        assert args.capacity_credit_required is True
+
+    def test_capacity_credit_defaults_are_off(self):
+        args = parse_router_args([])
+
+        assert args.capacity_credit_generation is None
+        assert args.capacity_credit_ttl_ms == 30_000
+        assert args.capacity_credit_terminal_retention_secs == 600
+        assert args.capacity_credit_required is False
+        assert args.prefer_trusted_tenant_header is False
+
+    def test_parse_preferred_trusted_tenant_header_options(self):
+        args = parse_router_args(
+            [
+                "--trust-tenant-header",
+                "--prefer-trusted-tenant-header",
+                "--tenant-header-name",
+                "x-comet-user",
+            ]
+        )
+
+        assert args.trust_tenant_header is True
+        assert args.prefer_trusted_tenant_header is True
+        assert args.tenant_header_name == "x-comet-user"
+
+    def test_parse_per_model_policy_args(self):
+        args = parse_router_args(
+            [
+                "--policy",
+                "cache_aware",
+                "--model-policy",
+                "kimi-k3=least_load",
+                "--model-policy",
+                "glm=round_robin",
+            ]
+        )
+
+        assert args.model_policies == {"kimi-k3": "least_load", "glm": "round_robin"}
+
+    @pytest.mark.parametrize("value", ["kimi-k3", "=least_load", "kimi-k3=nope"])
+    def test_invalid_model_policy_is_rejected(self, value):
+        with pytest.raises(ValueError):
+            parse_router_args(["--model-policy", value])
+
+    def test_duplicate_model_policy_is_rejected(self):
+        with pytest.raises(ValueError):
+            parse_router_args(
+                ["--model-policy", "kimi-k3=least_load", "--model-policy", "kimi-k3=random"]
+            )
+
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""
         args = [

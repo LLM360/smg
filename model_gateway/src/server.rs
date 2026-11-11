@@ -1527,7 +1527,48 @@ pub fn build_apps(
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
         .merge(public_routes);
-    let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
+    // Capacity-credit capabilities/issue/arm/cancel is a separate internal
+    // service-key API. It accepts only the shared gateway key, never ordinary
+    // tenant keys. Tenant resolution still runs so the trusted proxy-injected
+    // user is the exact same canonical TenantKey used by inference settlement.
+    let capacity_credit_routes = match &admission_mode {
+        middleware::scheduler::AdmissionMode::Priority(scheduler_state)
+            if scheduler_state.capacity_credits().is_some() =>
+        {
+            Router::new()
+                .route(
+                    "/internal/capacity-credits/capabilities",
+                    get(middleware::scheduler::capacity_credit_capabilities),
+                )
+                .route(
+                    "/internal/capacity-credits",
+                    post(middleware::scheduler::issue_capacity_credit),
+                )
+                .route(
+                    "/internal/capacity-credits/{credit}",
+                    delete(middleware::scheduler::cancel_capacity_credit),
+                )
+                .route(
+                    "/internal/capacity-credits/{credit}/arm",
+                    post(middleware::scheduler::arm_capacity_credit),
+                )
+                .layer(Extension(scheduler_state.clone()))
+                .route_layer(
+                    tower::ServiceBuilder::new()
+                        .layer(axum::middleware::from_fn_with_state(
+                            admin_auth_config.clone(),
+                            middleware::auth_middleware,
+                        ))
+                        .layer(tenant_resolution_state.clone().layer()),
+                )
+        }
+        _ => Router::new(),
+    };
+
+    let mut control_plane = Router::new()
+        .merge(admin_routes)
+        .merge(worker_routes)
+        .merge(capacity_credit_routes);
     if let Some(gated_routes) = gated_routes {
         control_plane = control_plane.merge(gated_routes);
     }
