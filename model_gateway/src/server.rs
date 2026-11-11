@@ -1164,6 +1164,14 @@ pub struct GatewayApps {
     pub admin: Option<Router>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BuildAppError {
+    #[error("invalid tenant header configuration: {0}")]
+    InvalidHeader(#[from] InvalidHeaderName),
+    #[error("priority scheduler configuration failed: {0}")]
+    Scheduler(String),
+}
+
 /// One router with every route: the layout without an admin listener. See
 /// [`build_apps`] for the arguments.
 pub fn build_app(
@@ -1174,7 +1182,7 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
-) -> Result<Router, InvalidHeaderName> {
+) -> Result<Router, BuildAppError> {
     build_apps(
         app_state,
         serving_auth_config,
@@ -1208,7 +1216,7 @@ pub fn build_apps(
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
     admin_listener: bool,
-) -> Result<GatewayApps, InvalidHeaderName> {
+) -> Result<GatewayApps, BuildAppError> {
     // The admin-only reads join the state once, for every attachment of
     // the control-plane layer below: the shared groups and the gated group.
     let control_plane_auth_state =
@@ -1239,11 +1247,12 @@ pub fn build_apps(
 
     // Choose the admission path once at startup: priority scheduler when
     // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
-    let admission_mode = middleware::scheduler::AdmissionMode::from_config(
+    let admission_mode = middleware::scheduler::AdmissionMode::try_from_config_checked(
         &app_state.context.router_config,
         app_state.context.worker_registry.clone(),
         app_state.context.rate_limiter.clone(),
-    );
+    )
+    .map_err(BuildAppError::Scheduler)?;
 
     // The admission members of the protected stacks, from the mode chosen
     // above: the priority scheduler's middleware (carrying its own
@@ -1407,7 +1416,7 @@ pub fn build_apps(
         .route_layer(
             tower::ServiceBuilder::new()
                 .layer(InertLayer(serving_auth_layer.clone()))
-                .layer(tenant_resolution_state.layer())
+                .layer(tenant_resolution_state.clone().layer())
                 .layer(InertLayer(priority_admission))
                 .layer(InertLayer(legacy_limit)),
         );

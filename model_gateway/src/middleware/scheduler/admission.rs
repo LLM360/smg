@@ -16,20 +16,35 @@ use std::sync::{
 use axum::{
     body::Body,
     extract::State,
-    http::Request,
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use smg_auth::RequestId;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use super::{
-    metrics as sched_metrics, state::SchedulerState, AdmitOutcome, Class, RejectionReason,
-    SchedulerError, SchedulerPermit, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
+    capacity_credit::CapacityCreditError,
+    capacity_credit_api::{
+        capacity_credit_error_response, capacity_credit_required_response,
+        presented_capacity_credit,
+    },
+    fair_share::FairShareProfile,
+    body::SchedulerBodyPermit,
+    metrics as sched_metrics,
+    state::SchedulerState,
+    AdmitOutcome, Class, GlobalFairShare, RejectionReason, SchedulerError,
+    SchedulerPermit, HEADER_X_SMG_PREEMPTED, OUTPUT_TOKEN_ESTIMATE_HEADER,
+    PRIORITY_HEADER,
 };
 use crate::{
-    middleware::{edge_body::BodyDuties, tenant_resolution::restamp_accepted_at, RouteRequestMeta},
+    middleware::{
+        admission_metrics::{AdmissionActiveGuard, AdmissionPendingGuard},
+        edge_body::BodyDuties,
+        tenant_resolution::restamp_accepted_at,
+        RouteRequestMeta,
+    },
     observability::metrics::{metrics_labels, Metrics},
     tenant::TenantKey,
 };
@@ -92,16 +107,173 @@ fn rejection_outcome(reason: RejectionReason) -> &'static str {
     }
 }
 
-pub async fn priority_admission_middleware(
-    State(state): State<Arc<SchedulerState>>,
+fn output_token_estimate(headers: &HeaderMap, ledger: &GlobalFairShare) -> u32 {
+    let configured_default = ledger.default_output_tokens();
+    let header = headers.get(OUTPUT_TOKEN_ESTIMATE_HEADER);
+    if !ledger.trusts_output_token_estimate_header() {
+        if header.is_some() {
+            sched_metrics::record_fair_share_fallback("untrusted_estimate");
+        }
+        return configured_default;
+    }
+    match header {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                sched_metrics::record_fair_share_fallback("invalid_estimate");
+                configured_default
+            }),
+        None => {
+            sched_metrics::record_fair_share_fallback("missing_estimate");
+            configured_default
+        }
+    }
+}
+
+async fn run_admitted_request(
     mut req: Request<Body>,
     next: Next,
+    mut permit: SchedulerPermit,
+    class: Class,
+    requested_class: Class,
+    tenant: &TenantKey,
+    partition: &super::state::SchedulerPartition,
 ) -> Response {
+    Metrics::record_http_admission_admitted();
+    let active_guard = AdmissionActiveGuard::new();
+    req.extensions_mut().insert(permit.cancel_token());
+    if let Some(proof) = permit.fair_share_admission_proof() {
+        let Some(meta) = req.extensions().get::<RouteRequestMeta>().cloned() else {
+            permit.cancel_fair_share_reservation();
+            Metrics::record_http_admission_rejected();
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return response;
+        };
+        req.extensions_mut().insert(meta.with_extension(proof));
+    }
+    // The class's queue wait was the scheduler's, bounded by its own timeout;
+    // the bound ahead of worker selection counts from here.
+    restamp_accepted_at(req.extensions_mut());
+    let mut response = next.run(req).await;
+    let outcome = if response.headers().contains_key(HEADER_X_SMG_PREEMPTED) {
+        sched_metrics::outcome::PREEMPTED
+    } else {
+        sched_metrics::outcome::ADMITTED
+    };
+    sched_metrics::record_admit(class, outcome);
+    sched_metrics::record_partition_admit(&partition.name, class, outcome);
+    trace!(
+        scheduler.class = class.as_str(),
+        scheduler.requested_class = requested_class.as_str(),
+        scheduler.tenant = %tenant,
+        scheduler.partition = %partition.name,
+        scheduler.admit_outcome = outcome,
+        "scheduler admission decision"
+    );
+    carry_permit(&mut response, permit, active_guard);
+    response
+}
+
+pub async fn priority_admission_middleware(
+    State(state): State<Arc<SchedulerState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    Metrics::record_http_admission_received();
+    let mut pending_guard = AdmissionPendingGuard::new();
     let tenant = req
         .extensions()
         .get::<RouteRequestMeta>()
         .map(|m| m.tenant_key().clone())
         .unwrap_or_else(|| TenantKey::new("anonymous"));
+    let route_request_id = req
+        .extensions()
+        .get::<RouteRequestMeta>()
+        .map(RouteRequestMeta::request_charge_id);
+
+    // A credit already owns a scheduler slot. Redeem it before the sibling
+    // RPS check so any local rejection can drop the held permit immediately
+    // instead of stranding capacity until the credit TTL expires.
+    let held_credit = match presented_capacity_credit(req.headers(), &tenant, &state) {
+        Ok(Some(presented)) => {
+            let Some(route_request_id) = route_request_id else {
+                Metrics::record_http_admission_rejected();
+                pending_guard.resolve();
+                return capacity_credit_error_response(CapacityCreditError::InternalState, None);
+            };
+            let Some(registry) = state.capacity_credits() else {
+                Metrics::record_http_admission_rejected();
+                pending_guard.resolve();
+                return capacity_credit_error_response(CapacityCreditError::Unknown, None);
+            };
+            match registry.redeem(&presented.token, &presented.binding) {
+                Ok(mut redeemed) => {
+                    if !redeemed
+                        .payload
+                        .bind_redeemed_capacity_credit(&redeemed.binding, route_request_id)
+                    {
+                        Metrics::record_http_admission_rejected();
+                        pending_guard.resolve();
+                        return capacity_credit_error_response(
+                            CapacityCreditError::InternalState,
+                            None,
+                        );
+                    }
+                    Some((redeemed.payload, presented.partition))
+                }
+                Err(error) => {
+                    Metrics::record_http_admission_rejected();
+                    pending_guard.resolve();
+                    return capacity_credit_error_response(error, None);
+                }
+            }
+        }
+        Ok(None) if state.capacity_credit_required() => {
+            Metrics::record_http_admission_rejected();
+            pending_guard.resolve();
+            return capacity_credit_required_response();
+        }
+        Ok(None) => None,
+        Err(error) => {
+            Metrics::record_http_admission_rejected();
+            pending_guard.resolve();
+            return capacity_credit_error_response(error, None);
+        }
+    };
+
+    // RPS sibling check (only set when an explicit per-second limit is
+    // configured). Checked before admission so a rejected request never
+    // acquires a new slot. A redeemed credit already owns its slot and is
+    // dropped here on rejection. Tokens are not returned; refill is time-based.
+    // Tracked by smg_http_rate_limit_total, so not double-counted here.
+    if let Some(bucket) = &state.rate_limiter {
+        if bucket.try_take(1.0).is_err() {
+            drop(held_credit);
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_http_admission_rejected();
+            pending_guard.resolve();
+            return crate::rate_limit::rejection_response(bucket.retry_after_secs(1.0));
+        }
+    }
+
+    if let Some((held_permit, partition)) = held_credit {
+        pending_guard.resolve();
+        return run_admitted_request(
+            req,
+            next,
+            held_permit.into_permit(),
+            Class::Default,
+            Class::Default,
+            &tenant,
+            &partition,
+        )
+        .await;
+    }
+
     let resolved = resolve_priority(&req, &state, &tenant);
     let class = resolved.effective;
 
@@ -116,18 +288,7 @@ pub async fn priority_admission_middleware(
         );
     }
 
-    // Per-second check (only set when an explicit rate is configured),
-    // run before admission so a rejected request never consumes a slot.
-    // `try_take` spends rate budget without a concurrency slot: the
-    // scheduler owns concurrency. Tracked by smg_http_rate_limit_total, so
-    // not double-counted here.
-    if let Some(bucket) = &state.rate_limiter {
-        if bucket.try_take(1.0).is_err() {
-            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            return SchedulerError::QueueFull.into_response();
-        }
-    }
-
+    let partition = state.partition_for(req.headers());
     let request_id = next_registry_id();
 
     // NOTE: client-disconnect detection during the queue wait is not yet
@@ -139,49 +300,55 @@ pub async fn priority_admission_middleware(
     // it, releasing the slot.
     let cancel = CancellationToken::new();
 
-    match state.scheduler.admit(class, request_id, cancel).await {
+    let (estimated_output_tokens, fair_share_profile) = match partition.scheduler.fair_share() {
+        Some(ledger) => (
+            output_token_estimate(req.headers(), ledger),
+            state.fair_share_profile_for(req.headers(), ledger),
+        ),
+        None => (1, FairShareProfile::Global),
+    };
+
+    match partition
+        .scheduler
+        .admit_for_tenant_profile(
+            class,
+            request_id,
+            cancel,
+            tenant.clone(),
+            fair_share_profile,
+            estimated_output_tokens,
+        )
+        .await
+    {
         AdmitOutcome::Admitted(permit) => {
-            // Hand the handler the cancel token (for preemption select!).
-            req.extensions_mut().insert(permit.cancel_token());
-            // The class's queue wait was the scheduler's, bounded by its own
-            // timeout; the bound ahead of worker selection counts from here.
-            restamp_accepted_at(req.extensions_mut());
-            let mut response = next.run(req).await;
-            // Best-effort: the handler's PreemptionGuard tags a *pre-response*
-            // preemption (a 503 carrying this header), which we count as
-            // `preempted`. A preemption that fires after the handler produced
-            // its 200 headers but before the first body byte is truncated by
-            // the edge's body wrapper and shows here as `admitted` — the
-            // response headers are already flushed, so the marker cannot be added. The
-            // authoritative preemption count is `smg_scheduler_preemption_total`
-            // (recorded at the preemptor side), not this bucket.
-            let outcome = if response.headers().contains_key(HEADER_X_SMG_PREEMPTED) {
-                sched_metrics::outcome::PREEMPTED
-            } else {
-                sched_metrics::outcome::ADMITTED
-            };
-            sched_metrics::record_admit(class, outcome);
-            trace!(
-                scheduler.class = class.as_str(),
-                scheduler.requested_class = resolved.requested.as_str(),
-                scheduler.tenant = %tenant,
-                scheduler.admit_outcome = outcome,
-                "scheduler admission decision"
-            );
-            carry_permit(&mut response, permit);
-            response
+            pending_guard.resolve();
+            run_admitted_request(
+                req,
+                next,
+                permit,
+                class,
+                resolved.requested,
+                &tenant,
+                &partition,
+            )
+            .await
         }
         AdmitOutcome::Rejected(reason) => {
+            Metrics::record_http_admission_rejected();
+            pending_guard.resolve();
             let outcome = rejection_outcome(reason);
             sched_metrics::record_admit(class, outcome);
+            sched_metrics::record_partition_admit(&partition.name, class, outcome);
             trace!(
                 scheduler.class = class.as_str(),
                 scheduler.requested_class = resolved.requested.as_str(),
                 scheduler.tenant = %tenant,
+                scheduler.partition = %partition.name,
                 scheduler.admit_outcome = outcome,
                 "scheduler admission decision"
             );
-            SchedulerError::from(reason).into_response()
+            SchedulerError::from(reason)
+                .into_response_with_retry_after(partition.scheduler.retry_after_secs(class))
         }
     }
 }
@@ -203,14 +370,25 @@ pub async fn priority_admission_middleware(
 /// preempted by this scheduler, which no worker can fake. A relayed header
 /// on an admitted stream leaves the permit on the body, the slot held and
 /// TTFT marked, as before.
-fn carry_permit(response: &mut Response, permit: SchedulerPermit) {
+fn carry_permit(
+    response: &mut Response,
+    permit: SchedulerPermit,
+    mut active_guard: AdmissionActiveGuard,
+) {
+    let status_code = response.status();
     if response.headers().contains_key(HEADER_X_SMG_PREEMPTED) && !permit.handle().is_preemptible()
     {
+        // The response is whole with its head: it counts as its status.
+        active_guard.record_outcome(status_code.as_u16());
         drop(permit);
         return;
     }
     BodyDuties::hand(response, |duties| {
-        duties.permit = Some(Box::new(permit));
+        duties.permit = Some(Box::new(SchedulerBodyPermit::new(
+            permit,
+            active_guard,
+            status_code,
+        )));
     });
 }
 
@@ -347,7 +525,7 @@ mod permit_tests {
             .header(HEADER_X_SMG_PREEMPTED, "true")
             .body(Body::from("{\"error\":\"overloaded\"}"))
             .expect("response");
-        carry_permit(&mut response, p);
+        carry_permit(&mut response, p, AdmissionActiveGuard::new());
         assert_eq!(
             sched.inflight_for_test(Class::Default),
             0,
@@ -375,7 +553,7 @@ mod permit_tests {
             .header(HEADER_X_SMG_PREEMPTED, "true")
             .body(Body::from("data: x\n\n"))
             .expect("response");
-        carry_permit(&mut response, p);
+        carry_permit(&mut response, p, AdmissionActiveGuard::new());
         assert_eq!(
             sched.inflight_for_test(Class::Default),
             1,
@@ -387,5 +565,38 @@ mod permit_tests {
         assert!(!handle.is_preemptible(), "the first frame marked TTFT");
         drop(body);
         assert_eq!(sched.inflight_for_test(Class::Default), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::middleware::scheduler::FairShareConfig;
+
+    fn ledger(trust_header: bool) -> GlobalFairShare {
+        GlobalFairShare::from_config(&FairShareConfig {
+            default_weight: 1.0,
+            default_output_tokens: 256,
+            trust_output_token_estimate_header: trust_header,
+            trust_request_model_header: false,
+            tenant_weights: HashMap::new(),
+            model_profiles: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn untrusted_client_estimate_cannot_reduce_reservation() {
+        let mut headers = HeaderMap::new();
+        headers.insert(OUTPUT_TOKEN_ESTIMATE_HEADER, "1".parse().unwrap());
+        assert_eq!(output_token_estimate(&headers, &ledger(false)), 256);
+    }
+
+    #[test]
+    fn trusted_proxy_estimate_is_honored() {
+        let mut headers = HeaderMap::new();
+        headers.insert(OUTPUT_TOKEN_ESTIMATE_HEADER, "128".parse().unwrap());
+        assert_eq!(output_token_estimate(&headers, &ledger(true)), 128);
     }
 }
