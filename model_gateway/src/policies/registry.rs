@@ -120,6 +120,9 @@ pub struct PolicyRegistry {
     /// Model ID -> Policy instance mapping (lock-free reads via DashMap)
     model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>>>,
 
+    /// Explicit model policy configurations supplied at router startup.
+    model_policy_configs: Arc<HashMap<String, PolicyConfig>>,
+
     /// The text questions' answers over the default and the per-model
     /// policies ([`TextNeeds`]), recomputed where one is added or removed
     /// ([`Self::refresh_text_needs`]).
@@ -221,6 +224,15 @@ impl PolicyRegistry {
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
     ) -> Self {
+        Self::with_model_policies(default_policy_config, routing_key_override, HashMap::new())
+    }
+
+    /// Create a registry with explicit per-model policy overrides.
+    pub fn with_model_policies(
+        default_policy_config: PolicyConfig,
+        routing_key_override: RoutingKeyOverrideConfig,
+        model_policy_configs: HashMap<String, PolicyConfig>,
+    ) -> Self {
         let default_policy = Self::create_policy_from_config(&default_policy_config);
         let routing_key_sticky = routing_key_override.enabled.then(|| {
             Arc::new(ManualPolicy::with_config(ManualConfig {
@@ -245,6 +257,7 @@ impl PolicyRegistry {
         let text_needs = TextNeeds::of(default_policy.as_ref());
         Self {
             model_policies: Arc::new(DashMap::new()),
+            model_policy_configs: Arc::new(model_policy_configs),
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
             model_worker_counts: Arc::new(DashMap::new()),
@@ -811,13 +824,23 @@ impl PolicyRegistry {
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
-        // 1. Check policy hint from worker
+        // 1. Explicit router configuration wins over worker-supplied labels.
+        if let Some(config) = self.model_policy_configs.get(model_id) {
+            debug!(
+                "Using configured policy '{}' for model {}",
+                config.name(),
+                model_id
+            );
+            return Self::create_policy_from_config(config);
+        }
+
+        // 2. Check policy hint from worker
         if let Some(policy_type) = policy_hint {
             debug!("Using policy hint '{}' for model {}", policy_type, model_id);
             return self.create_policy_from_type(policy_type);
         }
 
-        // 2. Use default policy
+        // 3. Use default policy
         debug!("Using default policy for model {}", model_id);
         Arc::clone(&self.default_policy)
     }
@@ -2932,5 +2955,20 @@ mod tests {
             picks, RECORDED,
             "the replay picked {picks:?}; the recorded sequence is the decision"
         );
+    }
+
+    #[test]
+    fn test_explicit_model_policy_overrides_default_and_worker_hint() {
+        let registry = PolicyRegistry::with_model_policies(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+            HashMap::from([("kimi-k3".to_string(), PolicyConfig::Random)]),
+        );
+
+        let k3 = registry.on_worker_added("kimi-k3", Some("round_robin"));
+        let other = registry.on_worker_added("other-model", None);
+
+        assert_eq!(k3.name(), "random");
+        assert_eq!(other.name(), "round_robin");
     }
 }

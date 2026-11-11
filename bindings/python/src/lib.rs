@@ -623,6 +623,7 @@ struct Router {
     model_aliases: HashMap<String, String>,
     model_id_from: Option<String>,
     model_path: Option<String>,
+    model_policies: HashMap<String, PolicyType>,
     multimodal_max_inflight_bytes: Option<usize>,
     multimodal_shm_min_bytes: Option<usize>,
     multimodal_tensor_transport: Option<String>,
@@ -1300,10 +1301,16 @@ impl Router {
             };
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+        let model_policies = self
+            .model_policies
+            .iter()
+            .map(|(model_id, policy)| Ok((model_id.clone(), convert_policy(policy)?)))
+            .collect::<config::ConfigResult<HashMap<_, _>>>()?;
 
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .model_policies(model_policies)
             .cache_boundaries(self.cache_boundaries.clone())
             .host(&self.host)
             .port(self.port)
@@ -1622,6 +1629,7 @@ impl Router {
         model_aliases = HashMap::new(),
         model_id_from = None,
         model_path = None,
+        model_policies = HashMap::new(),
         multimodal_max_inflight_bytes = None,
         multimodal_shm_min_bytes = None,
         multimodal_tensor_transport = None,
@@ -1853,6 +1861,7 @@ impl Router {
         model_aliases: HashMap<String, String>,
         model_id_from: Option<String>,
         model_path: Option<String>,
+        model_policies: HashMap<String, PolicyType>,
         multimodal_max_inflight_bytes: Option<usize>,
         multimodal_shm_min_bytes: Option<usize>,
         multimodal_tensor_transport: Option<String>,
@@ -2136,6 +2145,7 @@ impl Router {
             model_aliases,
             model_id_from,
             model_path,
+            model_policies,
             multimodal_max_inflight_bytes,
             multimodal_shm_min_bytes,
             multimodal_tensor_transport,

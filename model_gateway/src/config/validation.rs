@@ -402,6 +402,16 @@ impl ConfigValidator {
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
+        for (model_id, policy) in &config.model_policies {
+            if model_id.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policies".to_string(),
+                    value: model_id.clone(),
+                    reason: "Model ID must not be empty".to_string(),
+                });
+            }
+            Self::validate_policy(policy)?;
+        }
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
         Self::validate_value_shapes(config)?;

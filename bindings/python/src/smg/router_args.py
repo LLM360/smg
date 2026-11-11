@@ -959,6 +959,13 @@ class RouterArgs:
 
         # Routing policy configuration
         routing_group.add_argument(
+            f"--{prefix}model-policy",
+            action="append",
+            default=[],
+            metavar="MODEL=POLICY",
+            help="Per-model routing policy override. Repeat for multiple models.",
+        )
+        routing_group.add_argument(
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
@@ -2262,18 +2269,18 @@ class RouterArgs:
             ),
         )
         request_group.add_argument(
-            f"--{prefix}tenant-header-name",
-            type=str,
-            default=RouterArgs.tenant_header_name,
-            help="Header name to use when --trust-tenant-header is enabled.",
-        )
-        request_group.add_argument(
             f"--{prefix}prefer-trusted-tenant-header",
             action="store_true",
             help=(
                 "Prefer the trusted tenant header over authenticated proxy identity; "
                 "requires --trust-tenant-header"
             ),
+        )
+        request_group.add_argument(
+            f"--{prefix}tenant-header-name",
+            type=str,
+            default=RouterArgs.tenant_header_name,
+            help="Header name to use when --trust-tenant-header is enabled.",
         )
         request_group.add_argument(
             f"--{prefix}cors-allowed-origins",
@@ -3332,6 +3339,9 @@ class RouterArgs:
         args_dict["storage_context_headers"] = cls._parse_storage_context_headers(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
+        args_dict["model_policies"] = cls._parse_model_policies(
+            cli_args_dict.get(f"{prefix}model_policy", None)
+        )
         args_dict["model_aliases"] = cls._parse_model_aliases(
             cli_args_dict.get(f"{prefix}model_alias", [])
         )
@@ -3509,6 +3519,28 @@ class RouterArgs:
                 header, context_key = token.split("=", 1)
                 headers[header] = context_key
         return headers
+
+    @staticmethod
+    def _parse_model_policies(values: list[str] | None) -> dict[str, str]:
+        policies: dict[str, str] = {}
+        allowed = {*COMMON_POLICY_CHOICES, "bucket"}
+        for value in values or []:
+            if "=" not in value:
+                raise ValueError(f"invalid model policy '{value}'; expected MODEL=POLICY")
+            model_id, policy = value.split("=", 1)
+            model_id = model_id.strip()
+            policy = policy.strip()
+            if not model_id:
+                raise ValueError("model policy must have a non-empty model ID")
+            if policy not in allowed:
+                raise ValueError(
+                    f"invalid policy '{policy}' for model '{model_id}'; "
+                    f"expected one of {sorted(allowed)}"
+                )
+            if model_id in policies:
+                raise ValueError(f"duplicate model policy for '{model_id}'")
+            policies[model_id] = policy
+        return policies
 
     @staticmethod
     def _parse_model_aliases(alias_list):

@@ -326,6 +326,10 @@ struct RoutingArgs {
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
+    /// Per-model routing policy override in MODEL=POLICY form. Repeatable.
+    #[arg(long = "model-policy", action = ArgAction::Append, help_heading = "Routing Policy")]
+    model_policy: Vec<String>,
+
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
     /// pins a request to a worker already holding that prefix; below it the
     /// request is load-balanced instead
