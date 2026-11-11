@@ -37,8 +37,12 @@ use std::{io::Write, sync::Arc, time::Duration};
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, RETRY_AFTER},
+        StatusCode,
+    },
 };
+use metrics_exporter_prometheus::PrometheusBuilder;
 use portpicker::pick_unused_port;
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -103,6 +107,13 @@ impl SchedulerYaml {
             interactive: ClassYaml::base(),
             system: ClassYaml::base(),
         }
+    }
+
+    fn clear_queue_budget(&mut self) {
+        self.bulk.queue_size = 0;
+        self.default.queue_size = 0;
+        self.interactive.queue_size = 0;
+        self.system.queue_size = 0;
     }
 }
 
@@ -284,10 +295,148 @@ async fn join(
         .expect("spawned request task panicked")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - malformed scrape values must fail loudly"
+)]
+fn find_metric_value(rendered: &str, name: &str) -> Option<f64> {
+    rendered.lines().find_map(|line| {
+        let (metric, value) = line.split_once(' ')?;
+        (metric == name).then(|| value.parse::<f64>().expect("numeric metric value"))
+    })
+}
+
+#[expect(
+    clippy::panic,
+    reason = "test helper - missing required metrics must fail loudly"
+)]
+fn metric_value(rendered: &str, name: &str) -> f64 {
+    find_metric_value(rendered, name)
+        .unwrap_or_else(|| panic!("metric {name} missing from scrape:\n{rendered}"))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-/// Queue full → 429. Capacity 1, occupied by a held request; the Default
-/// queue has size 0 so the next admission can't even enqueue.
+/// The generic HTTP lifecycle metrics are the request-flow contract consumed
+/// by Comet. They must retain the same meaning when the priority scheduler is
+/// enabled: received requests split into admissions and rejections, queued and
+/// active gauges describe live work, and completed bodies record outcomes.
+#[test]
+#[serial]
+fn priority_scheduler_updates_generic_http_admission_metrics() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+
+    metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let mut yaml = SchedulerYaml::base();
+                yaml.clear_queue_budget();
+                yaml.default.queue_size = 1;
+                yaml.default.queue_timeout_secs = 30;
+                let yaml_file = write_scheduler_yaml(&yaml);
+                let config = scheduler_config(3607, "default", yaml_file.path().to_str().unwrap());
+
+                let gate = HoldGate::new();
+                let ctx =
+                    AppTestContext::new_with_config(config, vec![scheduler_worker(1, Some(&gate))])
+                        .await;
+                let app = ctx.create_app();
+
+                let held_app = app.clone();
+                let held = tokio::spawn(async move {
+                    held_app
+                        .oneshot(generate_request("held", None))
+                        .await
+                        .unwrap()
+                });
+                wait_arrivals(&gate, 1).await;
+
+                let queued_app = app.clone();
+                let queued = tokio::spawn(async move {
+                    queued_app
+                        .oneshot(generate_request("queued", None))
+                        .await
+                        .unwrap()
+                });
+
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        let scrape = handle.render();
+                        if find_metric_value(&scrape, "smg_http_admission_queued") == Some(1.0)
+                            && find_metric_value(&scrape, "smg_http_admission_limit") == Some(1.0)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("queued gauge never reached one");
+
+                let rejected = send(&app, generate_request("rejected", None)).await;
+                assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+                let _ = body_json(rejected).await;
+
+                let during = handle.render();
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_received_total"),
+                    3.0
+                );
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_admitted_total"),
+                    1.0
+                );
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_rejected_total"),
+                    1.0
+                );
+                assert_eq!(metric_value(&during, "smg_http_admission_active"), 1.0);
+                assert_eq!(metric_value(&during, "smg_http_admission_queued"), 1.0);
+                assert_eq!(metric_value(&during, "smg_http_admission_limit"), 1.0);
+                assert_eq!(
+                    metric_value(&during, "smg_http_admission_queue_capacity"),
+                    1.0
+                );
+
+                gate.release();
+                let held_response = join(held).await;
+                assert_eq!(held_response.status(), StatusCode::OK);
+                let _ = body_json(held_response).await;
+                let queued_response = join(queued).await;
+                assert_eq!(queued_response.status(), StatusCode::OK);
+                let _ = body_json(queued_response).await;
+
+                let completed = handle.render();
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_received_total"),
+                    3.0
+                );
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_admitted_total"),
+                    2.0
+                );
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_rejected_total"),
+                    1.0
+                );
+                assert_eq!(
+                    metric_value(&completed, "smg_http_admission_success_total"),
+                    2.0
+                );
+                assert_eq!(metric_value(&completed, "smg_http_admission_active"), 0.0);
+                assert_eq!(metric_value(&completed, "smg_http_admission_queued"), 0.0);
+
+                ctx.shutdown().await;
+            });
+    });
+}
+
+/// Queue full → 429. Capacity 1, occupied by a held request; the shared
+/// global queue budget is 0 so the next admission can't enqueue.
 #[expect(
     clippy::disallowed_methods,
     reason = "test infra: holds a request open in a spawned task"
@@ -296,7 +445,7 @@ async fn join(
 #[serial]
 async fn queue_full_returns_429() {
     let mut yaml = SchedulerYaml::base();
-    yaml.default.queue_size = 0; // nowhere to wait → immediate reject
+    yaml.clear_queue_budget(); // nowhere to wait → immediate reject
     let yaml_file = write_scheduler_yaml(&yaml);
     let config = scheduler_config(3601, "default", yaml_file.path().to_str().unwrap());
 
@@ -322,13 +471,7 @@ async fn queue_full_returns_429() {
         "queue full must map to 429"
     );
     assert_eq!(error_code(&resp).as_deref(), Some("scheduler_queue_full"));
-    assert_eq!(
-        resp.headers()
-            .get("retry-after")
-            .map(|v| v.to_str().unwrap()),
-        Some("2"),
-        "queue-full 429 must carry Retry-After: 2"
-    );
+    assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "30");
     let body = body_json(resp).await;
     assert_eq!(body["error"]["code"], "scheduler_queue_full");
 
@@ -382,13 +525,14 @@ async fn queue_timeout_returns_503() {
         resp.headers()
             .get("retry-after")
             .map(|v| v.to_str().unwrap()),
-        Some("2"),
-        "queue-timeout 503 must carry Retry-After: 2"
+        Some("1"),
+        "queue-timeout 503 must carry the live retry estimate (the 1 s queue timeout)"
     );
     assert_eq!(
         error_code(&resp).as_deref(),
         Some("scheduler_queue_timeout")
     );
+    assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "1");
 
     gate.release();
     let held_resp = join(held).await;
@@ -506,8 +650,7 @@ async fn tenant_clamp_strips_system_header_of_preemption_power() {
     // request to Default before it ever gets here.
     yaml.system.can_preempt = true;
     yaml.interactive.can_preempt = true;
-    yaml.default.queue_size = 0; // a non-preempting probe has nowhere to wait
-    yaml.bulk.queue_size = 4;
+    yaml.clear_queue_budget(); // a non-preempting probe has nowhere to wait
     yaml.bulk.queue_timeout_secs = 30;
     let yaml_file = write_scheduler_yaml(&yaml);
     // Clamp ceiling is Default for the anonymous tenant.
@@ -528,7 +671,7 @@ async fn tenant_clamp_strips_system_header_of_preemption_power() {
     wait_arrivals(&gate, 1).await;
 
     // Probe asks for `system` but is clamped to Default → cannot preempt →
-    // hits a zero-size queue → 429 (and the bulk victim is untouched).
+    // hits the zero-size global queue → 429 (and the bulk victim is untouched).
     let resp = send(&app, generate_request("probe", Some("system"))).await;
     assert_eq!(
         resp.status(),

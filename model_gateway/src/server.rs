@@ -2178,6 +2178,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
+
+    metrics::Metrics::initialize_http_admission(
+        config.router_config.max_concurrent_requests,
+        config.router_config.queue_size,
+    );
     // The mesh listener's port against the others: the mesh configuration is
     // not part of `RouterConfig`, so the validator cannot see it, and this is
     // the one place the CLI, the Python binding and a library caller all pass.

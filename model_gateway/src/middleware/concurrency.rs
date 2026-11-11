@@ -32,6 +32,7 @@ use tower::{Layer, Service};
 use tracing::{debug, warn};
 
 use super::{
+    admission_metrics::{AdmissionActiveGuard, AdmissionPendingGuard, AdmissionQueuedGuard},
     edge_body::{BodyDuties, Permit},
     tenant_resolution::restamp_accepted_at,
     token_bucket::TokenBucket,
@@ -53,10 +54,21 @@ fn shed_response(status: StatusCode, code: &'static str, message: &'static str) 
 }
 
 /// Returns an acquired token when the request is cancelled or the response body is dropped.
+///
+/// It also carries the HTTP admission lifecycle of the request: the active
+/// guard lives from admission to the end of the response body, and the
+/// outcome counts the response's status only when the body completes.
 pub struct TokenPermit {
-    token_bucket: Arc<TokenBucket>,
+    /// The bucket the token came from; none when rate limiting is disabled.
+    token_bucket: Option<Arc<TokenBucket>>,
     /// Number of tokens to return.
     tokens: f64,
+    /// Active-admission gauge guard held through the full response body.
+    active_guard: Option<AdmissionActiveGuard>,
+    /// HTTP status of the protected route's response.
+    status_code: StatusCode,
+    /// True only after the response body reaches its end.
+    completed: bool,
 }
 
 impl TokenPermit {
@@ -64,8 +76,11 @@ impl TokenPermit {
         token_bucket.try_acquire(tokens)?;
         Metrics::record_admission_inflight_acquired();
         Ok(Self {
-            token_bucket,
+            token_bucket: Some(token_bucket),
             tokens,
+            active_guard: None,
+            status_code: StatusCode::OK,
+            completed: false,
         })
     }
 
@@ -77,26 +92,62 @@ impl TokenPermit {
         token_bucket.acquire_timeout(tokens, timeout).await?;
         Metrics::record_admission_inflight_acquired();
         Ok(Self {
-            token_bucket,
+            token_bucket: Some(token_bucket),
             tokens,
+            active_guard: None,
+            status_code: StatusCode::OK,
+            completed: false,
         })
+    }
+
+    /// A permit that holds no token: rate limiting is disabled, and only the
+    /// admission lifecycle metrics ride on the response.
+    fn unlimited() -> Self {
+        Self {
+            token_bucket: None,
+            tokens: 0.0,
+            active_guard: None,
+            status_code: StatusCode::OK,
+            completed: false,
+        }
+    }
+
+    /// Marks the request admitted: counts it and starts the active guard.
+    fn admitted(mut self) -> Self {
+        Metrics::record_http_admission_admitted();
+        self.active_guard = Some(AdmissionActiveGuard::new());
+        self
     }
 }
 
 impl Drop for TokenPermit {
     fn drop(&mut self) {
-        debug!(
-            "TokenPermit: request ended, returning {} tokens to bucket",
-            self.tokens
-        );
-        // Use lock-free sync return - no runtime needed, guaranteed token return
-        self.token_bucket.return_tokens_sync(self.tokens);
-        Metrics::record_admission_inflight_released();
+        if let Some(active_guard) = &mut self.active_guard {
+            if self.completed {
+                active_guard.record_outcome(self.status_code.as_u16());
+            } else {
+                active_guard.record_interrupted();
+            }
+        }
+        if let Some(token_bucket) = self.token_bucket.take() {
+            debug!(
+                "TokenPermit: request ended, returning {} tokens to bucket",
+                self.tokens
+            );
+            // Use lock-free sync return - no runtime needed, guaranteed token return
+            token_bucket.return_tokens_sync(self.tokens);
+            Metrics::record_admission_inflight_released();
+        }
     }
 }
 
-/// On the response body: every frame passes; the drop returns the token.
-impl Permit for TokenPermit {}
+/// On the response body: every frame passes; the end of the body completes
+/// the admission outcome; the drop returns the token.
+impl Permit for TokenPermit {
+    fn body_finished(&mut self) {
+        self.completed = true;
+    }
+}
 
 /// Holds one slot of the queue-depth gauge; drop covers admit, reject, and
 /// request cancellation.
@@ -185,15 +236,19 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        // Rate limiting disabled: the route's own future, untouched.
+        Metrics::record_http_admission_received();
+        // Rate limiting disabled: the route's own future, with the admission
+        // lifecycle metrics on its response.
         let Some(token_bucket) = &self.app_state.context.rate_limiter else {
-            return ConcurrencyLimitFuture::Through {
+            return ConcurrencyLimitFuture::Admitted {
                 inner: self.inner.call(request),
+                permit: Some(TokenPermit::unlimited().admitted()),
             };
         };
         if let Ok(permit) = TokenPermit::try_acquire(Arc::clone(token_bucket), 1.0) {
             debug!("Acquired token immediately");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+            let permit = permit.admitted();
             // Granted at once: the acceptance stamped at tenant resolution a
             // moment ago stands (no wait in the queue to leave out, no second
             // clock read).
@@ -205,6 +260,7 @@ where
         let Some(queue) = &self.app_state.admission_queue else {
             warn!("No tokens available and queuing is disabled, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_http_admission_rejected();
             return ConcurrencyLimitFuture::Shed {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "admission_queue_full",
@@ -217,6 +273,7 @@ where
             warn!("Request queue is full, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_FULL);
+            Metrics::record_http_admission_rejected();
             return ConcurrencyLimitFuture::Shed {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "admission_queue_full",
@@ -227,6 +284,9 @@ where
         // reported ready, as tower's contract has it; the clone stays here.
         let clone = self.inner.clone();
         let route = std::mem::replace(&mut self.inner, clone);
+        // A request that is dropped while it waits counts as interrupted
+        // before admission.
+        let pending_guard = AdmissionPendingGuard::new();
         ConcurrencyLimitFuture::Queued {
             inner: Box::pin(admit_from_queue(
                 route,
@@ -234,6 +294,7 @@ where
                 slot,
                 Arc::clone(token_bucket),
                 queue.queue_timeout,
+                pending_guard,
             )),
         }
     }
@@ -248,6 +309,7 @@ async fn admit_from_queue<S>(
     slot: OwnedSemaphorePermit,
     token_bucket: Arc<TokenBucket>,
     queue_timeout: Duration,
+    mut pending_guard: AdmissionPendingGuard,
 ) -> Result<Response, Infallible>
 where
     S: Service<Request<Body>, Response = Response, Error = Infallible>,
@@ -255,6 +317,7 @@ where
     debug!("No tokens available, waiting in admission queue");
     let permit_result = {
         let _queued = QueueDepthGuard::enter();
+        let _admission_queued = AdmissionQueuedGuard::new();
         TokenPermit::acquire_timeout(token_bucket, 1.0, queue_timeout).await
     };
     match permit_result {
@@ -262,6 +325,8 @@ where
             // Free the queue slot before running the request: admitted
             // requests are bounded by the bucket, not the queue.
             drop(slot);
+            pending_guard.resolve();
+            let permit = permit.admitted();
             debug!("Acquired token from queue");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
             // The wait for the permit was the admission queue's, bounded by
@@ -276,6 +341,8 @@ where
             warn!("Request timed out in admission queue");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_TIMEOUT);
+            Metrics::record_http_admission_rejected();
+            pending_guard.resolve();
             Ok(shed_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "admission_queue_timeout",
@@ -285,9 +352,8 @@ where
     }
 }
 
-/// The permit on the response: held until the response body is fully
-/// consumed or dropped, by the edge's one body wrapper.
-fn hand_permit(response: &mut Response, permit: TokenPermit) {
+fn hand_permit(response: &mut Response, mut permit: TokenPermit) {
+    permit.status_code = response.status();
     BodyDuties::hand(response, |duties| {
         duties.permit = Some(Box::new(permit));
     });
@@ -299,9 +365,7 @@ pin_project! {
     /// wait where it was not, the shed built when it is polled.
     #[project = ConcurrencyLimitProj]
     pub enum ConcurrencyLimitFuture<F> {
-        /// Rate limiting disabled: the route's future as it is.
-        Through { #[pin] inner: F },
-        /// A token at once: the route's future, the permit for its response.
+        /// A token at once (or no limit): the route's future, the permit for its response.
         Admitted { #[pin] inner: F, permit: Option<TokenPermit> },
         /// No token: the wait in the admission queue, then the route.
         Queued { #[pin] inner: BoxFuture<'static, Result<Response, Infallible>> },
@@ -319,7 +383,6 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
-            ConcurrencyLimitProj::Through { inner } => inner.poll(cx),
             ConcurrencyLimitProj::Admitted { inner, permit } => {
                 let Ok(mut response) = ready!(inner.poll(cx));
                 if let Some(permit) = permit.take() {
