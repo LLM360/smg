@@ -20,7 +20,7 @@
 //! models. Neither mode can force a disjoint pool to idle.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -29,6 +29,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use smg_external_router::metrics::BoundedLabels;
 
 use super::{Class, FairShareConfig, SchedulerSettings};
 use crate::tenant::TenantKey;
@@ -156,7 +157,8 @@ pub struct GlobalFairShare {
     trust_request_model_header: bool,
     tenant_weights: HashMap<TenantKey, f64>,
     model_profiles: HashMap<String, ModelFairSharePolicy>,
-    metric_tenants: HashSet<TenantKey>,
+    /// Configured and runtime tenant labels admitted under the metric cap.
+    metric_tenants: BoundedLabels,
     state: Mutex<LedgerState>,
     next_scope: AtomicU64,
 }
@@ -184,28 +186,16 @@ impl GlobalFairShare {
     #[must_use]
     pub fn from_settings(settings: &SchedulerSettings) -> Option<Self> {
         settings.fair_share_config().map(|config| {
-            let mut ledger = Self::from_config(config);
-            let mut metric_tenants: Vec<_> = ledger
-                .tenant_weights
-                .keys()
-                .chain(
-                    ledger
-                        .model_profiles
-                        .values()
-                        .flat_map(|profile| profile.tenant_weights.keys()),
-                )
-                .cloned()
-                .collect();
-            metric_tenants.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-            metric_tenants.dedup();
-            metric_tenants.truncate(settings.tenant_metric_top_n as usize);
-            ledger.metric_tenants = metric_tenants.into_iter().collect();
-            ledger
+            Self::from_config_with_metric_top_n(config, settings.tenant_metric_top_n as usize)
         })
     }
 
     #[must_use]
     pub fn from_config(config: &FairShareConfig) -> Self {
+        Self::from_config_with_metric_top_n(config, 32)
+    }
+
+    fn from_config_with_metric_top_n(config: &FairShareConfig, metric_top_n: usize) -> Self {
         let tenant_weights: HashMap<_, _> = config
             .tenant_weights
             .iter()
@@ -231,15 +221,23 @@ impl GlobalFairShare {
                 )
             })
             .collect();
-        let metric_tenants = tenant_weights
+        // Explicitly weighted tenants keep metric identity regardless of whether
+        // an unlisted runtime tenant is seen first. BoundedLabels then admits
+        // discovered tenants into the remaining slots without eviction.
+        let metric_tenants = BoundedLabels::new(metric_top_n);
+        let mut configured_tenants: Vec<_> = tenant_weights
             .keys()
             .chain(
                 model_profiles
                     .values()
                     .flat_map(|profile: &ModelFairSharePolicy| profile.tenant_weights.keys()),
             )
-            .cloned()
             .collect();
+        configured_tenants.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        configured_tenants.dedup();
+        for tenant in configured_tenants {
+            metric_tenants.intern(tenant.as_str());
+        }
         Self {
             default_weight: config.default_weight,
             default_output_tokens: config.default_output_tokens,
@@ -294,7 +292,7 @@ impl GlobalFairShare {
     ) {
         super::metrics::record_fair_share_queue_wait(
             profile.metric_label(),
-            self.metric_tenant(tenant),
+            self.metric_tenant(tenant).as_ref(),
             class,
             wait,
         );
@@ -344,7 +342,7 @@ impl GlobalFairShare {
             .queued[class as usize] += 1;
         drop(state);
         if is_other {
-            super::metrics::record_fair_share_unknown_tenant(self.metric_tenant(tenant));
+            super::metrics::record_fair_share_unknown_tenant(self.metric_tenant(tenant).as_ref());
         }
     }
 
@@ -371,7 +369,7 @@ impl GlobalFairShare {
         Self::advance_system_virtual_time(&mut state);
         drop(state);
         if unknown {
-            super::metrics::record_fair_share_unknown_tenant(self.metric_tenant(tenant));
+            super::metrics::record_fair_share_unknown_tenant(self.metric_tenant(tenant).as_ref());
         }
     }
 
@@ -531,11 +529,11 @@ impl GlobalFairShare {
 
         super::metrics::set_fair_share_virtual_finish(
             "global",
-            self.metric_tenant(&tenant),
+            self.metric_tenant(&tenant).as_ref(),
             virtual_service,
         );
         super::metrics::set_fair_share_reserved_output_tokens(
-            self.metric_tenant(&tenant),
+            self.metric_tenant(&tenant).as_ref(),
             reserved_output_tokens,
         );
 
@@ -665,14 +663,14 @@ impl GlobalFairShare {
 
         super::metrics::set_fair_share_virtual_finish(
             model,
-            self.metric_tenant(&tenant),
+            self.metric_tenant(&tenant).as_ref(),
             inner_virtual_finish.unwrap_or(outer_virtual_finish),
         );
         if selected_bucket == ModelBucket::Other {
             super::metrics::set_fair_share_other_bucket_virtual_finish(model, outer_virtual_finish);
         }
         super::metrics::set_fair_share_reserved_output_tokens(
-            self.metric_tenant(&tenant),
+            self.metric_tenant(&tenant).as_ref(),
             reserved_output_tokens,
         );
 
@@ -777,12 +775,8 @@ impl GlobalFairShare {
         }
     }
 
-    fn metric_tenant<'a>(&'a self, tenant: &'a TenantKey) -> &'a str {
-        if self.metric_tenants.contains(tenant) {
-            tenant.as_str()
-        } else {
-            "other"
-        }
+    fn metric_tenant(&self, tenant: &TenantKey) -> Arc<str> {
+        self.metric_tenants.intern(tenant.as_str())
     }
 
     fn cancel_reservation(
@@ -843,11 +837,11 @@ impl GlobalFairShare {
         drop(state);
         super::metrics::set_fair_share_virtual_finish(
             "global",
-            self.metric_tenant(tenant),
+            self.metric_tenant(tenant).as_ref(),
             virtual_service,
         );
         super::metrics::set_fair_share_reserved_output_tokens(
-            self.metric_tenant(tenant),
+            self.metric_tenant(tenant).as_ref(),
             reserved_output_tokens,
         );
     }
@@ -917,14 +911,14 @@ impl GlobalFairShare {
 
         super::metrics::set_fair_share_virtual_finish(
             model,
-            self.metric_tenant(tenant),
+            self.metric_tenant(tenant).as_ref(),
             inner_virtual_finish.unwrap_or(outer_virtual_finish),
         );
         if is_other {
             super::metrics::set_fair_share_other_bucket_virtual_finish(model, outer_virtual_finish);
         }
         super::metrics::set_fair_share_reserved_output_tokens(
-            self.metric_tenant(tenant),
+            self.metric_tenant(tenant).as_ref(),
             reserved_output_tokens,
         );
     }
@@ -1005,10 +999,10 @@ impl GlobalFairShare {
         drop(state);
 
         let metric_tenant = self.metric_tenant(tenant);
-        super::metrics::record_fair_share_charged_output_tokens(metric_tenant, charged);
-        super::metrics::set_fair_share_virtual_finish("global", metric_tenant, virtual_service);
+        super::metrics::record_fair_share_charged_output_tokens(&metric_tenant, charged);
+        super::metrics::set_fair_share_virtual_finish("global", &metric_tenant, virtual_service);
         super::metrics::set_fair_share_reserved_output_tokens(
-            metric_tenant,
+            &metric_tenant,
             reserved_output_tokens,
         );
         if kind != SettlementKind::Observed {
@@ -1080,17 +1074,17 @@ impl GlobalFairShare {
         drop(state);
 
         let metric_tenant = self.metric_tenant(tenant);
-        super::metrics::record_fair_share_charged_output_tokens(metric_tenant, charged);
+        super::metrics::record_fair_share_charged_output_tokens(&metric_tenant, charged);
         super::metrics::set_fair_share_virtual_finish(
             model,
-            metric_tenant,
+            &metric_tenant,
             inner_virtual_finish.unwrap_or(outer_virtual_finish),
         );
         if is_other {
             super::metrics::set_fair_share_other_bucket_virtual_finish(model, outer_virtual_finish);
         }
         super::metrics::set_fair_share_reserved_output_tokens(
-            metric_tenant,
+            &metric_tenant,
             reserved_output_tokens,
         );
         if kind != SettlementKind::Observed {
@@ -1257,7 +1251,10 @@ impl Drop for FairShareReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::scheduler::ModelFairShareConfig;
+    use crate::{
+        middleware::scheduler::{ModelFairShareConfig, PrioritySchedulerYaml, SchedulerSettings},
+        observability::metrics::test_support::render_with_recorder,
+    };
 
     fn config(weights: &[(&str, f64)]) -> FairShareConfig {
         FairShareConfig {
@@ -1682,6 +1679,176 @@ mod tests {
         );
         selected.reservation.cancel();
         assert_eq!(ledger.snapshot(scope_id, &a).0, 50);
+    }
+
+    #[test]
+    fn unlisted_tenant_metrics_show_attributed_users_before_overflow() {
+        let fair_share = FairShareConfig {
+            tenant_weights: HashMap::from([("header:configured".to_string(), 1.0)]),
+            ..config(&[])
+        };
+        let yaml = PrioritySchedulerYaml {
+            fair_share: Some(fair_share),
+            ..Default::default()
+        };
+        let settings =
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 3, Some(&yaml)).unwrap();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scope_id = ledger.new_scope();
+
+        let rendered = render_with_recorder(|| {
+            for tenant in [
+                "header:alpha",
+                "header:beta",
+                "header:overflow",
+                "header:configured",
+            ] {
+                reserve_one(
+                    &ledger,
+                    scope_id,
+                    Class::Default,
+                    &TenantKey::new(tenant),
+                    10,
+                )
+                .unwrap()
+                .settle(Some(10), SettlementKind::Observed);
+            }
+        });
+
+        for tenant in ["header:configured", "header:alpha", "header:beta"] {
+            assert!(
+                rendered.contains(&format!(
+                    "smg_fair_share_charged_output_tokens_total{{tenant=\"{tenant}\"}} 10"
+                )),
+                "{tenant} must retain its own charged-token series: {rendered}"
+            );
+        }
+        for tenant in ["header:alpha", "header:beta"] {
+            assert!(
+                rendered.contains(&format!(
+                    "smg_fair_share_unknown_tenant_total{{tenant=\"{tenant}\"}} 1"
+                )),
+                "{tenant} must retain its own unlisted-tenant series: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("tenant=\"header:overflow\""),
+            "only a tenant past the cap joins the sentinel: {rendered}"
+        );
+        assert!(
+            rendered.contains("smg_fair_share_charged_output_tokens_total{tenant=\"other\"} 10"),
+            "the sentinel carries only the overflow user's tokens: {rendered}"
+        );
+        assert!(
+            rendered.contains("smg_fair_share_unknown_tenant_total{tenant=\"other\"} 1"),
+            "only the overflow user's unknown-tenant count is aggregated: {rendered}"
+        );
+    }
+
+    #[test]
+    fn configured_tenants_keep_sorted_priority_over_runtime_labels() {
+        let fair_share = FairShareConfig {
+            tenant_weights: HashMap::from([
+                ("header:z-configured".to_string(), 1.0),
+                ("header:a-configured".to_string(), 1.0),
+            ]),
+            ..config(&[])
+        };
+        let yaml = PrioritySchedulerYaml {
+            fair_share: Some(fair_share),
+            ..Default::default()
+        };
+        let settings =
+            SchedulerSettings::from_cli_and_yaml(true, Class::Default, 1, Some(&yaml)).unwrap();
+        let ledger = Arc::new(GlobalFairShare::from_settings(&settings).unwrap());
+        let scope_id = ledger.new_scope();
+
+        let rendered = render_with_recorder(|| {
+            for tenant in [
+                "header:runtime",
+                "header:z-configured",
+                "header:a-configured",
+            ] {
+                reserve_one(
+                    &ledger,
+                    scope_id,
+                    Class::Default,
+                    &TenantKey::new(tenant),
+                    10,
+                )
+                .unwrap()
+                .settle(Some(10), SettlementKind::Observed);
+            }
+        });
+
+        assert!(rendered.contains(
+            "smg_fair_share_charged_output_tokens_total{tenant=\"header:a-configured\"} 10"
+        ));
+        assert!(
+            rendered.contains("smg_fair_share_charged_output_tokens_total{tenant=\"other\"} 20")
+        );
+        assert!(!rendered.contains("tenant=\"header:z-configured\""));
+        assert!(!rendered.contains("tenant=\"header:runtime\""));
+        assert!(rendered.contains("smg_fair_share_unknown_tenant_total{tenant=\"other\"} 1"));
+    }
+
+    #[test]
+    fn large_backlog_does_not_starve_second_unlisted_user() {
+        let mut fair_share = config(&[]);
+        fair_share.trust_request_model_header = true;
+        fair_share.model_profiles = HashMap::from([(
+            "synthetic-model".to_string(),
+            ModelFairShareConfig {
+                tenant_weights: HashMap::new(),
+                other_weight: 100.0,
+            },
+        )]);
+        let ledger = Arc::new(GlobalFairShare::from_config(&fair_share));
+        let scope_id = ledger.new_scope();
+        let profile = ledger.profile_for_model("synthetic-model");
+        let heavy = TenantKey::new("header:heavy");
+        let later = TenantKey::new("header:later");
+
+        for _ in 0..100 {
+            reserve_one_in_profile(&ledger, scope_id, &profile, Class::Default, &heavy, 10)
+                .unwrap()
+                .settle(Some(10), SettlementKind::Observed);
+        }
+        ledger.register_waiter_in_profile(scope_id, &profile, &heavy, Class::Default);
+        ledger.register_waiter_in_profile(scope_id, &profile, &later, Class::Default);
+        let candidates = [
+            FairShareCandidate {
+                index: 0,
+                tenant: &heavy,
+                estimated_output_tokens: 10,
+            },
+            FairShareCandidate {
+                index: 1,
+                tenant: &later,
+                estimated_output_tokens: 10,
+            },
+        ];
+        // Solo service creates no debt against the idle user. A stable tie-break
+        // may serve the heavy user once, then the backlogged second user must win.
+        let mut served_later = false;
+        for _ in 0..2 {
+            let selected = ledger
+                .reserve_local_candidate_in_profile(scope_id, &profile, Class::Default, &candidates)
+                .expect("the model pool remains work-conserving");
+            let selected_index = selected.index;
+            selected
+                .reservation
+                .settle(Some(10), SettlementKind::Observed);
+            if selected_index == 1 {
+                served_later = true;
+                break;
+            }
+            ledger.register_waiter_in_profile(scope_id, &profile, &heavy, Class::Default);
+        }
+        assert!(
+            served_later,
+            "the second user wins within two contended selections"
+        );
     }
 
     #[test]

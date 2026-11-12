@@ -570,10 +570,20 @@ mod permit_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, io::Write, sync::Arc};
+
+    use axum::{middleware::from_fn_with_state, routing::post, Extension, Router};
+    use tempfile::NamedTempFile;
+    use tower::ServiceExt;
 
     use super::*;
-    use crate::middleware::scheduler::FairShareConfig;
+    use crate::{
+        config::RouterConfig,
+        middleware::scheduler::{AdmissionMode, FairShareConfig},
+        observability::metrics::test_support::render_with_recorder,
+        tenant::RouteRequestMeta,
+        worker::{BasicWorkerBuilder, WorkerRegistry},
+    };
 
     fn ledger(trust_header: bool) -> GlobalFairShare {
         GlobalFairShare::from_config(&FairShareConfig {
@@ -598,5 +608,140 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(OUTPUT_TOKEN_ESTIMATE_HEADER, "128".parse().unwrap());
         assert_eq!(output_token_estimate(&headers, &ledger(true)), 128);
+    }
+
+    #[test]
+    fn invalid_trusted_estimate_uses_default_and_counts_invalid_estimate() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OUTPUT_TOKEN_ESTIMATE_HEADER,
+            "not-a-number".parse().unwrap(),
+        );
+
+        let rendered = render_with_recorder(|| {
+            assert_eq!(output_token_estimate(&headers, &ledger(true)), 256);
+        });
+
+        assert!(
+            rendered.contains("smg_fair_share_fallback_total{reason=\"invalid_estimate\"} 1"),
+            "an invalid supplied estimate keeps its distinct reason: {rendered}"
+        );
+        assert!(!rendered.contains("reason=\"missing_estimate\""));
+    }
+
+    #[test]
+    fn missing_trusted_estimate_uses_default_and_counts_missing_estimate() {
+        let default_rendered = render_with_recorder(|| {
+            assert_eq!(output_token_estimate(&HeaderMap::new(), &ledger(true)), 256);
+        });
+        assert!(
+            default_rendered
+                .contains("smg_fair_share_fallback_total{reason=\"missing_estimate\"} 1"),
+            "one absent estimate uses the default and one fallback: {default_rendered}"
+        );
+
+        let rejection_rendered = render_with_recorder(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut yaml = NamedTempFile::new().unwrap();
+                    write!(
+                        yaml,
+                        r#"
+classes:
+  system:
+    reserved_floor: 0
+    reserved_per_slot: 0
+    queue_size: 1
+    queue_timeout_secs: 1
+    starvation_threshold_secs: 1
+    can_preempt: false
+  interactive:
+    reserved_floor: 0
+    reserved_per_slot: 0
+    queue_size: 1
+    queue_timeout_secs: 1
+    starvation_threshold_secs: 1
+    can_preempt: false
+  default:
+    reserved_floor: 0
+    reserved_per_slot: 0
+    queue_size: 0
+    queue_timeout_secs: 1
+    starvation_threshold_secs: 1
+    can_preempt: false
+  bulk:
+    reserved_floor: 0
+    reserved_per_slot: 0
+    queue_size: 0
+    queue_timeout_secs: 1
+    starvation_threshold_secs: 1
+    can_preempt: false
+fair_share:
+  default_output_tokens: 256
+  trust_output_token_estimate_header: true
+admission_partitions:
+  default:
+    max_concurrent_requests: 1
+    queue_size: 0
+default_admission_partition: default
+"#
+                    )
+                    .unwrap();
+                    let config = RouterConfig {
+                        max_concurrent_requests: 1,
+                        priority_scheduler_enabled: true,
+                        priority_scheduler_config: Some(yaml.path().to_string_lossy().into_owned()),
+                        ..RouterConfig::default()
+                    };
+                    let registry = Arc::new(WorkerRegistry::new());
+                    registry
+                        .register(Arc::new(
+                            BasicWorkerBuilder::new("grpc://estimate-worker:50051")
+                                .model(openai_protocol::model_card::ModelCard::new(
+                                    "synthetic-model",
+                                ))
+                                .status(openai_protocol::worker::WorkerStatus::Ready)
+                                .build(),
+                        ))
+                        .unwrap();
+                    let AdmissionMode::Priority(state) =
+                        AdmissionMode::try_build_priority(&config, registry, None).unwrap()
+                    else {
+                        panic!("priority scheduler should start");
+                    };
+                    let _held = state
+                        .scheduler
+                        .acquire_inflight(Class::System, RequestId("held".to_string()))
+                        .expect("the only scheduler slot");
+                    let app = Router::new()
+                        .route("/", post(|| async { StatusCode::OK }))
+                        .route_layer(from_fn_with_state(state, priority_admission_middleware))
+                        .layer(Extension(RouteRequestMeta::new(TenantKey::new(
+                            "header:alice",
+                        ))));
+
+                    let response = app
+                        .oneshot(Request::post("/").body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                });
+        });
+
+        assert!(
+            rejection_rendered
+                .contains("smg_fair_share_fallback_total{reason=\"missing_estimate\"} 1"),
+            "the rejected request still pays one admission fallback: {rejection_rendered}"
+        );
+        assert!(!rejection_rendered.contains("reason=\"invalid_estimate\""));
+        assert!(
+            rejection_rendered.contains(
+                "smg_scheduler_admit_total{class=\"default\",outcome=\"rejected_queue_full\"} 1"
+            ),
+            "the test proves that the estimate is read before rejection: {rejection_rendered}"
+        );
     }
 }

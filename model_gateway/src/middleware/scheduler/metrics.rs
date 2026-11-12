@@ -134,7 +134,7 @@ pub fn describe() {
     );
     describe_counter!(
         FAIR_SHARE_FALLBACK_TOTAL,
-        "Fair-share settlements that used an estimate instead of terminal usage"
+        "Fair-share estimate and settlement fallbacks by reason"
     );
     describe_counter!(
         FAIR_SHARE_UNKNOWN_TENANT_TOTAL,

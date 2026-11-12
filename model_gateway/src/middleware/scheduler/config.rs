@@ -316,10 +316,10 @@ pub struct SchedulerSettings {
     /// [`crate::tenant::RouteRequestMeta::tenant_key`].
     pub tenant_policies: HashMap<TenantKey, TenantPolicyConfig>,
     fair_share: Option<FairShareConfig>,
-    /// Cap on the distinct tenants the scheduler's tenant-labelled counters
-    /// (`smg_scheduler_clamp_total`, `smg_scheduler_unknown_priority_value_total`)
-    /// keep as series of their own: the first tenant keys up to the cap keep
-    /// theirs, everything past the cap is bucketed under `tenant="other"`.
+    /// Cap on distinct tenants with their own tenant-labelled scheduler and
+    /// fair-share metric series. Configured fair-share tenants take the first
+    /// slots; discovered runtime tenants take the remainder. Later tenants
+    /// use `tenant="other"` only in metrics, not in scheduling or accounting.
     pub tenant_metric_top_n: u32,
 }
 

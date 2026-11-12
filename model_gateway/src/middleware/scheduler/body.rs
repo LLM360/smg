@@ -256,6 +256,57 @@ mod tests {
         assert_eq!(ledger.snapshot(scope_id, &tenant).0, 100);
     }
 
+    #[test]
+    fn completed_response_without_usage_records_missing_usage() {
+        let rendered = crate::observability::metrics::test_support::render_with_recorder(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (scheduler, ledger, tenant, scope_id) = fair_scheduler(100);
+                    let permit = fair_permit(&scheduler, &tenant, "missing-usage", 100).await;
+                    guarded(Body::from(r#"{"choices":[]}"#), permit)
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(ledger.snapshot(scope_id, &tenant).0, 100);
+                });
+        });
+
+        assert!(
+            rendered.contains("smg_fair_share_fallback_total{reason=\"missing_usage\"} 1"),
+            "a completed body without usage uses the missing_usage reason: {rendered}"
+        );
+        assert!(!rendered.contains("reason=\"interrupted\""));
+    }
+
+    #[test]
+    fn dropped_incomplete_response_records_interrupted() {
+        let rendered = crate::observability::metrics::test_support::render_with_recorder(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (scheduler, ledger, tenant, scope_id) = fair_scheduler(100);
+                    let permit = fair_permit(&scheduler, &tenant, "interrupted", 100).await;
+                    let frames = vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"data: no terminal usage\n\n",
+                    ))];
+                    let body = guarded(Body::from_stream(tokio_stream::iter(frames)), permit);
+                    drop(body);
+                    assert_eq!(ledger.snapshot(scope_id, &tenant).0, 100);
+                });
+        });
+
+        assert!(
+            rendered.contains("smg_fair_share_fallback_total{reason=\"interrupted\"} 1"),
+            "an unsettled body uses the interrupted reason: {rendered}"
+        );
+        assert!(!rendered.contains("reason=\"missing_usage\""));
+    }
+
     #[tokio::test]
     async fn backend_error_keeps_the_provisional_charge() {
         let (scheduler, ledger, tenant, scope_id) = fair_scheduler(100);
