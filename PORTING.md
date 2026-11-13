@@ -46,6 +46,28 @@ fork KV-event sequence-gap recovery, fork gRPC servicer patches.
 Comet sets `deepseek-v4-flash-0731` to `least_load` instead of
 `size_aware_power_of_two`.
 
+## gRPC wire compatibility with the deployed servicer
+
+The deployed `smg-grpc-servicer` overlay pairs with `smg-grpc-proto` 0.4.14. A
+router from this branch must still talk to it, so the proto change from 0.4.14
+to v1.15.0 is additive only. The fork changes no proto file; the difference is
+upstream's own 0.4.14 to v1.15.0 delta.
+
+- No message is removed and no field changes number or wire type.
+- `sglang_scheduler.proto` `GenerateRequest.data_parallel_rank` stays field 16
+  and moves from implicit to `optional int32`, so an unset rank stays off the
+  wire and a pin to rank 0 is told from no pin.
+- `common.proto` `KvCacheCleared` gains `optional string ownership = 1`. An
+  empty message from 0.4.14 still decodes.
+- New messages and new optional fields are additive. A peer that does not know
+  a field ignores it.
+- `TensorData.dtype` and `GenerateComplete.finish_reason` gain comments only.
+
+`crates/grpc_client/python/tests/test_wire_compat.py` holds the 0.4.14 field
+inventory and checks every deployed field against the generated descriptors. It
+fails when a field moves number or wire type, when a message disappears, or when
+a new field reuses a deployed number.
+
 ## Commits
 
 Fork code for the scheduler is interleaved: `state.rs`, `engine.rs`, `config.rs`
