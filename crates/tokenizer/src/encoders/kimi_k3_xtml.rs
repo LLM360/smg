@@ -771,12 +771,30 @@ fn render_assistant_segments(
                 push_close_tag(out, "json");
             } else if let Some(args) = fnobj.get("arguments").and_then(Value::as_object) {
                 for (key, value) in args {
+                    // A parsed source argument keeps its reference type and
+                    // text; an object that reached the render as a value keeps
+                    // the value's own type and JSON.
+                    let (kind, text) = match value.get("__xtml_argument") {
+                        Some(argument) => (
+                            argument
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("string")
+                                .to_string(),
+                            argument
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        ),
+                        None => (xtml_type_name(value).to_string(), xtml_value(value)),
+                    };
                     push_open_tag(
                         out,
                         "argument",
-                        &[("key", key.clone()), ("type", xtml_type(value))],
+                        &[("key", key.clone()), ("type", kind)],
                     );
-                    push_message_text(out, &xtml_value(value));
+                    push_message_text(out, &text);
                     push_close_tag(out, "argument");
                 }
             }
@@ -809,7 +827,9 @@ fn nonempty_name(obj: &Map<String, Value>) -> Option<String> {
 // XTML value typing
 // ---------------------------------------------------------------------------
 
-fn xtml_type(value: &Value) -> String {
+/// The reference's `_xtml_type` as a static name, so a parsed argument keeps it
+/// without an allocation.
+fn xtml_type_name(value: &Value) -> &'static str {
     match value {
         Value::Bool(_) => "boolean",
         Value::Null => "null",
@@ -818,7 +838,6 @@ fn xtml_type(value: &Value) -> String {
         Value::Object(_) => "object",
         Value::Array(_) => "array",
     }
-    .to_string()
 }
 
 /// `_xtml_value`: strings pass through verbatim; everything else is JSON-encoded.
@@ -920,11 +939,11 @@ fn normalize_tool_arguments(arguments: Option<&Value>) -> (Value, Option<String>
             if s.trim().is_empty() {
                 return (empty_object(), None);
             }
-            match serde_json::from_str::<Value>(s) {
-                Ok(Value::Object(m)) => (Value::Object(m), None),
-                // Non-object JSON (Python raises); keep the raw text as a block.
-                Ok(_) => (empty_object(), Some(s.clone())),
-                // Unparsable (Python's `except: return {}, arguments`).
+            match parse_arguments_object(s) {
+                Ok(args) => (Value::Object(args), None),
+                // Non-object JSON (Python raises) and unparsable text
+                // (Python's `except: return {}, arguments`): keep the raw text
+                // as a `<json>` block.
                 Err(_) => (empty_object(), Some(s.clone())),
             }
         }
@@ -933,6 +952,169 @@ fn normalize_tool_arguments(arguments: Option<&Value>) -> (Value, Option<String>
     }
 }
 
+/// One parsed tool-call argument: its key, its reference type, and the text the
+/// reference emits for it.
+type ParsedArgument = (String, &'static str, String);
+
+/// Parse a JSON object string one level deep into `(key, type, text)` triples.
+///
+/// Mirrors the reference `_parse_arguments_object`: a non-string value keeps its
+/// original source literal, so `1e2` stays `1e2` (not `100.0`), `-0.0` stays
+/// `-0.0`, and `[1,2]` keeps its exact bytes. A string value keeps its decoded
+/// form. Nested values are never re-serialized. Anything after the closing `}`
+/// is ignored. Returns `Err` for malformed input and for valid non-object JSON.
+fn parse_arguments_object(s: &str) -> Result<Map<String, Value>> {
+    let bytes = s.as_bytes();
+    let mut index = 0usize;
+    skip_json_ws(bytes, &mut index);
+    if bytes.get(index) != Some(&b'{') {
+        return Err(anyhow!("JSON arguments must be an object"));
+    }
+    index += 1;
+    skip_json_ws(bytes, &mut index);
+    if index >= bytes.len() {
+        return Err(anyhow!("Unexpected end of JSON object"));
+    }
+    if bytes[index] == b'}' {
+        return Ok(Map::new());
+    }
+    let mut parsed: Vec<ParsedArgument> = Vec::new();
+    loop {
+        skip_json_ws(bytes, &mut index);
+        let (key, next) = json_string_at(s, index)?;
+        index = next;
+        skip_json_ws(bytes, &mut index);
+        if bytes.get(index) != Some(&b':') {
+            return Err(anyhow!("Expects ':' after {key}"));
+        }
+        index += 1;
+        skip_json_ws(bytes, &mut index);
+        // Record where the value starts so a non-string keeps its source bytes.
+        let value_start = index;
+        let (decoded, next) = json_value_at(s, index)?;
+        index = next;
+        let text = match &decoded {
+            Value::String(decoded) => decoded.clone(),
+            _ => s[value_start..next].to_string(),
+        };
+        parsed.push((key, xtml_type_name(&decoded), text));
+        skip_json_ws(bytes, &mut index);
+        match bytes.get(index) {
+            Some(b'}') => break,
+            Some(b',') => {
+                index += 1;
+                skip_json_ws(bytes, &mut index);
+                if bytes.get(index) == Some(&b'}') {
+                    // Python's decoder rejects a trailing comma.
+                    return Err(anyhow!("Expects a key after ','"));
+                }
+            }
+            other => {
+                return Err(anyhow!(
+                    "Expect '}}' or ',', got {:?}",
+                    other.map(|byte| *byte as char)
+                ))
+            }
+        }
+    }
+    Ok(parsed
+        .into_iter()
+        .fold(Map::new(), |mut map, (key, kind, text)| {
+            map.insert(
+                key,
+                serde_json::json!({"__xtml_argument": {"type": kind, "text": text}}),
+            );
+            map
+        }))
+}
+
+fn skip_json_ws(bytes: &[u8], index: &mut usize) {
+    while *index < bytes.len() && bytes[*index].is_ascii_whitespace() {
+        *index += 1;
+    }
+}
+
+/// The JSON string starting at `index`, decoded, and the index after its closing
+/// quote. `JSONDecoder(strict=False)` in the reference admits a literal control
+/// character inside a string; `serde_json` refuses it, so a string that holds one
+/// takes the raw-block path, as any other unparsable text does.
+fn json_string_at(s: &str, index: usize) -> Result<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(index) != Some(&b'"') {
+        return Err(anyhow!("JSON object key must be a string"));
+    }
+    let mut scan = index + 1;
+    let mut escaped = false;
+    while scan < bytes.len() {
+        let byte = bytes[scan];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            let raw = &s[index..=scan];
+            let decoded: String = serde_json::from_str(raw)
+                .map_err(|e| anyhow!("Invalid JSON string at {index}: {e}"))?;
+            return Ok((decoded, scan + 1));
+        }
+        scan += 1;
+    }
+    Err(anyhow!("Unterminated JSON string at {index}"))
+}
+
+/// The JSON value starting at `index`, decoded, and the index after it.
+fn json_value_at(s: &str, index: usize) -> Result<(Value, usize)> {
+    let bytes = s.as_bytes();
+    match bytes.get(index) {
+        Some(b'"') => {
+            let (decoded, next) = json_string_at(s, index)?;
+            Ok((Value::String(decoded), next))
+        }
+        Some(b'{') | Some(b'[') => {
+            let mut depth = 0usize;
+            let mut scan = index;
+            let mut in_string = false;
+            let mut escaped = false;
+            while scan < bytes.len() {
+                let byte = bytes[scan];
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        in_string = false;
+                    }
+                } else if byte == b'"' {
+                    in_string = true;
+                } else if byte == b'{' || byte == b'[' {
+                    depth += 1;
+                } else if byte == b'}' || byte == b']' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let raw = &s[index..=scan];
+                        let decoded: Value = serde_json::from_str(raw)
+                            .map_err(|e| anyhow!("Invalid JSON value at {index}: {e}"))?;
+                        return Ok((decoded, scan + 1));
+                    }
+                }
+                scan += 1;
+            }
+            Err(anyhow!("Unterminated JSON value at {index}"))
+        }
+        _ => {
+            // A scalar: read to the next `,` or `}`.
+            let mut scan = index;
+            while scan < bytes.len() && bytes[scan] != b',' && bytes[scan] != b'}' {
+                scan += 1;
+            }
+            let raw = s[index..scan].trim_end();
+            let decoded: Value = serde_json::from_str(raw)
+                .map_err(|e| anyhow!("Invalid JSON value at {index}: {e}"))?;
+            Ok((decoded, scan))
+        }
+    }
+}
 /// Deep-sort a message's `tools` and normalize any `tool_calls[].arguments`.
 fn normalize_message(message: &Value) -> Value {
     let obj = match message.as_object() {
@@ -1633,6 +1815,36 @@ mod tests {
             "got: {rendered}"
         );
         assert!(!rendered.contains("<|open|>argument"), "got: {rendered}");
+    }
+
+    /// A non-string argument keeps the source literal the reference keeps:
+    /// `serde_json` would normalize `1e2` to `100.0`, but the checkpoint's
+    /// encoder emits the bytes the caller wrote.
+    #[test]
+    fn numeric_and_nested_arguments_keep_their_source_literals() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "f",
+                    "arguments": "{\"exp\":1e2,\"neg_zero\":-0.0,\"neg\":-3,\"flag\":true,\
+                                  \"nothing\":null,\"nested\":[1,2,{\"b\":null}]}"
+                }
+            }]
+        })];
+        let rendered = apply_kimi_k3_xtml(&messages, &params(Some(true), None)).unwrap();
+        for expected in [
+            "<|open|>argument key=\"exp\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|>",
+            "<|open|>argument key=\"neg_zero\" type=\"number\"<|sep|>-0.0<|close|>argument<|sep|>",
+            "<|open|>argument key=\"neg\" type=\"number\"<|sep|>-3<|close|>argument<|sep|>",
+            "<|open|>argument key=\"flag\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|>",
+            "<|open|>argument key=\"nothing\" type=\"null\"<|sep|>null<|close|>argument<|sep|>",
+            "<|open|>argument key=\"nested\" type=\"array\"<|sep|>[1,2,{\"b\":null}]<|close|>argument<|sep|>",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected} in {rendered}");
+        }
+        assert!(!rendered.contains("100.0"), "got: {rendered}");
     }
 
     #[test]
