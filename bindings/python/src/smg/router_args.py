@@ -574,6 +574,13 @@ class RouterArgs:
     priority_scheduler_default_max_class: str = "default"
     priority_scheduler_enabled: bool = False
     priority_scheduler_tenant_metric_top_n: int = 32
+    # Scheduler-backed capacity credits
+    capacity_credit_generation: str | None = None
+    capacity_credit_required: bool = False
+    capacity_credit_terminal_retention_secs: int = 600
+    capacity_credit_ttl_ms: int = 30_000
+    # Per-model routing policy overrides (model id -> policy name)
+    model_policies: dict[str, str] = dataclasses.field(default_factory=dict)
     # Prometheus exporter
     prometheus_duration_buckets: list[float] | None = None
     prometheus_host: str | None = None
@@ -685,6 +692,8 @@ class RouterArgs:
     tool_call_parser: str | None = None
     # Tenant resolution: trust an upstream tenant header (tenant_header_name names it)
     trust_tenant_header: bool = False
+    # Let a valid trusted tenant header win over the authenticated caller
+    prefer_trusted_tenant_header: bool = False
     upstream_http2: bool = False
     upstream_pool_idle_timeout_secs: int = 3
     # WebRTC: the UDP bind address (an IP; None = the unspecified address of
@@ -949,6 +958,13 @@ class RouterArgs:
         )
 
         # Routing policy configuration
+        routing_group.add_argument(
+            f"--{prefix}model-policy",
+            action="append",
+            default=[],
+            metavar="MODEL=POLICY",
+            help="Per-model routing policy override. Repeat for multiple models.",
+        )
         routing_group.add_argument(
             f"--{prefix}policy",
             type=str,
@@ -2253,6 +2269,14 @@ class RouterArgs:
             ),
         )
         request_group.add_argument(
+            f"--{prefix}prefer-trusted-tenant-header",
+            action="store_true",
+            help=(
+                "Prefer the trusted tenant header over authenticated proxy identity; "
+                "requires --trust-tenant-header"
+            ),
+        )
+        request_group.add_argument(
             f"--{prefix}tenant-header-name",
             type=str,
             default=RouterArgs.tenant_header_name,
@@ -2358,6 +2382,30 @@ class RouterArgs:
                 "counters keep as tenant series of their own (the first N seen; the remainder "
                 'bucket under tenant="other").'
             ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-generation",
+            type=str,
+            default=RouterArgs.capacity_credit_generation,
+            help="Enable scheduler-backed credits for this allocator generation",
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-ttl-ms",
+            type=int,
+            default=RouterArgs.capacity_credit_ttl_ms,
+            help="Lifetime in milliseconds of an unredeemed capacity credit",
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-terminal-retention-secs",
+            type=int,
+            default=RouterArgs.capacity_credit_terminal_retention_secs,
+            help="Replay-tombstone retention after a credit becomes terminal",
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}capacity-credit-required",
+            action="store_true",
+            default=RouterArgs.capacity_credit_required,
+            help="Reject inference requests that do not redeem a valid credit",
         )
 
         # Tenant rate limit configuration
@@ -3291,6 +3339,9 @@ class RouterArgs:
         args_dict["storage_context_headers"] = cls._parse_storage_context_headers(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
+        args_dict["model_policies"] = cls._parse_model_policies(
+            cli_args_dict.get(f"{prefix}model_policy", None)
+        )
         args_dict["model_aliases"] = cls._parse_model_aliases(
             cli_args_dict.get(f"{prefix}model_alias", [])
         )
@@ -3468,6 +3519,28 @@ class RouterArgs:
                 header, context_key = token.split("=", 1)
                 headers[header] = context_key
         return headers
+
+    @staticmethod
+    def _parse_model_policies(values: list[str] | None) -> dict[str, str]:
+        policies: dict[str, str] = {}
+        allowed = {*COMMON_POLICY_CHOICES, "bucket"}
+        for value in values or []:
+            if "=" not in value:
+                raise ValueError(f"invalid model policy '{value}'; expected MODEL=POLICY")
+            model_id, policy = value.split("=", 1)
+            model_id = model_id.strip()
+            policy = policy.strip()
+            if not model_id:
+                raise ValueError("model policy must have a non-empty model ID")
+            if policy not in allowed:
+                raise ValueError(
+                    f"invalid policy '{policy}' for model '{model_id}'; "
+                    f"expected one of {sorted(allowed)}"
+                )
+            if model_id in policies:
+                raise ValueError(f"duplicate model policy for '{model_id}'")
+            policies[model_id] = policy
+        return policies
 
     @staticmethod
     def _parse_model_aliases(alias_list):

@@ -257,17 +257,25 @@ pub(crate) fn select_from(
 
     // The per-request predicate applies to every entry point, so a caller
     // that sets it can never dispatch to a worker it rejects.
+    // Trusted worker constraints (`x-smg-target-worker-url`,
+    // `x-smg-excluded-worker-urls`) apply here for the same reason.
     let accepted;
-    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
-        Some(accepts) => {
-            accepted = candidates
-                .iter()
-                .filter(|w| accepts(w.as_ref()))
-                .cloned()
-                .collect::<Vec<_>>();
-            &accepted
-        }
-        None => candidates,
+    let candidates: &[Arc<dyn Worker>] = if inputs.candidate_filter.is_some()
+        || header_utils::has_worker_constraints(inputs.headers)
+    {
+        accepted = candidates
+            .iter()
+            .filter(|w| {
+                header_utils::worker_url_is_allowed(inputs.headers, w.url())
+                    && inputs
+                        .candidate_filter
+                        .is_none_or(|accepts| accepts(w.as_ref()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &accepted
+    } else {
+        candidates
     };
 
     let mut info = SelectWorkerInfo {
@@ -937,6 +945,7 @@ pub(crate) fn select_pair(
 ) -> Result<Pair, Box<PairFailure>> {
     let admitted = |w: &Arc<dyn Worker>| {
         WireConstraint::admits(wire, w.as_ref())
+            && header_utils::worker_url_is_allowed(inputs.headers, w.url())
             && inputs
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
@@ -2049,6 +2058,47 @@ mod tests {
             failure_from(&[], MODEL, false),
             PlacementFailure::NoCandidates
         ));
+    }
+
+    /// The trusted worker constraints narrow every placement, so a request
+    /// never reaches a worker the control plane excluded or did not target.
+    #[test]
+    fn trusted_worker_constraints_narrow_the_candidates() {
+        let registry = registry_with(&[
+            ("http://h:1", ConnectionMode::Http, RuntimeType::Sglang),
+            ("http://h:2", ConnectionMode::Http, RuntimeType::Sglang),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let place = |name: &'static str, value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, value.parse().unwrap());
+            (0..4)
+                .map(|_| {
+                    select_single(
+                        &registry,
+                        &policies,
+                        MODEL,
+                        RoutingPool::HttpRegular,
+                        None,
+                        PlacementInputs {
+                            headers: Some(&headers),
+                            ..Default::default()
+                        },
+                    )
+                    .map(|w| w.url().to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(place("x-smg-target-worker-url", "http://h:2")
+            .iter()
+            .all(|url| url.as_deref() == Some("http://h:2")));
+        assert!(place("x-smg-excluded-worker-urls", "http://h:2")
+            .iter()
+            .all(|url| url.as_deref() == Some("http://h:1")));
+        assert!(place("x-smg-target-worker-url", "http://absent:9")
+            .iter()
+            .all(Option::is_none));
     }
 
     /// A caller's filter narrows the veto fallback and the verdict too: a

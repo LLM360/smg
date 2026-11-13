@@ -526,6 +526,10 @@ struct Router {
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
+    capacity_credit_generation: Option<String>,
+    capacity_credit_required: bool,
+    capacity_credit_terminal_retention_secs: u64,
+    capacity_credit_ttl_ms: u64,
     chat_template: Option<String>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
@@ -619,6 +623,7 @@ struct Router {
     model_aliases: HashMap<String, String>,
     model_id_from: Option<String>,
     model_path: Option<String>,
+    model_policies: HashMap<String, PolicyType>,
     multimodal_max_inflight_bytes: Option<usize>,
     multimodal_shm_min_bytes: Option<usize>,
     multimodal_tensor_transport: Option<String>,
@@ -637,6 +642,7 @@ struct Router {
     prefill_max_inflight_requests_per_worker: i32,
     prefill_min_ready_percent: Option<u8>,
     prefill_min_ready_workers: Option<usize>,
+    prefer_trusted_tenant_header: bool,
     prefill_policy: Option<PolicyType>,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
@@ -1295,10 +1301,16 @@ impl Router {
             };
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+        let model_policies = self
+            .model_policies
+            .iter()
+            .map(|(model_id, policy)| Ok((model_id.clone(), convert_policy(policy)?)))
+            .collect::<config::ConfigResult<HashMap<_, _>>>()?;
 
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .model_policies(model_policies)
             .cache_boundaries(self.cache_boundaries.clone())
             .host(&self.host)
             .port(self.port)
@@ -1407,6 +1419,11 @@ impl Router {
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
+            .prefer_trusted_tenant_header(self.prefer_trusted_tenant_header)
+            .capacity_credit_generation(self.capacity_credit_generation.clone())
+            .capacity_credit_ttl_ms(self.capacity_credit_ttl_ms)
+            .capacity_credit_terminal_retention_secs(self.capacity_credit_terminal_retention_secs)
+            .capacity_credit_required(self.capacity_credit_required)
             .tenant_header_name(&self.tenant_header_name)
             .maybe_storage_context_headers(
                 (!self.storage_context_headers.is_empty())
@@ -1521,6 +1538,10 @@ impl Router {
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
         cb_window_duration_secs = 120,
+        capacity_credit_generation = None,
+        capacity_credit_required = false,
+        capacity_credit_terminal_retention_secs = 600,
+        capacity_credit_ttl_ms = 30000,
         chat_template = None,
         client_cert_path = None,
         client_key_path = None,
@@ -1608,6 +1629,7 @@ impl Router {
         model_aliases = HashMap::new(),
         model_id_from = None,
         model_path = None,
+        model_policies = HashMap::new(),
         multimodal_max_inflight_bytes = None,
         multimodal_shm_min_bytes = None,
         multimodal_tensor_transport = None,
@@ -1625,6 +1647,7 @@ impl Router {
         prefill_max_inflight_requests_per_worker = -1,
         prefill_min_ready_percent = None,
         prefill_min_ready_workers = None,
+        prefer_trusted_tenant_header = false,
         prefill_policy = None,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
@@ -1747,6 +1770,10 @@ impl Router {
         cb_success_threshold: u32,
         cb_timeout_duration_secs: u64,
         cb_window_duration_secs: u64,
+        capacity_credit_generation: Option<String>,
+        capacity_credit_required: bool,
+        capacity_credit_terminal_retention_secs: u64,
+        capacity_credit_ttl_ms: u64,
         chat_template: Option<String>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
@@ -1834,6 +1861,7 @@ impl Router {
         model_aliases: HashMap<String, String>,
         model_id_from: Option<String>,
         model_path: Option<String>,
+        model_policies: HashMap<String, PolicyType>,
         multimodal_max_inflight_bytes: Option<usize>,
         multimodal_shm_min_bytes: Option<usize>,
         multimodal_tensor_transport: Option<String>,
@@ -1851,6 +1879,7 @@ impl Router {
         prefill_max_inflight_requests_per_worker: i32,
         prefill_min_ready_percent: Option<u8>,
         prefill_min_ready_workers: Option<usize>,
+        prefer_trusted_tenant_header: bool,
         prefill_policy: Option<PolicyType>,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
@@ -2025,6 +2054,10 @@ impl Router {
             cb_success_threshold,
             cb_timeout_duration_secs,
             cb_window_duration_secs,
+            capacity_credit_generation,
+            capacity_credit_required,
+            capacity_credit_terminal_retention_secs,
+            capacity_credit_ttl_ms,
             chat_template,
             client_cert_path,
             client_key_path,
@@ -2112,6 +2145,7 @@ impl Router {
             model_aliases,
             model_id_from,
             model_path,
+            model_policies,
             multimodal_max_inflight_bytes,
             multimodal_shm_min_bytes,
             multimodal_tensor_transport,
@@ -2129,6 +2163,7 @@ impl Router {
             prefill_max_inflight_requests_per_worker,
             prefill_min_ready_percent,
             prefill_min_ready_workers,
+            prefer_trusted_tenant_header,
             prefill_policy,
             prefill_queue_size,
             prefill_queue_timeout_secs,

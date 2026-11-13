@@ -401,6 +401,51 @@ impl CliArgs {
     }
 
     /// Build a routing policy with the same per-policy defaults as the CLI flags.
+    fn parse_model_policies(&self) -> ConfigResult<HashMap<String, PolicyConfig>> {
+        let allowed = [
+            "random",
+            "round_robin",
+            "passthrough",
+            "cache_aware",
+            "power_of_two",
+            "least_load",
+            "bucket",
+            "prefix_hash",
+            "consistent_hashing",
+            "manual",
+        ];
+        let mut policies = HashMap::new();
+        for value in &self.routing.model_policy {
+            let Some((model_id, policy)) = value.split_once('=') else {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policy".to_string(),
+                    value: value.clone(),
+                    reason: "expected MODEL=POLICY".to_string(),
+                });
+            };
+            let model_id = model_id.trim();
+            let policy = policy.trim();
+            if model_id.is_empty() || !allowed.contains(&policy) {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policy".to_string(),
+                    value: value.clone(),
+                    reason: "model must be non-empty and policy must be supported".to_string(),
+                });
+            }
+            if policies
+                .insert(model_id.to_string(), self.parse_policy(policy))
+                .is_some()
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_policy".to_string(),
+                    value: value.clone(),
+                    reason: format!("duplicate policy for model '{model_id}'"),
+                });
+            }
+        }
+        Ok(policies)
+    }
+
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
@@ -1098,6 +1143,7 @@ impl CliArgs {
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
         let policy = self.parse_policy(&self.routing.policy);
+        let model_policies = self.parse_model_policies()?;
         let discovery = self.discovery_config()?;
         let metrics = Some(MetricsConfig {
             port: self.serving.prometheus_port,
@@ -1134,6 +1180,7 @@ impl CliArgs {
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .model_policies(model_policies)
             .cache_boundaries(self.routing.cache_boundaries.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
@@ -1214,6 +1261,12 @@ impl CliArgs {
             .priority_scheduler_tenant_metric_top_n(
                 self.serving.priority_scheduler_tenant_metric_top_n,
             )
+            .capacity_credit_generation(self.serving.capacity_credit_generation.clone())
+            .capacity_credit_ttl_ms(self.serving.capacity_credit_ttl_ms)
+            .capacity_credit_terminal_retention_secs(
+                self.serving.capacity_credit_terminal_retention_secs,
+            )
+            .capacity_credit_required(self.serving.capacity_credit_required)
             .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
             .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
@@ -1276,6 +1329,7 @@ impl CliArgs {
                     .then(|| Self::parse_selector(&self.serving.storage_context_headers)),
             )
             .trust_tenant_header(self.serving.trust_tenant_header)
+            .prefer_trusted_tenant_header(self.serving.prefer_trusted_tenant_header)
             .tenant_header_name(&self.serving.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.serving.rate_limit_tokens_per_second)
             .max_background_responses(self.serving.max_background_responses)

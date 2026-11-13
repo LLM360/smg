@@ -54,6 +54,10 @@ pub struct CapacityTrackerSettings {
     /// regardless of the fleet. `None` (or originally-zero) means
     /// "derive from workers."
     pub override_capacity: Option<u16>,
+    /// Hard ceiling applied to worker-derived capacity. This keeps the
+    /// aggregate fleet signal from exceeding the operator's global request
+    /// budget while still allowing capacity to shrink with the healthy fleet.
+    pub max_capacity: Option<u16>,
     /// Per-worker slot count used for tier 3 (mixed) and pure tier-3
     /// (workers known, none report).
     pub slots_per_worker: u16,
@@ -90,6 +94,7 @@ impl Default for CapacityTrackerSettings {
     fn default() -> Self {
         Self {
             override_capacity: None,
+            max_capacity: None,
             slots_per_worker: 64,
             legacy_max_concurrent_requests: 1024,
         }
@@ -311,10 +316,12 @@ pub(super) fn recompute(
 
     let total_workers = workers.len();
     if total_workers == 0 {
-        return (
-            settings.legacy_max_concurrent_requests,
-            CapacitySource::LegacyFallback,
-        );
+        let capacity = settings
+            .max_capacity
+            .map_or(settings.legacy_max_concurrent_requests, |max| {
+                settings.legacy_max_concurrent_requests.min(max)
+            });
+        return (capacity, CapacitySource::LegacyFallback);
     }
 
     let mut sum_reported: u32 = 0;
@@ -329,6 +336,7 @@ pub(super) fn recompute(
     if non_reporters == 0 {
         // Tier 2: every worker reported.
         let capped = sum_reported.min(u32::from(u16::MAX)) as u16;
+        let capped = settings.max_capacity.map_or(capped, |max| capped.min(max));
         return (capped, CapacitySource::WorkerReported);
     }
 
@@ -338,6 +346,7 @@ pub(super) fn recompute(
         (non_reporters as u32).saturating_mul(u32::from(settings.slots_per_worker));
     let total = sum_reported.saturating_add(from_non_reporters);
     let capped = total.min(u32::from(u16::MAX)) as u16;
+    let capped = settings.max_capacity.map_or(capped, |max| capped.min(max));
     (capped, CapacitySource::Mixed)
 }
 
@@ -367,6 +376,7 @@ mod tests {
     fn test_settings_default_has_sensible_values() {
         let s = CapacityTrackerSettings::default();
         assert_eq!(s.override_capacity, None);
+        assert_eq!(s.max_capacity, None);
         assert_eq!(s.slots_per_worker, 64);
         assert_eq!(s.legacy_max_concurrent_requests, 1024);
     }
@@ -430,6 +440,33 @@ mod tests {
         ];
         let (capacity, source) = recompute(&settings, &workers);
         assert_eq!(capacity, 384);
+        assert_eq!(source, CapacitySource::WorkerReported);
+    }
+
+    #[test]
+    fn test_recompute_caps_worker_reported_capacity_at_global_maximum() {
+        let settings = CapacityTrackerSettings {
+            max_capacity: Some(8_000),
+            ..Default::default()
+        };
+        let workers = vec![
+            worker_with_capacity("http://w1", Some(5_000)),
+            worker_with_capacity("http://w2", Some(5_000)),
+        ];
+        let (capacity, source) = recompute(&settings, &workers);
+        assert_eq!(capacity, 8_000);
+        assert_eq!(source, CapacitySource::WorkerReported);
+    }
+
+    #[test]
+    fn test_recompute_keeps_worker_capacity_below_global_maximum() {
+        let settings = CapacityTrackerSettings {
+            max_capacity: Some(8_000),
+            ..Default::default()
+        };
+        let workers = vec![worker_with_capacity("http://w1", Some(4_000))];
+        let (capacity, source) = recompute(&settings, &workers);
+        assert_eq!(capacity, 4_000);
         assert_eq!(source, CapacitySource::WorkerReported);
     }
 

@@ -64,6 +64,17 @@ pub(crate) trait Permit: Send {
     fn first_data_frame(&mut self) -> bool {
         true
     }
+
+    /// A data frame of the handler's body is going out (the first one
+    /// included, after `first_data_frame` let it pass). Keep-alive frames
+    /// are not reported. The default ignores the bytes.
+    fn data_frame(&mut self, _data: &[u8]) {}
+
+    /// The body reached its end: its last frame, the declared length, or
+    /// an end seen before any poll. It is not called for a body that failed,
+    /// was cut short by the client, or was ended before its first byte. The
+    /// default does nothing.
+    fn body_finished(&mut self) {}
 }
 
 /// What the layers inside the edge hand the edge's one body wrapper.
@@ -198,6 +209,9 @@ impl EdgeBody {
         if let Some(span) = &mut self.span {
             span.ended(self.progress.sent());
         }
+        if let Some(permit) = &mut self.permit {
+            permit.body_finished();
+        }
         self.permit = None;
         self.keep_alive = None;
     }
@@ -209,6 +223,9 @@ impl EdgeBody {
         self.outcome.completed();
         if let Some(span) = &mut self.span {
             span.unpolled();
+        }
+        if let Some(permit) = &mut self.permit {
+            permit.body_finished();
         }
         self.permit = None;
         self.keep_alive = None;
@@ -242,6 +259,8 @@ impl EdgeBody {
     /// frame, and stays ended.
     fn end_before_first_byte(&mut self) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         self.ended = true;
+        // Not a finished body: the permit goes without `body_finished`.
+        self.permit = None;
         self.finished();
         Poll::Ready(None)
     }
@@ -267,6 +286,9 @@ impl HttpBody for EdgeBody {
                 if let Some(data) = frame.data_ref() {
                     if !this.data_frame_allowed() {
                         return this.end_before_first_byte();
+                    }
+                    if let Some(permit) = &mut this.permit {
+                        permit.data_frame(data);
                     }
                     if let Some(keep_alive) = &mut this.keep_alive {
                         keep_alive.frame_out(data);

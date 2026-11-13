@@ -106,6 +106,7 @@ mod tests {
         let yaml = PrioritySchedulerYaml {
             classes: Default::default(),
             tenant_policies,
+            ..Default::default()
         };
         let settings =
             SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap();

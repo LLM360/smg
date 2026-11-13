@@ -5,6 +5,7 @@ mod allocator_artifact_test;
 mod connection_limit_startup_test;
 mod control_plane_key_file_startup_test;
 mod health_check_knobs_startup_test;
+mod http_admission_series_startup_test;
 mod listener_ports_startup_test;
 mod log_dir_startup_test;
 mod mesh_tls_startup_test;

@@ -460,6 +460,27 @@ pub struct RouterConfig {
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
+    /// Explicit per-model policy overrides. Values are fully configured policy
+    /// instances, so cache-aware models inherit the same CLI tuning as the
+    /// gateway default without making that default cache-aware.
+    #[serde(default)]
+    pub model_policies: HashMap<String, PolicyConfig>,
+    /// Unique identifier for the allocator generation allowed to issue and
+    /// redeem scheduler-backed capacity credits. `None` keeps the entire
+    /// credit protocol unwired and behavior-preserving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_credit_generation: Option<String>,
+    /// Lifetime of an issued but unredeemed credit.
+    #[serde(default = "default_capacity_credit_ttl_ms")]
+    pub capacity_credit_ttl_ms: u64,
+    /// Replay-tombstone lifetime after redeem, cancel, or expiry.
+    #[serde(default = "default_capacity_credit_terminal_retention_secs")]
+    pub capacity_credit_terminal_retention_secs: u64,
+    /// Reject protected inference requests that do not redeem a valid credit.
+    /// This is the enforcement switch; the issue API can be enabled first
+    /// while this remains false.
+    #[serde(default)]
+    pub capacity_credit_required: bool,
     /// Standing-concurrency cap. -1 (default) derives it from the host (1024
     /// per available core, at least 4096); 0 disables it. Each admission
     /// permit is held for the full response, including streaming bodies.
@@ -688,6 +709,9 @@ pub struct PdReadinessConfig {
 pub struct TenantResolutionConfig {
     pub trust_tenant_header: bool,
     pub tenant_header_name: String,
+    /// Let a valid trusted tenant header take precedence over the
+    /// authenticated caller. Used when one proxy authenticates for many users.
+    pub prefer_trusted_tenant_header: bool,
 }
 
 /// A single tenant-scoped API key for serving-path authentication.
@@ -712,6 +736,7 @@ impl Default for TenantResolutionConfig {
         Self {
             trust_tenant_header: false,
             tenant_header_name: DEFAULT_TENANT_HEADER_NAME.to_string(),
+            prefer_trusted_tenant_header: false,
         }
     }
 }
@@ -965,6 +990,14 @@ impl Default for TokenizerCacheConfig {
 
 fn default_priority_scheduler_max_class() -> String {
     "default".to_string()
+}
+
+fn default_capacity_credit_ttl_ms() -> u64 {
+    30_000
+}
+
+fn default_capacity_credit_terminal_retention_secs() -> u64 {
+    600
 }
 
 fn default_priority_scheduler_tenant_metric_top_n() -> u32 {
@@ -2238,6 +2271,12 @@ impl Default for RouterConfig {
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
             tenant_resolution: TenantResolutionConfig::default(),
+            model_policies: HashMap::new(),
+            capacity_credit_generation: None,
+            capacity_credit_ttl_ms: default_capacity_credit_ttl_ms(),
+            capacity_credit_terminal_retention_secs:
+                default_capacity_credit_terminal_retention_secs(),
+            capacity_credit_required: false,
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,

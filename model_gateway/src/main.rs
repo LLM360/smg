@@ -326,6 +326,10 @@ struct RoutingArgs {
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
+    /// Per-model routing policy override in MODEL=POLICY form. Repeatable.
+    #[arg(long = "model-policy", action = ArgAction::Append, help_heading = "Routing Policy")]
+    model_policy: Vec<String>,
+
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
     /// pins a request to a worker already holding that prefix; below it the
     /// request is load-balanced instead
@@ -1126,6 +1130,11 @@ struct ServingArgs {
     #[arg(long, default_value_t = false, help_heading = "Request Handling")]
     trust_tenant_header: bool,
 
+    /// Prefer the trusted tenant header over an authenticated shared proxy
+    /// identity. Requires --trust-tenant-header.
+    #[arg(long, default_value_t = false, help_heading = "Request Handling")]
+    prefer_trusted_tenant_header: bool,
+
     /// Header name to use when --trust-tenant-header is enabled.
     #[arg(
         long,
@@ -1316,6 +1325,23 @@ struct ServingArgs {
     /// remainder bucket under `tenant="other"`).
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
+
+    /// Unique allocator generation that enables scheduler-backed capacity
+    /// credits. Omit to keep the protocol disabled.
+    #[arg(long, help_heading = "Priority Scheduler")]
+    capacity_credit_generation: Option<String>,
+
+    /// Lifetime in milliseconds of an unredeemed capacity credit.
+    #[arg(long, default_value_t = 30_000, help_heading = "Priority Scheduler")]
+    capacity_credit_ttl_ms: u64,
+
+    /// Retain terminal credit tombstones for replay protection.
+    #[arg(long, default_value_t = 600, help_heading = "Priority Scheduler")]
+    capacity_credit_terminal_retention_secs: u64,
+
+    /// Require every protected inference request to redeem a valid credit.
+    #[arg(long, help_heading = "Priority Scheduler")]
+    capacity_credit_required: bool,
 
     // ==================== Tenant Rate Limit ====================
     /// Enable per-tenant LLM token/request rate limiting. When unset

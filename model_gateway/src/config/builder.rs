@@ -636,6 +636,36 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn model_policies(mut self, policies: HashMap<String, PolicyConfig>) -> Self {
+        self.config.model_policies = policies;
+        self
+    }
+
+    pub fn capacity_credit_generation(mut self, generation: Option<String>) -> Self {
+        self.config.capacity_credit_generation = generation;
+        self
+    }
+
+    pub fn capacity_credit_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.config.capacity_credit_ttl_ms = ttl_ms;
+        self
+    }
+
+    pub fn capacity_credit_terminal_retention_secs(mut self, retention_secs: u64) -> Self {
+        self.config.capacity_credit_terminal_retention_secs = retention_secs;
+        self
+    }
+
+    pub fn capacity_credit_required(mut self, required: bool) -> Self {
+        self.config.capacity_credit_required = required;
+        self
+    }
+
+    pub fn prefer_trusted_tenant_header(mut self, prefer: bool) -> Self {
+        self.config.tenant_resolution.prefer_trusted_tenant_header = prefer;
+        self
+    }
+
     pub fn trust_tenant_header(mut self, trust: bool) -> Self {
         self.config.tenant_resolution.trust_tenant_header = trust;
         self

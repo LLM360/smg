@@ -1164,6 +1164,14 @@ pub struct GatewayApps {
     pub admin: Option<Router>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BuildAppError {
+    #[error("invalid tenant header configuration: {0}")]
+    InvalidHeader(#[from] InvalidHeaderName),
+    #[error("priority scheduler configuration failed: {0}")]
+    Scheduler(String),
+}
+
 /// One router with every route: the layout without an admin listener. See
 /// [`build_apps`] for the arguments.
 pub fn build_app(
@@ -1174,7 +1182,7 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
-) -> Result<Router, InvalidHeaderName> {
+) -> Result<Router, BuildAppError> {
     build_apps(
         app_state,
         serving_auth_config,
@@ -1208,7 +1216,7 @@ pub fn build_apps(
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
     admin_listener: bool,
-) -> Result<GatewayApps, InvalidHeaderName> {
+) -> Result<GatewayApps, BuildAppError> {
     // The admin-only reads join the state once, for every attachment of
     // the control-plane layer below: the shared groups and the gated group.
     let control_plane_auth_state =
@@ -1239,11 +1247,12 @@ pub fn build_apps(
 
     // Choose the admission path once at startup: priority scheduler when
     // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
-    let admission_mode = middleware::scheduler::AdmissionMode::from_config(
+    let admission_mode = middleware::scheduler::AdmissionMode::try_from_config_checked(
         &app_state.context.router_config,
         app_state.context.worker_registry.clone(),
         app_state.context.rate_limiter.clone(),
-    );
+    )
+    .map_err(BuildAppError::Scheduler)?;
 
     // The admission members of the protected stacks, from the mode chosen
     // above: the priority scheduler's middleware (carrying its own
@@ -1407,7 +1416,7 @@ pub fn build_apps(
         .route_layer(
             tower::ServiceBuilder::new()
                 .layer(InertLayer(serving_auth_layer.clone()))
-                .layer(tenant_resolution_state.layer())
+                .layer(tenant_resolution_state.clone().layer())
                 .layer(InertLayer(priority_admission))
                 .layer(InertLayer(legacy_limit)),
         );
@@ -1518,7 +1527,48 @@ pub fn build_apps(
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
         .merge(public_routes);
-    let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
+    // Capacity-credit capabilities/issue/arm/cancel is a separate internal
+    // service-key API. It accepts only the shared gateway key, never ordinary
+    // tenant keys. Tenant resolution still runs so the trusted proxy-injected
+    // user is the exact same canonical TenantKey used by inference settlement.
+    let capacity_credit_routes = match &admission_mode {
+        middleware::scheduler::AdmissionMode::Priority(scheduler_state)
+            if scheduler_state.capacity_credits().is_some() =>
+        {
+            Router::new()
+                .route(
+                    "/internal/capacity-credits/capabilities",
+                    get(middleware::scheduler::capacity_credit_capabilities),
+                )
+                .route(
+                    "/internal/capacity-credits",
+                    post(middleware::scheduler::issue_capacity_credit),
+                )
+                .route(
+                    "/internal/capacity-credits/{credit}",
+                    delete(middleware::scheduler::cancel_capacity_credit),
+                )
+                .route(
+                    "/internal/capacity-credits/{credit}/arm",
+                    post(middleware::scheduler::arm_capacity_credit),
+                )
+                .layer(Extension(scheduler_state.clone()))
+                .route_layer(
+                    tower::ServiceBuilder::new()
+                        .layer(axum::middleware::from_fn_with_state(
+                            admin_auth_config.clone(),
+                            middleware::auth_middleware,
+                        ))
+                        .layer(tenant_resolution_state.clone().layer()),
+                )
+        }
+        _ => Router::new(),
+    };
+
+    let mut control_plane = Router::new()
+        .merge(admin_routes)
+        .merge(worker_routes)
+        .merge(capacity_credit_routes);
     if let Some(gated_routes) = gated_routes {
         control_plane = control_plane.merge(gated_routes);
     }
@@ -2169,6 +2219,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
+
     // The mesh listener's port against the others: the mesh configuration is
     // not part of `RouterConfig`, so the validator cannot see it, and this is
     // the one place the CLI, the Python binding and a library caller all pass.
@@ -2312,6 +2363,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
         metrics::init_startup_series();
+        // The admission series (process start, zero counters, limit and
+        // queue capacity) are written after the recorder is installed: a
+        // gauge set before it lands in the no-op recorder and is lost. The
+        // priority scheduler's sampler replaces the limit with the sum of
+        // its partitions on its first tick.
+        metrics::Metrics::initialize_http_admission(
+            config.router_config.max_concurrent_requests,
+            config.router_config.queue_size,
+        );
         // Under Symphony the series of a request no table reads exist at zero
         // from the start; a table's own follow its model's first registration.
         if config.router_config.parser == ParserChoice::Symphony {

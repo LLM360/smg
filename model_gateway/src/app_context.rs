@@ -788,9 +788,10 @@ impl AppContextBuilder {
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
         self.policy_registry = Some(Arc::new(
-            PolicyRegistry::with_override(
+            PolicyRegistry::with_model_policies(
                 config.policy.clone(),
                 config.routing_key_override.clone(),
+                config.model_policies.clone(),
             )
             .with_pd_pairing_mode(config.pd_pairing_mode),
         ));
