@@ -82,6 +82,10 @@ pub const EXPECTED_HASHES: [u64; 4] = [
 const KIMI_K3_REPO: &str = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main";
 const KIMI_K3_CACHE_DIR: &str = ".tokenizer_cache/kimi_k3";
 
+const KIMI_K31_REPO: &str =
+    "https://huggingface.co/moonshotai/Kimi-K3.1-Pro/resolve/6d0a0202956796543364d666ab19c6ad1a494ee1";
+const KIMI_K31_CACHE_DIR: &str = ".tokenizer_cache/kimi_k31";
+
 /// A directory holding the Kimi-K3 tokenizer files (`tiktoken.model`,
 /// `tokenizer_config.json`) plus a minimal `config.json` naming the K3
 /// architecture so the tiktoken backend selects the XTML renderer.
@@ -143,6 +147,63 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
             r#"{"architectures": ["KimiK3ForConditionalGeneration"], "model_type": "kimi_k3"}"#,
         )
         .expect("Failed to write config.json");
+    }
+
+    cache_dir
+}
+
+/// A directory holding the Kimi-K3.1-Pro tokenizer files at the pinned
+/// revision (`tiktoken.model`, `tokenizer_config.json`) plus the checkpoint's
+/// own `config.json`, so the tiktoken backend selects the K3.1 renderer from
+/// `model_type=kimi_k31`.
+///
+/// `KIMI_K31_MODEL_DIR` points at a full checkpoint directory and skips the
+/// download; otherwise the tokenizer files are fetched once into
+/// `.tokenizer_cache/kimi_k31/`.
+#[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[expect(clippy::panic, reason = "test helper — panics are intentional")]
+pub fn ensure_kimi_k31_cached() -> PathBuf {
+    if let Some(dir) = std::env::var_os("KIMI_K31_MODEL_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    let _guard = hub_fetch::download_lock();
+
+    let cache_dir = PathBuf::from(KIMI_K31_CACHE_DIR);
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
+    }
+
+    for (file, min_bytes) in [
+        ("tiktoken.model", 1_000_000),
+        ("tokenizer_config.json", 500),
+        ("config.json", 500),
+    ] {
+        let path = cache_dir.join(file);
+        if path.exists() {
+            continue;
+        }
+        println!("Downloading Kimi-K3.1 {file} from HuggingFace...");
+        let client = http_client();
+        let answer = hub_fetch::fetch(&client, &format!("{KIMI_K31_REPO}/{file}"))
+            .unwrap_or_else(|e| panic!("Failed to download {file}: {e}"));
+        assert!(
+            answer.status.is_success(),
+            "Failed to download {file}: HTTP {}",
+            answer.status
+        );
+        let content = answer.body;
+        assert!(
+            content.len() >= min_bytes,
+            "Downloaded {file} too small: {} bytes",
+            content.len()
+        );
+        // Rename into place so a failed write never leaves a short file that
+        // the next run would trust.
+        let part = cache_dir.join(format!("{file}.part"));
+        fs::write(&part, content).expect("Failed to write to cache");
+        fs::rename(&part, &path).expect("Failed to move download into place");
     }
 
     cache_dir
